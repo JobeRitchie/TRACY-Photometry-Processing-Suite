@@ -8,9 +8,9 @@ Built with Python/Tkinter; everything runs locally in a single GUI.
 Version 1.0.1.
 
 ## Getting Started
-- Install Git
-- Install Python 3.9 or newer version
-- Open command prompt in a new folder and type git pull https://github.com/JobeRitchie/TRACY-Photometry-Processing-Suite
+- Install [Git](https://git-scm.com/install/windows)
+- Install [Python 3.9 or newer version](https://www.python.org/ftp/python/3.14.5/python-3.14.5-amd64.exe)
+- Open command prompt in a new folder and type `git clone https://github.com/JobeRitchie/TRACY-Photometry-Processing-Suite.git`
 - Double click Start_FP_GUI.bat
 - Click project tab and create a new project
 - Click processing tab and select either single files or a folder to process
