@@ -27600,12 +27600,57 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             messagebox.showerror("Update Error", str(exc))
 
     def _restart_app(self):
-        """Destroy the current window and re-launch the same Python script."""
+        """Re-launch the application in a fresh process, then close this one.
+
+        The new process is started *before* this one exits. os.execv is
+        unreliable on Windows (it often fails to replace the process, so the
+        old window closes but no new one appears), so instead we spawn a
+        detached child and then terminate the current process.
+        """
         import sys
+        import subprocess
+
         python = sys.executable
         script = os.path.abspath(__file__)
-        self.root.destroy()
-        os.execv(python, [python, script] + sys.argv[1:])
+        repo_dir = os.path.dirname(script)
+        args = [python, script] + sys.argv[1:]
+
+        try:
+            if os.name == 'nt':
+                # Detach the new process so it keeps running independently of
+                # this process and any launching console window.
+                DETACHED_PROCESS = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                # A detached process has no console, so give it null std
+                # handles — otherwise the relaunched app can crash the first
+                # time it writes to stdout/stderr.
+                subprocess.Popen(
+                    args,
+                    cwd=repo_dir,
+                    close_fds=True,
+                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(args, cwd=repo_dir, close_fds=True,
+                                 start_new_session=True)
+        except Exception as exc:
+            messagebox.showerror(
+                "Restart Failed",
+                f"The update was applied but the app could not relaunch "
+                f"automatically:\n{exc}\n\nPlease close and reopen the "
+                f"application manually."
+            )
+            return
+
+        # New instance is launching; tear down this one and exit hard so the
+        # old process fully releases before the new window appears.
+        try:
+            self.root.destroy()
+        finally:
+            os._exit(0)
 
     # ==================== CONNECTIVITY ANALYSIS METHODS ====================
 
