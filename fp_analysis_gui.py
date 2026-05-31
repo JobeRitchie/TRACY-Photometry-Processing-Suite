@@ -2149,33 +2149,33 @@ class FPAnalysisGUI:
         ttk.Button(control_frame, text="Visualize Data",
                   command=self.visualize_behavioral_data).grid(row=0, column=7, padx=5)
         
-        # Results display
+        # Embedded visualization area (populated by visualize_behavioral_data
+        # instead of opening a separate window). Shown above the metrics table.
+        self.behav_viz_container = ttk.LabelFrame(scrollable_frame, text="Visualization", padding=5)
+        self.behav_viz_container.pack(fill='both', expand=True, padx=5, pady=(5, 5))
+        ttk.Label(self.behav_viz_container,
+                  text='Click "Visualize Data" above to plot behavioral metrics here.',
+                  foreground='gray').pack(anchor='w', padx=5, pady=5)
+
+        # Results display (below the visualization)
         results_frame = ttk.LabelFrame(scrollable_frame, text="Behavioral Metrics", padding=5)
-        results_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        
+        results_frame.pack(fill='both', expand=True, padx=5, pady=(0, 5))
+
         # Create treeview for results
         tree_container = ttk.Frame(results_frame)
         tree_container.pack(fill='both', expand=True)
-        
+
         self.behav_tree = ttk.Treeview(tree_container, show='tree headings', height=15)
         vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.behav_tree.yview)
         hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.behav_tree.xview)
         self.behav_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        
+
         self.behav_tree.grid(row=0, column=0, sticky='nsew')
         vsb.grid(row=0, column=1, sticky='ns')
         hsb.grid(row=1, column=0, sticky='ew')
-        
+
         tree_container.grid_rowconfigure(0, weight=1)
         tree_container.grid_columnconfigure(0, weight=1)
-
-        # Embedded visualization area (populated by visualize_behavioral_data
-        # instead of opening a separate window).
-        self.behav_viz_container = ttk.LabelFrame(scrollable_frame, text="Visualization", padding=5)
-        self.behav_viz_container.pack(fill='both', expand=True, padx=5, pady=(0, 5))
-        ttk.Label(self.behav_viz_container,
-                  text='Click "Visualize Data" above to plot behavioral metrics here.',
-                  foreground='gray').pack(anchor='w', padx=5, pady=5)
 
     def create_groups_tab(self):
         """Tab for creating and managing subject groups"""
@@ -10333,10 +10333,76 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             f"Location: {project_path}"
         ))
     
+    def _show_loading_dialog(self, message):
+        """Show a modal 'please wait' dialog with an indeterminate progress bar.
+
+        Loading a project does a lot of synchronous file I/O on the main thread,
+        which makes Windows mark the window as 'Not Responding' and look like a
+        crash. This dialog (kept animated/responsive via _tick_loading during the
+        load) tells the user work is in progress instead.
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Loading Project")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        # Block the close button so the dialog can't be dismissed mid-load.
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        tk.Label(dialog, text=message, font=('Arial', 10), justify='center').pack(
+            pady=(20, 10), padx=20)
+        progress = ttk.Progressbar(dialog, length=300, mode='indeterminate')
+        progress.pack(pady=(0, 20), padx=20)
+        progress.start(12)
+
+        # Center over the main window.
+        dialog.update_idletasks()
+        w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (w // 2)
+        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (h // 2)
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
+        dialog.update()
+        return dialog
+
+    def _tick_loading(self):
+        """Keep the loading dialog animated/responsive during a long load."""
+        dialog = getattr(self, '_loading_dialog', None)
+        if dialog is not None:
+            try:
+                dialog.update()
+                return
+            except tk.TclError:
+                pass
+        self.root.update_idletasks()
+
+    def _close_loading_dialog(self, dialog):
+        """Tear down a loading dialog created by _show_loading_dialog."""
+        if dialog is None:
+            return
+        for action in (dialog.grab_release, dialog.destroy):
+            try:
+                action()
+            except tk.TclError:
+                pass
+
     def load_project(self):
+        """Load a project, showing a 'please wait' dialog during the file I/O."""
+        self._loading_dialog = self._show_loading_dialog(
+            f"Loading project '{self.current_project}'...\nPlease wait."
+        )
+        try:
+            return self._load_project_impl()
+        finally:
+            self._close_loading_dialog(self._loading_dialog)
+            self._loading_dialog = None
+
+    def _load_project_impl(self):
         """Load project configuration and data"""
         self.log_message(f"Loading project: {self.current_project}")
-        self.root.update_idletasks()  # Allow GUI to update
+        self._tick_loading()  # Keep loading dialog responsive
         
         # Clear all existing project data to start fresh
         self.processed_data = {}
@@ -10426,7 +10492,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     f"{len(self.per_subject_boutframe_shifts)} subject(s)")
             
             self.log_message(f"  Loaded project configuration")
-            self.root.update_idletasks()  # Allow GUI to update
+            self._tick_loading()  # Keep loading dialog responsive
             
             # Load processed data
             processed_dir = os.path.join(project_path, 'processed')
@@ -10437,7 +10503,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
                 for idx, subject in enumerate(processed_subjects):
                     self.log_message(f"  Loading subject {idx+1}/{total_subjects}: {subject}")
-                    self.root.update_idletasks()  # Allow GUI to update
+                    self._tick_loading()  # Keep loading dialog responsive
                     try:
                         subject_data = {}
                         
@@ -17676,6 +17742,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         canvas.draw_idle()
         return canvas
 
+    def _bout_fig_width(self, n_items, per_item=0.9, base=3.5, minimum=5.5):
+        """Content-aware figure width (inches) for the Bout Analysis plots.
+
+        Grows modestly with the number of categories so few-category plots stay
+        compact instead of stretching across the whole window, and is capped to
+        the available canvas width so wide plots never need a horizontal scroll.
+        """
+        content = max(minimum, int(max(1, n_items)) * per_item + base)
+        cap = 13.0
+        try:
+            cpx = self.bout_histogram_canvas.winfo_width()
+            if cpx > 100:
+                cap = (cpx - 24) / 100.0
+        except Exception:
+            pass
+        return max(minimum, min(content, cap))
+
     def _auto_viz_figure_size(self, plot_type, n_subjects):
         """Content-aware default figure size for the Visualization tab's 'auto' mode.
 
@@ -17764,8 +17847,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         plot_type = self.plot_type_var.get()
 
         # Determine figure size – use user-set values or fall back to
-        # content-aware, plot-type-specific defaults (scales with subject count).
-        default_w, default_h = self._auto_viz_figure_size(plot_type, len(valid_subjects))
+        # content-aware, plot-type-specific defaults (scales with item count).
+        # Group-mode grid plots draw one panel per *group*, not per subject, so
+        # size by group count there to avoid an oversized, mostly-empty figure.
+        size_count = len(valid_subjects)
+        if (self.plot_by_var.get() == "Group"
+                and any(t in plot_type for t in ("Position Heatmap", "Extracted Bouts"))):
+            try:
+                size_count = max(1, len(self.viz_group_listbox.curselection()))
+            except Exception:
+                pass
+        default_w, default_h = self._auto_viz_figure_size(plot_type, size_count)
         try:
             w_str = self.viz_fig_width_var.get().strip().lower()
             fig_w = float(w_str) if w_str not in ('', 'auto') else default_w
@@ -21314,7 +21406,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ax.set_ylabel('Y Position (cm)')
         ax.set_title(f'{subject_name} - Position Heatmap ({title_suffix}, {bin_size}cm bins)')
         ax.set_aspect('equal')
-        cbar = plt.colorbar(pcm, ax=ax, label='Average Z-score')
+        cbar = fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04, label='Average Z-score')
         ax.grid(True, alpha=0.3)
         
         fig.tight_layout()
@@ -21421,7 +21513,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax.set_ylabel('Y Position (cm)')
                     ax.set_title(f'{subject} ({channel})')
                     ax.set_aspect('equal')
-                    plt.colorbar(pcm, ax=ax, label='Avg Z-score')
+                    fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04, label='Avg Z-score')
                     ax.grid(True, alpha=0.3)
                 else:
                     ax.text(0.5, 0.5, 'No valid data', ha='center', va='center')
@@ -21471,7 +21563,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.set_ylabel('Y Position (cm)')
             ax.set_title(f'Position Heatmap - Group Average (n={n_subjects}, {channel}, {bin_size}cm bins)')
             ax.set_aspect('equal')
-            plt.colorbar(pcm, ax=ax, label='Avg Z-score')
+            fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04, label='Avg Z-score')
             ax.grid(True, alpha=0.3)
             
             fig.tight_layout()
@@ -21589,7 +21681,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.set_ylabel('Y Position (cm)')
             ax.set_title(f'{group_name}\n(n={gdata["n_subjects"]}, {channel}, {bin_size}cm bins)')
             ax.set_aspect('equal')
-            plt.colorbar(pcm, ax=ax, label='Avg Z-score')
+            fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04, label='Avg Z-score')
             ax.grid(True, alpha=0.3)
         
         fig.suptitle(f'Position Heatmap - Group Comparison', fontsize=14, fontweight='bold')
@@ -24868,8 +24960,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         def _draw_graph():
             self.root.update_idletasks()
             _FIG_DPI = 100
-            _cpx = self.bout_histogram_canvas.winfo_width()
-            fig_width = max(6, (_cpx - 24) / _FIG_DPI) if _cpx > 50 else 9
+            fig_width = self._bout_fig_width(len(bout_numbers), per_item=0.45, base=4.0, minimum=6.0)
             fig_height = max(3 * num_plots, 4)
             fig = Figure(figsize=(fig_width, fig_height), dpi=_FIG_DPI)
 
@@ -24906,15 +24997,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
             fig.tight_layout()
 
-            canvas = FigureCanvasTkAgg(fig, self.bout_histogram_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill='both', expand=True)
-
+            canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
             self.current_bout_canvas = canvas
             self.current_bout_figure = fig
-
-            toolbar = NavigationToolbar2Tk(canvas, self.bout_histogram_frame)
-            toolbar.update()
 
             self.bout_histogram_frame.update_idletasks()
             self.bout_histogram_canvas.configure(
@@ -25654,10 +25739,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         self.root.update_idletasks()
         _FIG_DPI = 100
-        _cpx = self.bout_histogram_canvas.winfo_width()
-        fig_width = max(6, (_cpx - 24) / _FIG_DPI) if _cpx > 100 else 9
+        fig_width = self._bout_fig_width(num_bars)
         fig = Figure(figsize=(fig_width, 2.5 * num_metrics), dpi=_FIG_DPI)
-        
+
         metric_names = {
             'avg_post': 'Average Post-Bout Z-Score',
             'max_post': 'Max Post-Bout Z-Score',
@@ -25765,21 +25849,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                        f'{mean_val:.2f}', ha='center', va='bottom', fontsize=7)
         
         fig.tight_layout()
-        
+
         # Store figure for axis control
         self.current_bout_figure = fig
-        
-        # Embed in tkinter
-        canvas = FigureCanvasTkAgg(fig, master=self.bout_histogram_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
+
+        # Embed at natural size so the plot stays compact instead of stretching
+        # across the full window width.
+        canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
         self.current_bout_canvas = canvas
-        
-        # Add toolbar
-        toolbar = NavigationToolbar2Tk(canvas, self.bout_histogram_frame)
-        toolbar.update()
-        
+
         # Force update of scroll region after drawing
         self.bout_histogram_frame.update_idletasks()
         self.bout_histogram_canvas.configure(scrollregion=self.bout_histogram_canvas.bbox("all"))
@@ -25974,8 +26052,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         def _draw_binned():
             self.root.update_idletasks()
             _FIG_DPI = 100
-            _cpx = self.bout_histogram_canvas.winfo_width()
-            fig_width = max(6, (_cpx - 24) / _FIG_DPI) if _cpx > 50 else 9
+            fig_width = self._bout_fig_width(len(sorted_bins), per_item=0.55, base=4.0, minimum=6.0)
             fig_height = max(3 * num_plots, 4)
             fig = Figure(figsize=(fig_width, fig_height), dpi=_FIG_DPI)
 
@@ -26025,13 +26102,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                   fontsize=10)
 
             fig.tight_layout()
-            canvas = FigureCanvasTkAgg(fig, self.bout_histogram_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill='both', expand=True)
+            canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
             self.current_bout_canvas  = canvas
             self.current_bout_figure  = fig
-            toolbar = NavigationToolbar2Tk(canvas, self.bout_histogram_frame)
-            toolbar.update()
             self.bout_histogram_frame.update_idletasks()
             self.bout_histogram_canvas.configure(
                 scrollregion=self.bout_histogram_canvas.bbox("all"))
@@ -26490,8 +26563,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         num_bars = len(bar_labels)
         self.root.update_idletasks()
         _FIG_DPI = 100
-        _cpx = self.bout_histogram_canvas.winfo_width()
-        fig_width = max(6, (_cpx - 24) / _FIG_DPI) if _cpx > 100 else 9
+        # Two grouped bars per category, so allow a little more width per item.
+        fig_width = self._bout_fig_width(num_bars, per_item=1.1, base=4.0)
         fig = Figure(figsize=(fig_width, 2.8 * num_metrics), dpi=_FIG_DPI)
         
         bar_width = 0.35
@@ -26531,14 +26604,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fig.tight_layout()
         
         self.current_bout_figure = fig
-        canvas = FigureCanvasTkAgg(fig, master=self.bout_histogram_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
+        canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
         self.current_bout_canvas = canvas
-        
-        toolbar = NavigationToolbar2Tk(canvas, self.bout_histogram_frame)
-        toolbar.update()
-        
+
         self.bout_histogram_frame.update_idletasks()
         self.bout_histogram_canvas.configure(scrollregion=self.bout_histogram_canvas.bbox("all"))
         
@@ -29486,11 +29554,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fig.tight_layout()
 
         # ── Embed matplotlib figure ────────────────────────────────────────────
-        canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
-        canvas.draw()
-        toolbar = NavigationToolbar2Tk(canvas, canvas_frame)
-        toolbar.update()
-        canvas.get_tk_widget().pack(fill='both', expand=True)
+        # Render at natural size so the plot stays compact instead of stretching
+        # to fill the whole tab width.
+        canvas = self._embed_plot_canvas(fig, canvas_frame)
         self.dec_prob_canvas_widget = canvas
 
         # ── Stats text area ────────────────────────────────────────────────────
