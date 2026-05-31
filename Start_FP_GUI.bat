@@ -3,7 +3,7 @@ REM Fiber Photometry Analysis GUI Launcher
 REM This batch file starts the FP Analysis GUI
 
 echo ========================================
-echo  Fiber Photometry Analysis GUI v2.7
+echo  Fiber Photometry Analysis GUI v1.0.1
 echo ========================================
 echo.
 
@@ -47,7 +47,7 @@ if errorlevel 1 (
 )
 
 :startgui
-echo Starting Fiber Photometry Analysis GUI v2.7...
+echo Starting Fiber Photometry Analysis GUI v1.0.1...
 echo.
 
 REM Run the Python GUI

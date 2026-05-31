@@ -15,12 +15,19 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import LinearSegmentedColormap
 from scipy.optimize import curve_fit
 from scipy import stats
-from scipy.signal import coherence, csd, spectrogram, fftconvolve
+from scipy.signal import coherence, spectrogram, fftconvolve
 import os
 import json
 from pathlib import Path
 import openpyxl
 from openpyxl import Workbook, load_workbook
+
+
+# Single source of truth for the application version. Referenced by the
+# Welcome tab, the Info/Changelog tab, and the System Check tab so the
+# displayed version only ever needs to be updated in one place.
+APP_VERSION = "1.0.1"
+APP_VERSION_DATE = "May 31, 2026"
 
 
 class ZoneEditor:
@@ -872,6 +879,7 @@ class FPAnalysisGUI:
             'accent_blue': '#4a90e2',  # Light blue accent
             'accent_dark_blue': '#2c5aa0',  # Dark blue accent
             'text_light': '#e2e8f0',   # Light text for dark backgrounds
+            'text_muted': '#94a3b8',   # Muted grey-blue for secondary text
             'text_dark': '#1a202c'     # Dark text for light backgrounds
         }
         
@@ -1450,7 +1458,15 @@ class FPAnalysisGUI:
                                  font=('Segoe UI', 20),
                                  fg=self.colors['text_light'],
                                  bg=self.colors['bg_dark'])
-        subtitle_label.pack(pady=(0, 40))
+        subtitle_label.pack(pady=(0, 8))
+
+        # Tagline summarizing what the app does
+        tagline_label = tk.Label(center_frame,
+                                 text="Processing  •  Behavior Sync  •  Bout & Spike Analysis  •  Connectivity  •  Visualization",
+                                 font=('Segoe UI', 11),
+                                 fg=self.colors['text_muted'],
+                                 bg=self.colors['bg_dark'])
+        tagline_label.pack(pady=(0, 40))
         
         # Separator line
         separator = tk.Frame(center_frame, height=2, bg=self.colors['accent_blue'])
@@ -1488,7 +1504,7 @@ class FPAnalysisGUI:
         version_frame.pack(pady=30)
         
         version_label = tk.Label(version_frame,
-                    text="Version 2.7  •  March 18, 2026",
+                    text=f"Version {APP_VERSION}  •  {APP_VERSION_DATE}",
                                 font=('Segoe UI', 16),
                                 fg=self.colors['accent_blue'],
                                 bg=self.colors['bg_dark'])
@@ -1685,9 +1701,19 @@ class FPAnalysisGUI:
         ttk.Button(ttl_entry_frame, text="Browse", command=self.browse_ttl).pack(side=tk.LEFT, padx=3)
         ttk.Button(ttl_entry_frame, text="❓", width=3, command=self.show_ttl_help).pack(side=tk.LEFT, padx=3)
         
+        # Advanced processing options grouped into a compact sub-notebook to
+        # keep the main Processing tab uncluttered (these are used less often).
+        advanced_nb = ttk.Notebook(scrollable_frame)
+        advanced_nb.pack(fill='x', padx=5, pady=5)
+
+        offset_outer = ttk.Frame(advanced_nb)
+        advanced_nb.add(offset_outer, text="Offset Bout Definitions")
+        naming_outer = ttk.Frame(advanced_nb)
+        advanced_nb.add(naming_outer, text="File Naming (Batch)")
+
         # Offset Bout Definitions
-        offset_frame = ttk.LabelFrame(scrollable_frame, text="Offset Bout Definitions", padding=5)
-        offset_frame.pack(fill='x', padx=5, pady=5)
+        offset_frame = ttk.LabelFrame(offset_outer, text="Offset Bout Definitions", padding=5)
+        offset_frame.pack(fill='both', expand=True, padx=5, pady=5)
         
         ttk.Label(offset_frame,
                   text="Generate additional behaviors by shifting boutframe/TTL onsets by a fixed number of frames.\n"
@@ -1714,8 +1740,8 @@ class FPAnalysisGUI:
         ttk.Button(offset_btn_row, text="Clear All", command=self.clear_bout_offsets).pack(side='left', padx=5)
         
         # File naming configuration
-        naming_frame = ttk.LabelFrame(scrollable_frame, text="File Naming Configuration (for Batch Processing)", padding=5)
-        naming_frame.pack(fill='x', padx=5, pady=5)
+        naming_frame = ttk.LabelFrame(naming_outer, text="File Naming Configuration (for Batch Processing)", padding=5)
+        naming_frame.pack(fill='both', expand=True, padx=5, pady=5)
         
         ttk.Label(naming_frame, text="FPData Pattern:").grid(row=0, column=0, sticky='w', padx=5, pady=2)
         self.fpdata_pattern_var = tk.StringVar(value=self.params['fpdata_pattern'])
@@ -3248,8 +3274,6 @@ class FPAnalysisGUI:
         ttk.Label(right, text="Coherence spectra — top 5 configurations",
                   font=('Segoe UI', 9, 'bold')).pack(anchor='w')
 
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         fig = Figure(figsize=(6, 4.5), dpi=96)
         ax  = fig.add_subplot(111)
 
@@ -8713,21 +8737,32 @@ class FPAnalysisGUI:
         fig.tight_layout()
     
     def create_info_tab(self):
-        """Tab with information about file naming and features"""
+        """Tab with information about file naming, features, and the changelog.
+
+        Organized as a sub-notebook (Overview + Changelog) so the reference
+        material and version history live together without adding a separate
+        top-level tab.
+        """
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="Info")
-        
-        # Create scrollable text widget
-        info_frame = ttk.Frame(tab)
+
+        info_notebook = ttk.Notebook(tab)
+        info_notebook.pack(fill='both', expand=True, padx=6, pady=6)
+
+        # ── Overview subtab ──────────────────────────────────────────────
+        overview_tab = ttk.Frame(info_notebook)
+        info_notebook.add(overview_tab, text="Overview")
+
+        info_frame = ttk.Frame(overview_tab)
         info_frame.pack(fill='both', expand=True, padx=10, pady=10)
-        
+
         text = tk.Text(info_frame, wrap='word', font=('Segoe UI', 10))
         scrollbar = ttk.Scrollbar(info_frame, command=text.yview)
         text.config(yscrollcommand=scrollbar.set)
-        
+
         text.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
-        
+
         # Add information content
         info_content = """
 ╔════════════════════════════════════════════════════════════════════════════════╗
@@ -8906,9 +8941,25 @@ VISUALIZATION OPTIONS:
     - Velocity calculation with outlier removal
     - Total distance traveled
     - Distance from center calculations
-    - Velocity calculation with outlier removal
-    - Total distance traveled
-    - Distance from center calculations
+
+ANALYSIS TABS:
+  • Groups: Organize subjects into experimental groups for group-level
+    averages and comparisons. Groups can be mutually exclusive or overlapping.
+  • Exclusions: Mark individual channels (e.g. G0/G1) as excluded per subject
+    so bad data is left out of that tab's plots and exports.
+  • Behavioral Data: Position-derived metrics (velocity, distance traveled,
+    zone occupancy, distance from center) when tracking data is available.
+  • Coherence: Spectral coherence between two channels via Morlet wavelet or
+    Welch's method — static coherence, sliding/time-resolved coherence,
+    bout-epoch coherence (baseline vs. post-onset), and group comparisons.
+  • Spike Analysis: Detects calcium transients ("spikes") using a MAD-based
+    threshold and reports rate, amplitude, and width per channel.
+  • Bout Analysis: Summary statistics and histograms across extracted bouts,
+    grouped by subject or by group.
+  • Decision Probability: Probability of explore vs. retreat decisions binned
+    by the current z-score of the photometry signal.
+  • Signal Integrity: Per-subject quality metrics (SNR, CV, isosbestic
+    correlation, artifacts, photobleaching) with an overall quality score.
 
 ADJUSTABLE PARAMETERS:
   • preboutframes: Frames before bout to include (default: 90)
@@ -8919,7 +8970,6 @@ ADJUSTABLE PARAMETERS:
   • exclude_frames_before: Exclude bouts before this frame number (default: 0)
   • maze_width_cm: Known maze width in cm for position calibration (default: 76)
   • velocity_outlier_threshold: Std devs for velocity outlier removal (default: 5)
-  • exclude_frames_before: Exclude bouts before this frame number (default: 0)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 TYPICAL WORKFLOW
@@ -8995,7 +9045,7 @@ BOUT EXTRACTION:
   • Stored separately for each behavior type
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-� SIGNAL INTEGRITY ANALYSIS - INTERPRETATION GUIDE
+🩺 SIGNAL INTEGRITY ANALYSIS - INTERPRETATION GUIDE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 The Signal Integrity tab provides comprehensive analysis of your photometry signal quality.
@@ -9258,7 +9308,7 @@ USING SIGNAL INTEGRITY FOR DATA QUALITY DECISIONS:
        → NO: Significant artifacts present (now: <3 extreme events = usable)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-�💡 TIPS & TROUBLESHOOTING
+💡 TIPS & TROUBLESHOOTING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 • File Naming: MUST match exactly - SubjectID must be identical in all files
@@ -9269,10 +9319,10 @@ USING SIGNAL INTEGRITY FOR DATA QUALITY DECISIONS:
 • Memory: Close other applications if processing many subjects
 • Parameters: Adjust based on your frame rate and experimental design
 • Backup: Original files are never modified - always work on copies
-• Exporttimestamp file found" → Ensure you have ComputerTS OR AnimalPosition file
-  ✗ "No : Processed data saved in project's 'processed' folder
+• Export: Processed data is saved in the project's 'processed' folder
 
 COMMON ERRORS:
+  ✗ "No timestamp file found" → Ensure you have ComputerTS OR AnimalPosition file
   ✗ "File not found" → Check file naming matches exactly
   ✗ "No boutframes sheet" → Ensure worksheet name = SubjectID
   ✗ "Biexponential fit failed" → Signal may be too noisy; falls back to linear
@@ -9288,14 +9338,60 @@ For issues or questions:
   • Ensure all file naming conventions are followed
   • Verify data file formats match requirements
 
-Version: 1.0.0
+Version: {APP_VERSION}
 Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-        
+
+        # Inject the live version without turning the whole block into an
+        # f-string (the text contains literal {SubjectID} placeholders).
+        info_content = info_content.replace("{APP_VERSION}", APP_VERSION)
+
         text.insert('1.0', info_content)
         text.config(state='disabled')  # Make read-only
+
+        # ── Changelog subtab ─────────────────────────────────────────────
+        changelog_tab = ttk.Frame(info_notebook)
+        info_notebook.add(changelog_tab, text="Changelog")
+
+        cl_frame = ttk.Frame(changelog_tab)
+        cl_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        cl_text = tk.Text(cl_frame, wrap='word', font=('Segoe UI', 10))
+        cl_scroll = ttk.Scrollbar(cl_frame, command=cl_text.yview)
+        cl_text.config(yscrollcommand=cl_scroll.set)
+        cl_text.pack(side='left', fill='both', expand=True)
+        cl_scroll.pack(side='right', fill='y')
+
+        cl_text.insert('1.0', self._get_changelog_text())
+        cl_text.config(state='disabled')  # Make read-only
+
+    def _get_changelog_text(self):
+        """Concise, human-readable version history shown on the Changelog subtab."""
+        return f"""
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                              TRACY  —  CHANGELOG                                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • UI: decluttered tabs, consistent spacing, and fixed text that was cut off or
+    squished at smaller window sizes.
+  • Graphs: dynamic figure sizing — plots now scale to the data and the window
+    instead of always stretching to full width.
+  • Added this Changelog (under Info) and a single in-app version number.
+  • Info tab rewritten to accurately describe every analysis tab and feature.
+  • Project save/load hardened so processed data reloads reliably.
+  • Removed unused/duplicate code and stale standalone coherence scripts; the
+    coherence analysis remains fully built into the Coherence tab.
+
+Version 1.0.0
+────────────────────────────────────────────────────────────────────────────────
+  • Initial release: processing pipeline, behavior sync, bout extraction,
+    visualization, coherence/connectivity, spike analysis, bout analysis,
+    decision probability, and signal-integrity quality metrics.
+"""
     
     def create_system_tab(self):
         """Tab for checking system requirements and dependencies"""
@@ -10186,10 +10282,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     df_beh.to_csv(beh_file, index=False)
                     
                     # Save derived behavioral metrics as JSON (fast)
-                    if 'zone_averages' in data or 'distance_averages_x' in data or 'entry_frames' in data:
+                    if ('zone_averages' in data or 'distance_averages_x' in data or
+                            'entry_frames' in data or 'outback' in data):
                         metrics = {}
                         if 'zone_averages' in data:
                             metrics['zone_averages'] = data['zone_averages']
+                        # Out/Back open-arm movement stats are derived during processing
+                        # but cannot be regenerated on load (zones aren't stored), so
+                        # persist them here to avoid losing them across save/reload.
+                        if 'outback' in data:
+                            metrics['outback'] = data['outback']
                         if 'distance_averages_x' in data:
                             metrics['distance_averages_x'] = {int(k): v for k, v in data['distance_averages_x'].items()}
                         if 'distance_averages_y' in data:
@@ -10646,6 +10748,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     metrics = json.load(f)
                                 if 'zone_averages' in metrics:
                                     subject_data['zone_averages'] = metrics['zone_averages']
+                                if 'outback' in metrics:
+                                    subject_data['outback'] = metrics['outback']
                                 if 'distance_averages_x' in metrics:
                                     subject_data['distance_averages_x'] = {int(k): v for k, v in metrics['distance_averages_x'].items()}
                                 if 'distance_averages_y' in metrics:
@@ -10776,7 +10880,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 self.log_message(f"    Regenerated entry bouts from entry_frames")
                             except Exception as e:
                                 self.log_message(f"    Warning: Could not regenerate entry_bouts: {str(e)}")
-                        
+
+                        # Regenerate Out/Back movement stats for projects saved before
+                        # 'outback' was persisted. Recompute zones from the synced
+                        # behaviour array and rebuild the stats so older projects don't
+                        # silently lose this metric on reload.
+                        if ('outback' not in subject_data and 'beh_synced' in subject_data
+                                and subject_data.get('has_position')):
+                            try:
+                                beh_synced = subject_data['beh_synced']
+                                zones = []
+                                for i in range(len(beh_synced)):
+                                    x, y = beh_synced[i, 2], beh_synced[i, 3]
+                                    if not (np.isnan(x) or np.isnan(y)):
+                                        zones.append(self.classify_zone(x, y))
+                                    else:
+                                        zones.append('unknown')
+                                outback_data = self.calculate_outback_movements(beh_synced, zones)
+                                if outback_data:
+                                    subject_data['outback'] = outback_data
+                                    self.log_message(f"    Regenerated Out/Back stats from behavior data")
+                            except Exception as e:
+                                self.log_message(f"    Warning: Could not regenerate outback: {str(e)}")
+
                         # Infer wavelength flags if not set (for backward compatibility)
                         # Set based on what actually loaded successfully, not just what metadata claims
                         if 'has_470' not in subject_data:
@@ -15965,26 +16091,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.root.clipboard_clear()
         self.root.clipboard_append(lines)
 
-    def _apply_shifts_from_text(self):
-        """(Legacy stub.)"""
-        pass
-
-    def _edit_per_subject_shift_entry(self):
-        """(Legacy stub.)"""
-        pass
-
-    def _on_shifts_cell_click(self):
-        """(Legacy stub.)"""
-        pass
-
-    def _on_shifts_tree_paste(self, event):
-        """(Legacy stub.)"""
-        pass
-
-    def _paste_shifts_from_lines(self, *a, **kw):
-        """(Legacy stub.)"""
-        pass
-
     def _remove_per_subject_shift_entry(self):
         """Remove the selected subject from per_subject_boutframe_shifts."""
         if not hasattr(self, 'per_subject_shifts_tree'):
@@ -17619,6 +17725,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.bout_stats_text.delete('1.0', 'end')
             self.bout_stats_text.config(state='disabled')
     
+    def _auto_viz_figure_size(self, plot_type, n_subjects):
+        """Content-aware default figure size for the Visualization tab's 'auto' mode.
+
+        Chooses dimensions that suit the plot type and how much data is shown so
+        simple single-subject plots stay compact instead of stretching to the
+        full width of the window, while dense multi-subject / grid plots grow
+        proportionally. Returns a (width, height) tuple in inches.
+        """
+        n = max(1, int(n_subjects or 1))
+
+        # Signal Integrity is a multi-panel dashboard; widen with more subjects.
+        if "Signal Integrity" in plot_type:
+            return (min(20.0, 14.0 + (n - 1) * 1.5), 10.0)
+
+        # Grid plots render one panel per subject.
+        if any(t in plot_type for t in ("Position Heatmap", "Extracted Bouts", "Zone Entry Bouts")):
+            ncols = min(3, n)
+            nrows = int(np.ceil(n / ncols))
+            if "Position Heatmap" in plot_type:
+                # Roughly square panels for spatial data.
+                return (min(18.0, 4.5 * ncols + 1.0), min(14.0, 4.5 * nrows + 1.0))
+            return (min(18.0, 5.0 * ncols + 1.0), min(14.0, 3.5 * nrows + 1.5))
+
+        # Time-series / single-axis traces: wide and short.
+        if plot_type in ("Raw Data", "Normalized (dF/F)", "Motion Corrected",
+                         "Z-scored", "Bouts Overlay"):
+            return (12.0, 5.0)
+
+        # Bar / average style plots grow modestly with subject count.
+        if any(t in plot_type for t in ("Zone Averages", "Distance from Center",
+                                        "Out/Back", "Compare Across Bouts")):
+            return (min(16.0, 8.0 + (n - 1) * 0.8), 6.0)
+
+        # Sensible default.
+        return (10.0, 6.0)
+
     def generate_plot(self):
         """Generate selected plot type"""
         # Get selected subjects or groups
@@ -17666,9 +17808,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         plot_type = self.plot_type_var.get()
 
-        # Determine figure size – use user-set values or fall back to plot-type defaults
-        default_w = 14 if "Signal Integrity" in plot_type else 10
-        default_h = 10 if "Signal Integrity" in plot_type else 6
+        # Determine figure size – use user-set values or fall back to
+        # content-aware, plot-type-specific defaults (scales with subject count).
+        default_w, default_h = self._auto_viz_figure_size(plot_type, len(valid_subjects))
         try:
             w_str = self.viz_fig_width_var.get().strip().lower()
             fig_w = float(w_str) if w_str not in ('', 'auto') else default_w
