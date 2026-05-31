@@ -1392,6 +1392,9 @@ class FPAnalysisGUI:
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
         self.root.after(50, self._on_notebook_tab_changed)
 
+        # Auto-check for updates on startup (background thread, non-blocking)
+        self.root.after(1500, self.check_for_updates)
+
     def _register_tab_mousewheel(self, tab, canvas, content_frame=None):
         """Register a tab-specific mousewheel handler for a scrollable canvas."""
         def _on_mousewheel(event):
@@ -9298,6 +9301,7 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
         """Tab for checking system requirements and dependencies"""
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="System Check")
+        self.system_check_tab = tab  # keep reference for tab-title updates
         
         # Title
         title_label = ttk.Label(tab, text="System Requirements Check", 
@@ -9351,8 +9355,28 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
                   command=self.install_requirements).pack(side='left', padx=5)
         ttk.Button(button_frame, text="View Requirements.txt", 
                   command=self.view_requirements).pack(side='left', padx=5)
-        
-        # Results text area
+
+        # Application Update section
+        update_frame = ttk.LabelFrame(tab, text="Application Updates", padding=10)
+        update_frame.pack(fill='x', padx=20, pady=(0, 10))
+
+        update_inner = ttk.Frame(update_frame)
+        update_inner.pack(fill='x')
+
+        ttk.Label(update_inner, text="Update Status:", font=('Segoe UI', 10)).pack(side='left', padx=(0, 10))
+        self.update_status_label = ttk.Label(update_inner, text="Not checked",
+                                             foreground='gray', font=('Segoe UI', 10))
+        self.update_status_label.pack(side='left', padx=(0, 20))
+
+        self.check_update_button = ttk.Button(update_inner, text="Check for Updates",
+                                              command=self.check_for_updates)
+        self.check_update_button.pack(side='left', padx=5)
+
+        self.install_update_button = ttk.Button(update_inner, text="Install Update",
+                                                command=self.perform_update, state='disabled')
+        self.install_update_button.pack(side='left', padx=5)
+
+
         results_frame = ttk.LabelFrame(tab, text="Installation Log", padding=10)
         results_frame.pack(fill='both', expand=True, padx=20, pady=(0, 20))
         
@@ -27295,8 +27319,154 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Button(req_window, text="Copy to Clipboard", 
                   command=copy_to_clipboard).pack(pady=5)
 
+    # ======================== Update Methods ========================
+
+    def check_for_updates(self):
+        """Fetch remote git metadata and check whether local branch is behind."""
+        import subprocess
+        import threading
+
+        # Guard: widget may not exist if tab was never created
+        if not hasattr(self, 'update_status_label'):
+            return
+
+        self.update_status_label.config(text="Checking...", foreground='gray')
+        self.check_update_button.config(state='disabled')
+        self.root.update_idletasks()
+
+        def _fetch_and_check():
+            try:
+                repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+                # Fetch latest metadata from remote (non-destructive)
+                subprocess.run(
+                    ['git', 'fetch', 'origin'],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    timeout=20
+                )
+
+                # Count commits that are on origin/main but not in local HEAD
+                result = subprocess.run(
+                    ['git', 'rev-list', 'HEAD..origin/main', '--count'],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                if result.returncode == 0:
+                    behind = int(result.stdout.strip())
+                    self.root.after(0, self._apply_update_check_result, behind, None)
+                else:
+                    self.root.after(0, self._apply_update_check_result, None,
+                                    result.stderr.strip() or "git rev-list failed")
+
+            except FileNotFoundError:
+                self.root.after(0, self._apply_update_check_result, None,
+                                "git not found – please install Git")
+            except subprocess.TimeoutExpired:
+                self.root.after(0, self._apply_update_check_result, None,
+                                "Timed out – check your network connection")
+            except Exception as exc:
+                self.root.after(0, self._apply_update_check_result, None, str(exc))
+
+        threading.Thread(target=_fetch_and_check, daemon=True).start()
+
+    def _apply_update_check_result(self, behind, error):
+        """Update the UI with the result of the update check (runs on main thread)."""
+        self.check_update_button.config(state='normal')
+
+        if error is not None:
+            self.update_status_label.config(
+                text=f"⚠ Could not check: {error}", foreground='orange'
+            )
+            self.install_update_button.config(state='disabled')
+            # Restore plain tab title
+            tab_idx = self.notebook.index(self.system_check_tab)
+            self.notebook.tab(tab_idx, text="System Check")
+            return
+
+        tab_idx = self.notebook.index(self.system_check_tab)
+        if behind == 0:
+            self.update_status_label.config(text="✓ Up to date", foreground='green')
+            self.install_update_button.config(state='disabled')
+            self.notebook.tab(tab_idx, text="System Check")
+        else:
+            self.update_status_label.config(
+                text=f"⚠ Update available! ({behind} commit(s) behind)",
+                foreground='red'
+            )
+            self.install_update_button.config(state='normal')
+            # Add visual warning indicator to the tab title
+            self.notebook.tab(tab_idx, text="System Check  ⚠")
+
+    def perform_update(self):
+        """Pull the latest version from the remote and restart the application."""
+        import subprocess
+
+        if not messagebox.askyesno(
+            "Install Update",
+            "This will download and apply the latest version from GitHub,\n"
+            "then automatically restart the application.\n\n"
+            "Any unsaved work will be lost. Continue?"
+        ):
+            return
+
+        self.system_text.delete('1.0', tk.END)
+        self.system_text.insert('end', "Pulling latest version from GitHub...\n")
+        self.system_text.insert('end', "=" * 60 + "\n\n")
+        self.root.update()
+
+        try:
+            repo_dir = os.path.dirname(os.path.abspath(__file__))
+            process = subprocess.Popen(
+                ['git', 'pull', 'origin', 'main'],
+                cwd=repo_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+
+            for line in process.stdout:
+                self.system_text.insert('end', line)
+                self.system_text.see('end')
+                self.root.update()
+
+            process.wait()
+
+            if process.returncode == 0:
+                self.system_text.insert('end', "\n" + "=" * 60 + "\n")
+                self.system_text.insert('end', "✓ Update successful!\n")
+                self.system_text.insert('end', "Restarting application in 2 seconds...\n")
+                self.system_text.see('end')
+                self.root.update()
+                self.root.after(2000, self._restart_app)
+            else:
+                self.system_text.insert('end', "\n✗ Update failed. See output above.\n")
+                messagebox.showerror(
+                    "Update Failed",
+                    "git pull reported an error.\nCheck the Installation Log for details."
+                )
+
+        except FileNotFoundError:
+            self.system_text.insert('end', "\n✗ git not found – please install Git.\n")
+            messagebox.showerror("Update Error",
+                                 "git executable not found.\nPlease install Git and try again.")
+        except Exception as exc:
+            self.system_text.insert('end', f"\n✗ Error: {exc}\n")
+            messagebox.showerror("Update Error", str(exc))
+
+    def _restart_app(self):
+        """Destroy the current window and re-launch the same Python script."""
+        import sys
+        python = sys.executable
+        script = os.path.abspath(__file__)
+        self.root.destroy()
+        os.execv(python, [python, script] + sys.argv[1:])
+
     # ==================== CONNECTIVITY ANALYSIS METHODS ====================
-    
+
     def calculate_static_coherence(self, signal1, signal2, fs=30, fmin=0.05, fmax=10, nperseg=None):
         """
         Calculate static spectral coherence between two signals using Welch method.
