@@ -868,9 +868,18 @@ class ZoneEditor:
 class FPAnalysisGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Tracy - Fiber Photometry Analysis Suite v2.7")
+        self.root.title(f"Tracy - Fiber Photometry Analysis Suite v{APP_VERSION}")
+        # Fallback size if the window is later un-maximized, then open maximized.
         self.root.geometry("1400x900")
-        
+        try:
+            # 'zoomed' maximizes on Windows; fall back to the Linux attribute.
+            self.root.state('zoomed')
+        except tk.TclError:
+            try:
+                self.root.attributes('-zoomed', True)
+            except tk.TclError:
+                pass
+
         # Configure color scheme (blues, blacks, off-white)
         self.colors = {
             'bg_dark': '#1a1f2e',      # Dark blue-black background
@@ -1265,12 +1274,7 @@ class FPAnalysisGUI:
         self.zones = copy.deepcopy(template['zones'])
         self.params['maze_type'] = template_name
         self.params['maze_width_cm'] = template['maze_width_cm']
-        
-        # Log loaded zones for debugging
-        print(f"Loaded template '{template_name}' with zones:")
-        for zone_name, zone_data in self.zones.items():
-            print(f"  {zone_name}: category='{zone_data.get('category', 'N/A')}'")
-        
+
     def open_zone_editor(self):
         """Open interactive zone editor window"""
         editor_window = tk.Toplevel(self.root)
