@@ -7,6 +7,22 @@ Built with Python/Tkinter; everything runs locally in a single GUI.
 *Created by Jobe Ritchie — Kash Lab, University of North Carolina at Chapel Hill.*
 Version 1.0.1.
 
+## Getting Started
+- Install Git
+- Install Python 3.9 or newer version
+- Open command prompt in a new folder and type git pull https://github.com/JobeRitchie/TRACY-Photometry-Processing-Suite
+- Double click Start_FP_GUI.bat
+- Click project tab and create a new project
+- Click processing tab and select either single files or a folder to process
+- Click visualization tab, select a subject, select an option from the plot type drop down, and click visualize
+- See Info tab for detailed information on all features
+
+## Requirements
+- Python 3.9+
+- Git
+- Dependencies listed in [requirements.txt](requirements.txt): pandas, numpy,
+  scipy, matplotlib, openpyxl (`tkinter` ships with standard Python).
+
 ## Features
 
 - **Project management** — organized projects with automatic save/load of
@@ -28,28 +44,6 @@ Version 1.0.1.
 - **Visualization** — raw / dF/F / motion-corrected / z-scored traces, bout
   overlays, position heatmaps, and more, with content-aware figure sizing.
 
-## Requirements
-
-- Python 3.9+
-- Dependencies listed in [requirements.txt](requirements.txt): pandas, numpy,
-  scipy, matplotlib, openpyxl (`tkinter` ships with standard Python).
-
-## Getting Started
-
-**Windows (easiest):** double-click `Start_FP_GUI.bat`. It checks for Python,
-installs dependencies, and launches the app.
-
-**Any platform:**
-
-```bash
-pip install -r requirements.txt
-python fp_analysis_gui.py
-```
-
-Then create or open a project on the **Project** tab and follow the workflow:
-Processing → (optional) Bout Frames Editor → Visualization and analysis tabs.
-See the **Info** tab in-app for file-naming requirements, a full feature guide,
-and the changelog.
 
 ## Input Files
 

@@ -2,11 +2,6 @@
 REM Fiber Photometry Analysis GUI Launcher
 REM This batch file starts the FP Analysis GUI
 
-echo ========================================
-echo  Fiber Photometry Analysis GUI v1.0.1
-echo ========================================
-echo.
-
 REM Change to the script directory
 cd /d "%~dp0"
 
@@ -19,6 +14,15 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+REM Read the app version from the source so this prompt always matches APP_VERSION
+set "APP_VERSION=unknown"
+for /f "usebackq delims=" %%v in (`python -c "import re;m=re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"',open('fp_analysis_gui.py',encoding='utf-8').read());print(m.group(1) if m else 'unknown')"`) do set "APP_VERSION=%%v"
+
+echo ========================================
+echo  Fiber Photometry Analysis GUI v%APP_VERSION%
+echo ========================================
+echo.
 
 echo Python found. Checking dependencies...
 echo.
@@ -47,7 +51,7 @@ if errorlevel 1 (
 )
 
 :startgui
-echo Starting Fiber Photometry Analysis GUI v1.0.1...
+echo Starting Fiber Photometry Analysis GUI v%APP_VERSION%...
 echo.
 
 REM Run the Python GUI
