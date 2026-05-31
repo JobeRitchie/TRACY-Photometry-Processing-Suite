@@ -2164,7 +2164,15 @@ class FPAnalysisGUI:
         
         tree_container.grid_rowconfigure(0, weight=1)
         tree_container.grid_columnconfigure(0, weight=1)
-        
+
+        # Embedded visualization area (populated by visualize_behavioral_data
+        # instead of opening a separate window).
+        self.behav_viz_container = ttk.LabelFrame(scrollable_frame, text="Visualization", padding=5)
+        self.behav_viz_container.pack(fill='both', expand=True, padx=5, pady=(0, 5))
+        ttk.Label(self.behav_viz_container,
+                  text='Click "Visualize Data" above to plot behavioral metrics here.',
+                  foreground='gray').pack(anchor='w', padx=5, pady=5)
+
     def create_groups_tab(self):
         """Tab for creating and managing subject groups"""
         tab = ttk.Frame(self.notebook)
@@ -2565,112 +2573,30 @@ class FPAnalysisGUI:
                  text="Channels with overall score below threshold are added to the Exclusions tab.",
                  foreground='gray', font=('Segoe UI', 8)).grid(row=12, column=3, columnspan=4, sticky='w', padx=5)
         
-        # Axis controls
-        axis_control_frame = ttk.LabelFrame(scrollable_frame, text="Axis Controls (Interactive)", padding=5)
-        axis_control_frame.pack(fill='x', padx=5, pady=(0, 5))
-        
-        ttk.Label(axis_control_frame, text="Y-axis limits:").grid(row=0, column=0, sticky='w', padx=5)
-        ttk.Label(axis_control_frame, text="Min:").grid(row=0, column=1, sticky='e', padx=5)
+        # Axis / Heatmap / Trace-styling controls live in the "Advanced Graph
+        # Settings" window (button above) to keep this tab uncluttered. Their
+        # backing variables are defined here so the settings window and the
+        # plotting code can use them.
         self.viz_ymin_var = tk.StringVar(value="auto")
-        ttk.Entry(axis_control_frame, textvariable=self.viz_ymin_var, width=10).grid(row=0, column=2, padx=5)
-        
-        ttk.Label(axis_control_frame, text="Max:").grid(row=0, column=3, sticky='e', padx=5)
         self.viz_ymax_var = tk.StringVar(value="auto")
-        ttk.Entry(axis_control_frame, textvariable=self.viz_ymax_var, width=10).grid(row=0, column=4, padx=5)
-        
-        ttk.Button(axis_control_frame, text="Apply Limits", command=self.apply_viz_axis_limits).grid(row=0, column=5, padx=5)
-        ttk.Button(axis_control_frame, text="Reset (Auto)", command=self.reset_viz_axis_limits).grid(row=0, column=6, padx=5)
-        
-        ttk.Label(axis_control_frame, text='Enter "auto" or numeric values', 
-                 foreground='gray', font=('Segoe UI', 8)).grid(row=0, column=7, sticky='w', padx=10)
-        
-        # Heatmap controls
-        heatmap_control_frame = ttk.LabelFrame(scrollable_frame, text="Heatmap Controls", padding=5)
-        heatmap_control_frame.pack(fill='x', padx=5, pady=(0, 5))
-        
-        # Color range controls
-        ttk.Label(heatmap_control_frame, text="Color Range:").grid(row=0, column=0, sticky='w', padx=5)
-        ttk.Label(heatmap_control_frame, text="Min:").grid(row=0, column=1, sticky='e', padx=5)
+
         self.heatmap_vmin_var = tk.StringVar(value="-3")
-        ttk.Entry(heatmap_control_frame, textvariable=self.heatmap_vmin_var, width=10).grid(row=0, column=2, padx=5)
-        
-        ttk.Label(heatmap_control_frame, text="Max:").grid(row=0, column=3, sticky='e', padx=5)
         self.heatmap_vmax_var = tk.StringVar(value="3")
-        ttk.Entry(heatmap_control_frame, textvariable=self.heatmap_vmax_var, width=10).grid(row=0, column=4, padx=5)
-        
-        ttk.Label(heatmap_control_frame, text="(Values outside range saturate to edge colors)", 
-                 foreground='gray', font=('Segoe UI', 8)).grid(row=0, column=5, sticky='w', padx=10)
-        
-        # Colormap selection
-        ttk.Label(heatmap_control_frame, text="Colormap:").grid(row=1, column=0, sticky='w', padx=5, pady=(5, 0))
         self.heatmap_cmap_var = tk.StringVar(value="RdBu_r")
-        cmap_options = ["RdBu_r", "viridis", "plasma", "inferno", "magma", "cividis", 
-                       "coolwarm", "seismic", "bwr", "rainbow", "jet", "custom"]
-        ttk.Combobox(heatmap_control_frame, textvariable=self.heatmap_cmap_var, 
-                    values=cmap_options, width=15, state='readonly').grid(row=1, column=1, columnspan=2, sticky='w', padx=5, pady=(5, 0))
-        
-        # Custom color selection (shown when "custom" is selected)
-        ttk.Label(heatmap_control_frame, text="Custom Colors:").grid(row=2, column=0, sticky='w', padx=5, pady=(5, 0))
-        custom_color_frame = ttk.Frame(heatmap_control_frame)
-        custom_color_frame.grid(row=2, column=1, columnspan=5, sticky='w', padx=5, pady=(5, 0))
-        
-        ttk.Label(custom_color_frame, text="Low:").pack(side='left', padx=(0, 5))
         self.heatmap_color_low_var = tk.StringVar(value="#0000FF")
-        self.heatmap_color_low_entry = ttk.Entry(custom_color_frame, textvariable=self.heatmap_color_low_var, width=10)
-        self.heatmap_color_low_entry.pack(side='left', padx=(0, 5))
-        self.heatmap_color_low_btn = tk.Button(custom_color_frame, text="Pick", width=5, 
-                                                command=lambda: self.pick_heatmap_color('low'))
-        self.heatmap_color_low_btn.pack(side='left', padx=(0, 10))
-        
-        ttk.Label(custom_color_frame, text="Mid:").pack(side='left', padx=(0, 5))
         self.heatmap_color_mid_var = tk.StringVar(value="#FFFFFF")
-        self.heatmap_color_mid_entry = ttk.Entry(custom_color_frame, textvariable=self.heatmap_color_mid_var, width=10)
-        self.heatmap_color_mid_entry.pack(side='left', padx=(0, 5))
-        self.heatmap_color_mid_btn = tk.Button(custom_color_frame, text="Pick", width=5,
-                                                command=lambda: self.pick_heatmap_color('mid'))
-        self.heatmap_color_mid_btn.pack(side='left', padx=(0, 10))
-        
-        ttk.Label(custom_color_frame, text="High:").pack(side='left', padx=(0, 5))
         self.heatmap_color_high_var = tk.StringVar(value="#FF0000")
-        self.heatmap_color_high_entry = ttk.Entry(custom_color_frame, textvariable=self.heatmap_color_high_var, width=10)
-        self.heatmap_color_high_entry.pack(side='left', padx=(0, 5))
-        self.heatmap_color_high_btn = tk.Button(custom_color_frame, text="Pick", width=5,
-                                                 command=lambda: self.pick_heatmap_color('high'))
-        self.heatmap_color_high_btn.pack(side='left', padx=(0, 10))
-        
-        # Initially disable custom colors
-        self.heatmap_color_low_entry.config(state='disabled')
-        self.heatmap_color_low_btn.config(state='disabled')
-        self.heatmap_color_mid_entry.config(state='disabled')
-        self.heatmap_color_mid_btn.config(state='disabled')
-        self.heatmap_color_high_entry.config(state='disabled')
-        self.heatmap_color_high_btn.config(state='disabled')
-        
-        # Trace colormap changes to enable/disable custom colors
+        # Custom-color picker widgets are created on demand in the settings
+        # window; track them so the colormap trace can enable/disable them.
+        self.heatmap_color_low_entry = self.heatmap_color_low_btn = None
+        self.heatmap_color_mid_entry = self.heatmap_color_mid_btn = None
+        self.heatmap_color_high_entry = self.heatmap_color_high_btn = None
         self.heatmap_cmap_var.trace('w', self.update_heatmap_custom_colors)
-        
-        # Trace styling controls
-        trace_style_frame = ttk.LabelFrame(scrollable_frame, text="Trace Styling", padding=5)
-        trace_style_frame.pack(fill='x', padx=5, pady=(0, 5))
-        
-        # Mean trace line width
-        ttk.Label(trace_style_frame, text="Mean Line Width:").grid(row=0, column=0, sticky='w', padx=5)
+
         self.mean_linewidth_var = tk.StringVar(value="1.5")
-        ttk.Entry(trace_style_frame, textvariable=self.mean_linewidth_var, width=10).grid(row=0, column=1, padx=5)
-        
-        # Individual trace line width
-        ttk.Label(trace_style_frame, text="Individual Trace Width:").grid(row=0, column=2, sticky='w', padx=(20, 5))
         self.trace_linewidth_var = tk.StringVar(value="0.3")
-        ttk.Entry(trace_style_frame, textvariable=self.trace_linewidth_var, width=10).grid(row=0, column=3, padx=5)
-        
-        # Individual trace opacity
-        ttk.Label(trace_style_frame, text="Individual Trace Opacity:").grid(row=0, column=4, sticky='w', padx=(20, 5))
         self.trace_alpha_var = tk.StringVar(value="0.3")
-        ttk.Entry(trace_style_frame, textvariable=self.trace_alpha_var, width=10).grid(row=0, column=5, padx=5)
-        
-        ttk.Label(trace_style_frame, text="(Values: line width 0.1-5, opacity 0.0-1.0)", 
-                 foreground='gray', font=('Segoe UI', 8)).grid(row=1, column=0, columnspan=6, sticky='w', padx=3, pady=5)
-        
+
         # Store current canvas and figure for axis updates
         self.current_viz_canvas = None
         self.current_viz_figure = None
@@ -14476,13 +14402,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         use_bins = self.use_time_bins.get()
         is_group_mode = self.behav_plot_by_var.get() == "Group"
         
-        # Create visualization window
-        viz_window = tk.Toplevel(self.root)
-        viz_window.title("Behavioral Data Visualization")
-        viz_window.geometry("1200x800")
-        
+        # Render into the embedded visualization area on the Behavioral Data
+        # tab instead of opening a separate window.
+        container = self.behav_viz_container
+        for widget in container.winfo_children():
+            widget.destroy()
+
         # Control frame
-        control_frame = ttk.Frame(viz_window)
+        control_frame = ttk.Frame(container)
         control_frame.pack(fill='x', padx=10, pady=10)
         
         ttk.Label(control_frame, text="Metric to visualize:").pack(side='left', padx=5)
@@ -14528,7 +14455,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         zone_mode_combo.pack(side='left', padx=5)
         
         # Plot canvas
-        plot_frame = ttk.Frame(viz_window)
+        plot_frame = ttk.Frame(container)
         plot_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         def update_plot():
@@ -14714,15 +14641,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.set_title(f'{metric.replace("_", " ")}', fontsize=14, fontweight='bold')
                 ax.grid(True, alpha=0.3, linestyle='--')
                 fig.tight_layout()
-                
-                # Add to GUI
-                canvas = FigureCanvasTkAgg(fig, plot_frame)
-                canvas.draw()
-                canvas.get_tk_widget().pack(fill='both', expand=True)
-                
-                toolbar = NavigationToolbar2Tk(canvas, plot_frame)
-                toolbar.update()
-                
+
+                # Add to GUI at natural size (no full-window stretch)
+                self._embed_plot_canvas(fig, plot_frame)
+
             except Exception as e:
                 ttk.Label(plot_frame, text=f"Error generating plot:\n{str(e)}",
                          font=('Segoe UI', 10), foreground='red').pack(expand=True, pady=20)
@@ -15104,15 +15026,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     
                     ax.grid(True, alpha=0.3, axis='y')
                     fig.tight_layout()
-            
-            # Add to GUI
-            canvas = FigureCanvasTkAgg(fig, plot_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill='both', expand=True)
-            
-            toolbar = NavigationToolbar2Tk(canvas, plot_frame)
-            toolbar.update()
-            
+
+            # Add to GUI at natural size (no full-window stretch)
+            self._embed_plot_canvas(fig, plot_frame)
+
         except Exception as e:
             ttk.Label(plot_frame, text=f"Error generating plot:\n{str(e)}",
                      font=('Segoe UI', 10), foreground='red').pack(expand=True, pady=20)
@@ -17725,6 +17642,36 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.bout_stats_text.delete('1.0', 'end')
             self.bout_stats_text.config(state='disabled')
     
+    def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True):
+        """Embed a matplotlib figure (+ optional toolbar) in `parent`, rendered
+        at the figure's natural pixel size so it does not stretch to fill the
+        whole window. This keeps plots at a sensible, readable scale instead of
+        ballooning to the full width/height of the tab.
+
+        manual_height: optional pixel height for the graphing area; when None
+        the figure's natural height (figsize x dpi) is used.
+        Returns the FigureCanvasTkAgg.
+        """
+        canvas = FigureCanvasTkAgg(fig, parent)
+        canvas.draw_idle()
+        widget = canvas.get_tk_widget()
+
+        dpi = fig.get_dpi()
+        w_px = int(fig.get_size_inches()[0] * dpi)
+        h_px = int(fig.get_size_inches()[1] * dpi)
+        if manual_height is not None:
+            h_px = max(100, int(manual_height))
+        widget.configure(width=w_px, height=h_px)
+        # Anchor top-left with no fill/expand -> the canvas keeps its requested
+        # size rather than being stretched to the container.
+        widget.pack(anchor='nw')
+
+        if add_toolbar:
+            toolbar = NavigationToolbar2Tk(canvas, parent)
+            toolbar.update()
+        canvas.draw_idle()
+        return canvas
+
     def _auto_viz_figure_size(self, plot_type, n_subjects):
         """Content-aware default figure size for the Visualization tab's 'auto' mode.
 
@@ -17735,9 +17682,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """
         n = max(1, int(n_subjects or 1))
 
-        # Signal Integrity is a multi-panel dashboard; widen with more subjects.
+        # Sizes are kept deliberately compact so plots render at a readable
+        # scale rather than filling the whole window; the canvas is shown at
+        # this natural size (see _embed_plot_canvas).
+
+        # Signal Integrity is a multi-panel dashboard.
         if "Signal Integrity" in plot_type:
-            return (min(20.0, 14.0 + (n - 1) * 1.5), 10.0)
+            return (min(13.0, 11.0 + (n - 1) * 0.5), 7.5)
 
         # Grid plots render one panel per subject.
         if any(t in plot_type for t in ("Position Heatmap", "Extracted Bouts", "Zone Entry Bouts")):
@@ -17745,21 +17696,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             nrows = int(np.ceil(n / ncols))
             if "Position Heatmap" in plot_type:
                 # Roughly square panels for spatial data.
-                return (min(18.0, 4.5 * ncols + 1.0), min(14.0, 4.5 * nrows + 1.0))
-            return (min(18.0, 5.0 * ncols + 1.0), min(14.0, 3.5 * nrows + 1.5))
+                return (min(12.0, 3.5 * ncols + 1.0), min(9.0, 3.5 * nrows + 1.0))
+            return (min(12.0, 4.0 * ncols + 1.0), min(9.0, 2.8 * nrows + 1.2))
 
         # Time-series / single-axis traces: wide and short.
         if plot_type in ("Raw Data", "Normalized (dF/F)", "Motion Corrected",
                          "Z-scored", "Bouts Overlay"):
-            return (12.0, 5.0)
+            return (10.5, 4.5)
 
         # Bar / average style plots grow modestly with subject count.
         if any(t in plot_type for t in ("Zone Averages", "Distance from Center",
                                         "Out/Back", "Compare Across Bouts")):
-            return (min(16.0, 8.0 + (n - 1) * 0.8), 6.0)
+            return (min(12.0, 7.0 + (n - 1) * 0.5), 5.0)
 
         # Sensible default.
-        return (10.0, 6.0)
+        return (9.0, 5.0)
 
     def generate_plot(self):
         """Generate selected plot type"""
@@ -17907,34 +17858,25 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Store figure and canvas for axis control
         self.current_viz_figure = fig
         
-        # Add to GUI with improved rendering
-        canvas = FigureCanvasTkAgg(fig, self.fig_frame)
-        canvas.draw_idle()  # Use draw_idle for better performance
+        # Tighten layout before embedding so labels aren't clipped.
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass  # Some plots may not support tight_layout
 
-        # Apply user-specified canvas (graphing area) height if set
+        # Resolve optional manual graphing-area height (px); 'auto' uses the
+        # figure's natural height.
+        manual_height = None
         try:
             ch_str = self.viz_canvas_height_var.get().strip().lower()
             if ch_str not in ('', 'auto'):
-                canvas_h = int(float(ch_str))
-                canvas.get_tk_widget().configure(height=max(100, canvas_h))
-                canvas.get_tk_widget().pack(fill='x', expand=False)
-            else:
-                canvas.get_tk_widget().pack(fill='both', expand=True)
+                manual_height = int(float(ch_str))
         except (ValueError, AttributeError):
-            canvas.get_tk_widget().pack(fill='both', expand=True)
-        
+            manual_height = None
+
+        # Embed at natural size so the plot doesn't stretch to fill the window.
+        canvas = self._embed_plot_canvas(fig, self.fig_frame, manual_height=manual_height)
         self.current_viz_canvas = canvas
-        
-        # Add toolbar with better integration
-        toolbar = NavigationToolbar2Tk(canvas, self.fig_frame)
-        toolbar.update()
-        
-        # Enable tight layout for better spacing
-        try:
-            fig.tight_layout()
-            canvas.draw_idle()
-        except:
-            pass  # Some plots may not support tight_layout
     
     def apply_viz_axis_limits(self):
         """Apply custom Y-axis limits to current visualization plot"""
@@ -17989,16 +17931,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.current_viz_canvas.flush_events()
     
     def update_heatmap_custom_colors(self, *args):
-        """Enable/disable custom color pickers based on colormap selection"""
+        """Enable/disable custom color pickers based on colormap selection.
+
+        The picker widgets only exist while the Advanced Graph Settings window
+        is open, so each is guarded against being absent or destroyed.
+        """
         is_custom = self.heatmap_cmap_var.get() == "custom"
         state = 'normal' if is_custom else 'disabled'
-        
-        self.heatmap_color_low_entry.config(state=state)
-        self.heatmap_color_low_btn.config(state=state)
-        self.heatmap_color_mid_entry.config(state=state)
-        self.heatmap_color_mid_btn.config(state=state)
-        self.heatmap_color_high_entry.config(state=state)
-        self.heatmap_color_high_btn.config(state=state)
+
+        for attr in ('heatmap_color_low_entry', 'heatmap_color_low_btn',
+                     'heatmap_color_mid_entry', 'heatmap_color_mid_btn',
+                     'heatmap_color_high_entry', 'heatmap_color_high_btn'):
+            widget = getattr(self, attr, None)
+            if widget is None:
+                continue
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass  # widget destroyed (settings window closed)
     
     def pick_heatmap_color(self, position):
         """Open color picker for heatmap custom colors"""
@@ -18186,6 +18136,44 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             row=1, column=2, columnspan=2, sticky='w', padx=15, pady=3
         )
 
+        # Custom colormap pickers (enabled only when Colormap == "custom")
+        ttk.Label(heatmap_frame, text="Custom Colors:").grid(row=2, column=0, sticky='w', padx=5, pady=3)
+        custom_color_frame = ttk.Frame(heatmap_frame)
+        custom_color_frame.grid(row=2, column=1, columnspan=3, sticky='w', padx=5, pady=3)
+
+        ttk.Label(custom_color_frame, text="Low:").pack(side='left', padx=(0, 4))
+        self.heatmap_color_low_entry = ttk.Entry(custom_color_frame, textvariable=self.heatmap_color_low_var, width=10)
+        self.heatmap_color_low_entry.pack(side='left', padx=(0, 4))
+        self.heatmap_color_low_btn = tk.Button(custom_color_frame, text="Pick", width=5,
+                                               command=lambda: self.pick_heatmap_color('low'))
+        self.heatmap_color_low_btn.pack(side='left', padx=(0, 10))
+
+        ttk.Label(custom_color_frame, text="Mid:").pack(side='left', padx=(0, 4))
+        self.heatmap_color_mid_entry = ttk.Entry(custom_color_frame, textvariable=self.heatmap_color_mid_var, width=10)
+        self.heatmap_color_mid_entry.pack(side='left', padx=(0, 4))
+        self.heatmap_color_mid_btn = tk.Button(custom_color_frame, text="Pick", width=5,
+                                               command=lambda: self.pick_heatmap_color('mid'))
+        self.heatmap_color_mid_btn.pack(side='left', padx=(0, 10))
+
+        ttk.Label(custom_color_frame, text="High:").pack(side='left', padx=(0, 4))
+        self.heatmap_color_high_entry = ttk.Entry(custom_color_frame, textvariable=self.heatmap_color_high_var, width=10)
+        self.heatmap_color_high_entry.pack(side='left', padx=(0, 4))
+        self.heatmap_color_high_btn = tk.Button(custom_color_frame, text="Pick", width=5,
+                                                command=lambda: self.pick_heatmap_color('high'))
+        self.heatmap_color_high_btn.pack(side='left', padx=(0, 10))
+
+        # Clear the widget references when the window closes so the colormap
+        # trace doesn't poke destroyed widgets.
+        def _clear_custom_color_refs():
+            self.heatmap_color_low_entry = self.heatmap_color_low_btn = None
+            self.heatmap_color_mid_entry = self.heatmap_color_mid_btn = None
+            self.heatmap_color_high_entry = self.heatmap_color_high_btn = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _clear_custom_color_refs)
+
+        # Set initial enabled/disabled state for the pickers.
+        self.update_heatmap_custom_colors()
+
         axis_frame = ttk.LabelFrame(main, text="Visualization Axis", padding=8)
         axis_frame.pack(fill='x', pady=(0, 8))
         ttk.Label(axis_frame, text="Y Min:").grid(row=0, column=0, sticky='w', padx=5, pady=3)
@@ -18223,7 +18211,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showerror("Settings Error", f"Unable to apply graph settings:\n{exc}")
 
         ttk.Button(footer, text="Apply & Refresh Plot", command=_apply_and_refresh).pack(side='left', padx=5)
-        ttk.Button(footer, text="Close", command=win.destroy).pack(side='left', padx=5)
+        ttk.Button(footer, text="Close", command=_clear_custom_color_refs).pack(side='left', padx=5)
 
     # -------------------- Channel selection helpers --------------------
     def on_viz_subject_selected(self, event=None):
