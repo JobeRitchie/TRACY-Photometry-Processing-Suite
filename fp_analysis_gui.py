@@ -1037,7 +1037,7 @@ class FPAnalysisGUI:
                 'open_arm_up': {
                     'x_min': epm_center - open_arm_width/2,
                     'x_max': epm_center + open_arm_width/2,
-                    'y_min': epm_center + center_halfwidth,  # Start where center ends
+                    'y_min': epm_center + center_halfwidth,  # Start where center ends... !
                     'y_max': epm_center + arm_length,
                     'color': '#90EE90',  # Light green
                     'category': 'open'
@@ -9301,7 +9301,7 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
         """Tab for checking system requirements and dependencies"""
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="System Check")
-        self.system_check_tab = tab  # keep reference for tab-title updates
+        self.system_check_tab = tab  # keep reference for tab-title updates... !!
         
         # Title
         title_label = ttk.Label(tab, text="System Requirements Check", 
