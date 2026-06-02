@@ -29140,6 +29140,59 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     # ======================== Update Methods ========================
 
+    def _ensure_git_safe_directory(self, repo_dir):
+        """Make sure git will operate on repo_dir.
+
+        When the app is installed on a network share (e.g. a UNC path owned by
+        a different account), git aborts with 'detected dubious ownership' and
+        the in-app updater can't fetch or pull. If we hit that, add repo_dir to
+        the user's GLOBAL git config safe.directory list (the only place git
+        honours it — it ignores the value from -c / repo-local config). Returns
+        True if git can read the repo afterwards.
+        """
+        import subprocess
+
+        def _can_read():
+            try:
+                r = subprocess.run(
+                    ['git', 'rev-parse', '--is-inside-work-tree'],
+                    cwd=repo_dir, capture_output=True, text=True, timeout=10)
+                return r.returncode == 0, (r.stderr or '')
+            except Exception:
+                # Probe itself failed (e.g. git missing); let the caller's own
+                # git call surface the real error rather than masking it here.
+                return True, ''
+
+        ok, err = _can_read()
+        if ok:
+            return True
+        if 'dubious ownership' not in err.lower():
+            return True  # a different problem — don't touch global config
+
+        def _add(val):
+            try:
+                subprocess.run(
+                    ['git', 'config', '--global', '--add', 'safe.directory', val],
+                    capture_output=True, text=True, timeout=10)
+            except Exception:
+                pass
+
+        # Prefer a narrow, path-specific exception; UNC paths can be recorded
+        # with either separator, so register both forms.
+        for val in {repo_dir, repo_dir.replace('\\', '/')}:
+            _add(val)
+        ok, _ = _can_read()
+        if not ok:
+            # Path matching on network shares can still miss; fall back to the
+            # wildcard so the updater is functional.
+            _add('*')
+            ok, _ = _can_read()
+        if ok:
+            self.log_message(
+                "Configured git safe.directory exception for the app folder "
+                "(repo is on a share owned by another account).")
+        return ok
+
     def check_for_updates(self):
         """Fetch remote git metadata and check whether local branch is behind."""
         import subprocess
@@ -29156,6 +29209,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         def _fetch_and_check():
             try:
                 repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+                # Handle repos on network shares owned by another account
+                # (otherwise git aborts with 'dubious ownership').
+                self._ensure_git_safe_directory(repo_dir)
 
                 # Fetch latest metadata from remote (non-destructive)
                 subprocess.run(
@@ -29239,6 +29296,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         try:
             repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+            # Handle repos on network shares owned by another account
+            # (otherwise git pull aborts with 'dubious ownership').
+            self._ensure_git_safe_directory(repo_dir)
+
             process = subprocess.Popen(
                 ['git', 'pull', 'origin', 'main'],
                 cwd=repo_dir,
