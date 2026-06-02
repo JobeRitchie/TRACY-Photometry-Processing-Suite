@@ -26,8 +26,8 @@ from openpyxl import Workbook, load_workbook
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.0.1"
-APP_VERSION_DATE = "May 31, 2026"
+APP_VERSION = "1.0.2"
+APP_VERSION_DATE = "June 1, 2026"
 
 
 class ZoneEditor:
@@ -9617,6 +9617,20 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Bout Analysis: action buttons consolidated into "Plot" and "Export" dropdown
+    menus to declutter the tab.
+  • Bout Analysis: "Compare Across Bouts" now draws a separate line per group when
+    groups are selected (previously pooled all subjects into one line).
+  • Bout Analysis: copy/paste export reworked into clean, Prism-ready tables with
+    explicit Group and Subject columns plus a mean/SEM/n summary.
+  • Visualization: zone-entry transition thresholds (min duration in zone +
+    refractory) are now editable under Advanced Graph Settings, with one-click
+    recompute — no full reprocess needed.
+  • Updater: handles installs on network shares (auto-resolves git "dubious
+    ownership") so in-app updates work without manual git setup.
+
+Version 1.0.1  •  May 31, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • UI: decluttered tabs, consistent spacing, and fixed text that was cut off or
     squished at smaller window sizes.
