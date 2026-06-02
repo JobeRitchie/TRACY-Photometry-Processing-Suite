@@ -15,7 +15,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.colors import LinearSegmentedColormap
 from scipy.optimize import curve_fit
 from scipy import stats
-from scipy.signal import coherence, spectrogram, fftconvolve
+from scipy.signal import coherence, spectrogram, fftconvolve, butter, filtfilt, savgol_filter
 import os
 import json
 from pathlib import Path
@@ -906,6 +906,17 @@ class FPAnalysisGUI:
             'auto_scale_boutframes': False,  # Auto-scale boutframe numbers to photometry FPS
             'precut_correct_boutframes': True,  # Subtract precut/n_led_states offset from boutframes to align with post-precut FP data
             'boutframe_manual_shift': 0,  # Manual frame shift applied after scaling (positive = shift forward, negative = shift backward)
+            # Start/end boutframes processing style for the Bout Analysis tab:
+            #   'onset'  = fixed window relative to bout start (default; works for start-only files)
+            #   'whole'  = metrics computed over the actual bout duration (start -> end; needs end frames)
+            #   'offset' = window relative to the bout END (needs end frames)
+            'boutframe_processing_style': 'onset',
+            # Bout exclusion filter (non-destructive; applied when bouts are extracted).
+            # Thresholds are in FRAMES (boutframe space).  0 = rule disabled.
+            'bout_exclude_enabled': False,
+            'bout_exclude_min_duration': 0,  # drop bouts shorter than this (needs end frames)
+            'bout_exclude_max_duration': 0,  # drop bouts longer than this (needs end frames)
+            'bout_exclude_min_gap': 0,       # drop a bout starting < this many frames after the previous bout's end (start, if no end)
             'exclude_frames_before': 0,  # Exclude bouts before this frame number
             'maze_type': 'EPM',  # Maze type: 'EPM' or 'OFT'
             'maze_width_cm': 76,  # Maze width in cm (for position calibration)
@@ -917,9 +928,21 @@ class FPAnalysisGUI:
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
             'baseline_frames': 45,  # Number of prebout frames to use for baseline (default: half of preboutframes)
-            # Rolling average smoothing (applied as final processing step)
+            # Signal smoothing (applied as final processing step).
+            # 'processing_rolling_avg_enabled' is the master on/off switch (kept
+            # under its original key for backward compatibility with old projects).
+            # 'processing_smoothing_method' selects which of the three filters to
+            # apply: 'butterworth' (low-pass), 'savgol' (Savitzky-Golay), or
+            # 'rolling' (moving average). Butterworth low-pass is the default
+            # because it is the most widely used smoothing step in the fiber
+            # photometry literature (e.g. TDT pipelines, pMAT, GuPPy).
             'processing_rolling_avg_enabled': False,
+            'processing_smoothing_method': 'butterworth',
             'processing_rolling_window_frames': 5,
+            'processing_butter_cutoff_hz': 6.0,   # Butterworth low-pass cutoff (Hz)
+            'processing_butter_order': 2,         # Butterworth filter order
+            'processing_savgol_window_frames': 11,  # Savitzky-Golay window (odd, frames)
+            'processing_savgol_polyorder': 3,       # Savitzky-Golay polynomial order
             # File naming patterns (for batch processing)
             'fpdata_pattern': 'FPData',  # Pattern to identify FPData files
             'fpdata_suffix': '0.csv',  # Suffix after subject ID for FPData files
@@ -971,6 +994,13 @@ class FPAnalysisGUI:
         self.precut_correct_boutframes_var = tk.BooleanVar(value=True)
         self.boutframes_video_fps_var = tk.StringVar(value='30')
         self.boutframe_manual_shift_var = tk.StringVar(value='0')
+        # Start/end boutframes: analysis processing style (Bout Analysis tab)
+        self.boutframe_processing_style_var = tk.StringVar(value='onset')
+        # Bout exclusion filter settings (Bout Frames Editor tab)
+        self.bout_exclude_enabled_var = tk.BooleanVar(value=False)
+        self.bout_exclude_min_dur_var = tk.StringVar(value='0')
+        self.bout_exclude_max_dur_var = tk.StringVar(value='0')
+        self.bout_exclude_min_gap_var = tk.StringVar(value='0')
 
         # Exclusion toggles for each tab
         self.use_exclusions_viz = tk.BooleanVar(value=False)
@@ -1824,16 +1854,74 @@ class FPAnalysisGUI:
         ttk.Label(baseline_params_frame, text="(frames before bout onset to average)", 
                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
 
-        rolling_proc_frame = ttk.Frame(channel_frame)
-        rolling_proc_frame.pack(anchor='w', pady=5, padx=20)
-        self.processing_rolling_avg_enabled = tk.BooleanVar(value=self.params['processing_rolling_avg_enabled'])
-        self.processing_rolling_window_var = tk.StringVar(value=str(self.params['processing_rolling_window_frames']))
-        ttk.Checkbutton(rolling_proc_frame, text="Apply rolling average as final processing step",
-                   variable=self.processing_rolling_avg_enabled).pack(side='left', padx=(0, 10))
-        ttk.Label(rolling_proc_frame, text="Window (frames):").pack(side='left', padx=(0, 5))
-        ttk.Entry(rolling_proc_frame, textvariable=self.processing_rolling_window_var, width=8).pack(side='left', padx=(0, 5))
-        ttk.Label(rolling_proc_frame, text="(1 disables smoothing)", 
-             foreground='gray', font=('Segoe UI', 8)).pack(side='left')
+        # ── Signal smoothing (final processing step) ──────────────────
+        ttk.Separator(channel_frame, orient='horizontal').pack(fill='x', pady=5)
+        ttk.Label(channel_frame, text="Signal Smoothing:",
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(5, 0))
+
+        smooth_frame = ttk.Frame(channel_frame)
+        smooth_frame.pack(anchor='w', pady=5, padx=20)
+
+        self.processing_rolling_avg_enabled = tk.BooleanVar(
+            value=self.params['processing_rolling_avg_enabled'])
+        ttk.Checkbutton(smooth_frame,
+                        text="Apply smoothing as final processing step",
+                        variable=self.processing_rolling_avg_enabled).pack(anchor='w')
+
+        self.processing_smoothing_method = tk.StringVar(
+            value=self.params['processing_smoothing_method'])
+        self.processing_rolling_window_var = tk.StringVar(
+            value=str(self.params['processing_rolling_window_frames']))
+        self.processing_butter_cutoff_var = tk.StringVar(
+            value=str(self.params['processing_butter_cutoff_hz']))
+        self.processing_butter_order_var = tk.StringVar(
+            value=str(self.params['processing_butter_order']))
+        self.processing_savgol_window_var = tk.StringVar(
+            value=str(self.params['processing_savgol_window_frames']))
+        self.processing_savgol_poly_var = tk.StringVar(
+            value=str(self.params['processing_savgol_polyorder']))
+
+        # Butterworth low-pass (literature default)
+        butter_row = ttk.Frame(smooth_frame)
+        butter_row.pack(anchor='w', pady=2, padx=20)
+        ttk.Radiobutton(butter_row, text="Butterworth low-pass",
+                        variable=self.processing_smoothing_method,
+                        value='butterworth').pack(side='left', padx=(0, 10))
+        ttk.Label(butter_row, text="Cutoff (Hz):").pack(side='left', padx=(0, 5))
+        ttk.Entry(butter_row, textvariable=self.processing_butter_cutoff_var,
+                  width=6).pack(side='left', padx=(0, 10))
+        ttk.Label(butter_row, text="Order:").pack(side='left', padx=(0, 5))
+        ttk.Entry(butter_row, textvariable=self.processing_butter_order_var,
+                  width=5).pack(side='left', padx=(0, 5))
+        ttk.Label(butter_row, text="(recommended for photometry)",
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
+
+        # Savitzky-Golay
+        savgol_row = ttk.Frame(smooth_frame)
+        savgol_row.pack(anchor='w', pady=2, padx=20)
+        ttk.Radiobutton(savgol_row, text="Savitzky-Golay",
+                        variable=self.processing_smoothing_method,
+                        value='savgol').pack(side='left', padx=(0, 10))
+        ttk.Label(savgol_row, text="Window (frames):").pack(side='left', padx=(0, 5))
+        ttk.Entry(savgol_row, textvariable=self.processing_savgol_window_var,
+                  width=6).pack(side='left', padx=(0, 10))
+        ttk.Label(savgol_row, text="Poly order:").pack(side='left', padx=(0, 5))
+        ttk.Entry(savgol_row, textvariable=self.processing_savgol_poly_var,
+                  width=5).pack(side='left', padx=(0, 5))
+        ttk.Label(savgol_row, text="(window must be odd & > poly order)",
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
+
+        # Rolling (moving) average
+        rolling_row = ttk.Frame(smooth_frame)
+        rolling_row.pack(anchor='w', pady=2, padx=20)
+        ttk.Radiobutton(rolling_row, text="Rolling average",
+                        variable=self.processing_smoothing_method,
+                        value='rolling').pack(side='left', padx=(0, 10))
+        ttk.Label(rolling_row, text="Window (frames):").pack(side='left', padx=(0, 5))
+        ttk.Entry(rolling_row, textvariable=self.processing_rolling_window_var,
+                  width=6).pack(side='left', padx=(0, 5))
+        ttk.Label(rolling_row, text="(1 disables smoothing)",
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
         
         # Processing parameters display (RIGHT SIDE)
         param_frame = ttk.LabelFrame(side_by_side_frame, text="Current Parameters", padding=5)
@@ -2060,6 +2148,206 @@ class FPAnalysisGUI:
                   foreground='gray', wraplength=700).pack(anchor='w', padx=10, pady=(0, 4))
 
         self._refresh_per_subject_shifts_list()
+
+        # ── Sub-tab 4: Bout Exclusions ──────────────────────────────────
+        excl_tab = ttk.Frame(self.boutframes_sub_notebook)
+        self.boutframes_sub_notebook.add(excl_tab, text="Bout Exclusions")
+
+        ttk.Label(excl_tab,
+                  text="Exclude bouts by duration or by proximity to the preceding bout.  This is a "
+                       "non-destructive filter: the boutframes file is never modified — the rules are "
+                       "applied to every subject when bouts are (re-)extracted.  Click "
+                       "“Apply Settings & Re-extract Bouts” above to update results.",
+                  foreground='gray', wraplength=720, justify='left').pack(anchor='w', padx=10, pady=(8, 4))
+
+        excl_frame = ttk.LabelFrame(excl_tab, text="Exclusion Rules (frames)", padding=10)
+        excl_frame.pack(fill='x', padx=10, pady=(0, 6))
+
+        ttk.Checkbutton(excl_frame, text="Enable bout exclusion filter",
+                        variable=self.bout_exclude_enabled_var,
+                        command=self._sync_bout_exclusion_params).grid(
+                            row=0, column=0, columnspan=4, sticky='w', pady=(0, 6))
+
+        # Min duration
+        ttk.Label(excl_frame, text="Exclude bouts shorter than:").grid(row=1, column=0, sticky='w', pady=2)
+        _e_mindur = ttk.Entry(excl_frame, textvariable=self.bout_exclude_min_dur_var, width=10)
+        _e_mindur.grid(row=1, column=1, sticky='w', padx=(4, 4))
+        ttk.Label(excl_frame, text="frames").grid(row=1, column=2, sticky='w')
+        self._excl_mindur_hint = ttk.Label(excl_frame, text="", foreground='gray', font=('Segoe UI', 8))
+        self._excl_mindur_hint.grid(row=1, column=3, sticky='w', padx=(8, 0))
+
+        # Max duration
+        ttk.Label(excl_frame, text="Exclude bouts longer than:").grid(row=2, column=0, sticky='w', pady=2)
+        _e_maxdur = ttk.Entry(excl_frame, textvariable=self.bout_exclude_max_dur_var, width=10)
+        _e_maxdur.grid(row=2, column=1, sticky='w', padx=(4, 4))
+        ttk.Label(excl_frame, text="frames").grid(row=2, column=2, sticky='w')
+        self._excl_maxdur_hint = ttk.Label(excl_frame, text="", foreground='gray', font=('Segoe UI', 8))
+        self._excl_maxdur_hint.grid(row=2, column=3, sticky='w', padx=(8, 0))
+
+        # Min gap (proximity)
+        self._excl_gap_label = ttk.Label(excl_frame, text="Minimum gap after previous bout's end:")
+        self._excl_gap_label.grid(row=3, column=0, sticky='w', pady=2)
+        _e_gap = ttk.Entry(excl_frame, textvariable=self.bout_exclude_min_gap_var, width=10)
+        _e_gap.grid(row=3, column=1, sticky='w', padx=(4, 4))
+        ttk.Label(excl_frame, text="frames").grid(row=3, column=2, sticky='w')
+        self._excl_gap_hint = ttk.Label(excl_frame, text="", foreground='gray', font=('Segoe UI', 8))
+        self._excl_gap_hint.grid(row=3, column=3, sticky='w', padx=(8, 0))
+
+        ttk.Label(excl_frame,
+                  text="Enter 0 to disable a rule.  Duration rules require a start/end boutframes file.  "
+                       "The proximity rule drops the later bout when it begins too soon after the previous "
+                       "kept bout.",
+                  foreground='gray', font=('Segoe UI', 8), wraplength=720, justify='left').grid(
+                      row=4, column=0, columnspan=4, sticky='w', pady=(6, 0))
+
+        # Live-update hints + params as the user types / toggles
+        for _e in (_e_mindur, _e_maxdur, _e_gap):
+            _e.bind('<KeyRelease>', lambda ev: self._update_bout_exclusion_hints())
+        if hasattr(self, 'boutframes_video_fps_var'):
+            self.boutframes_video_fps_var.trace_add(
+                'write', lambda *a: self._update_bout_exclusion_hints())
+
+        # Preview row
+        preview_row = ttk.Frame(excl_tab)
+        preview_row.pack(fill='x', padx=10, pady=(4, 4))
+        ttk.Button(preview_row, text="Preview Exclusions (All Subjects)",
+                   command=self._preview_bout_exclusions).pack(side='left')
+        ttk.Label(preview_row,
+                  text="Counts how many bouts each rule would remove across the whole file "
+                       "(uses current scaling/shift/precut settings).",
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=(10, 0))
+
+        excl_result_frame = ttk.LabelFrame(excl_tab, text="Preview Results", padding=4)
+        excl_result_frame.pack(fill='both', expand=True, padx=10, pady=(0, 8))
+        self.bout_exclusion_preview_text = tk.Text(excl_result_frame, height=14, wrap='none')
+        _excl_vsb = ttk.Scrollbar(excl_result_frame, orient='vertical',
+                                  command=self.bout_exclusion_preview_text.yview)
+        self.bout_exclusion_preview_text.configure(yscrollcommand=_excl_vsb.set, state='disabled')
+        self.bout_exclusion_preview_text.grid(row=0, column=0, sticky='nsew')
+        _excl_vsb.grid(row=0, column=1, sticky='ns')
+        excl_result_frame.grid_rowconfigure(0, weight=1)
+        excl_result_frame.grid_columnconfigure(0, weight=1)
+
+        self._update_bout_exclusion_hints()
+
+    def _frames_to_seconds_hint(self, frames_str):
+        """Return a '(= X.XX s @ N fps)' helper string for a frame-count entry."""
+        try:
+            frames = float(frames_str)
+        except (ValueError, TypeError):
+            return ""
+        if frames <= 0:
+            return ""
+        try:
+            fps = float(self.boutframes_video_fps_var.get())
+        except (ValueError, TypeError, AttributeError):
+            fps = 30.0
+        if fps <= 0:
+            return ""
+        return f"(= {frames / fps:.2f} s @ {fps:g} fps)"
+
+    def _update_bout_exclusion_hints(self):
+        """Refresh the seconds-equivalent hints and the proximity-rule wording, and
+        keep self.params in sync with the exclusion entry fields."""
+        if hasattr(self, '_excl_mindur_hint'):
+            self._excl_mindur_hint.config(text=self._frames_to_seconds_hint(self.bout_exclude_min_dur_var.get()))
+        if hasattr(self, '_excl_maxdur_hint'):
+            self._excl_maxdur_hint.config(text=self._frames_to_seconds_hint(self.bout_exclude_max_dur_var.get()))
+        if hasattr(self, '_excl_gap_hint'):
+            self._excl_gap_hint.config(text=self._frames_to_seconds_hint(self.bout_exclude_min_gap_var.get()))
+        if hasattr(self, '_excl_gap_label'):
+            if getattr(self, '_boutframes_has_end', False):
+                self._excl_gap_label.config(text="Minimum gap after previous bout's end:")
+            else:
+                self._excl_gap_label.config(text="Minimum time between bout starts:")
+        self._sync_bout_exclusion_params()
+
+    def _preview_bout_exclusions(self):
+        """Compute, across every sheet in the boutframes file, how many bouts the
+        current exclusion rules would remove.  Non-destructive."""
+        self._sync_bout_exclusion_params()
+        boutframes_file = self.boutframes_path_var.get()
+        if not boutframes_file or not os.path.exists(boutframes_file):
+            messagebox.showwarning("No Boutframes File",
+                                   "Load a boutframes file first (Processing tab).")
+            return
+        if not self.params.get('bout_exclude_enabled', False):
+            messagebox.showinfo("Exclusions Disabled",
+                                "Enable the bout exclusion filter to preview its effect.")
+            return
+
+        lines = []
+        total_before = 0
+        total_after = 0
+        any_end = False
+        try:
+            wb = load_workbook(boutframes_file, read_only=True)
+            sheets = wb.sheetnames
+            wb.close()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read boutframes file:\n{e}")
+            return
+
+        for sheet in sheets:
+            try:
+                df = pd.read_excel(boutframes_file, sheet_name=sheet)
+            except Exception:
+                continue
+            behaviors, has_end = self._parse_boutframes_dataframe(df)
+            any_end = any_end or has_end
+            sheet_before = 0
+            sheet_excl = 0
+            beh_lines = []
+            for name, raw_start, raw_end in behaviors:
+                if len(raw_start) == 0:
+                    continue
+                start = self._transform_boutframe_values(raw_start, sheet, as_int=True)
+                end = (self._transform_boutframe_values(raw_end, sheet, as_int=False)
+                       if raw_end is not None else None)
+                exclude_before = self.params.get('exclude_frames_before', 0)
+                _m = start >= exclude_before
+                start = start[_m]
+                if end is not None:
+                    end = end[_m]
+                n_before = len(start)
+                _, _, n_excl = self._apply_bout_exclusions(start, end)
+                sheet_before += n_before
+                sheet_excl += n_excl
+                if n_before:
+                    beh_lines.append(f"      {name}: {n_excl} of {n_before} removed "
+                                     f"({n_before - n_excl} kept)")
+            if sheet_before:
+                lines.append(f"  {sheet}: {sheet_excl} of {sheet_before} removed "
+                             f"({sheet_before - sheet_excl} kept)")
+                lines.extend(beh_lines)
+                total_before += sheet_before
+                total_after += (sheet_before - sheet_excl)
+
+        header = []
+        header.append("Bout Exclusion Preview")
+        header.append("=" * 60)
+        rules = []
+        if self.params.get('bout_exclude_min_duration', 0) > 0:
+            rules.append(f"min duration {self.params['bout_exclude_min_duration']} frames")
+        if self.params.get('bout_exclude_max_duration', 0) > 0:
+            rules.append(f"max duration {self.params['bout_exclude_max_duration']} frames")
+        if self.params.get('bout_exclude_min_gap', 0) > 0:
+            gap_kind = "gap after prev end" if any_end else "between starts"
+            rules.append(f"min {gap_kind} {self.params['bout_exclude_min_gap']} frames")
+        header.append("Rules: " + (", ".join(rules) if rules else "(none active)"))
+        if not any_end and (self.params.get('bout_exclude_min_duration', 0) > 0
+                            or self.params.get('bout_exclude_max_duration', 0) > 0):
+            header.append("NOTE: duration rules have no effect — this file has no end frames.")
+        header.append("")
+        header.append(f"TOTAL: {total_before - total_after} of {total_before} bouts removed "
+                      f"({total_after} kept)")
+        header.append("")
+
+        text = "\n".join(header + lines) if lines else "\n".join(header + ["  (no bouts found)"])
+        self.bout_exclusion_preview_text.config(state='normal')
+        self.bout_exclusion_preview_text.delete('1.0', tk.END)
+        self.bout_exclusion_preview_text.insert('1.0', text)
+        self.bout_exclusion_preview_text.config(state='disabled')
 
     def create_behavioral_data_tab(self):
         """Tab for behavioral metrics analysis"""
@@ -2448,8 +2736,8 @@ class FPAnalysisGUI:
         
         ttk.Label(control_frame, text="Plot Type:").grid(row=1, column=2, sticky='w', padx=5)
         self.plot_type_var = tk.StringVar(value="corrected")
-        plot_types = ["Signal Integrity", "Raw Data", "Normalized (dF/F)", "Motion Corrected", "Z-scored", 
-                     "Bouts Overlay", "Extracted Bouts", "Compare Across Bouts", "Position Heatmap",
+        plot_types = ["Signal Integrity", "Raw Data", "Normalized (dF/F)", "Motion Corrected", "Z-scored",
+                     "Bouts Overlay", "Extracted Bouts", "Bout Length Bins", "Compare Across Bouts", "Position Heatmap",
                      "Zone Entry Bouts", "Zone Averages", "Distance from Center", "Distance from Center (Euclidean)", "Out/Back"]
         ttk.Combobox(control_frame, textvariable=self.plot_type_var, values=plot_types, width=20).grid(row=1, column=3, padx=5)
         
@@ -6789,6 +7077,11 @@ class FPAnalysisGUI:
         self.current_bout_canvas         = None
         self.current_bout_figure         = None
         self.bout_metrics_data           = {}
+        # Bout-length bins (seconds). Each is (low, high); high=None means open-ended.
+        # Only usable when boutframes provide start AND end frames. Shared by the
+        # Bout Analysis "Bars by Bout Length" and the Visualization "Bout Length Bins" plot.
+        if not hasattr(self, 'bout_length_bins'):
+            self.bout_length_bins = [(0.0, 1.0), (1.0, 3.0), (3.0, None)]
 
         # ── COMPACT ANALYSIS CONTROLS ────────────────────────────────────
         ctrl = ttk.LabelFrame(scrollable_frame, text="Analysis Controls", padding=4)
@@ -6879,22 +7172,41 @@ class FPAnalysisGUI:
 
         btn_row = ttk.Frame(actions)
         btn_row.pack(fill='x')
+
         ttk.Button(btn_row, text="Calculate Metrics",
                    command=self.calculate_bout_metrics).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_row, text="Generate Bar Graphs",
-                   command=self.generate_bout_bar_graphs).pack(side='left', padx=3)
+
+        # Plot ▾ — all graph types live behind one dropdown
+        plot_mb = ttk.Menubutton(btn_row, text="Plot ▾")
+        plot_menu = tk.Menu(plot_mb, tearoff=0)
+        plot_menu.add_command(label="Bar Graphs (per metric)",
+                              command=self.generate_bout_bar_graphs)
+        plot_menu.add_command(label="Compare Across Bouts",
+                              command=self.compare_across_bouts)
+        plot_menu.add_command(label="Compare First vs Last",
+                              command=self.compare_first_vs_last_bouts)
+        plot_menu.add_command(label="Binned Progression",
+                              command=self.plot_binned_bout_progression)
+        plot_menu.add_separator()
+        plot_menu.add_command(label="Bars by Bout Length",
+                              command=self.plot_bout_length_bars)
+        plot_menu.add_command(label="Edit Length Bins…",
+                              command=self._open_bout_length_bin_editor)
+        plot_mb['menu'] = plot_menu
+        plot_mb.pack(side='left', padx=3)
+
         ttk.Button(btn_row, text="Run Statistics",
                    command=self.run_bout_statistics).pack(side='left', padx=3)
-        ttk.Button(btn_row, text="Compare Across Bouts",
-                   command=self.compare_across_bouts).pack(side='left', padx=3)
-        ttk.Button(btn_row, text="Compare First vs Last",
-                   command=self.compare_first_vs_last_bouts).pack(side='left', padx=3)
-        ttk.Button(btn_row, text="Plot Binned Progression",
-                   command=self.plot_binned_bout_progression).pack(side='left', padx=3)
-        ttk.Button(btn_row, text="Export Data",
-                   command=self.export_bout_metrics).pack(side='left', padx=3)
-        ttk.Button(btn_row, text="Export Bout Order Data",
-                   command=self.export_bout_order_data).pack(side='left', padx=3)
+
+        # Export ▾ — both export paths behind one dropdown
+        export_mb = ttk.Menubutton(btn_row, text="Export ▾")
+        export_menu = tk.Menu(export_mb, tearoff=0)
+        export_menu.add_command(label="Metrics Table (Excel)…",
+                                command=self.export_bout_metrics)
+        export_menu.add_command(label="Plot Data — copy/paste (Prism, Excel)…",
+                                command=self.export_bout_order_data)
+        export_mb['menu'] = export_menu
+        export_mb.pack(side='left', padx=3)
 
         # ── GRAPH AREA ───────────────────────────────────────────────────
         bout_graph_container = ttk.Frame(scrollable_frame)
@@ -9535,7 +9847,8 @@ Version 1.0.0
         self.viz_channel_vars = []
         for i in range(n):
             var = tk.IntVar(value=1)
-            chk = ttk.Checkbutton(self.viz_channel_check_frame, text=f'Ch{i}', variable=var)
+            chk = ttk.Checkbutton(self.viz_channel_check_frame,
+                                  text=self.get_channel_name(data, i), variable=var)
             chk.pack(side='left')
             self.viz_channel_vars.append(var)
 
@@ -9566,8 +9879,11 @@ Version 1.0.0
 
         ttk.Label(self.viz_channel_map_frame, text='Mapping:').pack(anchor='w')
 
-        # Determine default mapping and existing mapping
+        # Determine default mapping and existing mapping.
+        # channel_names may be stored as a list (index->name) or a dict; normalize to dict.
         existing = data.get('channel_name_map') or data.get('channel_names') or {}
+        if isinstance(existing, list):
+            existing = {idx: name for idx, name in enumerate(existing)}
         default_map = self.compute_default_channel_map(data, n)
 
         self.viz_channel_name_vars = []
@@ -9765,6 +10081,13 @@ Version 1.0.0
                                              filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         if filename:
             self.boutframes_path_var.set(filename)
+            # Auto-populate the boutframes editor so the user doesn't have to
+            # click "Reload from File" separately.
+            if hasattr(self, 'bout_subject_combo'):
+                try:
+                    self.update_bout_subjects()
+                except Exception as e:
+                    self.log_message(f"Could not load boutframes editor: {e}")
     
     def browse_ttl(self):
         filename = filedialog.askopenfilename(title="Select TTL File",
@@ -10443,7 +10766,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.timestamp_suffix_var.set(self.params.get('timestamp_suffix', '0.csv'))
             if hasattr(self, 'boutframe_manual_shift_var'):
                 self.boutframe_manual_shift_var.set(str(self.params.get('boutframe_manual_shift', 0)))
-            
+            if hasattr(self, 'boutframe_processing_style_var'):
+                self.boutframe_processing_style_var.set(self.params.get('boutframe_processing_style', 'onset'))
+            if hasattr(self, 'bout_exclude_enabled_var'):
+                self.bout_exclude_enabled_var.set(bool(self.params.get('bout_exclude_enabled', False)))
+            if hasattr(self, 'bout_exclude_min_dur_var'):
+                self.bout_exclude_min_dur_var.set(str(self.params.get('bout_exclude_min_duration', 0)))
+            if hasattr(self, 'bout_exclude_max_dur_var'):
+                self.bout_exclude_max_dur_var.set(str(self.params.get('bout_exclude_max_duration', 0)))
+            if hasattr(self, 'bout_exclude_min_gap_var'):
+                self.bout_exclude_min_gap_var.set(str(self.params.get('bout_exclude_min_gap', 0)))
+
+            # Signal smoothing UI vars
+            if hasattr(self, 'processing_rolling_avg_enabled'):
+                self.processing_rolling_avg_enabled.set(bool(self.params.get('processing_rolling_avg_enabled', False)))
+            if hasattr(self, 'processing_smoothing_method'):
+                self.processing_smoothing_method.set(self.params.get('processing_smoothing_method', 'butterworth'))
+            if hasattr(self, 'processing_rolling_window_var'):
+                self.processing_rolling_window_var.set(str(self.params.get('processing_rolling_window_frames', 5)))
+            if hasattr(self, 'processing_butter_cutoff_var'):
+                self.processing_butter_cutoff_var.set(str(self.params.get('processing_butter_cutoff_hz', 6.0)))
+            if hasattr(self, 'processing_butter_order_var'):
+                self.processing_butter_order_var.set(str(self.params.get('processing_butter_order', 2)))
+            if hasattr(self, 'processing_savgol_window_var'):
+                self.processing_savgol_window_var.set(str(self.params.get('processing_savgol_window_frames', 11)))
+            if hasattr(self, 'processing_savgol_poly_var'):
+                self.processing_savgol_poly_var.set(str(self.params.get('processing_savgol_polyorder', 3)))
+
             # Load groups
             self.groups = config.get('groups', {})
             self.groups_mutually_exclusive_var.set(bool(config.get('groups_mutually_exclusive', True)))
@@ -10465,10 +10814,41 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if 'fpdata_path' in config:
                 self.fpdata_path_var.set(config['fpdata_path'])
             if 'boutframes_file' in config:
-                self.boutframes_path_var.set(config['boutframes_file'])
-                # Update bout subjects if file exists
-                if hasattr(self, 'bout_subject_combo') and os.path.exists(config['boutframes_file']):
-                    self.update_bout_subjects()
+                saved_bf = config['boutframes_file']
+                # The project stores an absolute path to the original boutframes
+                # file. If it has moved (e.g. the project was shared/relocated),
+                # try a few sensible fallbacks before giving up so the editor isn't
+                # silently left blank.
+                resolved_bf = saved_bf if (saved_bf and os.path.exists(saved_bf)) else None
+                if resolved_bf is None and saved_bf:
+                    candidates = []
+                    bf_name = os.path.basename(saved_bf)
+                    # Alongside the FP data file...
+                    fp_path = config.get('fpdata_path', '')
+                    if fp_path:
+                        candidates.append(os.path.join(os.path.dirname(fp_path), bf_name))
+                        candidates.append(os.path.join(os.path.dirname(fp_path), 'boutframes.xlsx'))
+                    # ...or inside the loaded project directory.
+                    if 'project_path' in dir() and project_path:
+                        candidates.append(os.path.join(project_path, bf_name))
+                        candidates.append(os.path.join(project_path, 'raw', bf_name))
+                    for cand in candidates:
+                        if cand and os.path.exists(cand):
+                            resolved_bf = cand
+                            self.log_message(
+                                f"  Boutframes file moved; using found copy: {cand}")
+                            break
+                self.boutframes_path_var.set(resolved_bf or saved_bf)
+                if hasattr(self, 'bout_subject_combo'):
+                    if resolved_bf:
+                        try:
+                            self.update_bout_subjects()
+                        except Exception as e:
+                            self.log_message(f"  Could not populate boutframes editor: {e}")
+                    elif saved_bf:
+                        self.log_message(
+                            f"  Boutframes file not found: {saved_bf} — re-select it via "
+                            f"Browse on the Processing tab to use the editor.")
             if 'ttl_file' in config:
                 self.ttl_path_var.set(config['ttl_file'])
             
@@ -11337,10 +11717,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 for key, var in entries.items():
                     value_str = var.get().strip()
                     # Check if this is a string parameter (file naming patterns, maze type)
-                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method']:
+                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method', 'boutframe_processing_style', 'processing_smoothing_method']:
                         self.params[key] = value_str
                     # Check if this is a boolean parameter
-                    elif key in ['baseline_correct_bouts', 'processing_rolling_avg_enabled', 'auto_scale_boutframes', 'precut_correct_boutframes']:
+                    elif key in ['baseline_correct_bouts', 'processing_rolling_avg_enabled', 'auto_scale_boutframes', 'precut_correct_boutframes', 'bout_exclude_enabled']:
                         # Parse boolean values
                         if value_str.lower() in ['true', '1', 'yes', 'on']:
                             self.params[key] = True
@@ -11374,8 +11754,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.baseline_frames_var.set(str(self.params['baseline_frames']))
                 if hasattr(self, 'processing_rolling_avg_enabled'):
                     self.processing_rolling_avg_enabled.set(self.params['processing_rolling_avg_enabled'])
+                if hasattr(self, 'processing_smoothing_method'):
+                    self.processing_smoothing_method.set(self.params['processing_smoothing_method'])
                 if hasattr(self, 'processing_rolling_window_var'):
                     self.processing_rolling_window_var.set(str(self.params['processing_rolling_window_frames']))
+                if hasattr(self, 'processing_butter_cutoff_var'):
+                    self.processing_butter_cutoff_var.set(str(self.params['processing_butter_cutoff_hz']))
+                if hasattr(self, 'processing_butter_order_var'):
+                    self.processing_butter_order_var.set(str(self.params['processing_butter_order']))
+                if hasattr(self, 'processing_savgol_window_var'):
+                    self.processing_savgol_window_var.set(str(self.params['processing_savgol_window_frames']))
+                if hasattr(self, 'processing_savgol_poly_var'):
+                    self.processing_savgol_poly_var.set(str(self.params['processing_savgol_polyorder']))
                 
                 # Auto-save project to persist parameter changes
                 if self.current_project:
@@ -11408,13 +11798,34 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.params['baseline_frames'] = self.params['preboutframes'] // 2
             self.baseline_frames_var.set(str(self.params['baseline_frames']))
 
-        # Update processing-time rolling average settings
+        # Update processing-time smoothing settings
         self.params['processing_rolling_avg_enabled'] = self.processing_rolling_avg_enabled.get()
+        self.params['processing_smoothing_method'] = self.processing_smoothing_method.get()
         try:
             self.params['processing_rolling_window_frames'] = max(1, int(float(self.processing_rolling_window_var.get())))
         except ValueError:
             self.params['processing_rolling_window_frames'] = 5
             self.processing_rolling_window_var.set(str(self.params['processing_rolling_window_frames']))
+        try:
+            self.params['processing_butter_cutoff_hz'] = max(0.01, float(self.processing_butter_cutoff_var.get()))
+        except ValueError:
+            self.params['processing_butter_cutoff_hz'] = 6.0
+            self.processing_butter_cutoff_var.set(str(self.params['processing_butter_cutoff_hz']))
+        try:
+            self.params['processing_butter_order'] = max(1, int(float(self.processing_butter_order_var.get())))
+        except ValueError:
+            self.params['processing_butter_order'] = 2
+            self.processing_butter_order_var.set(str(self.params['processing_butter_order']))
+        try:
+            self.params['processing_savgol_window_frames'] = max(3, int(float(self.processing_savgol_window_var.get())))
+        except ValueError:
+            self.params['processing_savgol_window_frames'] = 11
+            self.processing_savgol_window_var.set(str(self.params['processing_savgol_window_frames']))
+        try:
+            self.params['processing_savgol_polyorder'] = max(1, int(float(self.processing_savgol_poly_var.get())))
+        except ValueError:
+            self.params['processing_savgol_polyorder'] = 3
+            self.processing_savgol_poly_var.set(str(self.params['processing_savgol_polyorder']))
         
         # Update file naming patterns
         self.params['fpdata_pattern'] = self.fpdata_pattern_var.get()
@@ -11435,7 +11846,30 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except ValueError:
             self.params['boutframe_manual_shift'] = 0
             self.boutframe_manual_shift_var.set('0')
-    
+
+        # Start/end boutframes processing style + exclusion filter
+        if hasattr(self, 'boutframe_processing_style_var'):
+            self.params['boutframe_processing_style'] = self.boutframe_processing_style_var.get()
+        self._sync_bout_exclusion_params()
+
+    def _sync_bout_exclusion_params(self):
+        """Copy the bout-exclusion UI values into self.params (frames; 0 = rule off)."""
+        if hasattr(self, 'bout_exclude_enabled_var'):
+            self.params['bout_exclude_enabled'] = bool(self.bout_exclude_enabled_var.get())
+        for pkey, var_name in (
+            ('bout_exclude_min_duration', 'bout_exclude_min_dur_var'),
+            ('bout_exclude_max_duration', 'bout_exclude_max_dur_var'),
+            ('bout_exclude_min_gap', 'bout_exclude_min_gap_var'),
+        ):
+            var = getattr(self, var_name, None)
+            if var is None:
+                continue
+            try:
+                val = int(float(var.get()))
+            except (ValueError, TypeError):
+                val = 0
+            self.params[pkey] = max(0, val)
+
     # ======================== Spike Detection ========================
     
     def detect_spikes(self, signal, fps=30, global_mad=None):
@@ -12212,6 +12646,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.log_message(f"  Detected {num_photometry_cols} photometry column(s): {photometry_col_indices}")
         self.log_message(f"  ComputerTimestamp column: {'Present' if has_computer_ts else 'Not present'}")
 
+        # Per-channel designation (e.g. G0/G1/R0) read from the column headers, so a
+        # subject recorded on region 1 is labelled "G1" instead of defaulting to "G0".
+        # Only honour header names that look like real designations (G/R + digit);
+        # otherwise leave channel_names unset so downstream falls back to positional Ch#.
+        detected_channel_names = None
+        if has_text_header:
+            import re
+            _names = []
+            for idx in photometry_col_indices:
+                raw_name = str(df_fp.columns[idx]).strip()
+                m = re.match(r'^([GR])\s*(\d+)$', raw_name, re.IGNORECASE)
+                _names.append(f"{m.group(1).upper()}{m.group(2)}" if m else raw_name)
+            # Use only when at least one looks like a G/R designation.
+            if any(re.match(r'^[GR]\d+$', n) for n in _names):
+                detected_channel_names = _names
+                result['channel_names'] = detected_channel_names
+                self.log_message(f"  Channel designations from header: {detected_channel_names}")
+
         if num_photometry_cols == 0:
             raise ValueError("No photometry data columns found in FPData file")
         
@@ -12672,45 +13124,64 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ttl_boutframes = self.convert_ttl_to_boutframes(ttl_file, computer_ts)
             
             if ttl_boutframes is not None and len(ttl_boutframes) > 0:
-                # Save as Excel boutframes file matching typical structure:
-                # Single file called "boutframes.xlsx" with subject ID as sheet name
-                # Each sheet has behavior columns with frame numbers
-                ttl_boutframes_path = os.path.join(
-                    os.path.dirname(fpdata_file),
-                    "boutframes.xlsx"
-                )
-                
-                # Create or append to boutframes file
+                # Convert TTL events from long (Behavior, Frame) to wide
+                # (behavior -> list of frames) format.
+                ttl_grouped = ttl_boutframes.groupby('Behavior')['Frame'].apply(list).to_dict()
+                ttl_behaviors = set(ttl_grouped.keys())
+
+                # Choose the merge target.  When the user supplied a boutframes
+                # file we merge the TTL-derived behaviors INTO it so manually
+                # scored bouts and TTL bouts are extracted together; otherwise we
+                # use the canonical boutframes.xlsx next to the FP data.  This
+                # avoids the previous behavior of replacing the subject's sheet,
+                # which discarded the manual behaviors and yielded TTL-only bouts.
+                if boutframes_file and os.path.exists(boutframes_file):
+                    target_path = boutframes_file
+                else:
+                    target_path = os.path.join(
+                        os.path.dirname(fpdata_file), "boutframes.xlsx")
+
                 try:
-                    if os.path.exists(ttl_boutframes_path):
-                        # Append to existing file
-                        with pd.ExcelWriter(ttl_boutframes_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-                            # Convert from long format (Behavior, Frame) to wide format (behaviors as columns)
-                            grouped = ttl_boutframes.groupby('Behavior')['Frame'].apply(list).to_dict()
-                            if len(grouped) == 0:
-                                frames_dict = {}
-                            else:
-                                max_len = max(len(v) for v in grouped.values())
-                                frames_dict = {beh: list(grouped[beh]) + [np.nan] * (max_len - len(grouped[beh])) for beh in grouped}
+                    # Seed the merged sheet with any existing behaviors for this
+                    # subject, dropping previously written TTL columns so repeated
+                    # runs stay idempotent (TTL columns are refreshed, not stacked).
+                    merged_cols = {}
+                    if os.path.exists(target_path):
+                        try:
+                            existing = pd.read_excel(target_path, sheet_name=subject_id)
+                            for col in existing.columns:
+                                if self._boutframe_base_behavior(col) in ttl_behaviors:
+                                    continue  # replaced below with fresh TTL data
+                                # Keep full column (including internal NaNs) so
+                                # paired __start/__end rows stay aligned.
+                                merged_cols[col] = existing[col].tolist()
+                        except Exception:
+                            pass  # no such sheet yet / unreadable -> start fresh
+
+                    # Add (or refresh) the TTL-derived behavior columns.
+                    for beh, frames_list in ttl_grouped.items():
+                        merged_cols[str(beh)] = list(frames_list)
+
+                    # Pad columns to equal length and write the subject's sheet.
+                    max_len = max((len(v) for v in merged_cols.values()), default=0)
+                    frames_dict = {k: list(v) + [np.nan] * (max_len - len(v))
+                                   for k, v in merged_cols.items()}
+
+                    if os.path.exists(target_path):
+                        with pd.ExcelWriter(target_path, engine='openpyxl', mode='a',
+                                            if_sheet_exists='replace') as writer:
                             pd.DataFrame(frames_dict).to_excel(writer, sheet_name=subject_id, index=False)
                     else:
-                        # Create new file
-                        with pd.ExcelWriter(ttl_boutframes_path, engine='openpyxl') as writer:
-                            grouped = ttl_boutframes.groupby('Behavior')['Frame'].apply(list).to_dict()
-                            if len(grouped) == 0:
-                                frames_dict = {}
-                            else:
-                                max_len = max(len(v) for v in grouped.values())
-                                frames_dict = {beh: list(grouped[beh]) + [np.nan] * (max_len - len(grouped[beh])) for beh in grouped}
+                        with pd.ExcelWriter(target_path, engine='openpyxl') as writer:
                             pd.DataFrame(frames_dict).to_excel(writer, sheet_name=subject_id, index=False)
-                    
-                    self.log_message(f"  Created/updated boutframes file: {ttl_boutframes_path}")
-                    beh_list = list(frames_dict.keys()) if 'frames_dict' in locals() else []
-                    self.log_message(f"    Sheet: {subject_id}, Behaviors: {beh_list}, Total events: {len(ttl_boutframes)}")
-                    
-                    # Use TTL-generated boutframes if no explicit boutframes file was provided
-                    if not boutframes_file or not os.path.exists(boutframes_file):
-                        boutframes_file = ttl_boutframes_path
+
+                    self.log_message(f"  Merged TTL behaviors into boutframes file: {target_path}")
+                    self.log_message(
+                        f"    Sheet: {subject_id}, Behaviors: {list(frames_dict.keys())} "
+                        f"(TTL-derived: {sorted(ttl_behaviors)}), Total TTL events: {len(ttl_boutframes)}")
+
+                    # All downstream extraction reads this merged file.
+                    boutframes_file = target_path
                 except Exception as e:
                     self.log_message(f"  Error saving boutframes file: {str(e)}")
                     import traceback
@@ -12728,6 +13199,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             _temp['n_led_states'] = result.get('n_led_states', _temp.get('n_led_states', 1))
             _temp['photometry_fps'] = result.get('photometry_fps', _temp.get('photometry_fps'))
             _temp['num_photometry_channels'] = result.get('num_photometry_channels', _temp.get('num_photometry_channels'))
+            if result.get('channel_names'):
+                _temp['channel_names'] = result['channel_names']
             self.processed_data[subject_id] = _temp
             bout_data = self.extract_bouts(subject_id, beh_synced, boutframes_file)
             result['bouts'] = bout_data
@@ -12735,13 +13208,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return result
 
     def _apply_processing_rolling_to_result(self, result):
-        """Apply optional rolling-average smoothing to processed signal matrices."""
+        """Apply optional smoothing to processed signal matrices as a final step.
+
+        The smoothing method is selected by ``processing_smoothing_method``:
+        Butterworth low-pass (default), Savitzky-Golay, or rolling average.
+        Only the photometry signal columns (index >= 2) are filtered; the
+        elapsed-time and timestamp columns (0 and 1) are left untouched.
+        """
         if not self.params.get('processing_rolling_avg_enabled', False):
             return
 
-        window = int(self.params.get('processing_rolling_window_frames', 1))
-        if window <= 1:
-            return
+        method = self.params.get('processing_smoothing_method', 'butterworth')
+        smoother, desc = self._build_signal_smoother(method, result)
+        if smoother is None:
+            return  # disabled or invalid configuration (already logged)
 
         signal_keys = [
             'dff_470', 'dff_570', 'dff',
@@ -12754,12 +13234,97 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] > 2:
                 smoothed = arr.copy()
                 for col in range(2, smoothed.shape[1]):
-                    smoothed[:, col] = pd.Series(smoothed[:, col]).rolling(
-                        window=window, center=True, min_periods=1
-                    ).mean().to_numpy()
+                    smoothed[:, col] = smoother(smoothed[:, col])
                 result[key] = smoothed
 
-        self.log_message(f"  Applied rolling average smoothing (window={window} frames)")
+        self.log_message(f"  Applied {desc}")
+
+    def _estimate_processing_fs(self, result):
+        """Estimate the sampling rate (Hz) of the processed signal matrices.
+
+        Column 0 of the dff/corrected/zscore arrays is elapsed time in MINUTES
+        (see calculate_dff), so the sample spacing is converted to seconds before
+        inverting. Returns None if no usable time vector is found.
+        """
+        for key in ('zscore', 'corrected', 'dff',
+                    'zscore_470', 'corrected_470', 'dff_470',
+                    'zscore_570', 'corrected_570', 'dff_570'):
+            arr = result.get(key)
+            if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] > 2:
+                t_min = np.asarray(arr[:, 0], dtype=float)
+                dt_min = np.median(np.diff(t_min))
+                if np.isfinite(dt_min) and dt_min > 0:
+                    return 1.0 / (dt_min * 60.0)
+        return None
+
+    def _build_signal_smoother(self, method, result):
+        """Return ``(smoother_fn, description)`` for the selected smoothing method.
+
+        ``smoother_fn`` maps a 1D array -> smoothed 1D array. Returns
+        ``(None, None)`` when smoothing should be skipped (disabled or invalid
+        configuration); a warning is logged for invalid configurations.
+        """
+        if method == 'savgol':
+            window = int(self.params.get('processing_savgol_window_frames', 11))
+            poly = max(1, int(self.params.get('processing_savgol_polyorder', 3)))
+            if window % 2 == 0:
+                window += 1  # Savitzky-Golay requires an odd window length
+            if window <= poly:
+                window = poly + 1 if (poly + 1) % 2 == 1 else poly + 2
+
+            def _sg(col):
+                col = np.asarray(col, dtype=float)
+                n = len(col)
+                if n <= poly:
+                    return col
+                w = window
+                if w > n:
+                    w = n if n % 2 == 1 else n - 1
+                if w <= poly:
+                    return col
+                return savgol_filter(col, w, poly)
+
+            return _sg, (f"Savitzky-Golay smoothing "
+                         f"(window={window} frames, polyorder={poly})")
+
+        if method == 'rolling':
+            window = int(self.params.get('processing_rolling_window_frames', 1))
+            if window <= 1:
+                return None, None  # window of 1 is a no-op
+
+            def _roll(col):
+                return pd.Series(col).rolling(
+                    window=window, center=True, min_periods=1).mean().to_numpy()
+
+            return _roll, f"rolling average smoothing (window={window} frames)"
+
+        # Default: Butterworth low-pass (most common in fiber photometry).
+        cutoff = float(self.params.get('processing_butter_cutoff_hz', 6.0))
+        order = max(1, int(self.params.get('processing_butter_order', 2)))
+        fs = self._estimate_processing_fs(result)
+        if fs is None or not np.isfinite(fs) or fs <= 0:
+            fs = float(self.params.get('fps', 30) or 30)
+        nyq = fs / 2.0
+        if cutoff <= 0:
+            self.log_message("  Warning: Butterworth cutoff must be > 0 Hz; "
+                             "skipping smoothing")
+            return None, None
+        if cutoff >= nyq:
+            clamped = 0.95 * nyq
+            self.log_message(f"  Warning: Butterworth cutoff ({cutoff:.2f} Hz) >= "
+                             f"Nyquist ({nyq:.2f} Hz); clamping to {clamped:.2f} Hz")
+            cutoff = clamped
+        b, a = butter(order, cutoff / nyq, btype='low')
+        padlen = 3 * max(len(a), len(b))
+
+        def _bw(col):
+            col = np.asarray(col, dtype=float)
+            if len(col) <= padlen:
+                return col  # too short for stable zero-phase filtering
+            return filtfilt(b, a, col)
+
+        return _bw, (f"Butterworth low-pass filter "
+                     f"(cutoff={cutoff:.2f} Hz, order={order}, fs={fs:.2f} Hz)")
     
     def calculate_dff(self, fp_data, ts1):
         """
@@ -15394,6 +15959,283 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message(traceback.format_exc())
             return None
     
+    # ── Start/End boutframes helpers ─────────────────────────────────────
+    @staticmethod
+    def _boutframe_base_behavior(col):
+        """Return the base behavior name for a boutframes column, stripping a
+        trailing ``__start`` / ``__end`` suffix (matched case-insensitively)."""
+        cl = str(col).lower()
+        if cl.endswith('__start'):
+            return str(col)[:-len('__start')]
+        if cl.endswith('__end'):
+            return str(col)[:-len('__end')]
+        return str(col)
+
+    @staticmethod
+    def _parse_boutframes_dataframe(df):
+        """Parse a boutframes sheet into behaviors with raw start/end frame arrays.
+
+        Two formats are supported and may be mixed in the same sheet:
+          * Start-only (legacy): one column per behavior, holding start frames.
+          * Start/End: paired columns ``Behavior__start`` and ``Behavior__end``
+            (double-underscore separator, matched case-insensitively).
+
+        Returns
+        -------
+        behaviors : list of (name, start_array, end_array_or_None)
+            ``start_array`` is float with NaN rows dropped.  ``end_array`` is
+            float aligned row-wise to ``start_array`` (may contain NaN where an
+            individual bout has no scored end), or ``None`` for start-only
+            behaviors.
+        has_end_any : bool
+            True if at least one behavior carries end frames.
+        """
+        cols = list(df.columns)
+        end_map = {}      # base_name_lower -> end column
+        for c in cols:
+            cl = str(c).lower()
+            if cl.endswith('__end'):
+                end_map[cl[:-len('__end')]] = c
+
+        behaviors = []
+        has_end_any = False
+        seen_bases = set()
+        for c in cols:
+            cl = str(c).lower()
+            if cl.endswith('__end'):
+                continue  # handled via its matching __start column
+            if cl.endswith('__start'):
+                base = cl[:-len('__start')]
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                name = str(c)[:-len('__start')]
+                start_arr = pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=float)
+                end_col = end_map.get(base)
+                if end_col is not None:
+                    end_arr = pd.to_numeric(df[end_col], errors='coerce').to_numpy(dtype=float)
+                    has_end_any = True
+                else:
+                    end_arr = None
+                mask = ~np.isnan(start_arr)
+                start_arr = start_arr[mask]
+                if end_arr is not None:
+                    end_arr = end_arr[mask]
+                behaviors.append((name, start_arr, end_arr))
+            else:
+                # Legacy start-only behavior column
+                start_arr = pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=float)
+                start_arr = start_arr[~np.isnan(start_arr)]
+                behaviors.append((str(c), start_arr, None))
+        return behaviors, has_end_any
+
+    def _transform_boutframe_values(self, frames, subject_id, as_int=True):
+        """Apply FPS scaling, manual shift, per-subject shift, and precut correction
+        to a boutframe array (same order/logic used for start frames historically).
+
+        Used for both start and end frames so they stay consistent.  When
+        *as_int* is False the result is rounded but kept as float so NaN (a
+        missing per-bout end) is preserved.
+        """
+        frames = np.asarray(frames, dtype=float)
+        if frames.size == 0:
+            return frames.astype(int) if as_int else frames
+        subject_data = self.processed_data.get(subject_id, {})
+
+        # FPS scaling
+        if self.params.get('auto_scale_boutframes', False):
+            vfps = float(self.params.get('boutframes_video_fps', 30))
+            pfps = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
+            if pfps and vfps > 0 and abs(pfps - vfps) > 0.1:
+                frames = np.round(frames * (pfps / vfps))
+
+        # Manual + per-subject shift
+        ms = int(self.params.get('boutframe_manual_shift', 0))
+        if ms:
+            frames = frames + ms
+        ps = self._get_per_subject_shift(subject_id)
+        if ps:
+            frames = frames + ps
+
+        # Precut correction
+        if self.params.get('precut_correct_boutframes', True):
+            pc = int(self.params.get('precut', 0))
+            nl = int(subject_data.get('n_led_states', 1))
+            off = pc // max(1, nl)
+            if off > 0:
+                frames = frames - off
+
+        if as_int:
+            return frames.astype(int)
+        return np.round(frames)
+
+    def _apply_bout_exclusions(self, start_frames, end_frames):
+        """Apply the duration / proximity exclusion filter (frames; 0 = rule off).
+
+        Rules (only when ``bout_exclude_enabled``):
+          * duration: drop bouts whose (end - start) is < min or > max (needs end).
+          * proximity: drop a bout that begins fewer than ``min_gap`` frames after
+            the previous *kept* bout's end (or its start, for start-only files —
+            i.e. a minimum time between bout starts).
+
+        Returns (start_kept, end_kept_or_None, n_excluded).  Inputs/outputs are
+        sorted by start frame.
+        """
+        start = np.asarray(start_frames)
+        end = None if end_frames is None else np.asarray(end_frames, dtype=float)
+        n0 = len(start)
+        if not self.params.get('bout_exclude_enabled', False) or n0 == 0:
+            return start, end, 0
+
+        # Sort by start frame, keeping start/end paired
+        order = np.argsort(start, kind='stable')
+        start = start[order]
+        if end is not None:
+            end = end[order]
+
+        keep = np.ones(n0, dtype=bool)
+        min_dur = int(self.params.get('bout_exclude_min_duration', 0) or 0)
+        max_dur = int(self.params.get('bout_exclude_max_duration', 0) or 0)
+        min_gap = int(self.params.get('bout_exclude_min_gap', 0) or 0)
+
+        # Duration rules (require end frames; NaN ends are left untouched)
+        if end is not None and (min_dur > 0 or max_dur > 0):
+            dur = end - start
+            valid = ~np.isnan(dur)
+            if min_dur > 0:
+                keep &= ~(valid & (dur < min_dur))
+            if max_dur > 0:
+                keep &= ~(valid & (dur > max_dur))
+
+        # Proximity rule (sequential over kept bouts)
+        if min_gap > 0:
+            last_ref = None
+            for i in range(n0):
+                if not keep[i]:
+                    continue
+                if last_ref is None:
+                    last_ref = self._bout_ref_end(start[i], end, i)
+                    continue
+                if (start[i] - last_ref) < min_gap:
+                    keep[i] = False  # too close; drop and keep previous reference
+                else:
+                    last_ref = self._bout_ref_end(start[i], end, i)
+
+        start_k = start[keep]
+        end_k = None if end is None else end[keep]
+        return start_k, end_k, int(n0 - int(keep.sum()))
+
+    @staticmethod
+    def _bout_ref_end(start_val, end_array, i):
+        """Reference frame for proximity gaps: the bout's end, or its start when no
+        end is available/scored."""
+        if end_array is None:
+            return start_val
+        e = end_array[i]
+        if e is None or (isinstance(e, float) and np.isnan(e)):
+            return start_val
+        return e
+
+    def _bout_channel_column(self, data, channel):
+        """Map a channel label ('G0'/'G1'/'Ch0'/...) to its beh_synced column index."""
+        beh = data.get('beh_synced')
+        if beh is None:
+            return None
+        stored_nch = data.get('num_photometry_channels')
+        if stored_nch and stored_nch > 0:
+            phot_cols = list(range(6, 6 + stored_nch))
+        else:
+            phot_cols = list(range(6, beh.shape[1])) if beh.shape[1] > 6 else []
+        if not phot_cols:
+            return None
+        # Prefer the subject's actual channel designation (e.g. a subject whose
+        # single channel is 'G1' maps to the first photometry column, not the 2nd).
+        names = data.get('channel_names')
+        if isinstance(names, list) and channel in names:
+            idx = names.index(channel)
+        else:
+            idx = 0
+            digits = ''.join(ch for ch in str(channel) if ch.isdigit())
+            if digits:
+                idx = int(digits)
+        if idx >= len(phot_cols):
+            return None
+        return phot_cols[idx]
+
+    def _bout_analysis_segment(self, subject, behavior, channel, bout_idx, stored_bout,
+                               window_start_frame, window_end_frame):
+        """Return the 1-D signal array to compute a bout metric over, honoring the
+        current start/end processing style.
+
+          'onset'  : slice the stored onset-aligned segment [onset+ws : onset+we]
+                     (legacy behavior; always used when no end frames exist).
+          'whole'  : the full bout (start -> end), pulled from beh_synced.
+          'offset' : window relative to the bout END, pulled from beh_synced.
+
+        Falls back to the 'onset' slice whenever end-frame data is unavailable or
+        cannot be aligned to this bout.  Returns ``None`` for an empty window.
+        """
+        prebout = self.params.get('preboutframes', 90)
+        onset_idx = prebout
+
+        def _onset_slice():
+            a = max(0, onset_idx + window_start_frame)
+            b = min(len(stored_bout), onset_idx + window_end_frame)
+            if b <= a:
+                return None
+            return stored_bout[a:b]
+
+        if hasattr(self, 'boutframe_processing_style_var'):
+            style = self.boutframe_processing_style_var.get()
+        else:
+            style = self.params.get('boutframe_processing_style', 'onset')
+        if style not in ('whole', 'offset'):
+            return _onset_slice()
+
+        data = self.processed_data.get(subject, {})
+        bouts_beh = data.get('bouts', {}).get(behavior, {})
+        starts = bouts_beh.get('onset_frames')
+        ends = bouts_beh.get('end_frames')
+        beh_synced = data.get('beh_synced')
+        if (ends is None or starts is None or beh_synced is None
+                or len(starts) != len(ends) or bout_idx >= len(starts)):
+            return _onset_slice()
+        start_f = starts[bout_idx]
+        end_f = ends[bout_idx]
+        if end_f is None or (isinstance(end_f, float) and np.isnan(end_f)):
+            return _onset_slice()
+
+        col = self._bout_channel_column(data, channel)
+        if col is None:
+            return _onset_slice()
+
+        start_f = int(round(start_f))
+        end_f = int(round(end_f))
+        if style == 'whole':
+            a, b = start_f, end_f
+        else:  # offset
+            a = end_f + window_start_frame
+            b = end_f + window_end_frame
+        a = max(0, a)
+        b = min(beh_synced.shape[0], b)
+        if b <= a:
+            return None
+        seg = np.asarray(beh_synced[a:b, col], dtype=float)
+        if seg.size == 0 or np.all(np.isnan(seg)):
+            return None
+
+        # Baseline-correct against the pre-bout window before the START frame so
+        # metrics stay referenced to the same baseline regardless of style.
+        if self.params.get('baseline_correct_bouts', False):
+            bf = int(self.params.get('baseline_frames', 45))
+            bstart = max(0, start_f - bf)
+            if bstart < start_f:
+                base = np.asarray(beh_synced[bstart:start_f, col], dtype=float)
+                base = base[~np.isnan(base)]
+                if base.size:
+                    seg = seg - np.mean(base)
+        return seg
+
     def extract_bouts(self, subject_id, beh_synced, boutframes_file):
         """Extract bout-aligned data"""
         try:
@@ -15435,49 +16277,53 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             num_channels = len(phot_cols)
 
             
-            # Process each behavior (column)
-            for behavior in df.columns:
-                frame_series = pd.to_numeric(df[behavior], errors='coerce').dropna()
-                frames = frame_series.to_numpy(dtype=float)
+            # Parse the sheet into behaviors.  Supports legacy start-only columns
+            # and the start/end format (paired 'Behavior__start' / 'Behavior__end').
+            behaviors, _has_end = self._parse_boutframes_dataframe(df)
 
-                # Apply FPS scale factor if boutframe scaling is enabled
-                if _scale_factor != 1.0:
-                    frames = np.round(frames * _scale_factor)
-                frames = frames.astype(int)
+            # Process each behavior
+            for behavior, raw_start, raw_end in behaviors:
+                if len(raw_start) == 0:
+                    continue
 
-                # Apply manual boutframe shift (positive = forward, negative = backward)
-                _manual_shift = int(self.params.get('boutframe_manual_shift', 0))
-                if _manual_shift != 0:
-                    frames = frames + _manual_shift
+                # Apply scaling / manual shift / per-subject shift / precut correction.
+                # Start frames index the signal (int); end frames keep float so a
+                # missing per-bout end stays NaN.
+                frames = self._transform_boutframe_values(raw_start, subject_id, as_int=True)
+                end_frames = None
+                if raw_end is not None:
+                    end_frames = self._transform_boutframe_values(raw_end, subject_id, as_int=False)
 
-                # Apply per-subject boutframe shift (after global shift/scaling)
-                _per_subj_shift = self._get_per_subject_shift(subject_id)
-                if _per_subj_shift != 0:
-                    frames = frames + _per_subj_shift
-
-                # Precut correction: boutframes scored from the full FP recording (before precut)
-                # need to be shifted back by precut // n_led_states to align with the post-precut
-                # beh_synced array.  Formula: corrected = frame - (precut / n_led_states)
+                # Log precut correction once per behavior (transform already applied it)
                 if self.params.get('precut_correct_boutframes', True):
                     _precut = int(self.params.get('precut', 0))
                     _n_led = int(subject_data.get('n_led_states', 1))
                     _precut_offset = _precut // max(1, _n_led)
                     if _precut_offset > 0:
-                        frames = frames - _precut_offset
                         self.log_message(
                             f"    Precut boutframe correction: -{_precut_offset} frames "
                             f"(precut={_precut} raw rows \u00f7 {_n_led} LED states) for {behavior}")
 
-                # Filter frames based on exclude_frames_before
-                frames = frames[frames >= exclude_before]
-                
+                # Filter frames based on exclude_frames_before (keep start/end paired)
+                _keep = frames >= exclude_before
+                frames = frames[_keep]
+                if end_frames is not None:
+                    end_frames = end_frames[_keep]
+
+                # Apply duration / proximity exclusion filter (non-destructive)
+                frames, end_frames, _n_excl = self._apply_bout_exclusions(frames, end_frames)
+                if _n_excl > 0:
+                    self.log_message(
+                        f"    Bout exclusion filter removed {_n_excl} bout(s) for {behavior}")
+
                 # Prepare per-channel containers
                 behavior_bouts = {f'Ch{ch}': [] for ch in range(num_channels)}
-                
+
+                # Visualization/extraction is always aligned to the bout START frame.
                 for frame in frames:
                     start_idx = max(0, frame - prebout)
                     end_idx = min(len(beh_synced), frame + postbout)
-                    
+
                     # Extract bout data for each photometry column detected
                     for ch, col_idx in enumerate(phot_cols):
                         bout_ch = beh_synced[start_idx:end_idx, col_idx]
@@ -15491,7 +16337,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 behavior_bouts[f'Ch{ch}'].append(bout_ch)
                             else:
                                 self.log_message(f"    Warning: Skipping invalid bout at frame {frame} for {behavior} (constant or zero variance) on Ch{ch}")
-                
+
                 # Provide backward-compatible keys for G0/G1 if present
                 behavior_entry = {}
                 for ch in range(num_channels):
@@ -15501,9 +16347,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if num_channels >= 2:
                     behavior_entry['G1'] = behavior_entry.get('Ch1', [])
 
-                # Store onset frames so other analyses can use them without
-                # needing to re-read the boutframes Excel file.
+                # Store onset (start) frames so other analyses can use them without
+                # re-reading the boutframes Excel file.  Also store end frames and
+                # durations when available (start/end format) for the whole-bout
+                # and offset-aligned processing styles.
                 behavior_entry['onset_frames'] = frames.tolist()
+                if end_frames is not None:
+                    behavior_entry['end_frames'] = end_frames.tolist()
+                    behavior_entry['durations'] = (end_frames - frames.astype(float)).tolist()
+                else:
+                    behavior_entry['end_frames'] = None
+                    behavior_entry['durations'] = None
 
                 bout_data[behavior] = behavior_entry
             
@@ -15519,11 +16373,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         src_frames = np.array(src_entry.get('onset_frames', []))
                         if len(src_frames) == 0:
                             continue
-                        shifted_frames = src_frames + offset_val
-                        # Filter: keep only frames within valid range
-                        shifted_frames = shifted_frames[(shifted_frames >= exclude_before) &
-                                                        (shifted_frames >= 0) &
-                                                        (shifted_frames < len(beh_synced))]
+                        src_ends = src_entry.get('end_frames')
+                        src_ends = (np.array(src_ends, dtype=float)
+                                    if src_ends is not None else None)
+                        shifted_all = src_frames + offset_val
+                        # Filter: keep only frames within valid range (end frames paired)
+                        _mask = ((shifted_all >= exclude_before) &
+                                 (shifted_all >= 0) &
+                                 (shifted_all < len(beh_synced)))
+                        shifted_frames = shifted_all[_mask]
+                        shifted_ends = ((src_ends + offset_val)[_mask]
+                                        if src_ends is not None else None)
                         if len(shifted_frames) == 0:
                             continue
                         # Extract bouts for offset frames
@@ -15547,6 +16407,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if num_channels >= 2:
                             offset_entry['G1'] = offset_entry.get('Ch1', [])
                         offset_entry['onset_frames'] = shifted_frames.tolist()
+                        if shifted_ends is not None:
+                            offset_entry['end_frames'] = shifted_ends.tolist()
+                            offset_entry['durations'] = (
+                                shifted_ends - shifted_frames.astype(float)).tolist()
+                        else:
+                            offset_entry['end_frames'] = None
+                            offset_entry['durations'] = None
                         offset_name = f"{src_behavior}_{suffix}"
                         bout_data[offset_name] = offset_entry
                         self.log_message(
@@ -15631,14 +16498,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             else:
                                 self.log_message(f"    Warning: Skipping invalid {entry_type} bout at frame {frame} for Ch{ch} (constant or zero variance)")
                 
-                # Pack per-channel results and provide backward-compatible keys
+                # Pack per-channel results and provide backward-compatible keys.
+                # Always expose both 'G0' and 'G1' (defaulting to []) so single-channel
+                # subjects don't raise KeyError in the G0/G1-keyed plotting/consumer code.
                 packed = {}
                 for ch in range(num_channels):
                     packed[f'Ch{ch}'] = zone_bouts.get(f'Ch{ch}', [])
-                if num_channels >= 1:
-                    packed['G0'] = packed.get('Ch0', [])
-                if num_channels >= 2:
-                    packed['G1'] = packed.get('Ch1', [])
+                packed['G0'] = packed.get('Ch0', [])
+                packed['G1'] = packed.get('Ch1', [])
 
                 entry_bout_data[entry_type][display_name] = packed
                 self.log_message(f"    Extracted {sum(len(v) for v in packed.values())} total bouts for {entry_type}")
@@ -15654,23 +16521,52 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # ======================== Boutframes Editor ========================
     
     def update_bout_subjects(self):
-        """Update subject list in boutframes editor"""
+        """Update subject list in boutframes editor. Returns True if populated."""
         boutframes_file = self.boutframes_path_var.get()
-        if boutframes_file and os.path.exists(boutframes_file):
-            wb = load_workbook(boutframes_file, read_only=True)
+        if not (boutframes_file and os.path.exists(boutframes_file)):
+            return False
+        wb = load_workbook(boutframes_file, read_only=True)
+        try:
             subjects = wb.sheetnames
-            self.bout_subject_combo['values'] = subjects
-            if subjects:
-                self.bout_subject_combo.current(0)
-                self.load_bout_subject()
-                self._populate_preview_behavior_combo()
-                self.refresh_scaled_preview()
-    
+        finally:
+            wb.close()
+        self.bout_subject_combo['values'] = subjects
+        if subjects:
+            self.bout_subject_combo.current(0)
+            self.load_bout_subject()
+            self._populate_preview_behavior_combo()
+            self.refresh_scaled_preview()
+            return True
+        return False
+
     def reload_boutframes(self):
-        """Reload boutframes from file"""
-        self.update_bout_subjects()
-        self._populate_preview_behavior_combo()
-        self.refresh_scaled_preview()
+        """Reload boutframes from file (editor 'Reload from File' button)."""
+        boutframes_file = self.boutframes_path_var.get()
+        if not boutframes_file:
+            messagebox.showwarning(
+                "No Boutframes File",
+                "No boutframes file is set.\n\nUse the 'Browse' button next to "
+                "'Boutframes File' on the Processing tab to select one.")
+            return
+        if not os.path.exists(boutframes_file):
+            messagebox.showerror(
+                "File Not Found",
+                f"The boutframes file could not be found:\n\n{boutframes_file}\n\n"
+                "It may have moved or been renamed since the project was saved. "
+                "Use 'Browse' to locate it again.")
+            return
+        try:
+            populated = self.update_bout_subjects()
+            self._populate_preview_behavior_combo()
+            self.refresh_scaled_preview()
+        except Exception as e:
+            messagebox.showerror("Reload Error",
+                                 f"Could not read the boutframes file:\n\n{e}")
+            return
+        if not populated:
+            messagebox.showwarning(
+                "No Sheets Found",
+                "The boutframes file was opened but contains no worksheets.")
     
     def load_bout_subject(self, event=None):
         """Load boutframes for selected subject"""
@@ -15703,7 +16599,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.bout_tree.insert('', 'end', text=str(idx), values=values)
             
             self.current_bout_df = df
-            
+
+            # Detect start/end format so the exclusion proximity-rule label can
+            # adapt its wording ("after previous end" vs "between starts").
+            _, self._boutframes_has_end = self._parse_boutframes_dataframe(df)
+            if hasattr(self, '_excl_gap_label'):
+                self._update_bout_exclusion_hints()
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load boutframes:\n{str(e)}")
     
@@ -17357,7 +18259,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             saved_subjects = [self.viz_subject_listbox.get(i) for i in saved_subject_indices]
         
         # Enable behavior selection for bout-related plots
-        if plot_type in ("Bouts Overlay", "Extracted Bouts", "Compare Across Bouts"):
+        if plot_type in ("Bouts Overlay", "Extracted Bouts", "Bout Length Bins", "Compare Across Bouts"):
             self.behavior_combo['state'] = 'readonly'
 
             behaviors = self._get_behavior_options_for_current_selection()
@@ -17608,6 +18510,30 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Entry(win_row, textvariable=self.frames_after_var, width=10).pack(side='left')
         ttk.Label(wf, text="(frames relative to bout onset; negative=before, positive=after)",
                   foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 0))
+
+        # ── Start/End Processing Style ───────────────────────────────────
+        sf = ttk.LabelFrame(dlg, text="Start/End Processing Style", padding=8)
+        sf.pack(fill='x', padx=12, pady=5)
+
+        def _set_style():
+            self.params['boutframe_processing_style'] = self.boutframe_processing_style_var.get()
+
+        ttk.Radiobutton(sf, text="Onset-aligned window (relative to bout start)",
+                        variable=self.boutframe_processing_style_var, value='onset',
+                        command=_set_style).grid(row=0, column=0, sticky='w', padx=5, pady=1)
+        ttk.Radiobutton(sf, text="Whole bout (start → end duration)",
+                        variable=self.boutframe_processing_style_var, value='whole',
+                        command=_set_style).grid(row=1, column=0, sticky='w', padx=5, pady=1)
+        ttk.Radiobutton(sf, text="Offset-aligned window (relative to bout end)",
+                        variable=self.boutframe_processing_style_var, value='offset',
+                        command=_set_style).grid(row=2, column=0, sticky='w', padx=5, pady=1)
+        ttk.Label(sf,
+                  text="Controls which signal span metrics are computed over.  'Whole' and 'Offset' require\n"
+                       "a boutframes file with end frames (Behavior__start / Behavior__end columns) and use the\n"
+                       "Analysis Window above relative to the bout end (Offset only).  Bout trace plots stay\n"
+                       "aligned to the bout START regardless of this setting.",
+                  foreground='gray', font=('Segoe UI', 8), justify='left').grid(
+                      row=3, column=0, sticky='w', padx=5, pady=(3, 0))
 
         # ── Bar Graph Y-Axis Limits ──────────────────────────────────────
         af = ttk.LabelFrame(dlg, text="Bar Graph Y-Axis Limits", padding=8)
@@ -17894,6 +18820,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.plot_signal_integrity(fig, data, subject)
             elif "Bouts Overlay" in plot_type:
                 self.plot_bouts_overlay(fig, data, subject)
+            elif "Bout Length Bins" in plot_type:
+                self.plot_bout_length_bins(fig, data, subject)
             elif "Extracted Bouts" in plot_type:
                 self.plot_extracted_bouts(fig, data)
             elif "Compare Across Bouts" in plot_type:
@@ -17938,6 +18866,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.plot_bout_comparison_by_group(fig, selected_groups)
                 else:
                     self.plot_bout_comparison_multi(fig, valid_subjects)
+            elif "Bout Length Bins" in plot_type:
+                self.plot_bout_length_bins_multi(fig, valid_subjects)
             elif "Extracted Bouts" in plot_type:
                 # Check if we're in group mode
                 if self.plot_by_var.get() == "Group":
@@ -18185,6 +19115,31 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception:
             pass
 
+    def _recompute_zone_entries_all(self):
+        """Re-run zone-entry detection + entry-bout extraction for every processed
+        subject that has position data, using the current duration / refractory
+        params. Lets the transition thresholds be retuned from the Visualization
+        tab without re-running the whole processing pipeline.
+
+        Returns the number of subjects updated.
+        """
+        updated = 0
+        for subject, data in self.processed_data.items():
+            beh = data.get('beh_synced')
+            if beh is None or 'entry_frames' not in data:
+                continue  # no position data → nothing to detect
+            try:
+                beh, entry_frames = self.detect_zone_entries(beh)
+                data['beh_synced'] = beh
+                data['entry_frames'] = entry_frames
+                data['entry_bouts'] = self.extract_entry_bouts(
+                    beh, entry_frames,
+                    num_photometry_channels=data.get('num_photometry_channels'))
+                updated += 1
+            except Exception as exc:
+                self.log_message(f"  Zone-entry recompute failed for {subject}: {exc}")
+        return updated
+
     def open_graph_settings_window(self):
         """Open an advanced graph settings window for visualization controls."""
         existing = getattr(self, 'graph_settings_window', None)
@@ -18199,7 +19154,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         win = tk.Toplevel(self.root)
         win.title("Advanced Graph Settings")
-        win.geometry("650x620")
+        win.geometry("650x760")
         win.transient(self.root)
         self.graph_settings_window = win
 
@@ -18292,6 +19247,80 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Label(size_frame,
                   text='Figure size sets the rendered plot dimensions. Graphing area height sets the display frame size.',
                   foreground='gray', font=('Segoe UI', 8)).grid(row=2, column=0, columnspan=6, sticky='w', padx=5, pady=(0, 3))
+
+        # ── Zone Entry Detection (transition thresholds) ──────────────────
+        # These control how long the animal must stay in a zone for a transition
+        # to count as a valid entry, and the refractory window that suppresses
+        # rapid re-entries. They are applied at detection time, so changing them
+        # here re-runs detection on already-processed subjects.
+        entry_frame = ttk.LabelFrame(
+            main, text="Zone Entry Detection  (transition thresholds)", padding=8)
+        entry_frame.pack(fill='x', pady=(0, 8))
+
+        ttk.Label(entry_frame,
+                  text="Minimum time in the target zone for an entry to count, plus the "
+                       "refractory window\nthat ignores rapid re-entries. Used by "
+                       "'Zone Entry Bouts' plots.",
+                  foreground='gray', font=('Segoe UI', 8), justify='left').grid(
+            row=0, column=0, columnspan=4, sticky='w', padx=5, pady=(0, 6))
+
+        # EPM thresholds
+        ttk.Label(entry_frame, text="EPM — min duration in open arm (s):").grid(
+            row=1, column=0, sticky='w', padx=5, pady=2)
+        epm_dur_var = tk.StringVar(value=str(self.params.get('min_open_arm_duration', 2.0)))
+        ttk.Spinbox(entry_frame, from_=0.1, to=10.0, increment=0.1, width=7,
+                    textvariable=epm_dur_var, format='%.1f').grid(row=1, column=1, padx=5, pady=2, sticky='w')
+        ttk.Label(entry_frame, text="EPM — min time between entries (s):").grid(
+            row=1, column=2, sticky='w', padx=15, pady=2)
+        epm_ref_var = tk.StringVar(value=str(self.params.get('min_time_between_entries', 3.0)))
+        ttk.Spinbox(entry_frame, from_=0.1, to=30.0, increment=0.5, width=7,
+                    textvariable=epm_ref_var, format='%.1f').grid(row=1, column=3, padx=5, pady=2, sticky='w')
+
+        # OFT / Custom Arena thresholds
+        ttk.Label(entry_frame, text="OFT / Custom — min duration in zone (s):").grid(
+            row=2, column=0, sticky='w', padx=5, pady=2)
+        oft_dur_var = tk.StringVar(value=str(self.params.get('oft_min_entry_duration', 0.5)))
+        ttk.Spinbox(entry_frame, from_=0.1, to=10.0, increment=0.1, width=7,
+                    textvariable=oft_dur_var, format='%.1f').grid(row=2, column=1, padx=5, pady=2, sticky='w')
+        ttk.Label(entry_frame, text="OFT / Custom — min time between entries (s):").grid(
+            row=2, column=2, sticky='w', padx=15, pady=2)
+        oft_ref_var = tk.StringVar(value=str(self.params.get('oft_min_time_between_entries', 1.0)))
+        ttk.Spinbox(entry_frame, from_=0.1, to=30.0, increment=0.5, width=7,
+                    textvariable=oft_ref_var, format='%.1f').grid(row=2, column=3, padx=5, pady=2, sticky='w')
+
+        def _apply_entry_detection():
+            try:
+                self.params['min_open_arm_duration'] = float(epm_dur_var.get())
+                self.params['min_time_between_entries'] = float(epm_ref_var.get())
+                self.params['oft_min_entry_duration'] = float(oft_dur_var.get())
+                self.params['oft_min_time_between_entries'] = float(oft_ref_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid Value",
+                    "Duration / refractory fields must be numeric.", parent=win)
+                return
+            n = self._recompute_zone_entries_all()
+            self.log_message(
+                f"Recomputed zone entries for {n} subject(s) with updated thresholds "
+                f"(EPM {self.params['min_open_arm_duration']}s/"
+                f"{self.params['min_time_between_entries']}s, "
+                f"OFT {self.params['oft_min_entry_duration']}s/"
+                f"{self.params['oft_min_time_between_entries']}s)")
+            if self.current_viz_figure is not None:
+                self.generate_plot()
+            messagebox.showinfo(
+                "Entries Recomputed",
+                f"Zone-entry detection re-run for {n} subject(s) with position data.\n"
+                "'Zone Entry Bouts' plots now reflect the new thresholds.",
+                parent=win)
+
+        ttk.Button(entry_frame, text="Apply & Recompute Entries",
+                   command=_apply_entry_detection).grid(
+            row=3, column=0, columnspan=2, sticky='w', padx=5, pady=(6, 0))
+        ttk.Label(entry_frame,
+                  text="Re-runs entry detection on processed subjects (no full reprocess needed).",
+                  foreground='gray', font=('Segoe UI', 8)).grid(
+            row=3, column=2, columnspan=2, sticky='w', padx=5, pady=(6, 0))
 
         footer = ttk.Frame(main)
         footer.pack(fill='x', pady=(8, 0))
@@ -18455,14 +19484,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             wl_label = f"{wavelength}nm"
             # choose colors but keep consistent naming
             for ch in sel_chs:
+                ch_label = self.get_channel_name(data, ch)
                 sig_col = 2 + (ch * 2)
                 iso_col = sig_col + 1
 
                 # Signal subplot
                 ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
                 signal = self._apply_visualizer_smoothing(fp_data[:, sig_col])
-                ax.plot(fp_data[:, 0], signal, label=f'Ch{ch} {wl_label}')
-                ax.set_title(f'Ch{ch} {wl_label} raw')
+                ax.plot(fp_data[:, 0], signal, label=f'{ch_label} {wl_label}')
+                ax.set_title(f'{ch_label} {wl_label} raw')
                 ax.set_xlabel('Time (s)')
                 ax.set_ylabel('F (a.u.)')
                 ax.legend()
@@ -18472,8 +19502,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if iso_col < fp_data.shape[1]:
                     ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
                     iso_signal = self._apply_visualizer_smoothing(fp_data[:, iso_col])
-                    ax.plot(fp_data[:, 0], iso_signal, label=f'Ch{ch} 415nm')
-                    ax.set_title(f'Ch{ch} 415nm isosbestic')
+                    ax.plot(fp_data[:, 0], iso_signal, label=f'{ch_label} 415nm')
+                    ax.set_title(f'{ch_label} 415nm isosbestic')
                     ax.set_xlabel('Time (s)')
                     ax.set_ylabel('F (a.u.)')
                     ax.legend()
@@ -18522,13 +19552,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
             wl_label = f"{wavelength}nm"
             for ch in sel_chs:
+                ch_label = self.get_channel_name(data, ch)
                 sig_col = 2 + (ch * 2) if dff.shape[1] > 2 + ch else 2 + ch
 
                 # Signal
                 ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
                 signal = self._apply_visualizer_smoothing(dff[:, sig_col])
-                ax.plot(dff[:, 0], signal, label=f'Ch{ch} {wl_label}')
-                ax.set_title(f'Ch{ch} {wl_label} (dF/F%)')
+                ax.plot(dff[:, 0], signal, label=f'{ch_label} {wl_label}')
+                ax.set_title(f'{ch_label} {wl_label} (dF/F%)')
                 ax.set_xlabel('Time (min)')
                 ax.set_ylabel('dF/F (%)')
                 ax.legend()
@@ -18539,10 +19570,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
                 if iso_col < dff.shape[1]:
                     iso_signal = self._apply_visualizer_smoothing(dff[:, iso_col])
-                    ax.plot(dff[:, 0], iso_signal, label=f'Ch{ch} 415nm')
+                    ax.plot(dff[:, 0], iso_signal, label=f'{ch_label} 415nm')
                 else:
                     ax.text(0.5, 0.5, 'No isosbestic', ha='center', va='center')
-                ax.set_title(f'Ch{ch} 415nm (dF/F%)')
+                ax.set_title(f'{ch_label} 415nm (dF/F%)')
                 ax.set_xlabel('Time (min)')
                 ax.set_ylabel('dF/F (%)')
                 ax.legend()
@@ -18585,14 +19616,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 continue
 
             for ch in sel_chs:
+                ch_label = self.get_channel_name(data, ch)
                 ax = fig.add_subplot(total_plots, 1, plot_idx)
                 col = 2 + ch
                 if col < corrected.shape[1]:
                     signal = self._apply_visualizer_smoothing(corrected[:, col])
-                    ax.plot(corrected[:, 0], signal, label=f'Ch{ch} {wavelength}nm')
+                    ax.plot(corrected[:, 0], signal, label=f'{ch_label} {wavelength}nm')
                 else:
                     ax.text(0.5, 0.5, 'No data for this channel', ha='center', va='center')
-                ax.set_title(f'Motion Corrected Ch{ch} {wavelength}nm')
+                ax.set_title(f'Motion Corrected {ch_label} {wavelength}nm')
                 ax.set_xlabel('Time (min)')
                 ax.set_ylabel('dF/F (%)')
                 ax.grid(True, alpha=0.3)
@@ -18634,7 +19666,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 col = 2 + ch
                 if col < zscore.shape[1]:
                     signal = self._apply_visualizer_smoothing(zscore[:, col])
-                    traces.append((zscore[:, 0], signal, f'Ch{ch} {wl_label}'))
+                    traces.append((zscore[:, 0], signal, f'{self.get_channel_name(data, ch)} {wl_label}'))
 
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
 
@@ -21739,8 +22771,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if self.is_subject_channel_excluded(subject_name, 'G1'):
                 show_g1 = False
         
-        g0_bouts = bout_data['G0'] if show_g0 else []
-        g1_bouts = bout_data['G1'] if show_g1 else []
+        # Use .get() — single-channel subjects only have a 'G0' key (no 'G1'),
+        # so direct indexing would raise KeyError and crash the whole plot.
+        g0_bouts = bout_data.get('G0', []) if show_g0 else []
+        g1_bouts = bout_data.get('G1', []) if show_g1 else []
         
         # Determine layout
         n_plots = (1 if g0_bouts else 0) + (1 if g1_bouts else 0)
@@ -24041,8 +25075,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 subject_has_g1 = subject in subjects_for_g1
                 
                 if average_within_subject:
-                    # Average G0 bouts for this subject (only if not excluded)
-                    if subject_has_g0 and bout_data['G0']:
+                    # Average G0 bouts for this subject (only if not excluded).
+                    # Use .get(): a subject recorded on a single channel may not
+                    # have a 'G0'/'G1' key at all, and a bracket access would
+                    # raise KeyError and abort the whole multi-subject plot.
+                    if subject_has_g0 and bout_data.get('G0'):
                         subject_g0_bouts = bout_data['G0']
                         
                         # Apply max bouts limit per subject
@@ -24058,7 +25095,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         all_g0_bouts.append(subject_avg)
                     
                     # Average G1 bouts for this subject (only if not excluded)
-                    if subject_has_g1 and bout_data['G1']:
+                    if subject_has_g1 and bout_data.get('G1'):
                         subject_g1_bouts = bout_data['G1']
                         
                         # Apply max bouts limit per subject
@@ -24074,8 +25111,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         all_g1_bouts.append(subject_avg)
                 else:
                     # Use all bouts (original behavior)
-                    bouts_g0 = bout_data['G0'] if subject_has_g0 else []
-                    bouts_g1 = bout_data['G1'] if subject_has_g1 else []
+                    bouts_g0 = bout_data.get('G0', []) if subject_has_g0 else []
+                    bouts_g1 = bout_data.get('G1', []) if subject_has_g1 else []
                     
                     # Apply max bouts limit per subject
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
@@ -24887,43 +25924,57 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Metrics: peak, average in window, AUC
         fps = self.params['fps']
         prebout = self.params['preboutframes']
-        
-        metrics_by_bout = {}  # {bout_num: {'peak': [], 'avg': [], 'auc': []}}
+
+        # Determine the series to draw: one per group in Group mode, otherwise
+        # a single pooled 'All' series. (Each subject contributes at most one
+        # bout per bout number, so per-bout pooling == per-subject values.)
+        in_group_mode = self.bout_analysis_by_var.get() == "Group"
+        if in_group_mode and subject_to_group:
+            groups_present = sorted(set(subject_to_group.values()))
+        else:
+            groups_present = ['All']
+
+        metrics_by_bout = {}  # {bout_num: {'peak': [], 'avg': [], 'auc': []}} (pooled)
+        # Per-group: {group: {bout_num: {'peak': [], 'avg': [], 'auc': []}}}
+        group_metrics = {g: {} for g in groups_present}
         # Track per-subject/bout data for repeated measures
         subject_bout_metrics = {}  # {subject: {bout_num: {'peak': val, 'avg': val, 'auc': val}}}
-        
+
         for bout_num, bout_list in bouts_by_number.items():
             metrics_by_bout[bout_num] = {'peak': [], 'avg': [], 'auc': []}
-            
+
             for bout, subject, group in bout_list:
-                # Find bout onset
-                onset_idx = prebout
-                
-                # Get analysis window
-                window_start = max(0, onset_idx + window_start_frame)
-                window_end = min(len(bout), onset_idx + window_end_frame)
-                
-                if window_end <= window_start:
+                # Get the analysis array honoring the start/end processing style
+                window_data = self._bout_analysis_segment(
+                    subject, behavior, channel, bout_num - 1, bout,
+                    window_start_frame, window_end_frame)
+                if window_data is None or len(window_data) == 0:
                     continue
-                
-                window_data = bout[window_start:window_end]
-                
+
                 # Calculate metrics
                 peak = np.max(window_data)
                 avg = np.mean(window_data)
                 auc = self._trapz_compat(window_data) / fps  # Area under curve
-                
+
                 metrics_by_bout[bout_num]['peak'].append(peak)
                 metrics_by_bout[bout_num]['avg'].append(avg)
                 metrics_by_bout[bout_num]['auc'].append(auc)
-                
+
+                # Accumulate into the correct group series
+                grp = group if group in group_metrics else 'All'
+                gm = group_metrics[grp].setdefault(
+                    bout_num, {'peak': [], 'avg': [], 'auc': []})
+                gm['peak'].append(peak)
+                gm['avg'].append(avg)
+                gm['auc'].append(auc)
+
                 # Track per-subject for repeated measures
                 if subject not in subject_bout_metrics:
                     subject_bout_metrics[subject] = {}
                 subject_bout_metrics[subject][bout_num] = {
                     'peak': peak, 'avg': avg, 'auc': auc
                 }
-        
+
         # Store data for export
         bout_numbers = sorted(metrics_by_bout.keys())
         self.bout_order_data = {
@@ -24933,6 +25984,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'bout_numbers': bout_numbers,
             'metrics_by_bout': metrics_by_bout,
             'subject_bout_metrics': subject_bout_metrics,
+            'subject_to_group': subject_to_group,
+            'groups_present': groups_present,
         }
 
         # Respect metric checkboxes — same set used by Calculate Metrics
@@ -24966,20 +26019,40 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
             x_pos   = np.arange(len(bout_numbers))
             x_labels = [f'#{bn}' for bn in bout_numbers]
+            COLORS = ['#2196F3', '#E53935', '#43A047', '#FB8C00', '#8E24AA',
+                      '#00ACC1', '#F4511E', '#6D4C41']
+            multi_group = len(groups_present) > 1
 
             for subplot_idx, (metric_key, ylabel, title, color) in enumerate(metric_configs, 1):
                 ax = fig.add_subplot(num_plots, 1, subplot_idx)
-                means = np.array([np.mean(metrics_by_bout[bn][metric_key]) for bn in bout_numbers])
-                ns    = np.array([len(metrics_by_bout[bn][metric_key]) for bn in bout_numbers])
-                sems  = np.array([
-                    np.std(metrics_by_bout[bn][metric_key]) / np.sqrt(len(metrics_by_bout[bn][metric_key]))
-                    if len(metrics_by_bout[bn][metric_key]) > 1 else 0
-                    for bn in bout_numbers
-                ])
 
-                ax.plot(x_pos, means, color=color, linewidth=2, marker='o', markersize=5, zorder=3)
-                ax.fill_between(x_pos, means - sems, means + sems, color=color, alpha=0.2, zorder=2)
-                ax.errorbar(x_pos, means, yerr=sems, fmt='none', color=color, capsize=4, linewidth=1.5, zorder=4)
+                for g_idx, grp in enumerate(groups_present):
+                    gcolor = COLORS[g_idx % len(COLORS)] if multi_group else color
+                    gm = group_metrics[grp]
+                    means = np.array([
+                        np.mean(gm[bn][metric_key]) if (bn in gm and gm[bn][metric_key]) else np.nan
+                        for bn in bout_numbers])
+                    ns = np.array([
+                        len(gm[bn][metric_key]) if bn in gm else 0 for bn in bout_numbers])
+                    sems = np.array([
+                        np.std(gm[bn][metric_key]) / np.sqrt(len(gm[bn][metric_key]))
+                        if (bn in gm and len(gm[bn][metric_key]) > 1) else 0
+                        for bn in bout_numbers])
+                    valid = ~np.isnan(means)
+                    lbl = grp if multi_group else None
+
+                    ax.plot(x_pos[valid], means[valid], color=gcolor, linewidth=2,
+                            marker='o', markersize=5, label=lbl, zorder=3)
+                    ax.fill_between(x_pos[valid], (means - sems)[valid], (means + sems)[valid],
+                                    color=gcolor, alpha=0.2, zorder=2)
+                    ax.errorbar(x_pos[valid], means[valid], yerr=sems[valid], fmt='none',
+                                color=gcolor, capsize=4, linewidth=1.5, zorder=4)
+
+                    for i, (n, m, s) in enumerate(zip(ns, means, sems)):
+                        if np.isnan(m):
+                            continue
+                        ax.text(i, m + s + (abs(m) * 0.02 + 0.02), f'n={n}',
+                                ha='center', va='bottom', fontsize=7, color='gray')
 
                 ax.axhline(0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
                 ax.set_xticks(x_pos)
@@ -24987,10 +26060,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.set_ylabel(ylabel, fontsize=10)
                 ax.set_title(title, fontsize=10, fontweight='bold')
                 ax.grid(True, alpha=0.3)
-
-                for i, (n, m, s) in enumerate(zip(ns, means, sems)):
-                    ax.text(i, m + s + (abs(m) * 0.02 + 0.02), f'n={n}',
-                            ha='center', va='bottom', fontsize=7, color='gray')
+                if multi_group:
+                    ax.legend(fontsize=8)
 
                 if subplot_idx == num_plots:
                     ax.set_xlabel('Bout Number', fontsize=10)
@@ -25523,21 +26594,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if len(bout) == 0:
                     continue
                 
-                # Find bout onset (frame 0)
-                # Assume bout is centered around onset
-                pre_frames = self.params.get('preboutframes', 90)
-                onset_idx = pre_frames
-                
-                # Get analysis window (peri-event)
-                # window_start_frame and window_end_frame are relative to onset
-                # Negative values = before onset, positive = after onset
-                window_start = max(0, onset_idx + window_start_frame)
-                window_end = min(len(bout), onset_idx + window_end_frame)
-                
-                if window_end <= window_start:
+                # Get the analysis array honoring the start/end processing style
+                # ('onset' = window relative to start, 'whole' = full start->end,
+                # 'offset' = window relative to end).  Falls back to onset window
+                # when end frames are unavailable.
+                post_bout_data = self._bout_analysis_segment(
+                    subject, behavior, channel, bout_idx, bout,
+                    window_start_frame, window_end_frame)
+                if post_bout_data is None or len(post_bout_data) == 0:
                     continue
-                
-                post_bout_data = bout[window_start:window_end]
                 
                 # Calculate metrics
                 row_values = []
@@ -25862,6 +26927,530 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.bout_histogram_frame.update_idletasks()
         self.bout_histogram_canvas.configure(scrollregion=self.bout_histogram_canvas.bbox("all"))
 
+    # ================== Bout-length binning (shared) ==================
+    def _get_bout_length_bins(self):
+        """Return the configured bout-length bins as a validated list of (low, high)
+        in seconds (high=None for open-ended), sorted by low edge."""
+        bins = [b for b in getattr(self, 'bout_length_bins', []) if b]
+        cleaned = []
+        for low, high in bins:
+            try:
+                lo = float(low)
+            except (TypeError, ValueError):
+                continue
+            hi = None
+            if high is not None and str(high).strip() != '':
+                try:
+                    hi = float(high)
+                except (TypeError, ValueError):
+                    hi = None
+            if hi is not None and hi <= lo:
+                continue
+            cleaned.append((lo, hi))
+        return sorted(cleaned, key=lambda b: b[0])
+
+    @staticmethod
+    def _bout_length_bin_label(low, high):
+        def _fmt(v):
+            return (f"{v:g}")
+        if high is None:
+            return f"{_fmt(low)}s+"
+        return f"{_fmt(low)}–{_fmt(high)}s"
+
+    def _assign_length_bin(self, dur_sec, bins):
+        """Return the index of the first bin containing dur_sec, or None."""
+        for idx, (lo, hi) in enumerate(bins):
+            if dur_sec >= lo and (hi is None or dur_sec < hi):
+                return idx
+        return None
+
+    def _iter_length_binned_bouts(self, data, behavior, channel, max_bouts=None):
+        """Yield (trace, duration_seconds) per bout for the given behavior/channel,
+        reading traces directly from beh_synced so they stay aligned with the stored
+        start/end frames (avoids the skipped-invalid-bout misalignment in stored lists).
+
+        Returns (bouts_list, status) where status is one of:
+            'ok'      - bouts returned
+            'no_end'  - behavior has no end frames (length binning not applicable)
+            'no_data' - behavior/channel/beh_synced missing or empty
+        """
+        bouts_beh = data.get('bouts', {}).get(behavior, {})
+        starts = bouts_beh.get('onset_frames')
+        ends = bouts_beh.get('end_frames')
+        beh = data.get('beh_synced')
+        if starts is None or len(starts) == 0 or beh is None:
+            return [], 'no_data'
+        if ends is None or len(ends) == 0:
+            return [], 'no_end'
+        col = self._bout_channel_column(data, channel)
+        if col is None:
+            return [], 'no_data'
+
+        fps = self.params.get('fps', 30)
+        prebout = self.params.get('preboutframes', 90)
+        postbout = self.params.get('postboutframes', 90)
+        baseline_correct = self.params.get('baseline_correct_bouts', False)
+        baseline_frames = self.params.get('baseline_frames', 45)
+
+        out = []
+        n = min(len(starts), len(ends))
+        for i in range(n):
+            s = starts[i]
+            e = ends[i]
+            if e is None or (isinstance(e, float) and np.isnan(e)):
+                continue
+            try:
+                s = int(round(float(s)))
+                e = int(round(float(e)))
+            except (TypeError, ValueError):
+                continue
+            dur_frames = e - s
+            if dur_frames <= 0:
+                continue
+            start_idx = max(0, s - prebout)
+            end_idx = min(beh.shape[0], s + postbout)
+            if end_idx <= start_idx:
+                continue
+            trace = np.asarray(beh[start_idx:end_idx, col], dtype=float)
+            if trace.size == 0 or np.all(np.isnan(trace)):
+                continue
+            if baseline_correct:
+                trace = self.apply_baseline_correction(trace, s, start_idx, prebout, baseline_frames)
+            out.append((trace, dur_frames / fps))
+            if max_bouts is not None and len(out) >= max_bouts:
+                break
+        return out, ('ok' if out else 'no_data')
+
+    def _open_bout_length_bin_editor(self):
+        """Modal-ish editor to add/remove bout-length bins (in seconds)."""
+        win = tk.Toplevel(self.root)
+        win.title("Edit Bout-Length Bins")
+        win.transient(self.root)
+
+        ttk.Label(win, text="Define bout-length bins (seconds). Leave 'High' blank for an open-ended bin.",
+                  wraplength=360).pack(anchor='w', padx=10, pady=(10, 4))
+
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill='both', expand=True, padx=10)
+        listbox = tk.Listbox(list_frame, height=7, width=30, exportselection=False)
+        listbox.pack(side='left', fill='both', expand=True)
+        sb = ttk.Scrollbar(list_frame, orient='vertical', command=listbox.yview)
+        sb.pack(side='right', fill='y')
+        listbox.config(yscrollcommand=sb.set)
+
+        def _refresh():
+            listbox.delete(0, tk.END)
+            for lo, hi in self._get_bout_length_bins():
+                listbox.insert(tk.END, self._bout_length_bin_label(lo, hi))
+
+        _refresh()
+
+        entry_row = ttk.Frame(win)
+        entry_row.pack(fill='x', padx=10, pady=6)
+        ttk.Label(entry_row, text="Low:").pack(side='left')
+        low_var = tk.StringVar()
+        ttk.Entry(entry_row, textvariable=low_var, width=7).pack(side='left', padx=(2, 8))
+        ttk.Label(entry_row, text="High:").pack(side='left')
+        high_var = tk.StringVar()
+        ttk.Entry(entry_row, textvariable=high_var, width=7).pack(side='left', padx=(2, 8))
+
+        def _add():
+            try:
+                lo = float(low_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid", "Low edge must be a number (seconds).", parent=win)
+                return
+            hi_str = high_var.get().strip()
+            hi = None
+            if hi_str:
+                try:
+                    hi = float(hi_str)
+                except ValueError:
+                    messagebox.showerror("Invalid", "High edge must be a number or blank.", parent=win)
+                    return
+                if hi <= lo:
+                    messagebox.showerror("Invalid", "High edge must be greater than Low edge.", parent=win)
+                    return
+            self.bout_length_bins = self._get_bout_length_bins() + [(lo, hi)]
+            low_var.set("")
+            high_var.set("")
+            _refresh()
+
+        def _remove():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            bins = self._get_bout_length_bins()
+            idx = sel[0]
+            if 0 <= idx < len(bins):
+                del bins[idx]
+                self.bout_length_bins = bins
+                _refresh()
+
+        ttk.Button(entry_row, text="Add", command=_add).pack(side='left', padx=(0, 4))
+        ttk.Button(entry_row, text="Remove Selected", command=_remove).pack(side='left')
+
+        ttk.Button(win, text="Done", command=win.destroy).pack(pady=(2, 10))
+
+    def _gather_length_binned_traces(self, subjects, behavior, use_channel=None):
+        """Collect, across subjects, the per-bin list of bout traces grouped by
+        bout length. Returns (bins, per_bin_traces, status).
+
+          per_bin_traces[i] -> list of 1-D trace arrays for bin i
+          status: 'ok' | 'no_end' | 'no_data'
+        """
+        bins = self._get_bout_length_bins()
+        if not bins:
+            return bins, [], 'no_bins'
+        per_bin = [[] for _ in bins]
+        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
+        saw_end = False
+        saw_any = False
+        for subject in subjects:
+            data = self.processed_data.get(subject)
+            if not data:
+                continue
+            # Choose channels: explicit one, else the subject's selected viz channels.
+            if use_channel is not None:
+                channels = [use_channel]
+            else:
+                channels = [self.get_channel_name(data, i)
+                            for i in self.get_selected_viz_channels(data)]
+            for ch in channels:
+                bouts, status = self._iter_length_binned_bouts(data, behavior, ch, max_bouts)
+                if status == 'no_end':
+                    continue
+                saw_end = True
+                for trace, dur_sec in bouts:
+                    saw_any = True
+                    bidx = self._assign_length_bin(dur_sec, bins)
+                    if bidx is not None:
+                        per_bin[bidx].append(trace)
+        if not saw_end:
+            return bins, per_bin, 'no_end'
+        if not saw_any:
+            return bins, per_bin, 'no_data'
+        return bins, per_bin, 'ok'
+
+    def _plot_length_binned_axis(self, ax, bins, per_bin, title):
+        """Draw one averaged trace per length bin on the given axis."""
+        COLORS = ['#2196F3', '#E53935', '#43A047', '#FB8C00', '#8E24AA',
+                  '#00ACC1', '#F4511E', '#6D4C41']
+        fps = self.params.get('fps', 30)
+        prebout = self.params.get('preboutframes', 90)
+        mean_width, _trace_width, _alpha = self.get_trace_styling()
+        plotted = False
+        for bidx, (lo, hi) in enumerate(bins):
+            traces = per_bin[bidx]
+            if not traces:
+                continue
+            max_len = max(len(t) for t in traces)
+            padded = np.full((len(traces), max_len), np.nan)
+            for i, t in enumerate(traces):
+                padded[i, :len(t)] = t
+            mean_trace = np.nanmean(padded, axis=0)
+            n_valid = np.sum(~np.isnan(padded), axis=0)
+            sem_trace = np.nanstd(padded, axis=0) / np.sqrt(np.maximum(n_valid, 1))
+            time_axis = (np.arange(max_len) - prebout) / fps
+            color = COLORS[bidx % len(COLORS)]
+            label = f"{self._bout_length_bin_label(lo, hi)} (n={len(traces)})"
+            ax.plot(time_axis, mean_trace, color=color, linewidth=mean_width, label=label)
+            ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
+                            color=color, alpha=0.18)
+            plotted = True
+        if plotted:
+            ax.axvline(0, color='r', linestyle='--', linewidth=1.5)
+            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+            ax.set_xlabel('Time from bout onset (s)')
+            ax.set_ylabel('Z-score')
+            ax.set_title(title)
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'No bouts fall within the defined length bins',
+                    ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_axis_off()
+
+    def plot_bout_length_bins(self, fig, data, subject):
+        """Visualization: averaged peri-event traces grouped by bout length (single subject)."""
+        behavior = self.behavior_var.get()
+        if not behavior:
+            fig.text(0.5, 0.5, 'Select a behavior to plot bout length bins',
+                     ha='center', va='center', fontsize=13)
+            return
+        sel_chs = self.get_selected_viz_channels(data)
+        channels = [self.get_channel_name(data, i) for i in sel_chs] or [self.get_channel_name(data, 0)]
+
+        # Detect the "no end frames" case up-front for a clear message.
+        any_end = False
+        for ch in channels:
+            _b, status = self._iter_length_binned_bouts(data, behavior, ch)
+            if status != 'no_end':
+                any_end = True
+                break
+        if not any_end:
+            fig.text(0.5, 0.5,
+                     f"Bout length binning requires boutframes with start AND end frames.\n"
+                     f"'{behavior}' has no end frames.",
+                     ha='center', va='center', fontsize=12)
+            return
+
+        n = len(channels)
+        for c_idx, ch in enumerate(channels, 1):
+            bins, per_bin, status = self._gather_length_binned_traces([subject], behavior, use_channel=ch)
+            ax = fig.add_subplot(n, 1, c_idx)
+            if status in ('no_end', 'no_data', 'no_bins'):
+                msg = {'no_bins': 'No length bins defined (use "Edit Length Bins…").',
+                       'no_data': f'No {behavior} bouts for {ch}'}.get(status, 'No data')
+                ax.text(0.5, 0.5, msg, ha='center', va='center', transform=ax.transAxes, fontsize=11)
+                ax.set_axis_off()
+                continue
+            self._plot_length_binned_axis(ax, bins, per_bin,
+                                          f'{subject} — {behavior}  |  {ch}  (by bout length)')
+        fig.tight_layout()
+
+    def plot_bout_length_bins_multi(self, fig, subjects):
+        """Visualization: averaged traces grouped by bout length, pooled across subjects."""
+        behavior = self.behavior_var.get()
+        if not behavior:
+            fig.text(0.5, 0.5, 'Select a behavior to plot bout length bins',
+                     ha='center', va='center', fontsize=13)
+            return
+        bins, per_bin, status = self._gather_length_binned_traces(subjects, behavior)
+        if status == 'no_bins':
+            fig.text(0.5, 0.5, 'No length bins defined (use "Edit Length Bins…").',
+                     ha='center', va='center', fontsize=12)
+            return
+        if status == 'no_end':
+            fig.text(0.5, 0.5,
+                     f"Bout length binning requires boutframes with start AND end frames.\n"
+                     f"'{behavior}' has no end frames.",
+                     ha='center', va='center', fontsize=12)
+            return
+        ax = fig.add_subplot(1, 1, 1)
+        if status == 'no_data':
+            ax.text(0.5, 0.5, f'No {behavior} bouts available', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=12)
+            ax.set_axis_off()
+            return
+        self._plot_length_binned_axis(
+            ax, bins, per_bin,
+            f'{len(subjects)} subjects — {behavior}  (by bout length)')
+        fig.tight_layout()
+
+    def plot_bout_length_bars(self):
+        """Bout Analysis: bar graph of response metrics grouped by bout-length bin."""
+        analysis_mode = self.bout_analysis_by_var.get()
+        if analysis_mode == "Group":
+            selected_indices = self.bout_analysis_group_listbox.curselection()
+            if not selected_indices:
+                messagebox.showerror("Error", "Please select at least one group")
+                return
+            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in selected_indices]
+            selected_subjects = []
+            for g in selected_groups:
+                selected_subjects.extend(self.groups.get(g, []))
+            selected_subjects = list(set(selected_subjects))
+        else:
+            selected_indices = self.bout_analysis_subject_listbox.curselection()
+            if not selected_indices:
+                messagebox.showerror("Error", "Please select at least one subject")
+                return
+            selected_subjects = [self.bout_analysis_subject_listbox.get(i) for i in selected_indices]
+            selected_groups = []
+
+        behavior = self.bout_analysis_behavior_var.get()
+        if not behavior:
+            messagebox.showerror("Error", "Please select a behavior")
+            return
+        channel = self.bout_analysis_channel_var.get()
+
+        if self.use_exclusions_bout.get():
+            selected_subjects = self.get_included_subjects_for_channel(selected_subjects, channel)
+            if not selected_subjects:
+                messagebox.showwarning("All Excluded", f"All subjects excluded for {channel}")
+                return
+
+        try:
+            window_start_frame = int(self.frames_before_var.get())
+            window_end_frame = int(self.frames_after_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid window start/end frame values")
+            return
+        if window_end_frame <= window_start_frame:
+            messagebox.showerror("Error", "Window end frame must be greater than window start frame")
+            return
+
+        bins = self._get_bout_length_bins()
+        if not bins:
+            messagebox.showinfo("No Bins", "No length bins defined. Use 'Edit Length Bins…' first.")
+            return
+
+        fps = self.params['fps']
+        prebout = self.params.get('preboutframes', 90)
+        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+
+        # Build subject -> group map (for the per-subject export columns)
+        subject_to_group = {}
+        if analysis_mode == "Group":
+            for g in selected_groups:
+                for s in self.groups.get(g, []):
+                    if s in selected_subjects:
+                        subject_to_group[s] = g
+
+        METRICS = ['peak', 'avg', 'auc']
+        # Per bin -> per metric -> list of per-bout values (pooled across subjects)
+        bin_vals = [{m: [] for m in METRICS} for _ in bins]
+        # Per subject -> per bin idx -> per metric -> list of per-bout values
+        subject_bin_vals = {}
+        saw_end = False
+        saw_any = False
+        for subject in selected_subjects:
+            data = self.processed_data.get(subject)
+            if not data:
+                continue
+            bouts, status = self._iter_length_binned_bouts(data, behavior, channel, max_bouts)
+            if status == 'no_end':
+                continue
+            saw_end = True
+            for trace, dur_sec in bouts:
+                bidx = self._assign_length_bin(dur_sec, bins)
+                if bidx is None:
+                    continue
+                ws = max(0, prebout + window_start_frame)
+                we = min(len(trace), prebout + window_end_frame)
+                if we <= ws:
+                    continue
+                wd = trace[ws:we]
+                wd = wd[~np.isnan(wd)]
+                if wd.size == 0:
+                    continue
+                saw_any = True
+                peak = float(np.max(wd))
+                avg = float(np.mean(wd))
+                auc = float(self._trapz_compat(wd) / fps)
+                bin_vals[bidx]['peak'].append(peak)
+                bin_vals[bidx]['avg'].append(avg)
+                bin_vals[bidx]['auc'].append(auc)
+                sb = subject_bin_vals.setdefault(subject, {})
+                sbb = sb.setdefault(bidx, {m: [] for m in METRICS})
+                sbb['peak'].append(peak)
+                sbb['avg'].append(avg)
+                sbb['auc'].append(auc)
+
+        if not saw_end:
+            messagebox.showinfo(
+                "Start/End Required",
+                f"Bout length binning requires boutframes with start AND end frames.\n"
+                f"'{behavior}' has no end frames.")
+            return
+        if not saw_any:
+            messagebox.showwarning("No Data", "No bouts fall within the defined length bins.")
+            return
+
+        # Collapse per-subject bout values to one mean per (subject, bin) for export.
+        subject_bin_data = {}
+        for subj, bdict in subject_bin_vals.items():
+            subject_bin_data[subj] = {
+                bidx: {m: float(np.mean(md[m])) for m in METRICS if md[m]}
+                for bidx, md in bdict.items()
+            }
+
+        bin_labels = [self._bout_length_bin_label(lo, hi) for lo, hi in bins]
+
+        # Store for export.
+        self.bout_order_data = {
+            'type': 'length_binned',
+            'behavior': behavior,
+            'channel': channel,
+            'bins': bin_labels,
+            'sorted_bins': list(range(len(bins))),
+            'bin_values': bin_vals,
+            'subject_bin_data': subject_bin_data,
+            'subject_to_group': subject_to_group,
+        }
+
+        _all_metric_configs = [
+            ('peak', 'Peak Z-Score', 'Peak Response by Bout Length', self.metric_max_post.get()),
+            ('avg', 'Average Z-Score', 'Average Response by Bout Length', self.metric_avg_post.get()),
+            ('auc', 'AUC (Z-score·s)', 'Area Under Curve by Bout Length', self.metric_auc.get()),
+        ]
+        metric_configs = [(mk, yl, ti) for mk, yl, ti, enabled in _all_metric_configs if enabled]
+        if not metric_configs:
+            messagebox.showwarning("No Metrics Selected",
+                                   "Please check at least one metric (Avg / Max / AUC) in Settings.")
+            return
+
+        bin_labels = [self._bout_length_bin_label(lo, hi) for lo, hi in bins]
+        x_pos = np.arange(len(bins))
+
+        # Clear old canvas
+        if getattr(self, 'current_bout_canvas', None):
+            try:
+                self.current_bout_canvas.get_tk_widget().destroy()
+            except Exception:
+                pass
+        if getattr(self, 'current_bout_figure', None):
+            try:
+                plt.close(self.current_bout_figure)
+            except Exception:
+                pass
+        for widget in self.bout_histogram_frame.winfo_children():
+            widget.destroy()
+
+        num_plots = len(metric_configs)
+
+        def _draw():
+            self.root.update_idletasks()
+            fig_width = self._bout_fig_width(len(bins), per_item=0.7, base=4.0, minimum=6.0)
+            fig_height = max(3 * num_plots, 4)
+            fig = Figure(figsize=(fig_width, fig_height), dpi=100)
+            for subplot_idx, (metric_key, ylabel, title) in enumerate(metric_configs, 1):
+                ax = fig.add_subplot(num_plots, 1, subplot_idx)
+                means, sems, ns = [], [], []
+                for bidx in range(len(bins)):
+                    vals = [v for v in bin_vals[bidx][metric_key] if not np.isnan(v)]
+                    if vals:
+                        means.append(np.mean(vals))
+                        sems.append(np.std(vals) / np.sqrt(len(vals)) if len(vals) > 1 else 0)
+                        ns.append(len(vals))
+                    else:
+                        means.append(np.nan)
+                        sems.append(0)
+                        ns.append(0)
+                means = np.array(means, dtype=float)
+                sems = np.array(sems, dtype=float)
+                colors = ['#2196F3', '#E53935', '#43A047', '#FB8C00', '#8E24AA',
+                          '#00ACC1', '#F4511E', '#6D4C41']
+                bar_colors = [colors[i % len(colors)] for i in range(len(bins))]
+                ax.bar(x_pos, np.nan_to_num(means), yerr=sems, capsize=4,
+                       color=bar_colors, alpha=0.85, zorder=3)
+                for xi, (n, m, s) in enumerate(zip(ns, means, sems)):
+                    if np.isnan(m):
+                        continue
+                    ax.text(xi, m + (s if not np.isnan(s) else 0) + (abs(m) * 0.02 + 0.02),
+                            f'n={n}', ha='center', va='bottom', fontsize=8, color='gray')
+                ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(bin_labels, fontsize=9)
+                ax.set_ylabel(ylabel, fontsize=10)
+                ax.set_title(f'{channel}: {behavior}  |  {title}', fontsize=10, fontweight='bold')
+                ax.grid(True, alpha=0.3, axis='y')
+                if subplot_idx == num_plots:
+                    ax.set_xlabel('Bout length bin', fontsize=10)
+            fig.tight_layout()
+            canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
+            self.current_bout_canvas = canvas
+            self.current_bout_figure = fig
+            self.bout_histogram_frame.update_idletasks()
+            self.bout_histogram_canvas.configure(
+                scrollregion=self.bout_histogram_canvas.bbox("all"))
+
+        self.bout_histogram_canvas.after(10, _draw)
+        self.log_message(
+            f"Bars by bout length: {len(selected_subjects)} subjects, {len(bins)} length bins "
+            f"({behavior}, {channel})")
+
     # ------------------------------------------------------------------
     def plot_binned_bout_progression(self):
         """Bin bouts into groups of X and plot mean ± SEM line graph across bins."""
@@ -26130,104 +27719,128 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         behavior  = data.get('behavior', '')
         channel   = data.get('channel', '')
 
-        lines = []
+        import datetime
 
+        METRIC_LABELS = {'peak': 'Peak (z-score)',
+                         'avg':  'Average (z-score)',
+                         'auc':  'AUC (z-score*s)'}
+
+        # Respect the metric checkboxes from Settings (same mapping the plots use).
+        metric_order = []
+        if self.metric_max_post.get(): metric_order.append('peak')
+        if self.metric_avg_post.get(): metric_order.append('avg')
+        if self.metric_auc.get():      metric_order.append('auc')
+        if not metric_order:
+            metric_order = ['peak', 'avg', 'auc']
+
+        def _fmt(v):
+            if v is None or v == '':
+                return ''
+            try:
+                if isinstance(v, float) and np.isnan(v):
+                    return ''
+            except Exception:
+                pass
+            return f"{v:.6f}"
+
+        # ── Normalise each data type onto a common (subject × x-axis) shape ──
+        #   subject_data[subject][x_key][metric] = value (per-subject mean)
         if data_type == 'across_bouts':
-            bout_numbers   = data['bout_numbers']
-            metrics_by_bout = data['metrics_by_bout']
-            subject_bout_metrics = data.get('subject_bout_metrics', {})
-
-            # --- summary sheet (wide format) ---
-            lines.append(f"# Bout-by-Bout Summary  |  {behavior}  |  {channel}")
-            lines.append("")
-            # Header
-            header = ["Bout"]
-            for m in ('peak', 'avg', 'auc'):
-                header += [f"{m}_mean", f"{m}_sem", f"{m}_n"]
-            lines.append("\t".join(header))
-            for bn in bout_numbers:
-                row = [f"#{bn}"]
-                for m in ('peak', 'avg', 'auc'):
-                    vals = metrics_by_bout[bn][m]
-                    mean = np.mean(vals) if vals else np.nan
-                    sem  = (np.std(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0
-                    row += [f"{mean:.6f}", f"{sem:.6f}", str(len(vals))]
-                lines.append("\t".join(row))
-
-            # --- per-subject wide table ---
-            lines.append("")
-            lines.append("# Per-Subject Means by Bout")
-            lines.append("")
-            all_subjects = sorted(subject_bout_metrics.keys())
-            subj_header  = ["Subject"] + [f"#{bn}" for bn in bout_numbers]
-            for m in ('peak', 'avg', 'auc'):
-                lines.append(f"## {m}")
-                lines.append("\t".join(subj_header))
-                for subj in all_subjects:
-                    row = [subj]
-                    for bn in bout_numbers:
-                        val = subject_bout_metrics[subj].get(bn, {}).get(m, '')
-                        row.append(f"{val:.6f}" if val != '' else '')
-                    lines.append("\t".join(row))
-                lines.append("")
-
+            x_keys   = data['bout_numbers']
+            x_labels = [f"#{bn}" for bn in x_keys]
+            subject_data     = data.get('subject_bout_metrics', {})
+            subject_to_group = data.get('subject_to_group', {})
+            x_axis_name      = "bout number"
+            title_line = f"Bout-by-bout response  |  {behavior}  |  {channel}"
         elif data_type == 'binned':
-            sorted_bins    = data['sorted_bins']
-            bin_labels     = data['bin_labels']
-            group_series   = data['group_series']
-            groups_present = data['groups_present']
-            bin_size       = data['bin_size']
-            subject_bin_data   = data.get('subject_bin_data', {})
-            subject_to_group   = data.get('subject_to_group', {})
-
-            lines.append(f"# Binned Bout Progression  |  {behavior}  |  {channel}"
-                         f"  |  bin size = {bin_size}")
-            lines.append("")
-
-            for m in ('peak', 'avg', 'auc'):
-                lines.append(f"## {m}")
-                # Header: Bin | Group1_mean | Group1_sem | Group1_n | Group2_mean ...
-                header = ["Bin"]
-                for grp in groups_present:
-                    header += [f"{grp}_mean", f"{grp}_sem", f"{grp}_n"]
-                lines.append("\t".join(header))
-                for b, lbl in zip(sorted_bins, bin_labels):
-                    row = [lbl]
-                    for grp in groups_present:
-                        vals = group_series[grp][b].get(m, [])
-                        vals = [v for v in vals if not np.isnan(v)]
-                        mean = np.mean(vals) if vals else np.nan
-                        sem  = (np.std(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0
-                        row += [f"{mean:.6f}" if not np.isnan(mean) else '',
-                                f"{sem:.6f}",
-                                str(len(vals))]
-                    lines.append("\t".join(row))
-                lines.append("")
-
-            # Per-subject table
-            lines.append("# Per-Subject Means by Bin")
-            all_subjects = sorted(subject_bin_data.keys())
-            for m in ('peak', 'avg', 'auc'):
-                lines.append(f"## {m}")
-                header_parts = []
-                if len(groups_present) > 1:
-                    header_parts.append("Group")
-                header_parts.append("Subject")
-                header_parts += bin_labels
-                lines.append("\t".join(header_parts))
-                for subj in all_subjects:
-                    row = []
-                    if len(groups_present) > 1:
-                        row.append(subject_to_group.get(subj, ''))
-                    row.append(subj)
-                    for b in sorted_bins:
-                        val = subject_bin_data[subj].get(b, {}).get(m, '')
-                        row.append(f"{val:.6f}" if val != '' else '')
-                    lines.append("\t".join(row))
-                lines.append("")
+            x_keys   = data['sorted_bins']
+            x_labels = data['bin_labels']
+            subject_data     = data.get('subject_bin_data', {})
+            subject_to_group = data.get('subject_to_group', {})
+            bin_size         = data.get('bin_size')
+            x_axis_name      = "bout bin"
+            title_line = (f"Binned bout progression  |  {behavior}  |  {channel}"
+                          f"  |  bin size = {bin_size} bouts")
+        elif data_type == 'length_binned':
+            x_keys   = data.get('sorted_bins', list(range(len(data.get('bins', [])))))
+            x_labels = data.get('bins', [])
+            subject_data     = data.get('subject_bin_data', {})
+            subject_to_group = data.get('subject_to_group', {})
+            x_axis_name      = "bout-length bin"
+            title_line = f"Response by bout length  |  {behavior}  |  {channel}"
         else:
             messagebox.showinfo("No Data", "No recognised bout order data to export.")
             return
+
+        has_groups = bool(subject_to_group)
+        subjects   = sorted(subject_data.keys(),
+                            key=lambda s: (subject_to_group.get(s, ''), s))
+
+        def getval(subj, xk, m):
+            return subject_data.get(subj, {}).get(xk, {}).get(m, None)
+
+        lines = []
+        # Metadata header — kept above the tables, separated by a blank line so it
+        # never lands inside a block you paste into Excel/Prism.
+        lines.append(f"# {title_line}")
+        lines.append(f"# Generated {datetime.datetime.now():%Y-%m-%d %H:%M}  |  "
+                     f"values = per-subject mean per {x_axis_name}  |  "
+                     f"mode: {'by Group' if has_groups else 'by Subject'}")
+        lines.append("")
+
+        # ── Per-subject wide blocks (one clean rectangle per metric) ──────────
+        # Layout: Group | Subject | <x1> | <x2> | …   (paste-ready for Prism).
+        for m in metric_order:
+            lines.append(METRIC_LABELS.get(m, m))
+            header = (["Group", "Subject"] if has_groups else ["Subject"]) + list(x_labels)
+            lines.append("\t".join(header))
+            for subj in subjects:
+                row = []
+                if has_groups:
+                    row.append(subject_to_group.get(subj, ''))
+                row.append(subj)
+                for xk in x_keys:
+                    row.append(_fmt(getval(subj, xk, m)))
+                lines.append("\t".join(row))
+            lines.append("")
+
+        # ── Group / overall summary (mean / SEM / n across subjects) ──────────
+        summary_groups = (sorted(set(subject_to_group.values()))
+                          if has_groups else ['All'])
+
+        def _col_vals(group, xk, m):
+            out = []
+            for subj in subjects:
+                if has_groups and subject_to_group.get(subj, '') != group:
+                    continue
+                v = getval(subj, xk, m)
+                if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                    out.append(v)
+            return out
+
+        lines.append("# Summary (mean / SEM / n across subjects)")
+        lines.append("")
+        for m in metric_order:
+            lines.append(METRIC_LABELS.get(m, m))
+            header = (["Group", "Stat"] if has_groups else ["Stat"]) + list(x_labels)
+            lines.append("\t".join(header))
+            for g in summary_groups:
+                means_row, sem_row, n_row = [], [], []
+                for xk in x_keys:
+                    vals = _col_vals(g, xk, m)
+                    if vals:
+                        means_row.append(f"{np.mean(vals):.6f}")
+                        sem_row.append(f"{(np.std(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0:.6f}")
+                        n_row.append(str(len(vals)))
+                    else:
+                        means_row.append('')
+                        sem_row.append('')
+                        n_row.append('0')
+                prefix = [g] if has_groups else []
+                lines.append("\t".join(prefix + ["mean"] + means_row))
+                lines.append("\t".join(prefix + ["SEM"]  + sem_row))
+                lines.append("\t".join(prefix + ["n"]    + n_row))
+            lines.append("")
 
         text_content = "\n".join(lines)
 
@@ -26418,16 +28031,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 'n_last': len(last_bouts)
             }
             
-            for label, bout_set in [('first', first_bouts), ('last', last_bouts)]:
-                for bout in bout_set:
+            for label, bout_set, base_idx in [
+                ('first', first_bouts, 0),
+                ('last', last_bouts, n_total - len(last_bouts)),
+            ]:
+                for j, bout in enumerate(bout_set):
                     if len(bout) == 0:
                         continue
-                    onset_idx = pre_frames
-                    window_start = max(0, onset_idx + window_start_frame)
-                    window_end = min(len(bout), onset_idx + window_end_frame)
-                    if window_end <= window_start:
+                    # Honor the start/end processing style (whole/offset use the
+                    # bout's true index within the subject's bout list)
+                    post_bout_data = self._bout_analysis_segment(
+                        subject, behavior, channel, base_idx + j, bout,
+                        window_start_frame, window_end_frame)
+                    if post_bout_data is None or len(post_bout_data) == 0:
                         continue
-                    post_bout_data = bout[window_start:window_end]
                     
                     if calc_avg:
                         subject_data[subject][label]['avg_post'].append(np.mean(post_bout_data))
