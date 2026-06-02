@@ -26,7 +26,7 @@ from openpyxl import Workbook, load_workbook
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 APP_VERSION_DATE = "June 1, 2026"
 
 
@@ -9618,17 +9618,29 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Bout-length analysis: bin bouts by their duration and compare
+    peak/avg/AUC across length bins ("Bars by Bout Length" in Bout Analysis and
+    a "Bout Length Bins" peri-event plot in Visualization), with an editable
+    length-bin editor. Requires boutframes with start AND end frames.
+  • New — Start/end boutframes: support boutframes files with Behavior__start /
+    Behavior__end columns, plus three metric processing styles (onset-aligned
+    window, whole bout, offset-aligned window).
+  • New — Bout-exclusion engine: non-destructive filter that drops bouts by
+    minimum/maximum duration or by proximity to the previous bout; the
+    boutframes file is never modified (re-extract to apply).
+  • New — Editable zone-entry transition thresholds (minimum duration in zone +
+    refractory) under Visualization → Advanced Graph Settings, with one-click
+    recompute (no full reprocess needed).
   • Bout Analysis: action buttons consolidated into "Plot" and "Export" dropdown
     menus to declutter the tab.
   • Bout Analysis: "Compare Across Bouts" now draws a separate line per group when
     groups are selected (previously pooled all subjects into one line).
   • Bout Analysis: copy/paste export reworked into clean, Prism-ready tables with
     explicit Group and Subject columns plus a mean/SEM/n summary.
-  • Visualization: zone-entry transition thresholds (min duration in zone +
-    refractory) are now editable under Advanced Graph Settings, with one-click
-    recompute — no full reprocess needed.
-  • Updater: handles installs on network shares (auto-resolves git "dubious
-    ownership") so in-app updates work without manual git setup.
+  • Fix: "Zone Entry Bouts" plot no longer fails for single-channel subjects.
+  • Updater: relaunch now uses a detached subprocess (fixes the app sometimes not
+    reopening after an update on Windows), and installs on network shares work
+    automatically (auto-resolves git "dubious ownership").
 
 Version 1.0.1  •  May 31, 2026
 ────────────────────────────────────────────────────────────────────────────────
