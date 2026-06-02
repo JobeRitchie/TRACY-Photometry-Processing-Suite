@@ -32,7 +32,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_VERSION_DATE = "June 2, 2026"
 
 
@@ -9626,6 +9626,19 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix — Visualization: "Extracted Bouts" / "Zone Entry Bouts" no longer render a
+    giant figure when many single subjects are selected. These plots collapse all
+    subjects into a fixed trace+heatmap layout, so they're now sized by channel
+    count instead of subject count.
+  • Fix — "Apply Settings & Re-extract Bouts" now works for TTL-derived bouts (and
+    other auto-generated boutframes). Each subject remembers the boutframes file
+    its bouts came from, so changing pre/post-bout frames and re-extracting is
+    correctly reflected in the visualization (previously re-extraction could find
+    no boutframes file and silently leave the old window in place). This is saved
+    with the project and restored on load.
+
+Version 1.2.0  •  June 2, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Bout Analysis export "All Behaviors → unified Excel (current settings)":
     applies the current settings (subjects/groups, metrics, window, max bouts,
     averaging, exclusions) to every behavior at once and writes one workbook with
@@ -10445,7 +10458,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     'n_led_states': data.get('n_led_states'),
                     'photometry_fps': data.get('photometry_fps'),
                     'channel_names': data.get('channel_names', []),
-                    'channel_name_map': {str(k): v for k, v in ch_name_map.items()}
+                    'channel_name_map': {str(k): v for k, v in ch_name_map.items()},
+                    # Boutframes file this subject's bouts were extracted from, so
+                    # "Apply Settings & Re-extract Bouts" still works after reload
+                    # (especially for TTL-derived boutframes that aren't the file
+                    # configured in the UI).
+                    'boutframes_file': data.get('boutframes_file')
                 }
                 metadata_file = os.path.join(project_path, 'processed', f'{subject}_metadata.json')
                 with open(metadata_file, 'w') as f:
@@ -10965,7 +10983,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 if raw_map:
                                     # JSON stores keys as strings; convert back to int
                                     subject_data['channel_name_map'] = {int(k): v for k, v in raw_map.items()}
-                        
+                                # Restore the boutframes file this subject was
+                                # extracted from so re-extraction works after reload.
+                                stored_bf = metadata.get('boutframes_file')
+                                if stored_bf:
+                                    subject_data['boutframes_file'] = stored_bf
+
                         # Load 470nm data if available
                         data_470_file = os.path.join(processed_dir, f'{subject}_data_470.csv')
                         if os.path.exists(data_470_file):
@@ -13251,7 +13274,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.processed_data[subject_id] = _temp
             bout_data = self.extract_bouts(subject_id, beh_synced, boutframes_file)
             result['bouts'] = bout_data
-        
+            # Remember the boutframes file this subject's bouts were extracted
+            # from (this is the merged/TTL-derived file when a TTL source was
+            # used). 'Apply Settings & Re-extract Bouts' uses it so re-extraction
+            # works even when no manual boutframes file is configured in the UI.
+            result['boutframes_file'] = boutframes_file
+
         return result
 
     def _apply_processing_rolling_to_result(self, result):
@@ -16781,13 +16809,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 "then you can re-extract bouts with updated settings.")
             return
 
-        boutframes_file = self.boutframes_path_var.get()
-        if not boutframes_file or not os.path.exists(boutframes_file):
-            messagebox.showwarning(
-                "No Boutframes File",
-                "No boutframes file is configured.\n"
-                "Please load a boutframes file in the workspace settings.")
-            return
+        global_bf = self.boutframes_path_var.get()
+
+        def _resolve_boutframes(sid):
+            """Boutframes file to re-extract this subject from: the one its bouts
+            were originally extracted from (recorded during processing — this is
+            the merged/TTL-derived file when a TTL source was used), falling back
+            to the path configured in the UI."""
+            per = self.processed_data.get(sid, {}).get('boutframes_file')
+            if per and os.path.exists(per):
+                return per
+            if global_bf and os.path.exists(global_bf):
+                return global_bf
+            return None
 
         # Snapshot the current GUI state into self.params before extracting
         self.sync_ui_to_params()
@@ -16802,6 +16836,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 "No Signal Data",
                 "Processed data found but no synchronized signal matrices are stored.\n"
                 "Please re-run the full analysis first.")
+            return
+
+        if not any(_resolve_boutframes(sid) for sid in subjects_with_data):
+            messagebox.showwarning(
+                "No Boutframes File",
+                "No boutframes file is available to re-extract from.\n"
+                "Load a boutframes file in the workspace settings, or re-run the "
+                "full analysis so the TTL-derived boutframes file is regenerated.")
             return
 
         n_total = len(subjects_with_data)
@@ -16819,8 +16861,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if hasattr(self, '_reextract_status_var') else None
                 ))
                 try:
+                    bf = _resolve_boutframes(sid)
+                    if not bf:
+                        raise FileNotFoundError(
+                            "no boutframes file available for this subject")
                     beh_synced = self.processed_data[sid]['beh_synced']
-                    bout_data = self.extract_bouts(sid, beh_synced, boutframes_file)
+                    bout_data = self.extract_bouts(sid, beh_synced, bf)
                     self.processed_data[sid]['bouts'] = bout_data
                     n_ok += 1
                 except Exception as exc:
@@ -18750,14 +18796,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if "Signal Integrity" in plot_type:
             return (min(13.0, 11.0 + (n - 1) * 0.5), 7.5)
 
-        # Grid plots render one panel per subject.
-        if any(t in plot_type for t in ("Position Heatmap", "Extracted Bouts", "Zone Entry Bouts")):
+        # Position Heatmap renders one panel per subject (a true grid).
+        # NOTE: "Extracted Bouts" and "Zone Entry Bouts" are deliberately NOT
+        # grid-sized here — their multi/group plots collapse all subjects into a
+        # fixed 1- or 2-row trace+heatmap layout, so they are sized by channel
+        # count in generate_plot (see _viz_bout_channel_rows) instead.
+        if "Position Heatmap" in plot_type:
             ncols = min(3, n)
             nrows = int(np.ceil(n / ncols))
-            if "Position Heatmap" in plot_type:
-                # Roughly square panels for spatial data.
-                return (min(12.0, 3.5 * ncols + 1.0), min(9.0, 3.5 * nrows + 1.0))
-            return (min(12.0, 4.0 * ncols + 1.0), min(9.0, 2.8 * nrows + 1.2))
+            # Roughly square panels for spatial data.
+            return (min(12.0, 3.5 * ncols + 1.0), min(9.0, 3.5 * nrows + 1.0))
 
         # Time-series / single-axis traces: wide and short.
         if plot_type in ("Raw Data", "Normalized (dF/F)", "Motion Corrected",
@@ -18771,6 +18819,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Sensible default.
         return (9.0, 5.0)
+
+    def _viz_bout_channel_rows(self, subjects):
+        """How many channel rows the bout trace+heatmap plots will draw (1 or 2).
+
+        The Extracted Bouts and Zone Entry Bouts plots lay out one row of
+        trace+heatmap per photometry channel that has data (G0 and/or G1), and
+        do NOT add a panel per subject. Sizing therefore depends on channel
+        count, not subject count. Returns 2 when any selected subject was
+        recorded on two photometry channels (and both are visible), else 1.
+        """
+        two_channel = False
+        for s in subjects:
+            d = self.processed_data.get(s, {})
+            if isinstance(d, dict) and d.get('num_photometry_channels', 1) and d['num_photometry_channels'] >= 2:
+                two_channel = True
+                break
+        if not two_channel:
+            return 1
+        # Respect the G0/G1 visibility toggles (Zone Entry Bouts honors these);
+        # if one channel is hidden only a single row is drawn.
+        try:
+            if not (self.show_g0.get() and self.show_g1.get()):
+                return 1
+        except Exception:
+            pass
+        return 2
 
     def _keep_legends_clear_of_data(self, fig):
         """Reposition every legend in the figure so it never sits on top of data.
@@ -18863,12 +18937,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # size by group count there to avoid an oversized, mostly-empty figure.
         size_count = len(valid_subjects)
         if (self.plot_by_var.get() == "Group"
-                and any(t in plot_type for t in ("Position Heatmap", "Extracted Bouts"))):
+                and "Position Heatmap" in plot_type):
             try:
                 size_count = max(1, len(self.viz_group_listbox.curselection()))
             except Exception:
                 pass
-        default_w, default_h = self._auto_viz_figure_size(plot_type, size_count)
+
+        if any(t in plot_type for t in ("Extracted Bouts", "Zone Entry Bouts")):
+            # These collapse every selected subject into a fixed 1- or 2-row
+            # trace+heatmap layout, so size by channel count, not subject count —
+            # otherwise selecting many subjects inflates the figure until it
+            # fills the screen.
+            rows = self._viz_bout_channel_rows(valid_subjects)
+            default_w, default_h = 11.0, 4.2 * rows + 0.6
+        else:
+            default_w, default_h = self._auto_viz_figure_size(plot_type, size_count)
         try:
             w_str = self.viz_fig_width_var.get().strip().lower()
             fig_w = float(w_str) if w_str not in ('', 'auto') else default_w
