@@ -18,9 +18,15 @@ from scipy import stats
 from scipy.signal import coherence, spectrogram, fftconvolve, butter, filtfilt, savgol_filter
 import os
 import json
+import subprocess
 from pathlib import Path
 import openpyxl
 from openpyxl import Workbook, load_workbook
+
+# On Windows, every child process the GUI spawns (git, pip, …) briefly flashes
+# its own console window. Passing this flag suppresses it. CREATE_NO_WINDOW
+# exists only on Windows, so the lookup is guarded; it is a no-op elsewhere.
+SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
 
 # Single source of truth for the application version. Referenced by the
@@ -29098,7 +29104,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     [sys.executable, '-m', 'pip', 'install', package],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True
+                    text=True,
+                    creationflags=SUBPROCESS_NO_WINDOW
                 )
                 
                 # Stream output for this package
@@ -29182,7 +29189,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             try:
                 r = subprocess.run(
                     ['git', 'rev-parse', '--is-inside-work-tree'],
-                    cwd=repo_dir, capture_output=True, text=True, timeout=10)
+                    cwd=repo_dir, capture_output=True, text=True, timeout=10,
+                    creationflags=SUBPROCESS_NO_WINDOW)
                 return r.returncode == 0, (r.stderr or '')
             except Exception:
                 # Probe itself failed (e.g. git missing); let the caller's own
@@ -29199,7 +29207,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             try:
                 subprocess.run(
                     ['git', 'config', '--global', '--add', 'safe.directory', val],
-                    capture_output=True, text=True, timeout=10)
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=SUBPROCESS_NO_WINDOW)
             except Exception:
                 pass
 
@@ -29245,7 +29254,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ['git', 'fetch', 'origin'],
                     cwd=repo_dir,
                     capture_output=True,
-                    timeout=20
+                    timeout=20,
+                    creationflags=SUBPROCESS_NO_WINDOW
                 )
 
                 # Count commits that are on origin/main but not in local HEAD
@@ -29254,7 +29264,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     cwd=repo_dir,
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=10,
+                    creationflags=SUBPROCESS_NO_WINDOW
                 )
 
                 if result.returncode == 0:
@@ -29332,7 +29343,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 cwd=repo_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True
+                text=True,
+                creationflags=SUBPROCESS_NO_WINDOW
             )
 
             for line in process.stdout:
