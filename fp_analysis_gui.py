@@ -32,8 +32,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.1.0"
-APP_VERSION_DATE = "June 1, 2026"
+APP_VERSION = "1.2.0"
+APP_VERSION_DATE = "June 2, 2026"
 
 
 class ZoneEditor:
@@ -7209,6 +7209,8 @@ class FPAnalysisGUI:
         export_menu = tk.Menu(export_mb, tearoff=0)
         export_menu.add_command(label="Metrics Table (Excel)…",
                                 command=self.export_bout_metrics)
+        export_menu.add_command(label="All Behaviors → unified Excel (current settings)…",
+                                command=self.export_bout_metrics_all)
         export_menu.add_command(label="Plot Data — copy/paste (Prism, Excel)…",
                                 command=self.export_bout_order_data)
         export_mb['menu'] = export_menu
@@ -9623,6 +9625,19 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Bout Analysis export "All Behaviors → unified Excel (current settings)":
+    applies the current settings (subjects/groups, metrics, window, max bouts,
+    averaging, exclusions) to every behavior at once and writes one workbook with
+    a sheet per behavior x channel, plus an Export Settings sheet. No need to
+    calculate each behavior first.
+  • Fix — Visualization: legends no longer cover the plotted data; every graph now
+    opens headroom and anchors the legend clear of the traces.
+  • Fix — Visualization "Distance from Center" (X/Y and Euclidean): plots no longer
+    fail silently (blank panel) on legacy/reloaded projects; distance bins are read
+    robustly and a plotting error now shows in-panel instead of leaving it blank.
+
+Version 1.1.0  •  June 1, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Bout-length analysis: bin bouts by their duration and compare
     peak/avg/AUC across length bins ("Bars by Bout Length" in Bout Analysis and
@@ -18757,6 +18772,44 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Sensible default.
         return (9.0, 5.0)
 
+    def _keep_legends_clear_of_data(self, fig):
+        """Reposition every legend in the figure so it never sits on top of data.
+
+        Time-series traces fill the whole axes, so a legend drawn over them hides
+        the signal (e.g. the group bout-overlay plots). For each axis that has a
+        legend we anchor it in the top-left corner and open matching headroom by
+        extending the y-axis upward, so the legend box lands in clear space above
+        the traces. Axes without a legend (heatmaps, colorbars) are left alone.
+        """
+        for ax in fig.get_axes():
+            leg = ax.get_legend()
+            if leg is None:
+                continue
+            handles, labels = ax.get_legend_handles_labels()
+            if not handles:
+                continue
+
+            # Preserve the original legend's styling where we can.
+            title_txt = leg.get_title().get_text() if leg.get_title() else None
+            try:
+                fontsize = leg.get_texts()[0].get_fontsize()
+            except (IndexError, AttributeError):
+                fontsize = 8
+            ncol = getattr(leg, '_ncols', None) or getattr(leg, '_ncol', 1) or 1
+
+            y0, y1 = ax.get_ylim()
+            if not (np.isfinite(y0) and np.isfinite(y1) and y1 > y0):
+                continue
+
+            # Headroom scales with the number of legend rows so multi-entry
+            # legends still clear the data.
+            n_rows = int(np.ceil(len(labels) / max(1, ncol)))
+            headroom = min(0.55, 0.16 + 0.07 * n_rows)
+            ax.set_ylim(y0, y1 + (y1 - y0) * headroom)
+
+            ax.legend(handles, labels, loc='upper left', fontsize=fontsize,
+                      ncol=ncol, title=title_txt, framealpha=0.9)
+
     def generate_plot(self):
         """Generate selected plot type"""
         # Get selected subjects or groups
@@ -18833,89 +18886,109 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # For single subject plots, use first selected subject
         # EXCEPT for Signal Integrity, which can handle multiple subjects
-        if ("Signal Integrity" in plot_type and len(valid_subjects) > 1):
-            # Multi-subject Signal Integrity summary
-            self.plot_signal_integrity_multi(fig, valid_subjects)
-        elif len(valid_subjects) == 1 or plot_type in ["Raw Data", "Normalized (dF/F)", "Motion Corrected", "Z-scored", "Signal Integrity"]:
-            subject = valid_subjects[0]
-            data = self.processed_data[subject]
-            
-            if "Raw" in plot_type:
-                self.plot_raw_data(fig, data)
-            elif "Normalized" in plot_type:
-                self.plot_dff_data(fig, data)
-            elif "Motion Corrected" in plot_type:
-                self.plot_corrected_data(fig, data)
-            elif "Z-scored" in plot_type:
-                self.plot_zscore_data(fig, data)
-            elif "Signal Integrity" in plot_type:
-                self.plot_signal_integrity(fig, data, subject)
-            elif "Bouts Overlay" in plot_type:
-                self.plot_bouts_overlay(fig, data, subject)
-            elif "Bout Length Bins" in plot_type:
-                self.plot_bout_length_bins(fig, data, subject)
-            elif "Extracted Bouts" in plot_type:
-                self.plot_extracted_bouts(fig, data)
-            elif "Compare Across Bouts" in plot_type:
-                self.plot_bout_comparison_single(fig, data, subject)
-            elif "Position Heatmap" in plot_type:
-                self.plot_position_heatmap(fig, data, subject)
-            elif "Zone Entry Bouts" in plot_type:
-                self.plot_zone_entry_bouts(fig, data, subject)
-            elif "Zone Averages" in plot_type:
-                self.plot_zone_averages(fig, data, subject)
-            elif "Distance from Center (Euclidean)" in plot_type:
-                self.plot_distance_from_center_euclidean(fig, data, subject)
-            elif "Distance from Center" in plot_type:
-                self.plot_distance_from_center(fig, data, subject)
-            elif "Out/Back" in plot_type:
-                self.plot_outback(fig, data, subject)
-        else:
-            # Multi-subject plots
-            if "Position Heatmap" in plot_type:
-                # If comparing groups, plot heatmaps per group instead of flattening subjects
-                if self.plot_by_var.get() == "Group":
-                    selected_indices = self.viz_group_listbox.curselection()
-                    selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
-                    self.plot_position_heatmap_by_group(fig, selected_groups)
-                else:
-                    self.plot_position_heatmap_multi(fig, valid_subjects)
-            elif "Zone Entry Bouts" in plot_type:
-                self.plot_zone_entry_bouts_multi(fig, valid_subjects)
-            elif "Zone Averages" in plot_type:
-                self.plot_zone_averages_multi(fig, valid_subjects)
-            elif "Distance from Center (Euclidean)" in plot_type:
-                self.plot_distance_from_center_euclidean_multi(fig, valid_subjects)
-            elif "Distance from Center" in plot_type:
-                self.plot_distance_from_center_multi(fig, valid_subjects)
-            elif "Out/Back" in plot_type:
-                self.plot_outback_multi(fig, valid_subjects)
-            elif "Compare Across Bouts" in plot_type:
-                # Check if we're in group mode
-                if self.plot_by_var.get() == "Group":
-                    selected_indices = self.viz_group_listbox.curselection()
-                    selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
-                    self.plot_bout_comparison_by_group(fig, selected_groups)
-                else:
-                    self.plot_bout_comparison_multi(fig, valid_subjects)
-            elif "Bout Length Bins" in plot_type:
-                self.plot_bout_length_bins_multi(fig, valid_subjects)
-            elif "Extracted Bouts" in plot_type:
-                # Check if we're in group mode
-                if self.plot_by_var.get() == "Group":
-                    # Get which groups were selected and create group-based plot
-                    selected_indices = self.viz_group_listbox.curselection()
-                    selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
-                    self.plot_extracted_bouts_by_group(fig, selected_groups)
-                else:
-                    self.plot_extracted_bouts_multi(fig, valid_subjects)
+        try:
+            if ("Signal Integrity" in plot_type and len(valid_subjects) > 1):
+                # Multi-subject Signal Integrity summary
+                self.plot_signal_integrity_multi(fig, valid_subjects)
+            elif len(valid_subjects) == 1 or plot_type in ["Raw Data", "Normalized (dF/F)", "Motion Corrected", "Z-scored", "Signal Integrity"]:
+                subject = valid_subjects[0]
+                data = self.processed_data[subject]
+
+                if "Raw" in plot_type:
+                    self.plot_raw_data(fig, data)
+                elif "Normalized" in plot_type:
+                    self.plot_dff_data(fig, data)
+                elif "Motion Corrected" in plot_type:
+                    self.plot_corrected_data(fig, data)
+                elif "Z-scored" in plot_type:
+                    self.plot_zscore_data(fig, data)
+                elif "Signal Integrity" in plot_type:
+                    self.plot_signal_integrity(fig, data, subject)
+                elif "Bouts Overlay" in plot_type:
+                    self.plot_bouts_overlay(fig, data, subject)
+                elif "Bout Length Bins" in plot_type:
+                    self.plot_bout_length_bins(fig, data, subject)
+                elif "Extracted Bouts" in plot_type:
+                    self.plot_extracted_bouts(fig, data)
+                elif "Compare Across Bouts" in plot_type:
+                    self.plot_bout_comparison_single(fig, data, subject)
+                elif "Position Heatmap" in plot_type:
+                    self.plot_position_heatmap(fig, data, subject)
+                elif "Zone Entry Bouts" in plot_type:
+                    self.plot_zone_entry_bouts(fig, data, subject)
+                elif "Zone Averages" in plot_type:
+                    self.plot_zone_averages(fig, data, subject)
+                elif "Distance from Center (Euclidean)" in plot_type:
+                    self.plot_distance_from_center_euclidean(fig, data, subject)
+                elif "Distance from Center" in plot_type:
+                    self.plot_distance_from_center(fig, data, subject)
+                elif "Out/Back" in plot_type:
+                    self.plot_outback(fig, data, subject)
             else:
-                messagebox.showinfo("Info", "Multi-subject comparison only available for Position Heatmap and Extracted Bouts")
-                return
+                # Multi-subject plots
+                if "Position Heatmap" in plot_type:
+                    # If comparing groups, plot heatmaps per group instead of flattening subjects
+                    if self.plot_by_var.get() == "Group":
+                        selected_indices = self.viz_group_listbox.curselection()
+                        selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                        self.plot_position_heatmap_by_group(fig, selected_groups)
+                    else:
+                        self.plot_position_heatmap_multi(fig, valid_subjects)
+                elif "Zone Entry Bouts" in plot_type:
+                    self.plot_zone_entry_bouts_multi(fig, valid_subjects)
+                elif "Zone Averages" in plot_type:
+                    self.plot_zone_averages_multi(fig, valid_subjects)
+                elif "Distance from Center (Euclidean)" in plot_type:
+                    self.plot_distance_from_center_euclidean_multi(fig, valid_subjects)
+                elif "Distance from Center" in plot_type:
+                    self.plot_distance_from_center_multi(fig, valid_subjects)
+                elif "Out/Back" in plot_type:
+                    self.plot_outback_multi(fig, valid_subjects)
+                elif "Compare Across Bouts" in plot_type:
+                    # Check if we're in group mode
+                    if self.plot_by_var.get() == "Group":
+                        selected_indices = self.viz_group_listbox.curselection()
+                        selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                        self.plot_bout_comparison_by_group(fig, selected_groups)
+                    else:
+                        self.plot_bout_comparison_multi(fig, valid_subjects)
+                elif "Bout Length Bins" in plot_type:
+                    self.plot_bout_length_bins_multi(fig, valid_subjects)
+                elif "Extracted Bouts" in plot_type:
+                    # Check if we're in group mode
+                    if self.plot_by_var.get() == "Group":
+                        # Get which groups were selected and create group-based plot
+                        selected_indices = self.viz_group_listbox.curselection()
+                        selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                        self.plot_extracted_bouts_by_group(fig, selected_groups)
+                    else:
+                        self.plot_extracted_bouts_multi(fig, valid_subjects)
+                else:
+                    messagebox.showinfo("Info", "Multi-subject comparison only available for Position Heatmap and Extracted Bouts")
+                    return
+        except Exception as e:
+            # Surface plotting failures in-panel instead of silently leaving a
+            # blank graphing area (previously any exception here aborted before
+            # the canvas was embedded, so "no graph" appeared with no feedback).
+            import traceback
+            tb = traceback.format_exc()
+            self.log_message(f"Error generating '{plot_type}' plot: {e}")
+            self.log_message(tb)
+            fig.clear()
+            fig.text(0.5, 0.5,
+                     f"Could not generate '{plot_type}' plot:\n{e}\n\n"
+                     f"See the log for details.",
+                     ha='center', va='center', fontsize=11, color='firebrick', wrap=True)
         
         # Store figure and canvas for axis control
         self.current_viz_figure = fig
-        
+
+        # Keep legends from covering the plotted data across every graph type.
+        try:
+            self._keep_legends_clear_of_data(fig)
+        except Exception as e:
+            self.log_message(f"Legend repositioning skipped: {e}")
+
         # Tighten layout before embedding so labels aren't clipped.
         try:
             fig.tight_layout()
@@ -23103,6 +23176,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception as e:
             self.log_message(f"  Warning: Could not recompute distance averages for {subject_name}: {e}")
 
+    @staticmethod
+    def _sorted_distance_bins(dist_dict):
+        """Return (distance, values) pairs sorted by numeric distance.
+
+        Robust to how the distance-average dict was produced: freshly computed
+        (int keys, values carry a 'distance' field), reloaded from JSON (keys may
+        be strings), or imported from the legacy Excel sheet (values keyed by a
+        plain row index with no 'distance' field). The bin distance is taken from
+        the value's 'distance' field when present, otherwise from the dict key.
+        """
+        bins = []
+        for key, values in dist_dict.items():
+            if not isinstance(values, dict):
+                continue
+            raw = values.get('distance', key)
+            try:
+                dist = float(raw)
+            except (TypeError, ValueError):
+                continue
+            bins.append((dist, values))
+        bins.sort(key=lambda b: b[0])
+        return bins
+
     def plot_distance_from_center(self, fig, data, subject_name):
         """Plot average z-score vs distance from center"""
         maze_type = self.params.get('maze_type', 'EPM')
@@ -23128,15 +23224,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # X-axis subplot
         ax1 = fig.add_subplot(1, 2, 1)
         
-        x_dist_data = data['distance_averages_x']
-        distances_x = sorted([d['distance'] for d in x_dist_data.values()])
-        
+        x_bins = self._sorted_distance_bins(data['distance_averages_x'])
+        distances_x = [b[0] for b in x_bins]
+
         if show_g0:
-            g0_means_x = [x_dist_data[d].get('G0_mean', np.nan) for d in distances_x]
+            g0_means_x = [v.get('G0_mean', np.nan) for _, v in x_bins]
             ax1.plot(distances_x, g0_means_x, 'o-', label='G0', linewidth=2, markersize=6, color='blue')
-        
+
         if show_g1:
-            g1_means_x = [x_dist_data[d].get('G1_mean', np.nan) for d in distances_x]
+            g1_means_x = [v.get('G1_mean', np.nan) for _, v in x_bins]
             ax1.plot(distances_x, g1_means_x, 's-', label='G1', linewidth=2, markersize=6, color='green')
         
         ax1.set_xlabel('Distance from Center X-axis (cm)')
@@ -23159,15 +23255,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Y-axis subplot
         ax2 = fig.add_subplot(1, 2, 2)
         
-        y_dist_data = data['distance_averages_y']
-        distances_y = sorted([d['distance'] for d in y_dist_data.values()])
-        
+        y_bins = self._sorted_distance_bins(data['distance_averages_y'])
+        distances_y = [b[0] for b in y_bins]
+
         if show_g0:
-            g0_means_y = [y_dist_data[d].get('G0_mean', np.nan) for d in distances_y]
+            g0_means_y = [v.get('G0_mean', np.nan) for _, v in y_bins]
             ax2.plot(distances_y, g0_means_y, 'o-', label='G0', linewidth=2, markersize=6, color='blue')
-        
+
         if show_g1:
-            g1_means_y = [y_dist_data[d].get('G1_mean', np.nan) for d in distances_y]
+            g1_means_y = [v.get('G1_mean', np.nan) for _, v in y_bins]
             ax2.plot(distances_y, g1_means_y, 's-', label='G1', linewidth=2, markersize=6, color='green')
         
         ax2.set_xlabel('Distance from Center Y-axis (cm)')
@@ -23199,15 +23295,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 show_g1 = False
 
         ax = fig.add_subplot(1, 1, 1)
-        eucl_data = data['distance_averages_euclidean']
-        distances = sorted([d['distance'] for d in eucl_data.values()])
+        eucl_bins = self._sorted_distance_bins(data['distance_averages_euclidean'])
+        distances = [b[0] for b in eucl_bins]
 
         if show_g0:
-            g0_means = [eucl_data[d].get('G0_mean', np.nan) for d in distances]
+            g0_means = [v.get('G0_mean', np.nan) for _, v in eucl_bins]
             ax.plot(distances, g0_means, 'o-', label='G0', linewidth=2, markersize=6, color='blue')
 
         if show_g1:
-            g1_means = [eucl_data[d].get('G1_mean', np.nan) for d in distances]
+            g1_means = [v.get('G1_mean', np.nan) for _, v in eucl_bins]
             ax.plot(distances, g1_means, 's-', label='G1', linewidth=2, markersize=6, color='green')
 
         ax.set_xlabel('Euclidean Distance from Center (cm)')
@@ -24344,9 +24440,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         all_y_data[dist] = {'G0': [], 'G1': []}
                     if subject_has_g0 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
                         all_y_data[dist]['G0'].append(values['G0_mean'])
-                    if subject_has_g1 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
-                        all_y_data[dist]['G0'].append(values['G0_mean'])
-                    if 'G1_mean' in values and not np.isnan(values['G1_mean']):
+                    if subject_has_g1 and 'G1_mean' in values and not np.isnan(values['G1_mean']):
                         all_y_data[dist]['G1'].append(values['G1_mean'])
             
             if distances_x is None:
@@ -29000,7 +29094,349 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export metrics:\n{str(e)}")
 
-    
+    def _compute_bout_metrics_for(self, behavior, channel, selected_subjects,
+                                  subject_to_group, window_start_frame, window_end_frame,
+                                  metric_specs, max_bouts, auc_mode):
+        """Headless bout-metric computation for one (behavior, channel).
+
+        Mirrors the per-bout math in calculate_bout_metrics but writes nothing
+        to the UI, so it can be reused to export every behavior at once.
+
+        Returns (by_subject, rows, columns, total_bouts):
+          by_subject  : {subject: {metric_key: [values]}} (NaNs omitted)
+          rows        : list of dict rows (one per bout) for an individual-bout sheet
+          columns     : ordered column labels for those rows
+          total_bouts : number of bouts processed
+        """
+        has_group = bool(subject_to_group)
+        columns = (['Group'] if has_group else []) + ['Subject', 'Behavior', 'Channel', 'Bout #']
+        columns += [label for _, label in metric_specs]
+
+        by_subject = {}
+        rows = []
+        total_bouts = 0
+        fps = self.params.get('fps', 1)
+
+        for subject in selected_subjects:
+            if subject not in self.processed_data:
+                continue
+            data = self.processed_data[subject]
+            if 'bouts' not in data or behavior not in data['bouts']:
+                continue
+            bouts_data = data['bouts'][behavior].get(channel, [])
+            if len(bouts_data) == 0:
+                continue
+            if max_bouts is not None:
+                bouts_data = bouts_data[:max_bouts]
+
+            subj_store = by_subject.setdefault(subject, {key: [] for key, _ in metric_specs})
+
+            for bout_idx, bout in enumerate(bouts_data):
+                if len(bout) == 0:
+                    continue
+                seg = self._bout_analysis_segment(
+                    subject, behavior, channel, bout_idx, bout,
+                    window_start_frame, window_end_frame)
+                if seg is None or len(seg) == 0:
+                    continue
+
+                row = {}
+                if has_group:
+                    row['Group'] = subject_to_group.get(subject, 'Unknown')
+                row['Subject'] = subject
+                row['Behavior'] = behavior
+                row['Channel'] = channel
+                row['Bout #'] = bout_idx + 1
+
+                for key, label in metric_specs:
+                    val = np.nan
+                    if key == 'avg_post':
+                        val = float(np.mean(seg))
+                    elif key == 'max_post':
+                        val = float(np.max(seg))
+                    elif key == 'min_post':
+                        val = float(np.min(seg))
+                    elif key == 'max_deriv':
+                        val = float(np.max(np.abs(np.diff(seg) * fps))) if len(seg) > 1 else np.nan
+                    elif key == 'tau':
+                        t = self.calculate_tau(seg)
+                        val = float(t) if t is not None else np.nan
+                    elif key == 'auc':
+                        auc_data = np.array(seg, dtype=float).copy()
+                        if auc_mode == 'above':
+                            auc_data[auc_data < 0] = 0
+                        elif auc_mode == 'below':
+                            auc_data[auc_data > 0] = 0
+                        val = float(self._trapz_compat(auc_data))
+                    row[label] = val
+                    if not (isinstance(val, float) and np.isnan(val)):
+                        subj_store[key].append(val)
+
+                rows.append(row)
+                total_bouts += 1
+
+        return by_subject, rows, columns, total_bouts
+
+    def export_bout_metrics_all(self):
+        """Export bout metrics for ALL behaviors (and channels) into one workbook.
+
+        Applies the current Bout Analysis settings — selected subjects/groups,
+        chosen metrics, analysis window, max-bouts limit, within-subject
+        averaging, and exclusions — to every behavior, writing one sheet per
+        behavior x channel that has data plus an 'Export Settings' sheet.
+
+        Unlike "Metrics Table (Excel)", this does not require pre-calculating
+        each behavior; metrics are computed on the fly here.
+        """
+        import re
+
+        if not getattr(self, 'processed_data', None):
+            messagebox.showerror("Error", "No processed data available.")
+            return
+
+        # Behaviors available across loaded subjects
+        behaviors = set()
+        for d in self.processed_data.values():
+            if 'bouts' in d:
+                behaviors.update(d['bouts'].keys())
+        behaviors = sorted(behaviors)
+        if not behaviors:
+            messagebox.showerror("Error", "No bout/behavior data found. Extract bouts first.")
+            return
+
+        # ── Metric selection (current settings) ───────────────────────────
+        calc_avg   = self.metric_avg_post.get()
+        calc_max   = self.metric_max_post.get()
+        calc_min   = self.metric_min_post.get()
+        calc_deriv = self.metric_first_deriv.get()
+        calc_tau   = self.metric_tau.get()
+        calc_auc   = self.metric_auc.get()
+        auc_mode   = self.metric_auc_mode.get()
+        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_auc]):
+            messagebox.showerror("Error", "Please select at least one metric in Settings.")
+            return
+
+        auc_label = 'AUC'
+        if auc_mode == 'above':
+            auc_label = 'AUC (+only)'
+        elif auc_mode == 'below':
+            auc_label = 'AUC (-only)'
+        metric_specs = []
+        if calc_avg:   metric_specs.append(('avg_post',  'Avg Post-Bout'))
+        if calc_max:   metric_specs.append(('max_post',  'Max Post-Bout'))
+        if calc_min:   metric_specs.append(('min_post',  'Min Post-Bout'))
+        if calc_deriv: metric_specs.append(('max_deriv', 'Max Derivative'))
+        if calc_tau:   metric_specs.append(('tau',       'Tau (seconds)'))
+        if calc_auc:   metric_specs.append(('auc',       auc_label))
+
+        # ── Analysis window ───────────────────────────────────────────────
+        try:
+            window_start_frame = int(self.frames_before_var.get())
+            window_end_frame   = int(self.frames_after_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid window start/end frame values.")
+            return
+        if window_end_frame <= window_start_frame:
+            messagebox.showerror("Error", "Window end frame must be greater than start frame.")
+            return
+
+        # ── Subject/group selection (current UI) ──────────────────────────
+        analysis_mode = self.bout_analysis_by_var.get()
+        if analysis_mode == 'Group':
+            sel = self.bout_analysis_group_listbox.curselection()
+            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in sel]
+            base_subjects = []
+            for g in selected_groups:
+                base_subjects.extend(self.groups.get(g, []))
+            base_subjects = list(dict.fromkeys(base_subjects))  # dedupe, keep order
+            if not base_subjects:
+                messagebox.showerror("Error", "Please select at least one group with members.")
+                return
+        else:
+            selected_groups = []
+            sel = self.bout_analysis_subject_listbox.curselection()
+            base_subjects = [self.bout_analysis_subject_listbox.get(i) for i in sel]
+            if not base_subjects:
+                messagebox.showerror("Error", "Please select at least one subject.")
+                return
+
+        # Subject -> group mapping
+        subject_to_group = {}
+        if analysis_mode == 'Group':
+            for g in selected_groups:
+                for s in self.groups.get(g, []):
+                    if s in base_subjects:
+                        subject_to_group[s] = g
+        else:
+            for g_name, members in self.groups.items():
+                for s in base_subjects:
+                    if s in members:
+                        subject_to_group[s] = g_name
+
+        average_ws       = self.bout_average_within_subject.get()
+        apply_exclusions = self.use_exclusions_bout.get()
+        max_bouts        = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        channels         = ['G0', 'G1']
+
+        # ── Compute every combo up front (so we never write an empty file) ─
+        used_names = set()
+
+        def _sheet_name(beh, ch):
+            base = re.sub(r'[\[\]\:\*\?\/\\]', '_', f"{beh}_{ch}")[:31]
+            name = base or 'Sheet'
+            i = 1
+            while name.lower() in used_names:
+                suffix = f"_{i}"
+                name = base[:31 - len(suffix)] + suffix
+                i += 1
+            used_names.add(name.lower())
+            return name
+
+        sort_key = lambda s: (subject_to_group.get(s, ''), s)
+        to_write = []        # (sheet_name, DataFrame)
+        combo_summary = []   # (behavior, channel, n_rows, n_bouts)
+
+        for behavior in behaviors:
+            for channel in channels:
+                subs = base_subjects
+                if apply_exclusions:
+                    subs = self.get_included_subjects_for_channel(base_subjects, channel)
+                if not subs:
+                    continue
+
+                by_subject, rows, columns, total_bouts = self._compute_bout_metrics_for(
+                    behavior, channel, subs, subject_to_group,
+                    window_start_frame, window_end_frame,
+                    metric_specs, max_bouts, auc_mode)
+                if total_bouts == 0:
+                    continue
+
+                if average_ws:
+                    data_rows = []
+                    for subject in sorted(by_subject.keys(), key=sort_key):
+                        row = {}
+                        if subject_to_group:
+                            row['Group'] = subject_to_group.get(subject, 'Ungrouped')
+                        row['Subject']  = subject
+                        row['Behavior'] = behavior
+                        row['Channel']  = channel
+                        n = 0
+                        for key, label in metric_specs:
+                            vals = np.array(by_subject[subject].get(key, []), dtype=float)
+                            vals = vals[~np.isnan(vals)]
+                            row[label] = float(np.mean(vals)) if len(vals) else np.nan
+                            n = max(n, len(vals))
+                        row['n_bouts'] = n
+                        data_rows.append(row)
+                    if not data_rows:
+                        continue
+                    df = pd.DataFrame(data_rows)
+                else:
+                    df = pd.DataFrame(rows, columns=columns)
+
+                to_write.append((_sheet_name(behavior, channel), df))
+                combo_summary.append((behavior, channel, df.shape[0], total_bouts))
+
+        if not to_write:
+            messagebox.showerror(
+                "No Data",
+                "No bouts matched the current settings for any behavior/channel.\n"
+                "Check the selected subjects/groups, exclusions, and metrics.")
+            return
+
+        # ── Ask for output filename ───────────────────────────────────────
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            initialfile="all_behaviors_bout_metrics.xlsx",
+            title="Export All Behaviors — Bout Metrics")
+        if not filename:
+            return
+
+        try:
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                for sheet, df in to_write:
+                    df.to_excel(writer, index=False, sheet_name=sheet)
+
+                # ── Settings / metadata sheet ─────────────────────────────
+                import datetime
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                if analysis_mode == 'Group':
+                    sel_label = ', '.join(sorted(set(subject_to_group.values()))) or '(none)'
+                else:
+                    sel_label = ', '.join(sorted(base_subjects))
+
+                metrics_selected = ', '.join(label for _, label in metric_specs) or '(none)'
+
+                settings = [
+                    ('Export Timestamp',         datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                    ('Scope',                    'All behaviors (current settings)'),
+                    ('Behaviors Exported',       ', '.join(behaviors)),
+                    ('Sheets Written',           len(to_write)),
+                    ('Channels',                 ', '.join(channels)),
+                    ('Analysis Mode',            analysis_mode),
+                    ('Selected Groups/Subjects', sel_label),
+                    ('n Subjects Selected',      len(base_subjects)),
+                    ('Max Bouts per Subject',    self.bout_max_bouts_var.get()),
+                    ('Average Within Subject',   'Yes' if average_ws else 'No'),
+                    ('Exclusions Applied',       'Yes' if apply_exclusions else 'No'),
+                    ('Metrics Calculated',       metrics_selected),
+                    ('Window Start Frame',       self.frames_before_var.get()),
+                    ('Window End Frame',         self.frames_after_var.get()),
+                ]
+                if apply_exclusions and getattr(self, 'exclusions', None):
+                    excl_parts = [
+                        f"{s}: {','.join(chs)}"
+                        for s, chs in self.exclusions.items() if chs
+                    ]
+                    if excl_parts:
+                        settings.append(('Excluded Subjects/Channels', '; '.join(excl_parts)))
+
+                wb = writer.book
+                ws = wb.create_sheet('Export Settings')
+                header_font = Font(bold=True, color='FFFFFF')
+                header_fill = PatternFill(fill_type='solid', fgColor='4472C4')
+                for col, title in ((1, 'Setting'), (2, 'Value')):
+                    c = ws.cell(row=1, column=col, value=title)
+                    c.font = header_font
+                    c.fill = header_fill
+                    c.alignment = Alignment(horizontal='center')
+                for r, (key, val) in enumerate(settings, start=2):
+                    ws.cell(row=r, column=1, value=key)
+                    ws.cell(row=r, column=2, value=str(val))
+                ws.column_dimensions['A'].width = 30
+                ws.column_dimensions['B'].width = 60
+
+                # Per-combo summary beneath the settings
+                start = len(settings) + 3
+                hdr = ['Behavior', 'Channel', 'Rows', 'Bouts']
+                for j, title in enumerate(hdr, start=1):
+                    c = ws.cell(row=start, column=j, value=title)
+                    c.font = header_font
+                    c.fill = header_fill
+                    c.alignment = Alignment(horizontal='center')
+                for i, (beh, ch, n_rows, n_bouts) in enumerate(combo_summary, start=start + 1):
+                    ws.cell(row=i, column=1, value=beh)
+                    ws.cell(row=i, column=2, value=ch)
+                    ws.cell(row=i, column=3, value=int(n_rows))
+                    ws.cell(row=i, column=4, value=int(n_bouts))
+
+            mode_str = 'averaged within subject' if average_ws else 'individual bouts'
+            self.log_message(
+                f"Exported all behaviors ({mode_str}) to {os.path.basename(filename)} "
+                f"— {len(to_write)} sheets")
+            messagebox.showinfo(
+                "Export Complete",
+                f"Exported {len(to_write)} behavior x channel sheets ({mode_str}):\n"
+                f"{os.path.basename(filename)}\n\n"
+                f"Behaviors: {len(behaviors)}  |  Subjects: {len(base_subjects)}  |  "
+                f"Max bouts: {self.bout_max_bouts_var.get()}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export all behaviors:\n{str(e)}")
+
+
     # ======================== System Check Methods ========================
     
     def check_all_dependencies(self):
