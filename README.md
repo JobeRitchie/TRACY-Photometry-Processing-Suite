@@ -5,7 +5,7 @@ with optional behavior synchronization and a broad set of built-in analyses.
 Built with Python/Tkinter; everything runs locally in a single GUI.
 
 *Created by Jobe Ritchie — Kash Lab, University of North Carolina at Chapel Hill.*
-Version 1.0.1.
+Version 1.0.2.
 
 ## Getting Started
 - Install [Git](https://git-scm.com/install/windows)
