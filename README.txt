@@ -6,7 +6,7 @@ with optional behavior synchronization and a broad set of built-in analyses.
 Built with Python/Tkinter; everything runs locally in a single GUI.
 
 Created by Jobe Ritchie - Kash Lab, University of North Carolina at Chapel Hill.
-Version 1.2.1.
+Version 1.2.2.
 
 
 Getting Started
@@ -28,7 +28,7 @@ Requirements
 - Python 3.9+
 - Git
 - Dependencies listed in requirements.txt: pandas, numpy, scipy, matplotlib,
-  openpyxl (tkinter ships with standard Python).
+  openpyxl, statsmodels (tkinter ships with standard Python).
 
 
 Features
