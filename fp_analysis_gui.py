@@ -1554,7 +1554,17 @@ class FPAnalysisGUI:
                                 fg=self.colors['accent_blue'],
                                 bg=self.colors['bg_dark'])
         version_label.pack()
-        
+
+        # Active-development reminder: Tracy ships frequent updates, so nudge
+        # users to check for them regularly via the System Check tab.
+        update_reminder_label = tk.Label(
+            version_frame,
+            text="🔄 Tracy is in active development — check for updates regularly in the 'System Check' tab",
+            font=('Segoe UI', 11),
+            fg=self.colors['text_muted'],
+            bg=self.colors['bg_dark'])
+        update_reminder_label.pack(pady=(8, 0))
+
         # Getting started hint
         hint_frame = tk.Frame(main_frame, bg=self.colors['bg_medium'], padx=30, pady=15)
         hint_frame.pack(side='bottom', fill='x')
@@ -7099,6 +7109,7 @@ class FPAnalysisGUI:
         self.metric_min_post             = tk.BooleanVar(value=True)
         self.metric_first_deriv          = tk.BooleanVar(value=False)
         self.metric_tau                  = tk.BooleanVar(value=False)
+        self.metric_t_half               = tk.BooleanVar(value=False)
         self.metric_auc                  = tk.BooleanVar(value=False)
         self.metric_auc_mode             = tk.StringVar(value="both")
         self.frames_before_var           = tk.StringVar(value="0")
@@ -9674,6 +9685,13 @@ Version {APP_VERSION}  •  {APP_VERSION_DATE}
     statsmodels dependency.
   • Validation — "Validation Tests/" runs the analysis on the bundled Sample Data,
     and "flmm_validation/" documents a head-to-head comparison against R fastFMM.
+  • Fix — Bout windows: peri-event plots, exports and stats now stay correctly
+    aligned when you reprocess or re-extract with different pre/post-bout frames.
+    Each subject's bouts remember the window they were extracted with, and every
+    plot/export realigns them to the current window before drawing or averaging,
+    so mixing subjects (or changing pre/post without re-extracting) no longer
+    pulls in the wrong samples or shifts the onset marker. The window is saved
+    with the project and restored on load.
 
 Version 1.2.1  •  June 2, 2026
 ────────────────────────────────────────────────────────────────────────────────
@@ -10700,7 +10718,22 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if 'bouts' in data and data['bouts']:
                     bout_dir = os.path.join(project_path, 'processed', 'bouts', subject)
                     os.makedirs(bout_dir, exist_ok=True)
-                    
+
+                    # Persist the pre/post window each behavior's bouts were
+                    # extracted with so realignment survives a save/reload (the
+                    # CSVs below only carry the raw arrays, not their onset index).
+                    bout_windows = {}
+                    for behavior, bout_data in data['bouts'].items():
+                        if isinstance(bout_data, dict) and '_prebout' in bout_data:
+                            bout_windows[behavior] = {
+                                'prebout': int(bout_data.get('_prebout')),
+                                'postbout': int(bout_data.get('_postbout',
+                                                 self.params.get('postboutframes', 90))),
+                            }
+                    if bout_windows:
+                        with open(os.path.join(bout_dir, '_bout_windows.json'), 'w') as f:
+                            json.dump(bout_windows, f, indent=2)
+
                     for behavior, bout_data in data['bouts'].items():
                         # Save G0 bouts
                         if bout_data['G0']:
@@ -11184,14 +11217,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         bout_dir = os.path.join(processed_dir, 'bouts', subject)
                         if os.path.exists(bout_dir):
                             bouts = {}
+                            # Restore the per-behavior extraction window saved
+                            # alongside the bout CSVs so visualization can realign
+                            # to the current pre/post even after a reload.
+                            bout_windows = {}
+                            _win_file = os.path.join(bout_dir, '_bout_windows.json')
+                            if os.path.exists(_win_file):
+                                try:
+                                    with open(_win_file) as f:
+                                        bout_windows = json.load(f)
+                                except Exception:
+                                    bout_windows = {}
                             for file in os.listdir(bout_dir):
                                 if file.endswith('_G0_bouts.csv'):
                                     behavior = file.replace('_G0_bouts.csv', '')
                                     g0_file = os.path.join(bout_dir, file)
                                     g1_file = os.path.join(bout_dir, f'{behavior}_G1_bouts.csv')
-                                    
+
                                     if behavior not in bouts:
                                         bouts[behavior] = {'G0': [], 'G1': []}
+                                        _w = bout_windows.get(behavior)
+                                        if _w:
+                                            bouts[behavior]['_prebout'] = int(_w.get('prebout'))
+                                            bouts[behavior]['_postbout'] = int(_w.get('postbout'))
                                     
                                     # Load G0 bouts
                                     df_g0 = pd.read_csv(g0_file)
@@ -16383,12 +16431,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         prebout = self.params.get('preboutframes', 90)
         onset_idx = prebout
 
+        # Realign the stored onset-aligned trace onto the current window so the
+        # onset index above is valid even when this bout was extracted with a
+        # different pre/post (identity when the windows already match).
+        _entry = self.processed_data.get(subject, {}).get('bouts', {}).get(behavior, {})
+        onset_bout = self._realign_bout_trace(stored_bout, self._entry_prebout(_entry))
+
         def _onset_slice():
             a = max(0, onset_idx + window_start_frame)
-            b = min(len(stored_bout), onset_idx + window_end_frame)
+            b = min(len(onset_bout), onset_idx + window_end_frame)
             if b <= a:
                 return None
-            return stored_bout[a:b]
+            return onset_bout[a:b]
 
         if hasattr(self, 'boutframe_processing_style_var'):
             style = self.boutframe_processing_style_var.get()
@@ -16564,8 +16618,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     behavior_entry['end_frames'] = None
                     behavior_entry['durations'] = None
 
+                # Record the pre/post window these traces were extracted with so
+                # visualization can re-align them onto the *current* window even
+                # when the user later changes preboutframes/postboutframes (or
+                # only some subjects were reprocessed).  Without this, the stored
+                # arrays carry no record of where their onset sits and plots
+                # silently assume the live param applies to every subject.
+                behavior_entry['_prebout'] = int(prebout)
+                behavior_entry['_postbout'] = int(postbout)
+
                 bout_data[behavior] = behavior_entry
-            
+
             # Generate offset-derived behaviors if any offsets are defined.
             # Each offset creates a copy of every original behavior with shifted onsets.
             if self.bout_offsets:
@@ -16619,6 +16682,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         else:
                             offset_entry['end_frames'] = None
                             offset_entry['durations'] = None
+                        offset_entry['_prebout'] = int(prebout)
+                        offset_entry['_postbout'] = int(postbout)
                         offset_name = f"{src_behavior}_{suffix}"
                         bout_data[offset_name] = offset_entry
                         self.log_message(
@@ -16630,7 +16695,69 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception as e:
             self.log_message(f"    Warning: Could not extract bouts for {subject_id}: {str(e)}")
             return {}
-    
+
+    # ── Bout window normalization for visualization ──────────────────
+    # Stored bouts carry the pre/post window they were extracted with
+    # ('_prebout'/'_postbout', added by extract_bouts).  The plotters all assume
+    # a single global window (onset at self.params['preboutframes'], total length
+    # pre+post).  When the live params differ from a stored bout's window — the
+    # user changed pre/post without re-extracting, or only some subjects were
+    # reprocessed — that assumption silently misaligns traces and pulls in the
+    # wrong samples.  These helpers re-position each stored trace so its onset
+    # lands on the *current* window, padding with NaN where the stored window
+    # doesn't reach and cropping where it overruns.
+
+    def _entry_prebout(self, entry):
+        """Prebout a bout entry was extracted with (falls back to current param)."""
+        if isinstance(entry, dict):
+            v = entry.get('_prebout')
+            if v is not None:
+                return int(v)
+        return int(self.params.get('preboutframes', 90))
+
+    def _realign_bout_trace(self, trace, src_prebout, dst_prebout=None, dst_total=None):
+        """Reposition one trace so its onset (at src_prebout) sits at dst_prebout
+        on an axis of length dst_total, NaN-padding/cropping as needed."""
+        if dst_prebout is None:
+            dst_prebout = int(self.params.get('preboutframes', 90))
+        if dst_total is None:
+            dst_total = dst_prebout + int(self.params.get('postboutframes', 90))
+        tr = np.asarray(trace, dtype=float)
+        out = np.full(dst_total, np.nan)
+        shift = dst_prebout - int(src_prebout)  # source idx s -> dst idx s + shift
+        dst_lo = max(0, shift)
+        dst_hi = min(dst_total, shift + len(tr))
+        if dst_hi > dst_lo:
+            out[dst_lo:dst_hi] = tr[dst_lo - shift:dst_hi - shift]
+        return out
+
+    def _realign_bouts(self, traces, src_prebout):
+        """Realign a list of stored traces onto the current window.  A no-op in
+        the common case where the stored window already matches the live params
+        (identity within floating tolerance), so it is safe to call everywhere."""
+        if not traces:
+            return []
+        dst_prebout = int(self.params.get('preboutframes', 90))
+        dst_total = dst_prebout + int(self.params.get('postboutframes', 90))
+        # Fast path: window already matches what the plotters expect.
+        if int(src_prebout) == dst_prebout and all(len(t) == dst_total for t in traces):
+            return list(traces)
+        return [self._realign_bout_trace(t, src_prebout, dst_prebout, dst_total)
+                for t in traces]
+
+    def _entry_channel_bouts(self, entry, channel_key, max_bouts=None):
+        """Fetch a channel's bouts from a behavior entry, realigned to the current
+        window.  Use this anywhere bouts are pulled for visualization so plots stay
+        correct across mixed extraction windows.  Returns [] when absent/empty."""
+        if not isinstance(entry, dict):
+            return []
+        bouts = entry.get(channel_key)
+        if not bouts:
+            return []
+        if max_bouts is not None:
+            bouts = bouts[:max_bouts]
+        return self._realign_bouts(bouts, self._entry_prebout(entry))
+
     def extract_entry_bouts(self, beh_synced, entry_frames_dict, num_photometry_channels=None):
         """Extract photometry traces aligned to zone entries
         
@@ -16711,6 +16838,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     packed[f'Ch{ch}'] = zone_bouts.get(f'Ch{ch}', [])
                 packed['G0'] = packed.get('Ch0', [])
                 packed['G1'] = packed.get('Ch1', [])
+                packed['_prebout'] = int(prebout)
+                packed['_postbout'] = int(postbout)
 
                 entry_bout_data[entry_type][display_name] = packed
                 self.log_message(f"    Extracted {sum(len(v) for v in packed.values())} total bouts for {entry_type}")
@@ -18712,10 +18841,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         variable=self.metric_min_post).grid(row=0, column=2, sticky='w', padx=5, pady=2)
         ttk.Checkbutton(mf, text="First Derivative (Max Rate of Change)",
                         variable=self.metric_first_deriv).grid(row=1, column=0, sticky='w', padx=5, pady=2)
-        ttk.Checkbutton(mf, text="Tau (Time Constant)",
+        ttk.Checkbutton(mf, text="Tau (Decay Constant)",
                         variable=self.metric_tau).grid(row=1, column=1, sticky='w', padx=5, pady=2)
         ttk.Checkbutton(mf, text="Area Under Curve",
                         variable=self.metric_auc).grid(row=1, column=2, sticky='w', padx=5, pady=2)
+        ttk.Checkbutton(mf, text="Half-Decay Time (t½)",
+                        variable=self.metric_t_half).grid(row=2, column=0, sticky='w', padx=5, pady=2)
         auc_row = ttk.Frame(mf)
         auc_row.grid(row=2, column=2, sticky='w', padx=20, pady=2)
         ttk.Radiobutton(auc_row, text="All",   variable=self.metric_auc_mode, value="both").pack(side='left', padx=2)
@@ -21586,15 +21717,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         channel_bouts = {}
         for ch in sel_chs:
             key = f'Ch{ch}'
+            # Realign to the current window so changing pre/post (without
+            # re-extracting) repositions the onset correctly instead of
+            # mislabelling the x-axis.
             if key in bout_data:
-                bouts = bout_data[key]
+                bouts = self._entry_channel_bouts(bout_data, key, max_bouts)
             else:
                 # Backwards compatibility: map Ch0->G0, Ch1->G1
                 gkey = 'G0' if ch == 0 else 'G1' if ch == 1 else None
-                bouts = bout_data.get(gkey, []) if gkey else []
+                bouts = self._entry_channel_bouts(bout_data, gkey, max_bouts) if gkey else []
 
-            if max_bouts is not None:
-                bouts = bouts[:max_bouts]
             channel_bouts[ch] = [b for b in bouts if len(b) > 0]
 
         # Ensure at least one channel has data
@@ -22088,10 +22220,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             bouts_list = behavior_entry[ch_key]
                             if not isinstance(bouts_list, (list, tuple)) or len(bouts_list) == 0:
                                 continue
-                            
+
                             # Apply max bouts limit
                             if max_bouts is not None and len(bouts_list) > max_bouts:
                                 bouts_list = bouts_list[:max_bouts]
+
+                            # Realign to the current window so exported bouts share
+                            # a common onset even across mixed extraction windows.
+                            bouts_list = self._realign_bouts(
+                                list(bouts_list), self._entry_prebout(behavior_entry))
                             
                             # Collect bouts for this subject-behavior-channel
                             subject_behavior_channel_bouts = {}
@@ -22357,11 +22494,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     for zone_name, zone_bouts in bout_type_data.items():
                         # G0 bouts
                         if show_g0 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G0')) and zone_bouts.get('G0'):
-                            g0_bouts = zone_bouts.get('G0', [])
-                            # Apply max bouts limit
-                            if max_bouts is not None and len(g0_bouts) > max_bouts:
-                                g0_bouts = g0_bouts[:max_bouts]
-                            
+                            # Realign to current window before export.
+                            g0_bouts = self._entry_channel_bouts(zone_bouts, 'G0', max_bouts)
+
                             if average_within_subject and len(g0_bouts) > 0:
                                 # Average within subject - create one averaged trace
                                 max_len = max(len(b) for b in g0_bouts)
@@ -22383,11 +22518,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         
                         # G1 bouts
                         if show_g1 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G1')) and zone_bouts.get('G1'):
-                            g1_bouts = zone_bouts.get('G1', [])
-                            # Apply max bouts limit
-                            if max_bouts is not None and len(g1_bouts) > max_bouts:
-                                g1_bouts = g1_bouts[:max_bouts]
-                            
+                            g1_bouts = self._entry_channel_bouts(zone_bouts, 'G1', max_bouts)
+
                             if average_within_subject and len(g1_bouts) > 0:
                                 # Average within subject - create one averaged trace
                                 max_len = max(len(b) for b in g1_bouts)
@@ -23091,9 +23223,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Use .get() — single-channel subjects only have a 'G0' key (no 'G1'),
         # so direct indexing would raise KeyError and crash the whole plot.
-        g0_bouts = bout_data.get('G0', []) if show_g0 else []
-        g1_bouts = bout_data.get('G1', []) if show_g1 else []
-        
+        # Realign to the current window so the onset marker matches the traces.
+        g0_bouts = self._entry_channel_bouts(bout_data, 'G0') if show_g0 else []
+        g1_bouts = self._entry_channel_bouts(bout_data, 'G1') if show_g1 else []
+
         # Determine layout
         n_plots = (1 if g0_bouts else 0) + (1 if g1_bouts else 0)
         if n_plots == 0:
@@ -23760,13 +23893,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             subject_has_g1 = subject in subjects_for_g1
             
             if average_within_subject:
-                # Average within subject first
+                # Average within subject first (realigned to current window)
                 if show_g0 and subject_has_g0 and bout_data['G0']:
-                    subject_g0_bouts = bout_data['G0']
-                    # Apply max bouts limit per subject
-                    if max_bouts is not None and len(subject_g0_bouts) > max_bouts:
-                        subject_g0_bouts = subject_g0_bouts[:max_bouts]
-                    
+                    subject_g0_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+
                     if len(subject_g0_bouts) > 0:
                         max_len = max(len(b) for b in subject_g0_bouts)
                         bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
@@ -23774,13 +23904,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             bout_matrix[i, :len(bout)] = bout
                         subject_avg = np.nanmean(bout_matrix, axis=0)
                         all_g0_bouts.append(subject_avg)
-                
+
                 if show_g1 and subject_has_g1 and bout_data['G1']:
-                    subject_g1_bouts = bout_data['G1']
-                    # Apply max bouts limit per subject
-                    if max_bouts is not None and len(subject_g1_bouts) > max_bouts:
-                        subject_g1_bouts = subject_g1_bouts[:max_bouts]
-                    
+                    subject_g1_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+
                     if len(subject_g1_bouts) > 0:
                         max_len = max(len(b) for b in subject_g1_bouts)
                         bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
@@ -23789,20 +23916,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         subject_avg = np.nanmean(bout_matrix, axis=0)
                         all_g1_bouts.append(subject_avg)
             else:
-                # Use all bouts (original behavior)
+                # Use all bouts (original behavior), realigned to current window
                 if show_g0 and subject_has_g0 and bout_data['G0']:
-                    subject_g0_bouts = bout_data['G0']
-                    # Apply max bouts limit per subject
-                    if max_bouts is not None and len(subject_g0_bouts) > max_bouts:
-                        subject_g0_bouts = subject_g0_bouts[:max_bouts]
-                    all_g0_bouts.extend(subject_g0_bouts)
-                
+                    all_g0_bouts.extend(self._entry_channel_bouts(bout_data, 'G0', max_bouts))
+
                 if show_g1 and subject_has_g1 and bout_data['G1']:
-                    subject_g1_bouts = bout_data['G1']
-                    # Apply max bouts limit per subject
-                    if max_bouts is not None and len(subject_g1_bouts) > max_bouts:
-                        subject_g1_bouts = subject_g1_bouts[:max_bouts]
-                    all_g1_bouts.extend(subject_g1_bouts)
+                    all_g1_bouts.extend(self._entry_channel_bouts(bout_data, 'G1', max_bouts))
         
         n_plots = (1 if all_g0_bouts else 0) + (1 if all_g1_bouts else 0)
         if n_plots == 0:
@@ -23955,9 +24074,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                 if average_within_subject:
                     if show_g0 and subject_has_g0 and bout_data['G0']:
-                        subj_bouts = bout_data['G0']
-                        if max_bouts is not None and len(subj_bouts) > max_bouts:
-                            subj_bouts = subj_bouts[:max_bouts]
+                        subj_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
                         if subj_bouts:
                             m = max(len(b) for b in subj_bouts)
                             mat = np.full((len(subj_bouts), m), np.nan)
@@ -23966,9 +24083,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             g0_bouts.append(np.nanmean(mat, axis=0))
 
                     if show_g1 and subject_has_g1 and bout_data['G1']:
-                        subj_bouts = bout_data['G1']
-                        if max_bouts is not None and len(subj_bouts) > max_bouts:
-                            subj_bouts = subj_bouts[:max_bouts]
+                        subj_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
                         if subj_bouts:
                             m = max(len(b) for b in subj_bouts)
                             mat = np.full((len(subj_bouts), m), np.nan)
@@ -23977,16 +24092,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             g1_bouts.append(np.nanmean(mat, axis=0))
                 else:
                     if show_g0 and subject_has_g0 and bout_data['G0']:
-                        subj_bouts = bout_data['G0']
-                        if max_bouts is not None and len(subj_bouts) > max_bouts:
-                            subj_bouts = subj_bouts[:max_bouts]
-                        g0_bouts.extend(subj_bouts)
+                        g0_bouts.extend(self._entry_channel_bouts(bout_data, 'G0', max_bouts))
 
                     if show_g1 and subject_has_g1 and bout_data['G1']:
-                        subj_bouts = bout_data['G1']
-                        if max_bouts is not None and len(subj_bouts) > max_bouts:
-                            subj_bouts = subj_bouts[:max_bouts]
-                        g1_bouts.extend(subj_bouts)
+                        g1_bouts.extend(self._entry_channel_bouts(bout_data, 'G1', max_bouts))
 
             group_g0_bouts[group_name] = g0_bouts
             group_g1_bouts[group_name] = g1_bouts
@@ -25065,6 +25174,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     fontsize=14, fontweight='bold', y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.96])
     
+    def _build_group_heatmap_rows(self, channel, group_names, subject_order,
+                                  subject_bouts, subject_bout_rows,
+                                  average_within_subject):
+        """Build the row matrix for a by-group heatmap.
+
+        When average_within_subject is True, each subject contributes one row
+        (its bout average). When False, every individual bout is its own row,
+        but the y-axis is still labelled once per subject (at the centre of
+        that subject's block of rows). Returns
+        (rows, ytick_positions, ytick_labels, group_row_counts)."""
+        rows = []
+        ytick_positions = []
+        ytick_labels = []
+        group_row_counts = []
+        for group_name in group_names:
+            rows_before = len(rows)
+            for group, subject in subject_order:
+                if group != group_name:
+                    continue
+                key = (group, subject, channel)
+                if average_within_subject:
+                    if key in subject_bouts:
+                        ytick_positions.append(len(rows))
+                        ytick_labels.append(subject[:8])
+                        rows.append(subject_bouts[key])
+                else:
+                    bouts = subject_bout_rows.get(key, [])
+                    if bouts:
+                        block_start = len(rows)
+                        rows.extend(bouts)
+                        # Single label centred on this subject's block of bouts
+                        ytick_positions.append((block_start + len(rows) - 1) / 2)
+                        ytick_labels.append(subject[:8])
+            group_row_counts.append(len(rows) - rows_before)
+        return rows, ytick_positions, ytick_labels, group_row_counts
+
     def plot_extracted_bouts_by_group(self, fig, group_names):
         """Plot extracted bouts by group with traces and individual subject heatmaps"""
         behavior = self.behavior_var.get()
@@ -25081,6 +25226,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         group_bouts = {}  # {group_name: {'G0': [bouts], 'G1': [bouts]}}
         subject_order = []  # List of (group_name, subject) tuples for heatmap ordering
         subject_bouts = {}  # {(group_name, subject, channel): averaged_bout_array}
+        subject_bout_rows = {}  # {(group_name, subject, channel): [individual bout arrays]}
         
         for group_name in group_names:
             group_bouts[group_name] = {'G0': [], 'G1': []}
@@ -25121,49 +25267,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
                 # Process G0 bouts for this subject (only if not excluded)
                 if subject_has_g0 and bout_data.get('G0'):
-                    subject_g0_bouts = bout_data['G0']
-                    
-                    # Apply max bouts limit per subject
+                    # Realign to current window so groups built from subjects with
+                    # different pre/post still share a common onset.
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if max_bouts is not None:
-                        subject_g0_bouts = subject_g0_bouts[:max_bouts]
-                    
+                    subject_g0_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+
                     if len(subject_g0_bouts) > 0:
                         max_len = max(len(b) for b in subject_g0_bouts)
                         bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
                         for i, bout in enumerate(subject_g0_bouts):
                             bout_matrix[i, :len(bout)] = bout
-                        
+
                         # Average within subject for the trace
                         subject_avg = np.nanmean(bout_matrix, axis=0)
                         group_bouts[group_name]['G0'].append(subject_avg)
                         
-                        # Store for heatmap (averaged per subject)
+                        # Store for heatmap: subject average (when averaging
+                        # within subject) and all individual bouts (when not)
                         subject_bouts[(group_name, subject, 'G0')] = subject_avg
+                        subject_bout_rows[(group_name, subject, 'G0')] = list(subject_g0_bouts)
                         if (group_name, subject) not in subject_order:
                             subject_order.append((group_name, subject))
                 
                 # Process G1 bouts for this subject (only if not excluded)
                 if subject_has_g1 and bout_data.get('G1'):
-                    subject_g1_bouts = bout_data['G1']
-                    
-                    # Apply max bouts limit per subject
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if max_bouts is not None:
-                        subject_g1_bouts = subject_g1_bouts[:max_bouts]
-                    
+                    subject_g1_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+
                     if len(subject_g1_bouts) > 0:
                         max_len = max(len(b) for b in subject_g1_bouts)
                         bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
                         for i, bout in enumerate(subject_g1_bouts):
                             bout_matrix[i, :len(bout)] = bout
-                        
+
                         # Average within subject for the trace
                         subject_avg = np.nanmean(bout_matrix, axis=0)
                         group_bouts[group_name]['G1'].append(subject_avg)
                         
-                        # Store for heatmap
+                        # Store for heatmap: subject average (when averaging
+                        # within subject) and all individual bouts (when not)
                         subject_bouts[(group_name, subject, 'G1')] = subject_avg
+                        subject_bout_rows[(group_name, subject, 'G1')] = list(subject_g1_bouts)
                         if (group_name, subject) not in subject_order:
                             subject_order.append((group_name, subject))
         
@@ -25239,37 +25383,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax1_trace.legend(loc='best', fontsize=8)
             ax1_trace.grid(True, alpha=0.3)
             
-            # Plot G0 heatmap (individual subjects ordered by group)
+            # Plot G0 heatmap (individual subjects ordered by group). When
+            # "average within subject" is off, every bout is its own row.
             if ax1_heat is not None and subject_order:
-                heatmap_data = []
-                ytick_labels = []
-                ytick_positions = []
-                current_row = 0
-                
-                for group_name in group_names:
-                    group_start_row = current_row
-                    for group, subject in subject_order:
-                        if group != group_name:
-                            continue
-                        key = (group, subject, 'G0')
-                        if key in subject_bouts:
-                            heatmap_data.append(subject_bouts[key])
-                            ytick_labels.append(f'{subject[:8]}')  # Truncate long names
-                            ytick_positions.append(current_row)
-                            current_row += 1
-                    
-                    # Add group label separator
-                    if current_row > group_start_row:
-                        # Add midpoint label for group
-                        group_mid = (group_start_row + current_row - 1) / 2
-                
+                (heatmap_data, ytick_positions, ytick_labels,
+                 group_row_counts) = self._build_group_heatmap_rows(
+                    'G0', group_names, subject_order, subject_bouts,
+                    subject_bout_rows, average_within_subject)
+
                 if heatmap_data:
                     # Pad all to same length
                     max_len = max(len(b) for b in heatmap_data)
                     heatmap_matrix = np.full((len(heatmap_data), max_len), np.nan)
                     for i, bout in enumerate(heatmap_data):
                         heatmap_matrix[i, :len(bout)] = bout
-                    
+
                     time_axis = (np.arange(max_len) - prebout) / fps
                     im = ax1_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
                                         extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
@@ -25277,20 +25405,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax1_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
                     ax1_heat.set_xlabel('Time from bout onset (s)')
                     ax1_heat.set_ylabel('Subject (by group)')
-                    ax1_heat.set_title('G0 Heatmap')
+                    ax1_heat.set_title('G0 Heatmap' if average_within_subject
+                                       else 'G0 Heatmap (All Bouts)')
                     ax1_heat.set_yticks(ytick_positions)
                     ax1_heat.set_yticklabels(ytick_labels, fontsize=7)
-                    
-                    # Add group dividers
+
+                    # Add group dividers between each group's block of rows
                     current_row = 0
-                    for group_name in group_names:
-                        group_count = sum(1 for g, s in subject_order if g == group_name 
-                                        and (g, s, 'G0') in subject_bouts)
+                    for group_count in group_row_counts:
                         if group_count > 0:
                             current_row += group_count
                             if current_row < len(heatmap_data):
                                 ax1_heat.axhline(current_row, color='white', linestyle='-', linewidth=2)
-                    
+
                     plt.colorbar(im, ax=ax1_heat, label='Z-score')
         
         # Plot G1 trace and heatmap
@@ -25326,37 +25453,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax2_trace.legend(loc='best', fontsize=8)
             ax2_trace.grid(True, alpha=0.3)
             
-            # Plot G1 heatmap (individual subjects ordered by group)
+            # Plot G1 heatmap (individual subjects ordered by group). When
+            # "average within subject" is off, every bout is its own row.
             if ax2_heat is not None and subject_order:
-                heatmap_data = []
-                ytick_labels = []
-                ytick_positions = []
-                current_row = 0
-                
-                for group_name in group_names:
-                    group_start_row = current_row
-                    for group, subject in subject_order:
-                        if group != group_name:
-                            continue
-                        key = (group, subject, 'G1')
-                        if key in subject_bouts:
-                            heatmap_data.append(subject_bouts[key])
-                            ytick_labels.append(f'{subject[:8]}')  # Truncate long names
-                            ytick_positions.append(current_row)
-                            current_row += 1
-                    
-                    # Add group label separator
-                    if current_row > group_start_row:
-                        # Add midpoint label for group
-                        group_mid = (group_start_row + current_row - 1) / 2
-                
+                (heatmap_data, ytick_positions, ytick_labels,
+                 group_row_counts) = self._build_group_heatmap_rows(
+                    'G1', group_names, subject_order, subject_bouts,
+                    subject_bout_rows, average_within_subject)
+
                 if heatmap_data:
                     # Pad all to same length
                     max_len = max(len(b) for b in heatmap_data)
                     heatmap_matrix = np.full((len(heatmap_data), max_len), np.nan)
                     for i, bout in enumerate(heatmap_data):
                         heatmap_matrix[i, :len(bout)] = bout
-                    
+
                     time_axis = (np.arange(max_len) - prebout) / fps
                     im = ax2_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
                                         extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
@@ -25364,20 +25475,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax2_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
                     ax2_heat.set_xlabel('Time from bout onset (s)')
                     ax2_heat.set_ylabel('Subject (by group)')
-                    ax2_heat.set_title('G1 Heatmap')
+                    ax2_heat.set_title('G1 Heatmap' if average_within_subject
+                                       else 'G1 Heatmap (All Bouts)')
                     ax2_heat.set_yticks(ytick_positions)
                     ax2_heat.set_yticklabels(ytick_labels, fontsize=7)
-                    
-                    # Add group dividers
+
+                    # Add group dividers between each group's block of rows
                     current_row = 0
-                    for group_name in group_names:
-                        group_count = sum(1 for g, s in subject_order if g == group_name 
-                                        and (g, s, 'G1') in subject_bouts)
+                    for group_count in group_row_counts:
                         if group_count > 0:
                             current_row += group_count
                             if current_row < len(heatmap_data):
                                 ax2_heat.axhline(current_row, color='white', linestyle='-', linewidth=2)
-                    
+
                     plt.colorbar(im, ax=ax2_heat, label='Z-score')
         
         fig.tight_layout()
@@ -25419,13 +25529,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # have a 'G0'/'G1' key at all, and a bracket access would
                     # raise KeyError and abort the whole multi-subject plot.
                     if subject_has_g0 and bout_data.get('G0'):
-                        subject_g0_bouts = bout_data['G0']
-                        
-                        # Apply max bouts limit per subject
+                        # Realign to current window so subjects extracted with a
+                        # different pre/post still average against a common onset.
                         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        if max_bouts is not None:
-                            subject_g0_bouts = subject_g0_bouts[:max_bouts]
-                        
+                        subject_g0_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+
                         max_len = max(len(b) for b in subject_g0_bouts)
                         bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
                         for i, bout in enumerate(subject_g0_bouts):
@@ -25435,13 +25543,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     
                     # Average G1 bouts for this subject (only if not excluded)
                     if subject_has_g1 and bout_data.get('G1'):
-                        subject_g1_bouts = bout_data['G1']
-                        
-                        # Apply max bouts limit per subject
                         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        if max_bouts is not None:
-                            subject_g1_bouts = subject_g1_bouts[:max_bouts]
-                        
+                        subject_g1_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+
                         max_len = max(len(b) for b in subject_g1_bouts)
                         bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
                         for i, bout in enumerate(subject_g1_bouts):
@@ -25449,16 +25553,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         subject_avg = np.nanmean(bout_matrix, axis=0)
                         all_g1_bouts.append(subject_avg)
                 else:
-                    # Use all bouts (original behavior)
-                    bouts_g0 = bout_data.get('G0', []) if subject_has_g0 else []
-                    bouts_g1 = bout_data.get('G1', []) if subject_has_g1 else []
-                    
-                    # Apply max bouts limit per subject
+                    # Use all bouts (original behavior), realigned to current window
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if max_bouts is not None:
-                        bouts_g0 = bouts_g0[:max_bouts]
-                        bouts_g1 = bouts_g1[:max_bouts]
-                    
+                    bouts_g0 = self._entry_channel_bouts(bout_data, 'G0', max_bouts) if subject_has_g0 else []
+                    bouts_g1 = self._entry_channel_bouts(bout_data, 'G1', max_bouts) if subject_has_g1 else []
+
                     if bouts_g0:
                         all_g0_bouts.extend(bouts_g0)
                     if bouts_g1:
@@ -25635,15 +25734,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             show_g0 = subject in subjects_for_g0
             show_g1 = subject in subjects_for_g1
         
-        bouts_g0 = bout_data.get('G0', []) if show_g0 else []
-        bouts_g1 = bout_data.get('G1', []) if show_g1 else []
-        
-        # Apply max bouts limit
+        # Realign to current window so the onset marker matches the traces even
+        # if pre/post changed since extraction.
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-        if max_bouts is not None:
-            bouts_g0 = bouts_g0[:max_bouts]
-            bouts_g1 = bouts_g1[:max_bouts]
-        
+        bouts_g0 = self._entry_channel_bouts(bout_data, 'G0', max_bouts) if show_g0 else []
+        bouts_g1 = self._entry_channel_bouts(bout_data, 'G1', max_bouts) if show_g1 else []
+
         # Filter by selected bout number if not "All"
         selected_bout = self.bout_number_var.get()
         if selected_bout != "All":
@@ -25794,22 +25890,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if 'bouts' in data and behavior in data['bouts']:
                 bout_data = data['bouts'][behavior]
                 
-                # Check if subject is excluded for each channel
+                # Check if subject is excluded for each channel.  Realign to the
+                # current window so bouts pooled by number across subjects share a
+                # common onset even when extracted with different pre/post.
+                max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
                 if subject in subjects_for_g0 and bout_data.get('G0'):
-                    bouts = bout_data['G0']
-                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if max_bouts is not None:
-                        bouts = bouts[:max_bouts]
+                    bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
                     for bout_num, bout in enumerate(bouts, 1):
                         if bout_num not in g0_bouts_by_number:
                             g0_bouts_by_number[bout_num] = []
                         g0_bouts_by_number[bout_num].append(bout)
-                
+
                 if subject in subjects_for_g1 and bout_data.get('G1'):
-                    bouts = bout_data['G1']
-                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if max_bouts is not None:
-                        bouts = bouts[:max_bouts]
+                    bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
                     for bout_num, bout in enumerate(bouts, 1):
                         if bout_num not in g1_bouts_by_number:
                             g1_bouts_by_number[bout_num] = []
@@ -25987,22 +26080,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if 'bouts' in data and behavior in data['bouts']:
                     bout_data = data['bouts'][behavior]
                     
-                    # Check if subject is excluded for each channel
+                    # Check if subject is excluded for each channel.  Realign to
+                    # the current window so bouts pooled by number across groups
+                    # share a common onset regardless of extraction pre/post.
+                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
                     if subject in subjects_for_g0 and bout_data.get('G0'):
-                        bouts = bout_data['G0']
-                        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        if max_bouts is not None:
-                            bouts = bouts[:max_bouts]
+                        bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
                         for bout_num, bout in enumerate(bouts, 1):
                             if bout_num not in g0_data_by_group[group_name]:
                                 g0_data_by_group[group_name][bout_num] = []
                             g0_data_by_group[group_name][bout_num].append(bout)
-                    
+
                     if subject in subjects_for_g1 and bout_data.get('G1'):
-                        bouts = bout_data['G1']
-                        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        if max_bouts is not None:
-                            bouts = bouts[:max_bouts]
+                        bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
                         for bout_num, bout in enumerate(bouts, 1):
                             if bout_num not in g1_data_by_group[group_name]:
                                 g1_data_by_group[group_name][bout_num] = []
@@ -26602,14 +26692,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             data = self.processed_data[subject]
             if 'bouts' not in data or behavior not in data['bouts']:
                 continue
-            bouts_data = data['bouts'][behavior].get(channel, [])
+            entry = data['bouts'][behavior]
+            bouts_data = entry.get(channel, [])
             if not bouts_data:
                 # Backwards compatibility: Ch0<->G0, Ch1<->G1
                 alt = 'G0' if channel == 'Ch0' else 'G1' if channel == 'Ch1' else None
                 if alt:
-                    bouts_data = data['bouts'][behavior].get(alt, [])
+                    bouts_data = entry.get(alt, [])
             if max_bouts is not None:
                 bouts_data = bouts_data[:max_bouts]
+            # Realign to current window so subjects/bouts extracted with different
+            # pre/post stack on a common onset (otherwise the min-length truncation
+            # below silently drops samples and mis-aligns the time course).
+            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
             grp = subject_to_group.get(subject)
             for order, bout in enumerate(bouts_data, 1):
                 arr = np.asarray(bout, dtype=float)
@@ -26652,13 +26747,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 for beh in behaviors:
                     if beh not in data['bouts']:
                         continue
-                    bouts_data = data['bouts'][beh].get(channel, [])
+                    entry = data['bouts'][beh]
+                    bouts_data = entry.get(channel, [])
                     if not bouts_data:
                         alt = 'G0' if channel == 'Ch0' else 'G1' if channel == 'Ch1' else None
                         if alt:
-                            bouts_data = data['bouts'][beh].get(alt, [])
+                            bouts_data = entry.get(alt, [])
                     if max_bouts is not None:
                         bouts_data = bouts_data[:max_bouts]
+                    bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
                     for bout in bouts_data:
                         arr = np.asarray(bout, dtype=float)
                         if arr.size == 0 or not np.any(np.isfinite(arr)):
@@ -26690,13 +26787,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for beh in behaviors:
                 if beh not in data['bouts']:
                     continue
-                bouts_data = data['bouts'][beh].get(channel, [])
+                entry = data['bouts'][beh]
+                bouts_data = entry.get(channel, [])
                 if not bouts_data:
                     alt = 'G0' if channel == 'Ch0' else 'G1' if channel == 'Ch1' else None
                     if alt:
-                        bouts_data = data['bouts'][beh].get(alt, [])
+                        bouts_data = entry.get(alt, [])
                 if max_bouts is not None:
                     bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
                 for bout in bouts_data:
                     arr = np.asarray(bout, dtype=float)
                     if arr.size == 0 or not np.any(np.isfinite(arr)):
@@ -28266,13 +28365,14 @@ cat("OK\n")
         calc_min = self.metric_min_post.get()
         calc_deriv = self.metric_first_deriv.get()
         calc_tau = self.metric_tau.get()
+        calc_t_half = self.metric_t_half.get()
         calc_auc = self.metric_auc.get()
         auc_mode = self.metric_auc_mode.get()
-        
-        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_auc]):
+
+        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_t_half, calc_auc]):
             messagebox.showerror("Error", "Please select at least one metric to calculate")
             return
-        
+
         # Clear previous results
         self.bout_metrics_tree.delete(*self.bout_metrics_tree.get_children())
         
@@ -28298,6 +28398,8 @@ cat("OK\n")
             columns.append('Max Derivative')
         if calc_tau:
             columns.append('Tau (seconds)')
+        if calc_t_half:
+            columns.append('t½ (seconds)')
         if calc_auc:
             auc_label = 'AUC'
             if auc_mode == 'above':
@@ -28341,12 +28443,13 @@ cat("OK\n")
                 if group_subjects:
                     self.bout_metrics_data[combo_key]['groups'][group_name] = group_subjects
         
-        for metric in ['avg_post', 'max_post', 'min_post', 'max_deriv', 'tau', 'auc']:
+        for metric in ['avg_post', 'max_post', 'min_post', 'max_deriv', 'tau', 't_half', 'auc']:
             if (metric == 'avg_post' and calc_avg) or \
                (metric == 'max_post' and calc_max) or \
                (metric == 'min_post' and calc_min) or \
                (metric == 'max_deriv' and calc_deriv) or \
                (metric == 'tau' and calc_tau) or \
+               (metric == 't_half' and calc_t_half) or \
                (metric == 'auc' and calc_auc):
                 self.bout_metrics_data[combo_key]['metrics'][metric] = []
         
@@ -28435,7 +28538,17 @@ cat("OK\n")
                         self.bout_metrics_data[combo_key]['by_subject'][subject]['tau'].append(tau_val)
                     else:
                         row_values.append("N/A")
-                
+
+                if calc_t_half:
+                    # Model-free half-decay time from the peak (seconds)
+                    t_half_val = self.calculate_t_half(post_bout_data)
+                    if t_half_val is not None:
+                        row_values.append(f"{t_half_val:.2f}")
+                        self.bout_metrics_data[combo_key]['metrics']['t_half'].append(t_half_val)
+                        self.bout_metrics_data[combo_key]['by_subject'][subject]['t_half'].append(t_half_val)
+                    else:
+                        row_values.append("N/A")
+
                 if calc_auc:
                     # Calculate area under curve using trapezoidal rule
                     # Apply mode: 'both', 'above' (positive only), 'below' (negative only)
@@ -28473,56 +28586,107 @@ cat("OK\n")
             except Exception as e:
                 self.log_message(f"Auto-graph generation failed: {e}")
     
-    def calculate_tau(self, data):
-        """Calculate time constant (tau) from exponential fit (decay or rise), returned in seconds"""
+    def _orient_transient(self, data):
+        """Orient a window so its dominant transient is a positive deflection
+        and locate the peak. Decay metrics measure the descent from this peak.
+
+        A signal that dips below baseline (negative-going transient) is flipped
+        so the same decay-from-peak logic applies to both. Returns
+        (sig, baseline, peak_idx) with sig oriented positive, or None if the
+        window is too short. ``baseline`` is estimated from the leading samples
+        of the window (before the peak) as a robust median."""
+        data = np.asarray(data, dtype=float)
+        data = data[~np.isnan(data)]
         if len(data) < 5:
             return None
-        
-        fps = self.params.get('fps', 1)
-        
-        try:
-            x = np.arange(len(data))
-            
-            # Determine if signal is decaying or rising
-            start_val = np.mean(data[:3])
-            end_val = np.mean(data[-3:])
-            amplitude = start_val - end_val
-            
-            if abs(amplitude) < 1e-6:
-                return None  # No meaningful change
-            
-            if amplitude > 0:
-                # Decay: a * exp(-x/tau) + c
-                def exp_func(x, a, tau, c):
-                    return a * np.exp(-x / tau) + c
-                
-                a0 = amplitude
-                tau0 = len(data) / 3
-                c0 = end_val
-                bounds = ([0, 1, -np.inf], [np.inf, len(data) * 2, np.inf])
-            else:
-                # Rise: a * (1 - exp(-x/tau)) + c
-                def exp_func(x, a, tau, c):
-                    return a * (1 - np.exp(-x / tau)) + c
-                
-                a0 = end_val - start_val
-                tau0 = len(data) / 3
-                c0 = start_val
-                bounds = ([0, 1, -np.inf], [np.inf, len(data) * 2, np.inf])
-            
-            popt, _ = curve_fit(
-                exp_func, x, data,
-                p0=[a0, tau0, c0],
-                bounds=bounds,
-                maxfev=5000
-            )
-            
-            tau_frames = popt[1]
-            tau_seconds = tau_frames / fps  # Convert frames to seconds
-            return tau_seconds
-        except:
+
+        # Baseline = median of the leading portion of the window (pre-peak level)
+        lead = max(3, len(data) // 10)
+        baseline = float(np.median(data[:lead]))
+
+        pos_idx = int(np.argmax(data))
+        neg_idx = int(np.argmin(data))
+        # Choose whichever excursion from baseline is larger as "the" transient
+        if abs(data[pos_idx] - baseline) >= abs(data[neg_idx] - baseline):
+            return data, baseline, pos_idx
+        # Negative-going: flip so the peak is a positive deflection
+        return -data, -baseline, neg_idx
+
+    def calculate_tau(self, data):
+        """Decay time constant (tau, in seconds) from a mono-exponential fit of
+        the descending phase, measured from the peak of the transient to the end
+        of the window: ``a*exp(-(t-t_peak)/tau) + c``. Tau is the time to fall to
+        1/e (~37%) of the peak above the post-decay baseline.
+
+        Unlike a fit over the whole window, this isolates the decay and ignores
+        the baseline and rising edge, so it reflects the true decay rate of the
+        event. Returns None if the decay cannot be estimated (no clear peak,
+        too few post-peak samples, or the fit fails to converge)."""
+        oriented = self._orient_transient(data)
+        if oriented is None:
             return None
-    
+        sig, baseline, peak_idx = oriented
+
+        fps = self.params.get('fps', 1) or 1
+
+        # Fit only the descending phase, from the peak to the end of the window
+        decay = sig[peak_idx:]
+        if len(decay) < 5:
+            return None
+
+        amp = float(decay[0] - baseline)
+        if amp <= 1e-6:
+            return None  # no meaningful deflection to decay from
+
+        try:
+            x = np.arange(len(decay))
+
+            def exp_decay(x, a, tau, c):
+                return a * np.exp(-x / tau) + c
+
+            tau0 = max(2.0, len(decay) / 3.0)
+            popt, _ = curve_fit(
+                exp_decay, x, decay,
+                p0=[amp, tau0, baseline],
+                bounds=([0, 1e-3, -np.inf], [np.inf, len(decay) * 5, np.inf]),
+                maxfev=5000,
+            )
+            tau_seconds = popt[1] / fps  # frames -> seconds
+            return tau_seconds
+        except Exception:
+            return None
+
+    def calculate_t_half(self, data):
+        """Model-free half-decay time (in seconds): time from the peak of the
+        transient until the signal falls halfway back to its baseline.
+
+        Because it requires no curve fitting, it never fails to converge and is
+        robust to noise -- often a more trustworthy decay measure than tau. The
+        crossing is linearly interpolated between frames for sub-frame
+        precision. Returns None if the signal never decays to the half level
+        within the window."""
+        oriented = self._orient_transient(data)
+        if oriented is None:
+            return None
+        sig, baseline, peak_idx = oriented
+
+        fps = self.params.get('fps', 1) or 1
+
+        peak_val = float(sig[peak_idx])
+        amp = peak_val - baseline
+        if amp <= 1e-6:
+            return None
+
+        half_level = baseline + amp / 2.0
+        # Walk forward from the peak to the first crossing of the half level
+        for i in range(peak_idx + 1, len(sig)):
+            if sig[i] <= half_level:
+                prev, curr = sig[i - 1], sig[i]
+                frac = 0.0 if prev == curr else (prev - half_level) / (prev - curr)
+                t_frames = (i - 1 + frac) - peak_idx
+                return t_frames / fps
+        return None  # never decayed to half within the window
+
     def generate_bout_bar_graphs(self):
         """Generate bar graphs for calculated metrics (mean ± SEM per subject or group)"""
         if not hasattr(self, 'bout_metrics_data') or not self.bout_metrics_data:
@@ -28601,9 +28765,10 @@ cat("OK\n")
             'max_post': 'Max Post-Bout Z-Score',
             'min_post': 'Min Post-Bout Z-Score',
             'max_deriv': 'Max First Derivative (Δz/s)',
-            'tau': 'Tau (Time Constant, seconds)'
+            'tau': 'Tau (Decay Constant, seconds)',
+            't_half': 'Half-Decay Time t½ (seconds)'
         }
-        
+
         for idx, metric_key in enumerate(metrics.keys(), 1):
             ax = fig.add_subplot(num_metrics, 1, idx)
             
@@ -29317,11 +29482,15 @@ cat("OK\n")
             data = self.processed_data[subject]
             if 'bouts' not in data or behavior not in data['bouts']:
                 continue
-            bouts_data = data['bouts'][behavior].get(channel, [])
+            entry = data['bouts'][behavior]
+            bouts_data = entry.get(channel, [])
             if not bouts_data:
                 continue
             if max_bouts is not None:
                 bouts_data = bouts_data[:max_bouts]
+            # Realign so the onset index below is valid even if this subject's
+            # bouts were extracted with a different pre/post window.
+            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
 
             # Assign each bout to a bin (0-based)
             bin_accum = {}  # {bin_idx: {metric: [values]}}
@@ -29743,13 +29912,14 @@ cat("OK\n")
         calc_min = self.metric_min_post.get()
         calc_deriv = self.metric_first_deriv.get()
         calc_tau = self.metric_tau.get()
+        calc_t_half = self.metric_t_half.get()
         calc_auc = self.metric_auc.get()
         auc_mode = self.metric_auc_mode.get()
-        
-        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_auc]):
+
+        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_t_half, calc_auc]):
             messagebox.showerror("Error", "Please select at least one metric to calculate")
             return
-        
+
         # Determine which metrics are active
         active_metrics = []
         if calc_avg: active_metrics.append('avg_post')
@@ -29757,14 +29927,16 @@ cat("OK\n")
         if calc_min: active_metrics.append('min_post')
         if calc_deriv: active_metrics.append('max_deriv')
         if calc_tau: active_metrics.append('tau')
+        if calc_t_half: active_metrics.append('t_half')
         if calc_auc: active_metrics.append('auc')
-        
+
         metric_names = {
             'avg_post': 'Average Post-Bout Z-Score',
             'max_post': 'Max Post-Bout Z-Score',
             'min_post': 'Min Post-Bout Z-Score',
             'max_deriv': 'Max First Derivative (\u0394z/s)',
-            'tau': 'Tau (Time Constant, seconds)',
+            'tau': 'Tau (Decay Constant, seconds)',
+            't_half': 'Half-Decay Time t\u00bd (seconds)',
             'auc': 'Area Under Curve'
         }
         
@@ -29848,6 +30020,10 @@ cat("OK\n")
                         tau_val = self.calculate_tau(post_bout_data)
                         if tau_val is not None:
                             subject_data[subject][label]['tau'].append(tau_val)
+                    if calc_t_half:
+                        t_half_val = self.calculate_t_half(post_bout_data)
+                        if t_half_val is not None:
+                            subject_data[subject][label]['t_half'].append(t_half_val)
                     if calc_auc:
                         auc_data = post_bout_data.copy()
                         if auc_mode == 'above':
@@ -30162,7 +30338,8 @@ cat("OK\n")
             'max_post': 'Max Post-Bout Z-Score',
             'min_post': 'Min Post-Bout Z-Score',
             'max_deriv': 'Max First Derivative (Δz/s)',
-            'tau': 'Tau (Time Constant, seconds)',
+            'tau': 'Tau (Decay Constant, seconds)',
+            't_half': 'Half-Decay Time t½ (seconds)',
             'auc': 'Area Under Curve'
         }
         
@@ -30699,6 +30876,7 @@ cat("OK\n")
                     'Min Post-Bout'   if self.metric_min_post.get()    else '',
                     'Max Derivative'  if self.metric_first_deriv.get() else '',
                     'Tau'             if self.metric_tau.get()         else '',
+                    'Half-Decay (t½)' if self.metric_t_half.get()     else '',
                     f'AUC ({auc_mode_str})' if self.metric_auc.get()  else '',
                 ])) or '(none)'
 
@@ -30824,6 +31002,9 @@ cat("OK\n")
                     elif key == 'tau':
                         t = self.calculate_tau(seg)
                         val = float(t) if t is not None else np.nan
+                    elif key == 't_half':
+                        t = self.calculate_t_half(seg)
+                        val = float(t) if t is not None else np.nan
                     elif key == 'auc':
                         auc_data = np.array(seg, dtype=float).copy()
                         if auc_mode == 'above':
@@ -30873,9 +31054,10 @@ cat("OK\n")
         calc_min   = self.metric_min_post.get()
         calc_deriv = self.metric_first_deriv.get()
         calc_tau   = self.metric_tau.get()
+        calc_t_half = self.metric_t_half.get()
         calc_auc   = self.metric_auc.get()
         auc_mode   = self.metric_auc_mode.get()
-        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_auc]):
+        if not any([calc_avg, calc_max, calc_min, calc_deriv, calc_tau, calc_t_half, calc_auc]):
             messagebox.showerror("Error", "Please select at least one metric in Settings.")
             return
 
@@ -30890,6 +31072,7 @@ cat("OK\n")
         if calc_min:   metric_specs.append(('min_post',  'Min Post-Bout'))
         if calc_deriv: metric_specs.append(('max_deriv', 'Max Derivative'))
         if calc_tau:   metric_specs.append(('tau',       'Tau (seconds)'))
+        if calc_t_half: metric_specs.append(('t_half',   't½ (seconds)'))
         if calc_auc:   metric_specs.append(('auc',       auc_label))
 
         # ── Analysis window ───────────────────────────────────────────────
