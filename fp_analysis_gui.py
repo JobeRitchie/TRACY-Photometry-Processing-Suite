@@ -17,6 +17,8 @@ from scipy.optimize import curve_fit
 from scipy import stats
 from scipy.signal import coherence, spectrogram, fftconvolve, butter, filtfilt, savgol_filter
 import os
+import re
+import sys
 import json
 import subprocess
 from pathlib import Path
@@ -32,8 +34,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.2.2"
-APP_VERSION_DATE = "June 3, 2026"
+APP_VERSION = "1.3.0"
+APP_VERSION_DATE = "June 17, 2026"
 
 
 class ZoneEditor:
@@ -872,9 +874,110 @@ class ZoneEditor:
 
 
 class FPAnalysisGUI:
+    @staticmethod
+    def _resolve_asset(name):
+        """Path to a bundled asset, working both as a script and a PyInstaller bundle."""
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, "assets", name)
+
+    def _set_window_icon(self):
+        """Apply the TRACY logo to the title bar / taskbar. Never fatal if missing."""
+        ico = self._resolve_asset("tracy_icon.ico")
+        try:
+            # Baseline (and the title-bar / non-Windows path).
+            self.root.iconbitmap(default=ico)
+        except Exception:
+            try:
+                self._icon_img = tk.PhotoImage(file=self._resolve_asset("tracy_logo.png"))
+                self.root.iconphoto(True, self._icon_img)
+            except Exception:
+                pass
+        # tkinter's iconbitmap loads a single small frame and lets Windows
+        # stretch it for the taskbar -> blurry. Set the icon through the Win32
+        # API instead so Windows picks the best-fit frame from the .ico at the
+        # exact small/large sizes it needs (the crisp way the shell does it).
+        # Re-apply a few times: the window is maximized and the GUI is rebuilt
+        # after this runs, and matplotlib later flips the process DPI awareness,
+        # any of which can reset the class icon.
+        if os.name == "nt" and os.path.exists(ico):
+            for delay in (60, 800, 2500):
+                self.root.after(delay, lambda: self._apply_windows_icon(ico))
+
+    def _real_dpi_scale(self, u, hwnd):
+        """True monitor DPI scale (e.g. 1.5 at 150%), even though this process is
+        DPI-unaware. A DPI-unaware process only ever *sees* 96 DPI, so we briefly
+        flip THIS THREAD to per-monitor awareness to read the real value, then
+        restore it so Tk's rendering / window size are left untouched."""
+        import ctypes
+        from ctypes import wintypes
+        prev = None
+        try:
+            u.SetThreadDpiAwarenessContext.restype = wintypes.HANDLE
+            u.SetThreadDpiAwarenessContext.argtypes = [wintypes.HANDLE]
+            prev = u.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # per-monitor v2
+        except Exception:
+            prev = None
+        scale = 1.0
+        try:
+            dx, dy = wintypes.UINT(), wintypes.UINT()
+            hmon = u.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+            if ctypes.windll.shcore.GetDpiForMonitor(
+                    hmon, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0 and dx.value:
+                scale = dx.value / 96.0
+        except Exception:
+            pass
+        finally:
+            if prev is not None:
+                try:
+                    u.SetThreadDpiAwarenessContext(prev)
+                except Exception:
+                    pass
+        return scale
+
+    def _apply_windows_icon(self, ico):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            u.LoadImageW.restype = wintypes.HANDLE
+            u.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                     ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                       wintypes.WPARAM, wintypes.LPARAM]
+            IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
+            WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+            hwnd = u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            # DPI-correct window icons for the title bar / Alt+Tab.
+            scale = self._real_dpi_scale(u, hwnd)
+            small = u.LoadImageW(None, ico, IMAGE_ICON,
+                                 round(16 * scale), round(16 * scale), LR_LOADFROMFILE)
+            big = u.LoadImageW(None, ico, IMAGE_ICON,
+                               round(32 * scale), round(32 * scale), LR_LOADFROMFILE)
+            if small:
+                u.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small)
+            if big:
+                u.SendMessageW(hwnd, WM_SETICON, ICON_BIG, big)
+            # THE TASKBAR reads the window-CLASS icon. tkinter set it to a small
+            # frame, and whatever exact pixel size the taskbar wants (≈36 px at
+            # 150%) it UPSCALES that small frame -> the fuzzy edges. We can't be
+            # sure of the precise size it wants, so hand it a 256 px icon: Windows
+            # then only ever DOWNSCALES (always crisp) and never upscales. This
+            # also works regardless of the process's DPI-awareness state.
+            hires = u.LoadImageW(None, ico, IMAGE_ICON, 256, 256, LR_LOADFROMFILE)
+            setcls = getattr(u, "SetClassLongPtrW", None) or getattr(u, "SetClassLongW", None)
+            if setcls is not None and hires:
+                setcls.restype = wintypes.HANDLE
+                setcls.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.HANDLE]
+                GCLP_HICON, GCLP_HICONSM = -14, -34
+                setcls(hwnd, GCLP_HICON, hires)
+                setcls(hwnd, GCLP_HICONSM, hires)
+        except Exception:
+            pass
+
     def __init__(self, root):
         self.root = root
         self.root.title(f"Tracy - Fiber Photometry Analysis Suite v{APP_VERSION}")
+        self._set_window_icon()
         # Fallback size if the window is later un-maximized, then open maximized.
         self.root.geometry("1400x900")
         try:
@@ -1424,25 +1527,60 @@ class FPAnalysisGUI:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
         self._tab_mousewheel_handlers = {}
-        
-        # Create tabs
+
+        # --- Main tab groups (ABEL-style): leaf tabs live in nested notebooks ---
+        # Welcome is a single landing page added directly to the main notebook.
         self.create_welcome_tab()
+
+        # Project group: project setup + data-shaping tabs
+        self._project_group_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self._project_group_frame, text="Project")
+        self.project_notebook = ttk.Notebook(self._project_group_frame)
+        self.project_notebook.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # Data group: analysis / results tabs
+        self._data_group_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self._data_group_frame, text="Data")
+        self.data_notebook = ttk.Notebook(self._data_group_frame)
+        self.data_notebook.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # Info group: overview, changelog, system check
+        self._info_group_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self._info_group_frame, text="Info")
+        self.info_notebook = ttk.Notebook(self._info_group_frame)
+        self.info_notebook.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self._sub_notebooks = [
+            self.project_notebook, self.data_notebook, self.info_notebook,
+        ]
+        self._group_frame_to_subnb = {
+            str(self._project_group_frame): self.project_notebook,
+            str(self._data_group_frame): self.data_notebook,
+            str(self._info_group_frame): self.info_notebook,
+        }
+
+        # Project-group subtabs
         self.create_project_tab()
         self.create_processing_tab()
         self.create_boutframes_tab()
         self.create_groups_tab()
         self.create_exclusions_tab()
+        # Data-group subtabs
         self.create_behavioral_data_tab()
         self.create_visualization_tab()
         self.create_connectivity_analysis_tab()
         self.create_spike_analysis_tab()
         self.create_bout_analysis_tab()
         self.create_decision_probability_tab()
+        self.create_kinematics_tab()
+        # Info-group subtabs
         self.create_info_tab()
         self.create_system_tab()
 
         # Keep mouse wheel bound to the active tab's scroll canvas.
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+        for _sub_nb in self._sub_notebooks:
+            _sub_nb.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
         self.root.after(50, self._on_notebook_tab_changed)
 
         # Auto-check for updates on startup (background thread, non-blocking)
@@ -1470,8 +1608,13 @@ class FPAnalysisGUI:
             content_frame.bind("<Enter>", _activate_mousewheel)
 
     def _on_notebook_tab_changed(self, event=None):
-        """Bind global wheel events to the currently selected tab's canvas handler."""
+        """Bind global wheel events to the currently selected leaf tab's canvas handler."""
         current_tab = self.notebook.select()
+        # If a main-tab group is selected, drill into its sub-notebook to find the
+        # actually-visible leaf tab.
+        sub_nb = self._group_frame_to_subnb.get(current_tab)
+        if sub_nb is not None:
+            current_tab = sub_nb.select()
         handler = self._tab_mousewheel_handlers.get(current_tab)
         if handler is not None:
             self.root.bind_all("<MouseWheel>", handler)
@@ -1565,6 +1708,20 @@ class FPAnalysisGUI:
             bg=self.colors['bg_dark'])
         update_reminder_label.pack(pady=(8, 0))
 
+        # Live update-availability badge. Driven by the startup update check
+        # (_apply_update_check_result): a red blinking "Update available" when
+        # the local copy is behind origin/main, or a stable green "Up to date"
+        # when current. Stays blank until the first check resolves.
+        self._welcome_badge_blink_job = None
+        self._welcome_badge_blink_on = True
+        self.welcome_update_badge = tk.Label(
+            version_frame,
+            text="",
+            font=('Segoe UI', 13, 'bold'),
+            fg=self.colors['bg_dark'],
+            bg=self.colors['bg_dark'])
+        self.welcome_update_badge.pack(pady=(12, 0))
+
         # Getting started hint
         hint_frame = tk.Frame(main_frame, bg=self.colors['bg_medium'], padx=30, pady=15)
         hint_frame.pack(side='bottom', fill='x')
@@ -1578,8 +1735,8 @@ class FPAnalysisGUI:
         
     def create_project_tab(self):
         """Tab for project creation and management"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Project")
+        tab = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab, text="Setup")
         
         # Project info frame
         info_frame = ttk.LabelFrame(tab, text="Project Information", padding=10)
@@ -1655,8 +1812,8 @@ class FPAnalysisGUI:
         
     def create_processing_tab(self):
         """Tab for data processing"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Processing")
+        tab = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab, text="Processing")
         
         # Create canvas with scrollbar for scrollable content
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -2024,8 +2181,8 @@ class FPAnalysisGUI:
         
     def create_boutframes_tab(self):
         """Tab for viewing and editing boutframes"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Bout Frames Editor")
+        tab = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab, text="Bout Frames Editor")
 
         # ── Shared subject/file controls (above both subtabs) ──────────
         control_frame = ttk.Frame(tab)
@@ -2394,8 +2551,8 @@ class FPAnalysisGUI:
 
     def create_behavioral_data_tab(self):
         """Tab for behavioral metrics analysis"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Behavioral Data")
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Behavioral Data")
         
         # Create canvas with scrollbar for scrollable content
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -2510,8 +2667,8 @@ class FPAnalysisGUI:
 
     def create_groups_tab(self):
         """Tab for creating and managing subject groups"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Groups")
+        tab = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab, text="Groups")
         
         # Create canvas with scrollbar for scrollable content
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -2651,8 +2808,8 @@ class FPAnalysisGUI:
         
     def create_exclusions_tab(self):
         """Tab for managing subject exclusions on a per-channel basis"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Exclusions")
+        tab = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab, text="Exclusions")
         
         # Main container
         main_container = ttk.Frame(tab)
@@ -2713,8 +2870,8 @@ class FPAnalysisGUI:
         
     def create_visualization_tab(self):
         """Tab for data visualization"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Visualization")
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Visualization")
         
         # Create canvas with scrollbar for scrollable content
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -2947,8 +3104,8 @@ class FPAnalysisGUI:
     
     def create_connectivity_analysis_tab(self):
         """Tab for spectral coherence analysis (Morlet wavelet / Welch)."""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Coherence")
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Coherence")
 
         # ── scrollable canvas ──────────────────────────────────────────────
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -2975,15 +3132,15 @@ class FPAnalysisGUI:
 
         ttk.Label(r0, text="Ch 1:").pack(side='left', padx=(0, 2))
         self.conn_channel1_var = tk.StringVar(value="G0")
-        ttk.Combobox(r0, textvariable=self.conn_channel1_var,
-                     values=["G0", "G1", "R1"], state='readonly', width=8
-                     ).pack(side='left', padx=(0, 10))
+        self.conn_channel1_combo = ttk.Combobox(r0, textvariable=self.conn_channel1_var,
+                     values=["G0", "G1", "R1"], state='readonly', width=8)
+        self.conn_channel1_combo.pack(side='left', padx=(0, 10))
 
         ttk.Label(r0, text="Ch 2:").pack(side='left', padx=(0, 2))
         self.conn_channel2_var = tk.StringVar(value="G1")
-        ttk.Combobox(r0, textvariable=self.conn_channel2_var,
-                     values=["G0", "G1", "R1"], state='readonly', width=8
-                     ).pack(side='left', padx=(0, 10))
+        self.conn_channel2_combo = ttk.Combobox(r0, textvariable=self.conn_channel2_var,
+                     values=["G0", "G1", "R1"], state='readonly', width=8)
+        self.conn_channel2_combo.pack(side='left', padx=(0, 10))
 
         ttk.Label(r0, text="Method:").pack(side='left', padx=(0, 2))
         self.conn_coh_method_var = tk.StringVar(value=self.conn_params['coherence_method'])
@@ -3308,6 +3465,38 @@ class FPAnalysisGUI:
         else:  # Group
             for group in sorted(self.groups.keys()):
                 self.conn_listbox.insert('end', group)
+        self._refresh_conn_channels()
+
+    def _all_channel_names(self):
+        """Union of detected channel designations across all processed subjects,
+        ordered green-then-red by region index. Falls back to a sane default."""
+        names = set()
+        for data in self.processed_data.values():
+            for nm in self._ordered_channel_names(data):
+                if re.match(r'^[GR]\d+$', str(nm)):
+                    names.add(str(nm))
+        if not names:
+            return ["G0", "G1"]
+
+        def _key(nm):
+            return (0 if nm[0].upper() == 'G' else 1,
+                    int(nm[1:]) if nm[1:].isdigit() else 0)
+        return sorted(names, key=_key)
+
+    def _refresh_conn_channels(self):
+        """Populate the connectivity channel dropdowns from detected channels,
+        preserving the current selection when still valid."""
+        chans = self._all_channel_names()
+        for combo, var, default in (
+            (getattr(self, 'conn_channel1_combo', None), self.conn_channel1_var, chans[0]),
+            (getattr(self, 'conn_channel2_combo', None), self.conn_channel2_var,
+             chans[1] if len(chans) > 1 else chans[0]),
+        ):
+            if combo is None:
+                continue
+            combo['values'] = chans
+            if var.get() not in chans:
+                var.set(default)
 
     def _toggle_grp_tab_mode(self):
         """Show/hide By-Bout-specific fields and buttons in the By Group tab."""
@@ -7073,8 +7262,8 @@ class FPAnalysisGUI:
 
     def create_bout_analysis_tab(self):
         """Tab for analyzing extracted bout data with histograms"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Bout Analysis")
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Bout Analysis")
 
         # ── Outer scrollable canvas (vertical only) ──────────────────────
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -7188,12 +7377,11 @@ class FPAnalysisGUI:
         self.bout_analysis_behavior_combo.grid(row=0, column=1, sticky='w', padx=(4, 0), pady=2)
         self.bout_analysis_behavior_combo.bind('<<ComboboxSelected>>', self._on_bout_behavior_changed)
         ttk.Label(sel_frame, text="Channel:").grid(row=1, column=0, sticky='w', pady=2)
-        ch_frame = ttk.Frame(sel_frame)
-        ch_frame.grid(row=1, column=1, sticky='w', padx=(4, 0))
-        ttk.Radiobutton(ch_frame, text="G0", variable=self.bout_analysis_channel_var,
-                        value="G0").pack(side='left')
-        ttk.Radiobutton(ch_frame, text="G1", variable=self.bout_analysis_channel_var,
-                        value="G1").pack(side='left', padx=(6, 0))
+        self.bout_analysis_channel_frame = ttk.Frame(sel_frame)
+        self.bout_analysis_channel_frame.grid(row=1, column=1, sticky='w', padx=(4, 0))
+        # Radiobuttons are built dynamically from the detected channels so any
+        # number of channels (G0/G1/R4/R5/…) can be analyzed.
+        self.refresh_bout_analysis_channels()
 
         # Settings button (far right)
         ttk.Button(row1, text="\u2699  Settings",
@@ -7344,8 +7532,8 @@ class FPAnalysisGUI:
     
     def create_spike_analysis_tab(self):
         """Create spike analysis tab for detecting and analyzing calcium transients"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Spike Analysis")
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Spike Analysis")
 
         # ── Horizontal split: left = scrollable controls, right = live preview ──
         paned = tk.PanedWindow(tab, orient=tk.HORIZONTAL, sashwidth=6,
@@ -9031,21 +9219,15 @@ class FPAnalysisGUI:
         fig.tight_layout()
     
     def create_info_tab(self):
-        """Tab with information about file naming, features, and the changelog.
+        """Populate the Info main tab with Overview and Changelog subtabs.
 
-        Organized as a sub-notebook (Overview + Changelog) so the reference
-        material and version history live together without adding a separate
-        top-level tab.
+        Adds directly to ``self.info_notebook`` (the Info main-tab group), which
+        also hosts the System Check subtab. Keeps reference material and version
+        history together under one top-level Info tab.
         """
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Info")
-
-        info_notebook = ttk.Notebook(tab)
-        info_notebook.pack(fill='both', expand=True, padx=6, pady=6)
-
         # ── Overview subtab ──────────────────────────────────────────────
-        overview_tab = ttk.Frame(info_notebook)
-        info_notebook.add(overview_tab, text="Overview")
+        overview_tab = ttk.Frame(self.info_notebook)
+        self.info_notebook.add(overview_tab, text="Overview")
 
         info_frame = ttk.Frame(overview_tab)
         info_frame.pack(fill='both', expand=True, padx=10, pady=10)
@@ -9646,8 +9828,8 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
         text.config(state='disabled')  # Make read-only
 
         # ── Changelog subtab ─────────────────────────────────────────────
-        changelog_tab = ttk.Frame(info_notebook)
-        info_notebook.add(changelog_tab, text="Changelog")
+        changelog_tab = ttk.Frame(self.info_notebook)
+        self.info_notebook.add(changelog_tab, text="Changelog")
 
         cl_frame = ttk.Frame(changelog_tab)
         cl_frame.pack(fill='both', expand=True, padx=10, pady=10)
@@ -9669,6 +9851,32 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Full multi-channel support: TRACY now identifies, labels, and analyzes
+    ANY number of photometry channels (green and red, with any region index such
+    as R4/R5), not just G0/G1. Channels are read from the recording's column
+    headers and used consistently everywhere.
+  • Fix — Exclusions tab now lists EVERY detected channel. Previously channels
+    were filtered against a fixed list that stopped at R2, so higher-numbered red
+    channels (R3/R4/R5…) were silently missing and could not be excluded.
+  • Fix — Channel selectors are now built from the channels actually present, with
+    correct G/R labels, across the Connectivity/Coherence, Signal Integrity,
+    Visualization and Bout Analysis tabs (previously hard-coded to G0/G1/R1 or
+    mislabeled red channels as "G").
+  • Fix (correctness) — Per-channel wavelength routing. In recordings that
+    interleave 470 nm and 560 nm, red channels' bout / behavior / zone traces were
+    being taken from the 470 nm frames. Each channel now uses its OWN wavelength
+    (green → 470 nm, red → 560 nm). Deinterleaving was verified sample-for-sample
+    against the raw LED-state data.
+  • Fix — The behavior-synced data now supports any channel count. Previously the
+    5th and later channels collided with the elapsed-time / velocity / distance
+    columns, silently corrupting bout, zone and kinematics analysis beyond four
+    channels. The kinematics columns were moved after the photometry channels;
+    existing projects load unchanged (behavior files are remapped by column name).
+  • Fix — Bouts now save and reload per channel, so red / high-index channels
+    survive a save/reload (previously only G0/G1 bouts were persisted).
+
+Version 1.2.2  •  June 3, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — FLMM time-course statistics (Bout Analysis → Plot ▾ → "Time-Course
     Statistics"): Functional Linear Mixed Model (FUI) analysis of the whole
@@ -9766,8 +9974,8 @@ Version 1.0.0
     
     def create_system_tab(self):
         """Tab for checking system requirements and dependencies"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="System Check")
+        tab = ttk.Frame(self.info_notebook)
+        self.info_notebook.add(tab, text="System Check")
         self.system_check_tab = tab  # keep reference for tab-title updates... !!
         
         # Title
@@ -10016,7 +10224,14 @@ Version 1.0.0
         default_map = self.compute_default_channel_map(data, n)
 
         self.viz_channel_name_vars = []
-        options = [f'G{i}' for i in range(4)] + [f'R{i}' for i in range(4)] + ['None']
+        # Offer a generous range of designations plus whatever is already mapped,
+        # so high region indices (R4/R5/…) remain selectable in the override UI.
+        options = [f'G{i}' for i in range(8)] + [f'R{i}' for i in range(8)]
+        for i in range(n):
+            cur = existing.get(i, default_map.get(i, f'Ch{i}'))
+            if cur not in options:
+                options.append(cur)
+        options.append('None')
         for i in range(n):
             cur = existing.get(i, default_map.get(i, f'Ch{i}'))
             var = tk.StringVar(value=cur)
@@ -10362,7 +10577,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def new_project(self):
         """Show dialog for new project"""
         self.project_name_var.set("")
-        self.notebook.select(0)  # Switch to project tab
+        # Switch to Project main tab → Setup subtab
+        self.notebook.select(self._project_group_frame)
+        self.project_notebook.select(0)
     
     def create_new_project(self):
         """Create a new project directory"""
@@ -10420,49 +10637,67 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showwarning("Warning", "Project folder found but no saved data detected.\n"
                                                  "This may be a new or empty project.")
     
-    def save_project(self):
-        """Save project configuration and data"""
+    def save_project(self, quiet=False, subjects=None):
+        """Save project configuration and data.
+
+        quiet=True suppresses the modal progress window and the completion dialog
+        so the save can run automatically right after processing / re-extraction
+        without interrupting the user.
+
+        subjects, when given, limits the per-subject disk write to that list of
+        subject IDs (the project config and .tracy file are always refreshed).
+        This lets a single-subject reprocess overwrite just that subject's files
+        instead of rewriting the whole cohort.
+        """
         if not self.current_project:
-            messagebox.showwarning("No Project", "No project is currently open")
+            if not quiet:
+                messagebox.showwarning("No Project", "No project is currently open")
             return
-        
-        self.log_message("Saving project...")
-        
-        # Create progress window
-        progress_window = tk.Toplevel(self.root)
-        progress_window.title("Saving Project")
-        progress_window.geometry("400x150")
-        progress_window.transient(self.root)
-        progress_window.grab_set()
-        
-        # Center the window
-        progress_window.update_idletasks()
-        x = (progress_window.winfo_screenwidth() // 2) - (400 // 2)
-        y = (progress_window.winfo_screenheight() // 2) - (150 // 2)
-        progress_window.geometry(f"400x150+{x}+{y}")
-        
-        # Progress widgets
-        progress_label = tk.Label(progress_window, text="Initializing save...", font=('Arial', 10))
-        progress_label.pack(pady=10)
-        
-        progress_bar = ttk.Progressbar(progress_window, length=350, mode='determinate')
-        progress_bar.pack(pady=10)
-        
-        progress_detail = tk.Label(progress_window, text="", font=('Arial', 9), fg='gray')
-        progress_detail.pack(pady=5)
-        
-        self.root.update_idletasks()  # Allow GUI to update
-        
+
+        self.log_message("Saving project..." if not quiet else "Persisting processed data to disk...")
+
+        # Create progress window (interactive saves only)
+        progress_window = None
+        progress_bar = None
+        progress_label = None
+        progress_detail = None
+        if not quiet:
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("Saving Project")
+            progress_window.geometry("400x150")
+            progress_window.transient(self.root)
+            progress_window.grab_set()
+
+            # Center the window
+            progress_window.update_idletasks()
+            x = (progress_window.winfo_screenwidth() // 2) - (400 // 2)
+            y = (progress_window.winfo_screenheight() // 2) - (150 // 2)
+            progress_window.geometry(f"400x150+{x}+{y}")
+
+            # Progress widgets
+            progress_label = tk.Label(progress_window, text="Initializing save...", font=('Arial', 10))
+            progress_label.pack(pady=10)
+
+            progress_bar = ttk.Progressbar(progress_window, length=350, mode='determinate')
+            progress_bar.pack(pady=10)
+
+            progress_detail = tk.Label(progress_window, text="", font=('Arial', 9), fg='gray')
+            progress_detail.pack(pady=5)
+
+            self.root.update_idletasks()  # Allow GUI to update
+
         project_path = os.path.join(self.project_dir, self.current_project)
-        
+
         # Calculate total steps for progress bar
         total_subjects = len(self.processed_data)
         total_steps = 3 + total_subjects  # config + tracy + behavioral + subjects
         current_step = 0
-        
+
         def update_progress(message, detail=""):
             nonlocal current_step
             current_step += 1
+            if quiet or progress_window is None:
+                return
             progress = (current_step / total_steps) * 100
             progress_bar['value'] = progress
             progress_label.config(text=message)
@@ -10497,8 +10732,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message("  Saved project configuration")
         except Exception as e:
             self.log_message(f"  Error saving project config: {str(e)}")
-            progress_window.destroy()
-            messagebox.showerror("Save Error", f"Failed to save project configuration: {str(e)}")
+            if progress_window is not None:
+                progress_window.destroy()
+            if not quiet:
+                messagebox.showerror("Save Error", f"Failed to save project configuration: {str(e)}")
             return
         
         update_progress("Saving .tracy file...", "")
@@ -10523,9 +10760,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Save processed data (optimized - only essential files)
         subjects_saved = 0
-        
-        for idx, (subject, data) in enumerate(self.processed_data.items()):
-            update_progress(f"Saving subject {idx+1}/{total_subjects}", f"{subject}")
+
+        # When a targeted subject list is given (e.g. a single-subject reprocess),
+        # only write those subjects' files; otherwise write every processed subject.
+        _subject_filter = set(subjects) if subjects is not None else None
+        _items_to_save = [(s, d) for s, d in self.processed_data.items()
+                          if _subject_filter is None or s in _subject_filter]
+
+        for idx, (subject, data) in enumerate(_items_to_save):
+            update_progress(f"Saving subject {idx+1}/{len(_items_to_save)}", f"{subject}")
             
             try:
                 # Save metadata
@@ -10659,24 +10902,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if 'beh_synced' in data:
                     beh_file = os.path.join(project_path, 'processed', f'{subject}_behavior.csv')
                     n_cols = data['beh_synced'].shape[1]
-                    # Define proper column names based on array structure
-                    # Columns: 0=frame, 1=timestamp, 2=X_cm, 3=Y_cm, 4-5=other, 6-9=photometry channels,
-                    # 10=elapsed_min, 11=velocity, 12=dist_per_frame, 13=dist_center_x, 14=dist_center_y
-                    # 15+: zone entry flags (one column per zone)
-                    col_names = ['frame', 'timestamp', 'X_cm', 'Y_cm', 'col_4', 'col_5', 
-                                'G0_zscore', 'G1_zscore', 'photo_ch2', 'photo_ch3', 
-                                'elapsed_min', 'velocity_cm_per_sec', 'dist_per_frame', 
-                                'dist_from_center_x', 'dist_from_center_y']
-                    
-                    # Add zone entry flag columns
-                    if n_cols > 15:
-                        zone_names = list(self.zones.keys())
-                        for i in range(n_cols - 15):
-                            if i < len(zone_names):
-                                col_names.append(f'entry_{zone_names[i]}')
-                            else:
-                                col_names.append(f'entry_flag_{i}')
-                    
+                    # Column NAMES describe the v2 layout so the file is self-describing
+                    # and can be reloaded by name regardless of channel count:
+                    #   0=frame,1=timestamp,2=X_cm,3=Y_cm,4-5=spare,
+                    #   6..6+N-1 = Ch{i}_zscore, then the kinematics block.
+                    n_ch = self._beh_channel_count(data)
+                    col_names = ['frame', 'timestamp', 'X_cm', 'Y_cm', 'col_4', 'col_5']
+                    col_names += [f'Ch{i}_zscore' for i in range(n_ch)]
+                    col_names += ['elapsed_min', 'velocity_cm_per_sec', 'dist_per_frame',
+                                  'dist_from_center_x', 'dist_from_center_y']
+                    # Pad/trim to the actual width (defensive against any extra columns).
+                    while len(col_names) < n_cols:
+                        col_names.append(f'extra_{len(col_names)}')
+
                     # Save behavior CSV
                     df_beh = pd.DataFrame(data['beh_synced'], columns=col_names[:n_cols])
                     df_beh.to_csv(beh_file, index=False)
@@ -10714,10 +10952,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         with open(metrics_file, 'w') as f:
                             json.dump(metrics, f, indent=2)
                 
-                # Save bout data (skip if not needed - can be regenerated)
-                if 'bouts' in data and data['bouts']:
+                # Save bout data (skip if not needed - can be regenerated).
+                # The key (not just a truthy value) gates this so that a reprocess
+                # which produced *no* bouts still clears stale bout files below.
+                if 'bouts' in data:
                     bout_dir = os.path.join(project_path, 'processed', 'bouts', subject)
                     os.makedirs(bout_dir, exist_ok=True)
+
+                    # Clear any bout files left over from a previous extraction so a
+                    # reprocess/re-extract with different settings (changed behaviors,
+                    # or a different pre/post window) can't leave orphaned CSVs that
+                    # would later load as stale, mis-windowed bouts.
+                    for _stale in os.listdir(bout_dir):
+                        if _stale.endswith('_bouts.csv') or _stale == '_bout_windows.json':
+                            try:
+                                os.remove(os.path.join(bout_dir, _stale))
+                            except OSError:
+                                pass
 
                     # Persist the pre/post window each behavior's bouts were
                     # extracted with so realignment survives a save/reload (the
@@ -10734,26 +10985,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         with open(os.path.join(bout_dir, '_bout_windows.json'), 'w') as f:
                             json.dump(bout_windows, f, indent=2)
 
+                    # Save bouts for every channel under its real designation so
+                    # red / high-index channels (R4, R5, …) round-trip through a
+                    # save/reload instead of being silently dropped.
+                    n_ch = self.get_num_channels(data)
+                    ch_names = [self.get_channel_name(data, ch) for ch in range(n_ch)]
                     for behavior, bout_data in data['bouts'].items():
-                        # Save G0 bouts
-                        if bout_data['G0']:
-                            g0_file = os.path.join(bout_dir, f'{behavior}_G0_bouts.csv')
-                            max_len = max(len(b) for b in bout_data['G0'])
-                            g0_array = np.full((len(bout_data['G0']), max_len), np.nan)
-                            for i, bout in enumerate(bout_data['G0']):
-                                g0_array[i, :len(bout)] = bout
-                            df_g0 = pd.DataFrame(g0_array)
-                            df_g0.to_csv(g0_file, index=False)
-                        
-                        # Save G1 bouts
-                        if bout_data['G1']:
-                            g1_file = os.path.join(bout_dir, f'{behavior}_G1_bouts.csv')
-                            max_len = max(len(b) for b in bout_data['G1'])
-                            g1_array = np.full((len(bout_data['G1']), max_len), np.nan)
-                            for i, bout in enumerate(bout_data['G1']):
-                                g1_array[i, :len(bout)] = bout
-                            df_g1 = pd.DataFrame(g1_array)
-                            df_g1.to_csv(g1_file, index=False)
+                        if not isinstance(bout_data, dict):
+                            continue
+                        for ch, ch_name in enumerate(ch_names):
+                            traces = bout_data.get(ch_name)
+                            if not traces:
+                                traces = bout_data.get(f'Ch{ch}')
+                            if not traces:
+                                continue
+                            ch_file = os.path.join(bout_dir, f'{behavior}_{ch_name}_bouts.csv')
+                            max_len = max(len(b) for b in traces)
+                            ch_array = np.full((len(traces), max_len), np.nan)
+                            for i, bout in enumerate(traces):
+                                ch_array[i, :len(bout)] = bout
+                            pd.DataFrame(ch_array).to_csv(ch_file, index=False)
                 
                 # Skip saving entry bouts to save time (can be regenerated if needed)
                 
@@ -10799,20 +11050,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             except Exception as e:
                 self.log_message(f"Warning: Could not save behavioral metrics: {str(e)}")
         
+        self.log_message(f"✓ Project '{self.current_project}' saved successfully!")
+        self.log_message(f"✓ Saved data for {subjects_saved} subject(s)")
+        self.log_message(f"✓ Optimized save: z-scores + behavioral data only")
+
+        if quiet or progress_window is None:
+            return
+
         # Complete progress
         progress_bar['value'] = 100
         progress_label.config(text="Save complete!", fg='green')
         progress_detail.config(text=f"Successfully saved {subjects_saved} subject(s)")
         progress_window.update()
-        
-        self.log_message(f"✓ Project '{self.current_project}' saved successfully!")
-        self.log_message(f"✓ Saved data for {subjects_saved} subject(s)")
-        self.log_message(f"✓ Optimized save: z-scores + behavioral data only")
-        
+
         # Close progress window after a brief delay and show completion message
         self.root.after(1000, progress_window.destroy)
         self.root.after(1100, lambda: messagebox.showinfo(
-            "Save Complete", 
+            "Save Complete",
             f"Project '{self.current_project}' saved successfully!\n\n"
             f"Subjects saved: {subjects_saved}\n"
             f"Location: {project_path}"
@@ -11203,7 +11457,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if os.path.exists(beh_file):
                             try:
                                 df_beh = pd.read_csv(beh_file)
-                                subject_data['beh_synced'] = df_beh.values
+                                # Reconstruct by column name into the canonical layout so
+                                # old (fixed) and new (dynamic) saves both load correctly.
+                                _nch = subject_data.get('num_photometry_channels')
+                                if not _nch and isinstance(subject_data.get('zscore'), np.ndarray) \
+                                        and subject_data['zscore'].ndim == 2:
+                                    _nch = subject_data['zscore'].shape[1] - 2
+                                subject_data['beh_synced'] = self._reconstruct_beh_synced(df_beh, _nch)
                                 # Verify we have position data columns if has_position is True
                                 if subject_data.get('has_position', False):
                                     if df_beh.shape[1] < 11:
@@ -11228,34 +11488,55 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         bout_windows = json.load(f)
                                 except Exception:
                                     bout_windows = {}
+                            # Load bouts for every saved channel (G0/G1/R4/… or
+                            # legacy Ch{n}), keyed by the real designation in the
+                            # filename. Positional Ch{idx} and legacy G0/G1 aliases
+                            # are rebuilt afterwards for index-based consumers.
                             for file in os.listdir(bout_dir):
-                                if file.endswith('_G0_bouts.csv'):
-                                    behavior = file.replace('_G0_bouts.csv', '')
-                                    g0_file = os.path.join(bout_dir, file)
-                                    g1_file = os.path.join(bout_dir, f'{behavior}_G1_bouts.csv')
+                                m = re.match(r'^(.*)_([GR]\d+|Ch\d+)_bouts\.csv$', file)
+                                if not m:
+                                    continue
+                                behavior, chname = m.group(1), m.group(2)
+                                if behavior not in bouts:
+                                    bouts[behavior] = {}
+                                    _w = bout_windows.get(behavior)
+                                    if _w:
+                                        bouts[behavior]['_prebout'] = int(_w.get('prebout'))
+                                        bouts[behavior]['_postbout'] = int(_w.get('postbout'))
+                                df_ch = pd.read_csv(os.path.join(bout_dir, file))
+                                traces = []
+                                for _, row in df_ch.iterrows():
+                                    bout = row.dropna().values
+                                    if len(bout) > 0:
+                                        traces.append(bout)
+                                bouts[behavior][chname] = traces
 
-                                    if behavior not in bouts:
-                                        bouts[behavior] = {'G0': [], 'G1': []}
-                                        _w = bout_windows.get(behavior)
-                                        if _w:
-                                            bouts[behavior]['_prebout'] = int(_w.get('prebout'))
-                                            bouts[behavior]['_postbout'] = int(_w.get('postbout'))
-                                    
-                                    # Load G0 bouts
-                                    df_g0 = pd.read_csv(g0_file)
-                                    for _, row in df_g0.iterrows():
-                                        bout = row.dropna().values
-                                        if len(bout) > 0:
-                                            bouts[behavior]['G0'].append(bout)
-                                    
-                                    # Load G1 bouts
-                                    if os.path.exists(g1_file):
-                                        df_g1 = pd.read_csv(g1_file)
-                                        for _, row in df_g1.iterrows():
-                                            bout = row.dropna().values
-                                            if len(bout) > 0:
-                                                bouts[behavior]['G1'].append(bout)
-                            
+                            # Rebuild positional Ch{idx} + legacy G0/G1 aliases so
+                            # index-based consumers (visualization) keep working.
+                            ch_order = subject_data.get('channel_names')
+                            name_to_idx = ({str(n): i for i, n in enumerate(ch_order)}
+                                           if isinstance(ch_order, list) else {})
+
+                            def _pos(key):
+                                if key in name_to_idx:
+                                    return name_to_idx[key]
+                                # G/Ch digit equals the column position for legacy
+                                # data; red names are resolved only via the map above.
+                                mm = re.match(r'^(?:Ch|G)(\d+)$', key)
+                                return int(mm.group(1)) if mm else None
+
+                            for behavior, chdict in bouts.items():
+                                for key in list(chdict.keys()):
+                                    if key.startswith('_'):
+                                        continue
+                                    idx = _pos(key)
+                                    if idx is not None:
+                                        chdict.setdefault(f'Ch{idx}', chdict[key])
+                                if 'Ch0' in chdict:
+                                    chdict.setdefault('G0', chdict['Ch0'])
+                                if 'Ch1' in chdict:
+                                    chdict.setdefault('G1', chdict['Ch1'])
+
                             if bouts:
                                 subject_data['bouts'] = bouts
                         
@@ -11436,8 +11717,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if ('entry_frames' in subject_data and 'beh_synced' in subject_data and 
                             needs_entry_bout_regen):
                             try:
-                                entry_bout_data = self.extract_entry_bouts(subject_data['beh_synced'], 
-                                                                           subject_data['entry_frames'])
+                                entry_bout_data = self.extract_entry_bouts(
+                                    subject_data['beh_synced'], subject_data['entry_frames'],
+                                    num_photometry_channels=self._beh_channel_count(subject_data))
                                 subject_data['entry_bouts'] = entry_bout_data
                                 self.log_message(f"    Regenerated entry bouts from entry_frames")
                             except Exception as e:
@@ -12392,6 +12674,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'fallbacks_used': [],
             'mismatched_led_samples': [],
             'zero_variance_channels': [],
+            'structure_warnings': [],
             'mode': self.processing_mode.get(),
             'batch_folder': '',
             'fpdata_files_found': [],
@@ -12420,6 +12703,30 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.update_bout_analysis_subjects()
             self.update_dec_prob_subjects()
             self.update_conn_listbox()
+
+            # Persist the freshly processed subjects to disk so they overwrite
+            # any prior processing for those subjects (including stale bout files
+            # from an older pre/post window).  Without this the new results live
+            # only in memory and a reload would resurrect the old data.
+            _just_processed = list(dict.fromkeys(
+                self.processing_summary.get('subjects_processed', [])))
+            if _just_processed:
+                try:
+                    self.save_project(quiet=True, subjects=_just_processed)
+                    self.log_message(
+                        f"  Saved updated results for {len(_just_processed)} "
+                        f"subject(s) to disk.")
+                except Exception as save_exc:
+                    self.log_message(
+                        f"  Warning: could not auto-save processed data: {save_exc}")
+
+            # Show the colour-coded summary popup of what processed / failed /
+            # warned.  Guarded so a display hiccup never breaks the run itself.
+            try:
+                self.show_processing_summary()
+            except Exception as summary_exc:
+                self.log_message(
+                    f"  Warning: could not display processing summary: {summary_exc}")
         except Exception as e:
             self.log_message(f"ERROR: {str(e)}")
             messagebox.showerror("Error", f"Processing failed:\n{str(e)}")
@@ -12455,13 +12762,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message(f"Processing subject: {subject_id}")
 
         self.processing_summary['subjects_attempted'].append(subject_id)
-        
-        # Process the data
-        result = self.process_fp_data(subject_id, fpdata_file, computerts_file)
-        self.processed_data[subject_id] = result
-        self.processing_summary['subjects_processed'].append(subject_id)
-        
-        self.log_message(f"  ✓ Completed {subject_id}")
+
+        # Process the data.  Record (don't re-raise) processing errors so the
+        # summary popup can report the failure in red rather than aborting the
+        # whole run with only a bare error dialog.
+        try:
+            result = self.process_fp_data(subject_id, fpdata_file, computerts_file)
+            self.processed_data[subject_id] = result
+            self.processing_summary['subjects_processed'].append(subject_id)
+            self.log_message(f"  ✓ Completed {subject_id}")
+        except Exception as e:
+            self.processing_summary['subjects_failed'].append((subject_id, str(e)))
+            self.log_message(f"  ✗ Error processing {subject_id}: {str(e)}")
     
     def process_batch(self):
         """Process all subjects in a folder"""
@@ -12584,125 +12896,203 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.root.update_idletasks()  # Allow GUI to update after each subject
     
     def show_processing_summary(self):
-        """Display a comprehensive summary of the processing results"""
+        """Display a colour-coded popup summarising the processing results.
+
+        Green = succeeded, red = failed, amber = warnings (fallbacks applied,
+        missing companion files, file-structure deviations).  Adapts to both
+        single-file and whole-folder runs.
+        """
         if not hasattr(self, 'processing_summary'):
             return
-        
+
         summary = self.processing_summary
-        
-        # Build summary message
-        msg_lines = []
-        msg_lines.append("="*60)
-        msg_lines.append("PROCESSING SUMMARY")
-        msg_lines.append("="*60)
 
         def _unique_preserve(items):
-            seen = set()
-            ordered = []
+            seen, ordered = set(), []
             for item in items:
                 if item not in seen:
                     seen.add(item)
                     ordered.append(item)
             return ordered
 
-        # Normalize lists for cleaner reporting
+        # --- Gather and normalise the collected data -----------------------
         processed_subjects = _unique_preserve(summary.get('subjects_processed', []))
         failed_subjects = summary.get('subjects_failed', [])
         attempted_subjects = _unique_preserve(summary.get('subjects_attempted', []))
         missing_behavior = _unique_preserve(summary.get('missing_behavior', []))
         missing_ttl = _unique_preserve(summary.get('missing_ttl', []))
         no_position_data = _unique_preserve(summary.get('no_position_data', []))
-        subject_id_collisions = _unique_preserve(summary.get('subject_id_collisions', []))
+        collisions = _unique_preserve(summary.get('subject_id_collisions', []))
+        fallbacks = _unique_preserve(summary.get('fallbacks_used', []))
+        mismatched_led = _unique_preserve(summary.get('mismatched_led_samples', []))
+        zero_variance = _unique_preserve(summary.get('zero_variance_channels', []))
+        structure_warnings = _unique_preserve(summary.get('structure_warnings', []))
 
-        total_files_found = len(summary.get('fpdata_files_found', []))
-        total_attempted = len(summary.get('subjects_attempted', []))
-        total_unique_attempted = len(attempted_subjects)
-        total_processed = len(processed_subjects)
-        total_failed = len(failed_subjects)
-        failed_subject_ids = {subj for subj, _ in failed_subjects}
-        attempted_set = set(attempted_subjects)
-        processed_set = set(processed_subjects)
-        unresolved_subjects = sorted(list(attempted_set - processed_set - failed_subject_ids))
+        failed_ids = {subj for subj, _ in failed_subjects}
+        unresolved = sorted(set(attempted_subjects) - set(processed_subjects) - failed_ids)
 
-        msg_lines.append(f"\nMode: {summary.get('mode', 'unknown')}")
-        if summary.get('mode') == 'batch':
-            msg_lines.append(f"Batch folder: {summary.get('batch_folder', '')}")
-            msg_lines.append(f"FPData files discovered: {total_files_found}")
-        msg_lines.append(f"Subject processing attempts: {total_attempted} ({total_unique_attempted} unique IDs)")
-        
-        # Subjects processed
-        msg_lines.append(f"\n✓ Successfully processed: {total_processed} subject(s)")
-        if processed_subjects:
-            for subj in processed_subjects:
-                msg_lines.append(f"  • {subj}")
-        
-        # Failed subjects
-        if total_failed > 0:
-            msg_lines.append(f"\n✗ Failed: {total_failed} subject(s)")
-            for subj, error in failed_subjects:
-                msg_lines.append(f"  • {subj}: {error[:60]}...")
+        mode = summary.get('mode', 'single')
+        is_batch = (mode == 'batch')
+        n_processed = len(processed_subjects)
+        n_failed = len(failed_subjects)
 
-        # Warnings and issues
-        has_issues = False
+        # File-structure deviations: what the file looked like vs. what we expect.
+        structure_items = list(structure_warnings) + list(mismatched_led) + list(zero_variance)
 
-        if unresolved_subjects:
-            msg_lines.append(f"\n⚠ Attempted but not completed ({len(unresolved_subjects)} subject(s)):")
-            for subj in unresolved_subjects:
-                msg_lines.append(f"  • {subj} - Not marked as processed or failed (check parsing/logs)")
+        # Missing companion files (with the consequence spelled out succinctly).
+        companion_items = []
+        for s in missing_behavior:
+            companion_items.append(f"{s} — no timestamp/behaviour file (behaviour sync skipped)")
+        for s in missing_ttl:
+            companion_items.append(f"{s} — no TTL/DigitalIOs file (auto boutframes skipped)")
+        for s in no_position_data:
+            companion_items.append(f"{s} — no position (X/Y) data (zone analysis unavailable)")
 
-        if subject_id_collisions:
-            has_issues = True
-            msg_lines.append(f"\n⚠ Subject ID collisions ({len(subject_id_collisions)} instance(s)):")
-            for item in subject_id_collisions:
-                msg_lines.append(f"  • {item}")
-        
-        if missing_behavior:
-            has_issues = True
-            msg_lines.append(f"\n⚠ Missing behavior/timestamp files ({len(missing_behavior)} subject(s)):")
-            for subj in missing_behavior:
-                msg_lines.append(f"  • {subj} - No behavioral synchronization performed")
+        total_warn = (len(structure_items) + len(companion_items) + len(fallbacks)
+                      + len(collisions) + len(unresolved))
 
-        if missing_ttl:
-            has_issues = True
-            msg_lines.append(f"\n⚠ Missing TTL/DigitalIOs files ({len(missing_ttl)} subject(s)):")
-            for subj in missing_ttl:
-                msg_lines.append(f"  • {subj} - TTL-derived boutframes not auto-generated")
-        
-        if no_position_data:
-            has_issues = True
-            msg_lines.append(f"\n⚠ No position data ({len(no_position_data)} subject(s)):")
-            for subj in no_position_data:
-                msg_lines.append(f"  • {subj} - Zone analysis unavailable")
-        
-        if summary['mismatched_led_samples']:
-            has_issues = True
-            msg_lines.append(f"\n⚠ Mismatched LED samples ({len(summary['mismatched_led_samples'])} subject(s)):")
-            for item in summary['mismatched_led_samples']:
-                msg_lines.append(f"  • {item}")
-        
-        if summary['fallbacks_used']:
-            has_issues = True
-            msg_lines.append(f"\n⚠ Fallbacks applied ({len(summary['fallbacks_used'])} instance(s)):")
-            for item in summary['fallbacks_used']:
-                msg_lines.append(f"  • {item}")
-        
-        if summary['zero_variance_channels']:
-            has_issues = True
-            msg_lines.append(f"\n⚠ Zero variance channels ({len(summary['zero_variance_channels'])} channel(s)):")
-            for item in summary['zero_variance_channels']:
-                msg_lines.append(f"  • {item}")
-        
-        if not has_issues and total_failed == 0:
-            msg_lines.append("\n✓ No warnings or issues detected!")
-        
-        msg_lines.append("\n" + "="*60)
-        
-        # Join all lines
-        summary_text = "\n".join(msg_lines)
-        
-        # Display in message box
-        messagebox.showinfo("Processing Complete", summary_text)
-    
+        # --- Overall status -> banner colour & headline -------------------
+        if n_failed > 0 or n_processed == 0:
+            status = 'bad'
+        elif total_warn > 0:
+            status = 'warn'
+        else:
+            status = 'good'
+
+        palette = {
+            'good': ('#e6f4ea', '#1e7e34'),   # background, foreground
+            'warn': ('#fff4d6', '#9a6700'),
+            'bad':  ('#fdecea', '#c62828'),
+        }
+        icon = {'good': '✓', 'warn': '⚠', 'bad': '✗'}
+
+        if is_batch:
+            n_found = len(summary.get('fpdata_files_found', []))
+            if status == 'good':
+                headline = f"All {n_processed} subject(s) processed successfully"
+            elif status == 'warn':
+                headline = f"Processed {n_processed} subject(s) — {total_warn} warning(s)"
+            else:
+                headline = f"{n_failed} failed · {n_processed} processed of {n_found} file(s)"
+        else:
+            subj = (processed_subjects or [s for s, _ in failed_subjects]
+                    or attempted_subjects or ['subject'])[0]
+            if status == 'good':
+                headline = f"{subj} processed successfully"
+            elif status == 'warn':
+                headline = f"{subj} processed — {total_warn} warning(s)"
+            else:
+                headline = (f"{subj} failed to process" if n_failed
+                            else "Processing did not complete")
+
+        # --- Build the dialog ---------------------------------------------
+        bg_light = self.colors['bg_light']
+        text_dark = self.colors['text_dark']
+        text_muted = self.colors['text_muted']
+
+        win = tk.Toplevel(self.root)
+        win.title("Processing Summary")
+        win.configure(bg=bg_light)
+        win.transient(self.root)
+        win.resizable(False, True)
+
+        # Banner
+        bbg, bfg = palette[status]
+        banner = tk.Frame(win, bg=bbg)
+        banner.pack(fill='x')
+        tk.Label(banner, text=f"{icon[status]}  {headline}", bg=bbg, fg=bfg,
+                 font=('Segoe UI', 13, 'bold'), anchor='w',
+                 padx=18, pady=14).pack(fill='x')
+
+        # Sub-stats line
+        sub = ["Mode: whole folder" if is_batch else "Mode: single file"]
+        if is_batch:
+            sub.append(f"{len(summary.get('fpdata_files_found', []))} FPData file(s) found")
+        sub.append(f"{n_processed} processed")
+        if n_failed:
+            sub.append(f"{n_failed} failed")
+        if total_warn:
+            sub.append(f"{total_warn} warning(s)")
+        tk.Label(win, text="   ·   ".join(sub), bg=bg_light, fg=text_muted,
+                 font=('Segoe UI', 9), anchor='w',
+                 padx=18).pack(fill='x', pady=(10, 4))
+
+        # Scrollable body
+        body_wrap = tk.Frame(win, bg=bg_light)
+        body_wrap.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+        canvas = tk.Canvas(body_wrap, bg=bg_light, highlightthickness=0, width=600)
+        vsb = ttk.Scrollbar(body_wrap, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg=bg_light)
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+        canvas.bind_all('<MouseWheel>', _on_wheel)
+
+        def add_section(title, items, kind):
+            if not items:
+                return
+            sbg, sfg = palette[kind]
+            card = tk.Frame(inner, bg='white', highlightthickness=1,
+                            highlightbackground='#e2e8f0')
+            card.pack(fill='x', pady=6, padx=2)
+            tk.Label(card, text=f"{icon[kind]}  {title}  ({len(items)})",
+                     bg=sbg, fg=sfg, font=('Segoe UI', 10, 'bold'),
+                     anchor='w', padx=12, pady=6).pack(fill='x')
+            for it in items:
+                tk.Label(card, text=f"• {it}", bg='white', fg=text_dark,
+                         font=('Segoe UI', 9), anchor='w', justify='left',
+                         wraplength=555).pack(fill='x', padx=14, pady=1)
+            tk.Frame(card, bg='white', height=4).pack()
+
+        add_section("Successfully processed", processed_subjects, 'good')
+        add_section("Failed to process",
+                    [f"{s}: {err}" for s, err in failed_subjects], 'bad')
+        add_section("Attempted but not completed", unresolved, 'bad')
+        add_section("File-structure deviations", structure_items, 'warn')
+        add_section("Missing companion files", companion_items, 'warn')
+        add_section("Fallbacks applied", fallbacks, 'warn')
+        add_section("Subject ID collisions", collisions, 'warn')
+
+        if status == 'good':
+            tk.Label(inner, text="No warnings or issues detected.", bg=bg_light,
+                     fg='#1e7e34', font=('Segoe UI', 9, 'italic'),
+                     anchor='w', padx=4, pady=4).pack(fill='x')
+
+        # Size the canvas to its content (capped), then centre the window.
+        inner.update_idletasks()
+        canvas.configure(height=min(inner.winfo_reqheight(), 380))
+
+        # Close button
+        btn_bar = tk.Frame(win, bg=bg_light)
+        btn_bar.pack(fill='x', padx=12, pady=(4, 12))
+
+        def _close():
+            try:
+                canvas.unbind_all('<MouseWheel>')
+            except Exception:
+                pass
+            win.destroy()
+
+        ttk.Button(btn_bar, text="Close", command=_close).pack(side='right')
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+        win.update_idletasks()
+        w = 640
+        h = min(win.winfo_reqheight(), 660)
+        try:
+            x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
+            y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            win.geometry(f"{w}x{h}")
+        win.grab_set()
+
     def extract_subject_id(self, filename, pattern, suffix):
         """Extract subject ID from filename by removing pattern and suffix"""
         import re
@@ -12837,6 +13227,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.log_message(f"  Detected {num_photometry_cols} photometry column(s): {photometry_col_indices}")
         self.log_message(f"  ComputerTimestamp column: {'Present' if has_computer_ts else 'Not present'}")
 
+        # Flag deviations from the expected FPData layout for the summary popup.
+        if not has_computer_ts and hasattr(self, 'processing_summary'):
+            self.processing_summary.setdefault('structure_warnings', []).append(
+                f"{subject_id}: FPData has no ComputerTimestamp column "
+                f"(expected at column 3)")
+
         # Per-channel designation (e.g. G0/G1/R0) read from the column headers, so a
         # subject recorded on region 1 is labelled "G1" instead of defaulting to "G0".
         # Only honour header names that look like real designations (G/R + digit);
@@ -12854,6 +13250,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 detected_channel_names = _names
                 result['channel_names'] = detected_channel_names
                 self.log_message(f"  Channel designations from header: {detected_channel_names}")
+            elif hasattr(self, 'processing_summary'):
+                # Header present but no recognizable G/R designation — a deviation
+                # from the expected FPData layout (e.g. G0/G1/R0 column names).
+                self.processing_summary.setdefault('structure_warnings', []).append(
+                    f"{subject_id}: FPData header lacks G/R channel designation "
+                    f"(expected e.g. G0/G1/R0) — using positional Ch#")
 
         if num_photometry_cols == 0:
             raise ValueError("No photometry data columns found in FPData file")
@@ -12895,26 +13297,40 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         frame_idx = next((i for i, c in enumerate(cols_lower) if c in frame_candidates), None)
                         ts_idx = next((i for i, c in enumerate(cols_lower) if c in ts_candidates), None)
 
-                        new_cols = []
-                        if frame_idx is not None:
-                            new_cols.append(cols[frame_idx])
-                        if ts_idx is not None and ts_idx != frame_idx:
-                            new_cols.append(cols[ts_idx])
+                        # Build the standard layout explicitly so X/Y are ALWAYS at
+                        # indices 2/3, regardless of which of frame/timestamp exist.
+                        # Relying on column selection previously shifted X to index 1
+                        # when no frame column was present, which broke both the
+                        # behavior↔FP timestamp sync (reads col 1 as time) and the
+                        # position parsing (reads cols 2/3 as X/Y).
+                        n_beh = len(df_beh)
 
-                        # Ensure X and Y are in positions 2 and 3
-                        new_cols.append(cols[x_idx])
-                        new_cols.append(cols[y_idx])
+                        def _numcol(idx, fallback):
+                            if idx is None:
+                                return fallback
+                            return pd.to_numeric(df_beh[cols[idx]], errors='coerce').to_numpy(dtype=float)
 
-                        # Append remaining columns
-                        for c in cols:
-                            if c not in new_cols:
-                                new_cols.append(c)
+                        frame_col = _numcol(frame_idx, np.arange(n_beh, dtype=float))
+                        ts_col    = _numcol(ts_idx, np.full(n_beh, np.nan))
+                        x_col     = _numcol(x_idx, np.full(n_beh, np.nan))
+                        y_col     = _numcol(y_idx, np.full(n_beh, np.nan))
 
-                        df_reordered = df_beh[new_cols]
-                        df_numeric = df_reordered.apply(pd.to_numeric, errors='coerce')
-                        beh_raw = df_numeric.values
+                        used = {frame_idx, ts_idx, x_idx, y_idx}
+                        rest = [pd.to_numeric(df_beh[cols[i]], errors='coerce').to_numpy(dtype=float)
+                                for i in range(len(cols)) if i not in used]
+                        beh_raw = np.column_stack([frame_col, ts_col, x_col, y_col] + rest)
                         has_position = True
-                        self.log_message(f"  Position data detected (X/Y columns: {cols[x_idx]}, {cols[y_idx]})")
+                        self.log_message(
+                            f"  Position data detected (X/Y columns: {cols[x_idx]}, {cols[y_idx]}; "
+                            f"frame={'yes' if frame_idx is not None else 'synthesized'}, "
+                            f"timestamp={'yes' if ts_idx is not None else 'MISSING'})")
+                        if ts_idx is None:
+                            self.log_message(
+                                "    Warning: no timestamp column in position file — "
+                                "behavior↔FP synchronization will be unavailable for this subject.")
+                            if hasattr(self, 'processing_summary'):
+                                self.processing_summary.setdefault('fallbacks_used', []).append(
+                                    f"{subject_id}: position file has no timestamp column")
                     else:
                         # Named columns but no X/Y found - use positional heuristic
                         beh_data = df_beh.apply(pd.to_numeric, errors='coerce').values
@@ -12922,6 +13338,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             has_position = True
                             beh_raw = beh_data
                             self.log_message(f"  Position data detected (4+ columns, assuming X/Y at positions 2-3)")
+                        elif beh_data.shape[1] == 1:
+                            # Single-column position file = per-frame timestamps only
+                            # (no X/Y). Build the standard [frame, timestamp] layout
+                            # so the sync code (reads column 1 as the timestamp) works.
+                            beh_raw = self._build_timestamp_only_beh(df_beh.iloc[:, 0])
+                            has_position = False
+                            self.log_message(
+                                "  Single-column position file detected — treating it as "
+                                "per-frame timestamps (no X/Y); frame indices synthesized.")
+                            if hasattr(self, 'processing_summary'):
+                                self.processing_summary['no_position_data'].append(subject_id)
                         else:
                             beh_raw = beh_data[:, :2] if beh_data.shape[1] >= 2 else beh_data
                             self.log_message(f"  No position data (only {beh_data.shape[1]} columns)")
@@ -12937,6 +13364,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         has_position = True
                         beh_raw = beh_data
                         self.log_message(f"  Position data detected (no header, {beh_data.shape[1]} columns, X/Y assumed at positions 2-3)")
+                    elif beh_data.shape[1] == 1:
+                        # Single-column position file = per-frame timestamps only
+                        # (no X/Y). Build the standard [frame, timestamp] layout so
+                        # the sync code, which reads column 1 as the timestamp,
+                        # works correctly. Frame indices are synthesized.
+                        beh_raw = self._build_timestamp_only_beh(df_beh.iloc[:, 0])
+                        has_position = False
+                        self.log_message(
+                            "  Single-column position file detected — treating it as "
+                            "per-frame timestamps (no X/Y); frame indices synthesized.")
+                        if hasattr(self, 'processing_summary'):
+                            self.processing_summary['no_position_data'].append(subject_id)
                     else:
                         beh_raw = beh_data[:, :2] if beh_data.shape[1] >= 2 else beh_data
                         self.log_message(f"  No position data (only {beh_data.shape[1]} columns)")
@@ -13179,21 +13618,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             result['zscore_570'] = zscore_570
             processed_wavelengths.append('570')
         
-        # For backward compatibility, store primary wavelength as default
-        # Priority: 470nm if available, otherwise 570nm
-        if process_green:
-            result['data'] = result['data_470']
-            result['dff'] = result['dff_470']
-            result['corrected'] = result['corrected_470']
-            result['zscore'] = result['zscore_470']
+        # Build the "primary" default matrices used by the behaviour-synced
+        # pipeline (bouts, zone/kinematics) and exports.  Each channel is taken
+        # from the wavelength matrix matching its G/R designation so green
+        # channels carry their 470 nm signal and red channels their 560/570 nm
+        # signal — instead of forcing every channel onto a single wavelength.
+        for _key in ('data', 'dff', 'corrected', 'zscore'):
+            combined = self._combine_by_wavelength(result, _key)
+            if combined is not None:
+                result[_key] = combined
+
+        if process_green and process_red:
+            primary_wavelength = "470nm (Green) + 570nm (Red)"
+        elif process_green:
             primary_wavelength = "470nm (Green)"
         elif process_red:
-            result['data'] = result['data_570']
-            result['dff'] = result['dff_570']
-            result['corrected'] = result['corrected_570']
-            result['zscore'] = result['zscore_570']
             primary_wavelength = "570nm (Red)"
-        
+
         result['primary_channel'] = primary_wavelength
         result['processed_wavelengths'] = processed_wavelengths
 
@@ -13218,7 +13659,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Process position data if available
             if has_position:
                 self.log_message(f"  Processing position data (calibration, velocity, distance)...")
-                beh_synced = self.process_position_data(beh_synced)
+                beh_synced = self.process_position_data(
+                    beh_synced, n_channels=result.get('num_photometry_channels'))
                 result['beh_synced'] = beh_synced
                 
                 # Detect zone entries and add entry flags
@@ -13243,7 +13685,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
                 # Calculate distance-based averages
                 self.log_message(f"  Calculating distance-from-center averages...")
-                x_dist_avgs, y_dist_avgs, eucl_dist_avgs = self.calculate_distance_based_averages(beh_synced)
+                x_dist_avgs, y_dist_avgs, eucl_dist_avgs = self.calculate_distance_based_averages(
+                beh_synced, n_channels=result.get('num_photometry_channels'))
                 result['distance_averages_x'] = x_dist_avgs
                 result['distance_averages_y'] = y_dist_avgs
                 result['distance_averages_euclidean'] = eucl_dist_avgs
@@ -13281,20 +13724,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Use FP timestamps (column 1 of zscore)
             timestamps = zscore[:, 1]
             
-            # Build synthetic beh_synced array
-            # Structure: frame(0), timestamp(1), X(2), Y(3), unused(4-5), G0(6), G1(7), ..., elapsed(10)
+            # Build synthetic beh_synced array.
+            # Layout: frame(0), timestamp(1), X(2), Y(3), unused(4-5),
+            #         channels(6..6+N-1), then the kinematics block at 6+N.
             num_photo_channels = zscore.shape[1] - 2
-            # Ensure we have enough columns for all photometry channels
-            n_cols = max(11, 6 + num_photo_channels + 1)  # +1 for elapsed time at column 10
+            kin_base = self._beh_kin_base(num_photo_channels)
+            n_cols = self._beh_width(num_photo_channels)
             beh_synced = np.full((n_frames, n_cols), np.nan)
-            
+
             # Fill in data
             beh_synced[:, 0] = frames  # Frame numbers
             beh_synced[:, 1] = timestamps  # Computer timestamps
             # Columns 2-5 remain NaN (no position data)
             for ch in range(num_photo_channels):  # All photometry channels
                 beh_synced[:, 6 + ch] = zscore[:, 2 + ch]
-            beh_synced[:, 10] = zscore[:, 0]  # Elapsed time
+            beh_synced[:, kin_base] = zscore[:, 0]  # Elapsed time (after channels)
             
             result['beh_synced'] = beh_synced
             result['has_position'] = False
@@ -13673,6 +14117,25 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return corrected
     
+    def _build_timestamp_only_beh(self, ts_series):
+        """Build a standard [frame, timestamp] behavior array from a single column.
+
+        Some position files contain only one column of per-frame timestamps (no
+        frame index, no X/Y). The synchronization code expects the timestamp at
+        column index 1 (layout: frame, timestamp, X, Y, ...), so we synthesize a
+        0-based frame index in column 0 and place the timestamps in column 1.
+
+        Args:
+            ts_series: pandas Series / array-like holding the single timestamp column.
+
+        Returns:
+            np.ndarray of shape (N, 2): column 0 = synthesized frame index,
+            column 1 = timestamps (NaN where unparseable).
+        """
+        ts_col = pd.to_numeric(pd.Series(ts_series), errors='coerce').to_numpy(dtype=float)
+        frame_col = np.arange(len(ts_col), dtype=float)
+        return np.column_stack([frame_col, ts_col])
+
     def synchronize_behavior(self, zscore_data, beh_raw, has_position=False):
         """Synchronize behavior timestamps with photometry data
         
@@ -13683,13 +14146,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """
         # Determine number of photometry channels available
         num_photo_channels = zscore_data.shape[1] - 2  # Subtract elapsed time and timestamp columns
-        
-        # Determine number of columns needed
-        n_cols = 11 if not has_position else max(11, beh_raw.shape[1])
-        
+        kin_base = self._beh_kin_base(num_photo_channels)
+
+        # Determine number of columns needed. The kinematics block lives at
+        # 6+N.. so the array must be at least that wide regardless of channel
+        # count; position files may carry extra leading columns too.
+        min_cols = self._beh_width(num_photo_channels)
+        n_cols = min_cols if not has_position else max(min_cols, beh_raw.shape[1])
+
         # Create extended behavior array
-        # Columns: 0=frame, 1=timestamp, 2=X (if present), 3=Y (if present), 4-5=unused, 
-        #          6=G0, 7=G1 (if present), 8-9=unused, 10=elapsed_time
+        # Columns: 0=frame, 1=timestamp, 2=X (if present), 3=Y (if present), 4-5=unused,
+        #          6..6+N-1 = photometry channels, then elapsed/velocity/distance/center.
         beh_synced = np.full((len(beh_raw), n_cols), np.nan)
         
         # Copy all original behavior columns
@@ -13745,14 +14212,44 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
                 fp_ts_ref  = fp_elapsed_rel
                 beh_ts_ref = beh_elapsed_rel
-                
+
+                # Estimate the precut duration (the elapsed column is in minutes
+                # relative to the *pre-precut* first sample, so its first value is
+                # exactly the time skipped by the precut).
+                try:
+                    precut_s = float(fp_elapsed[0]) * 60.0
+                    if not np.isfinite(precut_s) or precut_s < 0:
+                        precut_s = 0.0
+                except Exception:
+                    precut_s = 0.0
+
                 self.log_message(
-                    f"    Warning: Behavior/FP timestamp mismatch detected "
-                    f"(beh range [{beh_min:.3g}, {beh_max:.3g}] vs "
-                    f"FP range [{fp_min:.3g}, {fp_max:.3g}]). "
-                    f"Using relative elapsed-time matching."
+                    f"    Sync mode: RELATIVE elapsed-time matching "
+                    f"(timestamp ranges do not overlap: beh [{beh_min:.3g}, {beh_max:.3g}] "
+                    f"vs FP [{fp_min:.3g}, {fp_max:.3g}])."
                 )
-        
+                self.log_message(
+                    f"    Warning: relative matching aligns both recordings from t=0, so "
+                    f"(a) the ~{precut_s:.2f} s removed by the precut is NOT compensated and "
+                    f"(b) any true start delay between the position and FP files is zeroed. "
+                    f"Verify alignment with the Kinematics → 'Velocity–Signal cross-correlation' "
+                    f"plot: a consistent non-zero peak lag across subjects indicates a residual offset."
+                )
+            else:
+                # Absolute (shared-clock) matching — the robust path. Report the
+                # apparent start offset between the two files so a delay is visible.
+                start_offset = float(beh_min - fp_min)
+                self.log_message(
+                    f"    Sync mode: ABSOLUTE timestamp matching (shared clock). "
+                    f"Position-file start minus FP start = {start_offset:+.3g} "
+                    f"(same units as the timestamps; handled automatically by absolute matching)."
+                )
+        elif valid_mask.sum() <= 1:
+            self.log_message(
+                "    Sync warning: position file has no usable timestamp column — "
+                "FP signal could not be aligned to behavior for this subject."
+            )
+
         # For each behavior timestamp, find closest photometry timestamp
         for i in range(len(beh_raw)):
             beh_ts = beh_ts_ref[i]
@@ -13764,10 +14261,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             
             # Store matched values for each available channel
             for ch_idx, fp_channel in enumerate(fp_channels):
-                if 6 + ch_idx < n_cols:  # Ensure we don't exceed column bounds
+                if 6 + ch_idx < kin_base:  # Channels occupy cols 6 .. 6+N-1
                     beh_synced[i, 6 + ch_idx] = fp_channel[idx]
-            
-            beh_synced[i, 10] = fp_elapsed[idx] # Elapsed time
+
+            beh_synced[i, kin_base] = fp_elapsed[idx]  # Elapsed time (after channels)
         
         # Sanity check: warn if the vast majority of frames still map to the same FP index
         # (can happen if relative matching also fails, e.g. completely different session lengths)
@@ -13787,28 +14284,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return beh_synced
     
-    def process_position_data(self, beh_synced):
+    def process_position_data(self, beh_synced, n_channels=None):
         """Process position data (X, Y coordinates) if present
-        
+
         Performs:
         - Position calibration (pixel to cm conversion)
         - Velocity calculation
         - Distance traveled calculation
         - Distance from center calculation
-        
+
         Args:
             beh_synced: Synchronized behavior array with X, Y in columns 2, 3
-            
+            n_channels: Number of photometry channels (cols 6..6+N-1). The
+                kinematics block is written at 6+N onward.
+
         Returns:
-            Updated beh_synced array with additional columns:
-            - Column 11: Velocity (cm/s)
-            - Column 12: Distance per frame (cm)
-            - Column 13: Distance from center X-axis (cm)
-            - Column 14: Distance from center Y-axis (cm)
+            Updated beh_synced array with the kinematics block at 6+N:
+            elapsed(+0), velocity(+1), dist_per_frame(+2), center_x(+3), center_y(+4)
         """
-        # Ensure we have enough columns
-        if beh_synced.shape[1] < 15:
-            new_cols = np.full((beh_synced.shape[0], 15 - beh_synced.shape[1]), np.nan)
+        if n_channels is None:
+            # Best-effort: assume the array is already sized to the v2 layout.
+            n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
+        kin_base = self._beh_kin_base(n_channels)
+
+        # Ensure we have enough columns for the kinematics block.
+        needed = self._beh_width(n_channels)
+        if beh_synced.shape[1] < needed:
+            new_cols = np.full((beh_synced.shape[0], needed - beh_synced.shape[1]), np.nan)
             beh_synced = np.column_stack([beh_synced, new_cols])
         
         # 1. Calibrate position data (convert pixels to cm)
@@ -13875,7 +14377,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         outlier_limit = mean_vel + threshold * std_vel
         velocity[velocity > outlier_limit] = 0
         
-        beh_synced[:, 11] = velocity  # Store velocity in column 11
+        beh_synced[:, kin_base + 1] = velocity  # Velocity (kinematics +1)
         
         # 3. Calculate distance traveled using 10-frame chunks
         chunk_size = 10
@@ -13909,7 +14411,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 dist_per_frame_chunk = distance_chunk / remainder
                 dist_per_frame[start_idx:] = dist_per_frame_chunk
         
-        beh_synced[:, 12] = dist_per_frame  # Store distance per frame in column 12
+        beh_synced[:, kin_base + 2] = dist_per_frame  # Distance per frame (kinematics +2)
         
         # Log total distance
         self.log_message(f"    Total distance traveled: {total_distance:.2f} cm")
@@ -13920,9 +14422,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         x_to_center = np.abs(beh_synced[:, 2] - center_x)
         y_to_center = np.abs(beh_synced[:, 3] - center_y)
         
-        beh_synced[:, 13] = x_to_center  # Distance from center on X-axis
-        beh_synced[:, 14] = y_to_center  # Distance from center on Y-axis
-        
+        beh_synced[:, kin_base + 3] = x_to_center  # Distance from center X (kinematics +3)
+        beh_synced[:, kin_base + 4] = y_to_center  # Distance from center Y (kinematics +4)
+
         return beh_synced
     
     def detect_zone_entries(self, beh_synced):
@@ -14302,7 +14804,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return zone_averages
     
-    def calculate_distance_based_averages(self, beh_synced):
+    def calculate_distance_based_averages(self, beh_synced, n_channels=None):
         """Calculate average z-score based on distance from center along X, Y, and Euclidean distance
         
         Similar to MATLAB code that bins by 1cm distance from center and calculates
@@ -14316,10 +14818,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """
         has_g0 = beh_synced.shape[1] > 6
         has_g1 = beh_synced.shape[1] > 7
-        
-        # Distance from center is in columns 13 (X-axis) and 14 (Y-axis)
-        x_distances = beh_synced[:, 13]
-        y_distances = beh_synced[:, 14]
+
+        # Distance from center lives in the kinematics block at 6+N (+3 = X, +4 = Y).
+        kin_base = self._beh_kin_base(
+            n_channels if n_channels is not None
+            else max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)))
+        x_distances = beh_synced[:, kin_base + 3]
+        y_distances = beh_synced[:, kin_base + 4]
         # Euclidean distance derived from X and Y components
         eucl_distances = np.sqrt(x_distances**2 + y_distances**2)
 
@@ -14419,10 +14924,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Returns:
             Dictionary with max distance and photometry averages at that zone
         """
-        # Y position is in column 3, distance from center Y is in column 14
+        # Y position is in column 3; distance-from-center-Y is the last kinematics column.
+        _kb = self._beh_kin_base(max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)))
         y_positions = beh_synced[:, 3]
-        y_distances = beh_synced[:, 14]  # Already calculated absolute distance from center
-        
+        y_distances = beh_synced[:, _kb + 4]  # Already calculated absolute distance from center
+
         # Find the maximum absolute Y distance from center
         valid_y_dist = y_distances[~np.isnan(y_distances)]
         if len(valid_y_dist) == 0:
@@ -14526,8 +15032,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fps = self.params['fps']
         min_duration_frames = int(0.5 * fps)  # 0.5 second minimum
         
-        # Get Y distances and positions
-        y_distances = beh_synced[:, 14]  # Distance from center Y
+        # Get Y distances and positions (distance-from-center-Y is the last kinematics column)
+        _kb = self._beh_kin_base(max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)))
+        y_distances = beh_synced[:, _kb + 4]  # Distance from center Y
         y_positions = beh_synced[:, 3]   # Y position
         
         # Create mask for frames in the max distance zone
@@ -14820,11 +15327,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 beh_synced = data['beh_synced']
                 subjects_processed += 1
                 
-                # Get position data from numpy array columns
-                # Column 2: X_cm, Column 3: Y_cm, Column 11: velocity
+                # Position data: X_cm/Y_cm at cols 2/3; velocity in the kinematics
+                # block at 6+N+1 (after the photometry channels).
+                _vel_col = self._beh_kin_base(self._beh_channel_count(data)) + 1
                 x_coords = beh_synced[:, 2]
                 y_coords = beh_synced[:, 3]
-                velocity = beh_synced[:, 11] if beh_synced.shape[1] > 11 else np.zeros(len(beh_synced))
+                velocity = (beh_synced[:, _vel_col]
+                            if beh_synced.shape[1] > _vel_col else np.zeros(len(beh_synced)))
                 
                 # Calculate zones for each frame
                 zones = []
@@ -16398,7 +16907,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if stored_nch and stored_nch > 0:
             phot_cols = list(range(6, 6 + stored_nch))
         else:
-            phot_cols = list(range(6, beh.shape[1])) if beh.shape[1] > 6 else []
+            guess = beh.shape[1] - 6 - len(self.BEH_KIN_FIELDS)
+            phot_cols = list(range(6, 6 + guess)) if guess > 0 else (
+                list(range(6, beh.shape[1])) if beh.shape[1] > 6 else [])
         if not phot_cols:
             return None
         # Prefer the subject's actual channel designation (e.g. a subject whose
@@ -16524,15 +17035,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         f"    Boutframe scaling: {_video_fps} fps (video) → "
                         f"{_photo_fps:.3f} Hz (photometry) | factor={_scale_factor:.4f}")
             
-            # Detect available photometry columns (columns 6+ contain per-channel z-scores).
-            # Use stored channel count when available to avoid counting non-photometry
-            # columns (e.g. elapsed time at column 10) as channels.
+            # Photometry channels occupy cols 6 .. 6+N-1; the kinematics block
+            # (elapsed/velocity/distance/center) follows AFTER them. Use the stored
+            # channel count so kinematics columns are never mistaken for channels.
             subject_data = self.processed_data.get(subject_id, {})
             stored_nch = subject_data.get('num_photometry_channels')
             if stored_nch is not None and stored_nch > 0:
                 phot_cols = list(range(6, 6 + stored_nch))
             else:
-                phot_cols = list(range(6, beh_synced.shape[1])) if beh_synced.shape[1] > 6 else []
+                # Fallback: derive count by removing the trailing kinematics block.
+                guess = beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)
+                phot_cols = list(range(6, 6 + guess)) if guess > 0 else (
+                    list(range(6, beh_synced.shape[1])) if beh_synced.shape[1] > 6 else [])
             num_channels = len(phot_cols)
 
             
@@ -16597,14 +17111,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             else:
                                 self.log_message(f"    Warning: Skipping invalid bout at frame {frame} for {behavior} (constant or zero variance) on Ch{ch}")
 
-                # Provide backward-compatible keys for G0/G1 if present
+                # Store each channel under both its positional Ch{n} key (used by
+                # index-based consumers like visualization) and its real designation
+                # (G0/G1/R4/…) so name-based consumers work for any channel count.
                 behavior_entry = {}
                 for ch in range(num_channels):
                     behavior_entry[f'Ch{ch}'] = behavior_bouts.get(f'Ch{ch}', [])
+                for ch in range(num_channels):
+                    real = self.get_channel_name(subject_data, ch)
+                    if real not in behavior_entry:
+                        behavior_entry[real] = behavior_entry[f'Ch{ch}']
+                # Keep explicit G0/G1 aliases for backward compatibility.
                 if num_channels >= 1:
-                    behavior_entry['G0'] = behavior_entry.get('Ch0', [])
+                    behavior_entry.setdefault('G0', behavior_entry.get('Ch0', []))
                 if num_channels >= 2:
-                    behavior_entry['G1'] = behavior_entry.get('Ch1', [])
+                    behavior_entry.setdefault('G1', behavior_entry.get('Ch1', []))
 
                 # Store onset (start) frames so other analyses can use them without
                 # re-reading the boutframes Excel file.  Also store end frames and
@@ -16670,10 +17191,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         offset_entry = {}
                         for ch in range(num_channels):
                             offset_entry[f'Ch{ch}'] = offset_bouts.get(f'Ch{ch}', [])
+                        for ch in range(num_channels):
+                            real = self.get_channel_name(subject_data, ch)
+                            if real not in offset_entry:
+                                offset_entry[real] = offset_entry[f'Ch{ch}']
                         if num_channels >= 1:
-                            offset_entry['G0'] = offset_entry.get('Ch0', [])
+                            offset_entry.setdefault('G0', offset_entry.get('Ch0', []))
                         if num_channels >= 2:
-                            offset_entry['G1'] = offset_entry.get('Ch1', [])
+                            offset_entry.setdefault('G1', offset_entry.get('Ch1', []))
                         offset_entry['onset_frames'] = shifted_frames.tolist()
                         if shifted_ends is not None:
                             offset_entry['end_frames'] = shifted_ends.tolist()
@@ -16758,6 +17283,78 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             bouts = bouts[:max_bouts]
         return self._realign_bouts(bouts, self._entry_prebout(entry))
 
+    def _stored_bout_trace_length(self, data):
+        """Length (in frames) of a subject's stored bout traces, or None.
+
+        Returns the *maximum* trace length across the subject's behaviors/bouts.
+        This is the raw extraction length before realignment, so it reflects the
+        pre/post window the bouts were extracted with; the max (rather than the
+        first trace) avoids being fooled by bouts clipped at the recording edge,
+        which are shorter than the full window."""
+        if not isinstance(data, dict):
+            return None
+        bouts = data.get('bouts')
+        if not bouts:
+            return None
+        best = None
+        for entry in bouts.values():
+            if not isinstance(entry, dict):
+                continue
+            for ch in ('G0', 'G1'):
+                for tr in entry.get(ch) or []:
+                    try:
+                        L = len(tr)
+                    except TypeError:
+                        continue
+                    if best is None or L > best:
+                        best = L
+        return best
+
+    def _warn_if_mixed_bout_windows(self, subjects):
+        """Warn when the selected subjects' stored bouts span more than one
+        extraction window, or were extracted with a window different from the
+        current pre/post settings.
+
+        Either case means the bout plots realign (NaN-pad / crop) some subjects
+        onto the current axis, so they silently show truncated / blank regions —
+        the classic "zero data" symptom of a partial reprocess.  Logged every
+        time; the modal popup is shown only when the situation changes so it
+        doesn't nag on every plot."""
+        cur_total = (int(self.params.get('preboutframes', 90))
+                     + int(self.params.get('postboutframes', 90)))
+        lengths = {}  # trace length -> [subjects]
+        for s in subjects:
+            L = self._stored_bout_trace_length(self.processed_data.get(s, {}))
+            if L is not None:
+                lengths.setdefault(L, []).append(s)
+
+        if not lengths:
+            return  # no stored bouts to compare
+
+        distinct = sorted(lengths)
+        # Consistent iff a single window that matches the current settings.
+        if len(distinct) == 1 and distinct[0] == cur_total:
+            self._mixed_window_warn_sig = None
+            return
+
+        short = [s for L in distinct if L < cur_total for s in lengths[L]]
+        lines = [f"{L} frames: {', '.join(lengths[L])}" for L in distinct]
+        msg = (
+            "The selected subjects' bouts were not all extracted with the "
+            "current pre/post window (prebout + postbout = "
+            f"{cur_total} frames).\n\n"
+            "Windows found:\n  " + "\n  ".join(lines) + "\n\n"
+            "Subjects with a shorter window appear truncated (blank) at the "
+            "edges of the plot, and mixed windows can misalign the average. "
+            "Set the desired pre/post window and click "
+            "“⟲ Apply Settings & Re-extract Bouts”, then re-plot.")
+        self.log_message("  Warning: mixed bout-extraction windows — " + "; ".join(lines))
+
+        sig = tuple((L, tuple(sorted(lengths[L]))) for L in distinct) + (cur_total,)
+        if getattr(self, '_mixed_window_warn_sig', None) != sig:
+            self._mixed_window_warn_sig = sig
+            messagebox.showwarning("Mixed Bout Windows", msg)
+
     def extract_entry_bouts(self, beh_synced, entry_frames_dict, num_photometry_channels=None):
         """Extract photometry traces aligned to zone entries
         
@@ -16786,7 +17383,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if num_photometry_channels is not None and num_photometry_channels > 0:
             phot_cols = list(range(6, 6 + num_photometry_channels))
         else:
-            phot_cols = list(range(6, beh_synced.shape[1])) if beh_synced.shape[1] > 6 else []
+            guess = beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)
+            phot_cols = list(range(6, 6 + guess)) if guess > 0 else (
+                list(range(6, beh_synced.shape[1])) if beh_synced.shape[1] > 6 else [])
         num_channels = len(phot_cols)
 
         self.log_message(f"  Extracting entry bouts...")
@@ -16842,7 +17441,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 packed['_postbout'] = int(postbout)
 
                 entry_bout_data[entry_type][display_name] = packed
-                self.log_message(f"    Extracted {sum(len(v) for v in packed.values())} total bouts for {entry_type}")
+                # Count only the per-channel trace lists (Ch0..ChN); packed also
+                # holds scalar window metadata (_prebout/_postbout) and the G0/G1
+                # aliases of Ch0/Ch1, neither of which should be len()'d/summed.
+                _n_extracted = sum(len(packed.get(f'Ch{ch}', []))
+                                   for ch in range(num_channels))
+                self.log_message(f"    Extracted {_n_extracted} total bouts for {entry_type}")
             else:
                 self.log_message(f"    No {entry_type} entries to extract")
                 entry_bout_data[entry_type][display_name] = {
@@ -17114,6 +17718,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             n_ok = 0
             n_fail = 0
             errors = []
+            ok_subjects = []
             for i, sid in enumerate(subjects_with_data):
                 self.root.after(0, lambda i=i: (
                     self._reextract_status_var.set(f"Working\u2026 ({i}/{n_total})")
@@ -17128,6 +17733,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     bout_data = self.extract_bouts(sid, beh_synced, bf)
                     self.processed_data[sid]['bouts'] = bout_data
                     n_ok += 1
+                    ok_subjects.append(sid)
                 except Exception as exc:
                     n_fail += 1
                     errors.append(f"{sid}: {exc}")
@@ -17138,6 +17744,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if n_fail:
                     status += f"  {n_fail} failed."
                 self.log_message(status)
+
+                # Persist the re-extracted bouts to disk (overwriting the old
+                # window's CSVs + _bout_windows.json) so the new window survives a
+                # reload instead of living only in memory.
+                if ok_subjects and self.current_project:
+                    try:
+                        self.save_project(quiet=True, subjects=ok_subjects)
+                        self.log_message(
+                            f"  Saved re-extracted bouts for {len(ok_subjects)} "
+                            f"subject(s) to disk.")
+                    except Exception as save_exc:
+                        self.log_message(
+                            f"  Warning: could not save re-extracted bouts: {save_exc}")
+
                 if hasattr(self, '_reextract_status_var'):
                     self._reextract_status_var.set(status)
                 if n_fail == 0:
@@ -18397,21 +19017,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Label(header_frame, text="Behavioral Data:", 
                  font=('Segoe UI', 10, 'bold')).grid(row=0, column=2, sticky='w', padx=20)
         
-        # Common channel names to check for
-        possible_channels = ['G0', 'G1', 'G2', 'R0', 'R1', 'R2']
-        
+        # A valid channel designation is a G/R prefix followed by a region index
+        # (e.g. G0, G1, R2, R4, R5). Validate by shape rather than a fixed list so
+        # higher-numbered red channels (R3/R4/R5...) are not silently dropped.
+        import re
+        _is_channel = lambda ch: bool(re.match(r'^[GR]\d+$', str(ch)))
+
         # Create row for each subject
         for subject in sorted(self.processed_data.keys()):
             data = self.processed_data[subject]
-            
+
             # Determine available channels for this subject
             available_channels = []
             channel_names = data.get('channel_names') or data.get('channel_name_map', {})
-            
+
             if isinstance(channel_names, list):
-                available_channels = [ch for ch in channel_names if ch in possible_channels]
+                available_channels = [ch for ch in channel_names if _is_channel(ch)]
             elif isinstance(channel_names, dict):
-                available_channels = [ch for ch in channel_names.values() if ch in possible_channels]
+                # channel_name_map is keyed by column index; preserve column order.
+                try:
+                    ordered = [channel_names[k] for k in sorted(channel_names, key=lambda x: int(x))]
+                except (ValueError, TypeError):
+                    ordered = list(channel_names.values())
+                available_channels = [ch for ch in ordered if _is_channel(ch)]
             else:
                 # Fallback: assume G0 and G1 if has wavelengths
                 if data.get('has_470'):
@@ -18654,20 +19282,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 subject = self.viz_subject_listbox.get(selected_indices[0])
                 if subject in self.processed_data:
                     data = self.processed_data[subject]
-                    available_channels = []
-                    # Check 470nm channels
-                    if data.get('has_470', False):
-                        fp_data_470 = data.get('data_470')
-                        if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                            num_channels = (fp_data_470.shape[1] - 2) // 2
-                            available_channels = [f"G{i}" for i in range(num_channels)]
-                    # If no 470nm, check 570nm
-                    elif data.get('has_570', False):
-                        fp_data_570 = data.get('data_570')
-                        if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                            num_channels = (fp_data_570.shape[1] - 2) // 2
-                            available_channels = [f"G{i}" for i in range(num_channels)]
-                    
+                    # Use the real channel designations (G0/G1/R4/…) in column
+                    # order so every channel is selectable and labelled correctly.
+                    available_channels = self._ordered_channel_names(data)
+
                     if available_channels:
                         self.integrity_channel_combo['values'] = available_channels
                         # Set to first available channel if current selection is invalid
@@ -18945,10 +19563,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for i, subject in enumerate(sorted_subjects):
             if subject in selected_subjects:
                 self.bout_analysis_subject_listbox.selection_set(i)
-        
-        # Update behavior combo
+
+        # Update behavior combo and channel radiobuttons
         self.update_bout_analysis_behaviors()
-    
+        self.refresh_bout_analysis_channels()
+
+    def refresh_bout_analysis_channels(self):
+        """Rebuild the bout-analysis channel radiobuttons from the channels
+        actually present across processed subjects (any count, G or R)."""
+        frame = getattr(self, 'bout_analysis_channel_frame', None)
+        if frame is None:
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        chans = self._all_channel_names()
+        for idx, ch in enumerate(chans):
+            ttk.Radiobutton(frame, text=ch, variable=self.bout_analysis_channel_var,
+                            value=ch).pack(side='left', padx=(0 if idx == 0 else 6, 0))
+        if self.bout_analysis_channel_var.get() not in chans:
+            self.bout_analysis_channel_var.set(chans[0])
+
     def update_bout_analysis_behaviors(self):
         """Update behavior combo box in bout analysis tab"""
         behaviors = set()
@@ -19189,8 +19823,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Clear previous plot
         for widget in self.fig_frame.winfo_children():
             widget.destroy()
-        
+
         plot_type = self.plot_type_var.get()
+
+        # Warn if the selected subjects' stored bouts span mismatched extraction
+        # windows (a partial reprocess) — these plots realign onto the current
+        # window, so otherwise some subjects silently show blank/truncated data.
+        if any(t in plot_type for t in
+               ("Extracted Bouts", "Compare Across Bouts", "Bouts Overlay")):
+            try:
+                self._warn_if_mixed_bout_windows(valid_subjects)
+            except Exception as _e:
+                self.log_message(f"Bout-window check skipped: {_e}")
 
         # Determine figure size – use user-set values or fall back to
         # content-aware, plot-type-specific defaults (scales with item count).
@@ -19818,20 +20462,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 subject = self.viz_subject_listbox.get(selected_indices[0])
                 if subject in self.processed_data:
                     data = self.processed_data[subject]
-                    available_channels = []
-                    # Check 470nm channels
-                    if data.get('has_470', False):
-                        fp_data_470 = data.get('data_470')
-                        if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                            num_channels = (fp_data_470.shape[1] - 2) // 2
-                            available_channels = [f"G{i}" for i in range(num_channels)]
-                    # If no 470nm, check 570nm
-                    elif data.get('has_570', False):
-                        fp_data_570 = data.get('data_570')
-                        if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                            num_channels = (fp_data_570.shape[1] - 2) // 2
-                            available_channels = [f"G{i}" for i in range(num_channels)]
-                    
+                    # Use the real channel designations (G0/G1/R4/…) in column order.
+                    available_channels = self._ordered_channel_names(data)
+
                     if available_channels:
                         self.integrity_channel_combo['values'] = available_channels
                         # Set to first available channel if current selection is invalid
@@ -19867,10 +20500,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Fallback to two-channel legacy
             num_channels = 2
 
-        # Create checkboxes
+        # Create checkboxes labelled with the real channel designation (G0/R4/…)
+        # so every channel — regardless of count or region index — is selectable.
         for ch in range(num_channels):
             var = tk.IntVar(value=1 if ch < 2 else 0)
-            cb = ttk.Checkbutton(self.viz_channel_check_frame, text=f'Ch{ch}', variable=var)
+            cb = ttk.Checkbutton(self.viz_channel_check_frame,
+                                 text=self.get_channel_name(data, ch), variable=var)
             cb.pack(side='left', padx=2)
             self.viz_channel_vars.append(var)
 
@@ -20621,7 +21256,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             )
             
             metrics = {
-                'channel': f'G{ch_idx}',
+                'channel': self.get_channel_name(data, ch_idx),
                 'snr': snr,
                 'cv': signal_std,  # Actually signal std, kept variable name for compatibility
                 'correlation': correlation,
@@ -20778,7 +21413,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             ch_snr = 0.0
                         
                         channel_assessments_470.append({
-                            'name': f'G{ch_idx}',
+                            'name': self.get_channel_name(data, ch_idx),
                             'snr': ch_snr,
                             'signal_std': np.std(ch_signal),
                             'correlation': abs(r_value),
@@ -20846,7 +21481,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             ch_snr = 0.0
                         
                         channel_assessments_570.append({
-                            'name': f'G{ch_idx}',
+                            'name': self.get_channel_name(data, ch_idx),
                             'snr': ch_snr,
                             'signal_std': np.std(ch_signal),
                             'correlation': abs(r_value),
@@ -20859,12 +21494,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if has_470:
             fp_data_470 = data.get('data_470')
             if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                # Get selected channel index from UI
+                # Get selected channel index from UI (resolve by column position so
+                # red-named channels like R4 map to the correct column, not the digit).
                 selected_channel_str = self.integrity_channel_var.get()
-                try:
-                    selected_ch_idx = int(selected_channel_str.replace('G', '').replace('Ch', ''))
-                except:
-                    selected_ch_idx = 0  # Default to G0
+                selected_ch_idx = self._channel_position(data, selected_channel_str)
                 
                 # Calculate column indices for selected channel
                 # Data format: [time, computer_ts, G0_signal, G0_iso, G1_signal, G1_iso, ...]
@@ -21109,12 +21742,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if has_570:
             fp_data_570 = data.get('data_570')
             if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                # Get selected channel index from UI (same as 470nm)
+                # Get selected channel index from UI (resolve by column position).
                 selected_channel_str = self.integrity_channel_var.get()
-                try:
-                    selected_ch_idx = int(selected_channel_str.replace('G', '').replace('Ch', ''))
-                except:
-                    selected_ch_idx = 0  # Default to G0
+                selected_ch_idx = self._channel_position(data, selected_channel_str)
                 
                 # Calculate column indices for selected channel
                 ch_signal_col = 2 + (selected_ch_idx * 2)
@@ -21540,20 +22170,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             corr_range_470_val, corr_range_570_val
         )
         
-        # Add channel information to title
-        # Get selected channel for display
-        selected_channel_str = self.integrity_channel_var.get()
-        try:
-            selected_ch_idx = int(selected_channel_str.replace('G', '').replace('Ch', ''))
-        except:
-            selected_ch_idx = 0
-        
+        # Add channel information to title (use the real designation as selected)
+        selected_channel_str = self.integrity_channel_var.get() or "G0"
         if has_470 and has_570:
-            channel_info = f"Both 470nm and 570nm - Channel G{selected_ch_idx}"
+            channel_info = f"Both 470nm and 570nm - Channel {selected_channel_str}"
         elif has_470:
-            channel_info = f"470nm Channel G{selected_ch_idx}"
+            channel_info = f"470nm Channel {selected_channel_str}"
         else:
-            channel_info = f"570nm Channel G{selected_ch_idx}"
+            channel_info = f"570nm Channel {selected_channel_str}"
         
         # Add overall score at the top
         score_ax = fig.add_subplot(4, 1, 1)
@@ -23506,11 +24130,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return  # All present, nothing to do
 
         beh_synced = data.get('beh_synced')
-        if beh_synced is None or beh_synced.shape[1] < 15:
+        _nch = self._beh_channel_count(data)
+        if beh_synced is None or beh_synced.shape[1] < self._beh_width(_nch):
             return  # Not enough columns to recompute
 
         try:
-            x_avgs, y_avgs, eucl_avgs = self.calculate_distance_based_averages(beh_synced)
+            x_avgs, y_avgs, eucl_avgs = self.calculate_distance_based_averages(
+                beh_synced, n_channels=_nch)
             if x_avgs and 'distance_averages_x' not in data:
                 data['distance_averages_x'] = x_avgs
             if y_avgs and 'distance_averages_y' not in data:
@@ -31578,23 +32204,69 @@ cat("OK\n")
             )
             self.install_update_button.config(state='disabled')
             # Restore plain tab title
-            tab_idx = self.notebook.index(self.system_check_tab)
-            self.notebook.tab(tab_idx, text="System Check")
+            tab_idx = self.info_notebook.index(self.system_check_tab)
+            self.info_notebook.tab(tab_idx, text="System Check")
+            self.notebook.tab(self._info_group_frame, text="Info")
             return
 
-        tab_idx = self.notebook.index(self.system_check_tab)
+        tab_idx = self.info_notebook.index(self.system_check_tab)
         if behind == 0:
             self.update_status_label.config(text="✓ Up to date", foreground='green')
             self.install_update_button.config(state='disabled')
-            self.notebook.tab(tab_idx, text="System Check")
+            self.info_notebook.tab(tab_idx, text="System Check")
+            self.notebook.tab(self._info_group_frame, text="Info")
         else:
             self.update_status_label.config(
                 text=f"⚠ Update available! ({behind} commit(s) behind)",
                 foreground='red'
             )
             self.install_update_button.config(state='normal')
-            # Add visual warning indicator to the tab title
-            self.notebook.tab(tab_idx, text="System Check  ⚠")
+            # Add visual warning indicator to the subtab title and the Info main tab
+            self.info_notebook.tab(tab_idx, text="System Check  ⚠")
+            self.notebook.tab(self._info_group_frame, text="Info  ⚠")
+
+        # Mirror the result on the Welcome page badge.
+        self._set_welcome_update_badge(behind, error)
+
+    def _set_welcome_update_badge(self, behind, error):
+        """Reflect the latest update-check result on the Welcome page badge.
+
+        ``behind`` > 0 -> red blinking "Update available"; 0 -> stable green
+        "Up to date"; an error leaves the badge blank so we don't alarm the
+        user when the check simply couldn't run (offline, no git, etc.).
+        """
+        badge = getattr(self, 'welcome_update_badge', None)
+        if badge is None or not badge.winfo_exists():
+            return
+
+        # Stop any running blink animation before reconfiguring.
+        if self._welcome_badge_blink_job is not None:
+            self.root.after_cancel(self._welcome_badge_blink_job)
+            self._welcome_badge_blink_job = None
+
+        if error is not None:
+            badge.config(text="", fg=self.colors['bg_dark'])
+            return
+
+        if behind and behind > 0:
+            badge.config(text="●  Update available", fg='#e23b3b')
+            self._welcome_badge_blink_on = True
+            self._blink_welcome_update_badge()
+        else:
+            badge.config(text="●  Up to date", fg='#3cb44b')
+
+    def _blink_welcome_update_badge(self):
+        """Toggle the Welcome update badge between visible and hidden to blink."""
+        badge = getattr(self, 'welcome_update_badge', None)
+        if badge is None or not badge.winfo_exists():
+            self._welcome_badge_blink_job = None
+            return
+        self._welcome_badge_blink_on = not self._welcome_badge_blink_on
+        # Blink by fading the text to the background colour and back.
+        color = '#e23b3b' if self._welcome_badge_blink_on else self.colors['bg_dark']
+        badge.config(fg=color)
+        self._welcome_badge_blink_job = self.root.after(
+            600, self._blink_welcome_update_badge)
 
     def perform_update(self):
         """Pull the latest version from the remote and restart the application."""
@@ -32506,22 +33178,191 @@ cat("OK\n")
                 self.connectivity_results[group_name] = group_results
                 _emit('log', f"  Completed group: {group_name} ({processed_count}/{len(group_subjects)} subjects)")
     
+    def _ordered_channel_names(self, data):
+        """Return photometry channel names in column order (position 0..n-1).
+
+        Falls back to the canonical index→name helper when no explicit
+        designation map is stored, so the ordering always matches the
+        column ordering used inside the processed matrices.
+        """
+        names = data.get('channel_names')
+        if isinstance(names, list) and names:
+            return [str(n) for n in names]
+        cmap = data.get('channel_name_map')
+        if isinstance(cmap, dict) and cmap:
+            try:
+                return [str(cmap[k]) for k in sorted(cmap, key=lambda x: int(x))]
+            except (ValueError, TypeError):
+                return [str(v) for v in cmap.values()]
+        return [self.get_channel_name(data, i) for i in range(self.get_num_channels(data))]
+
+    def _channel_position(self, data, name):
+        """Return the 0-based column position of a named channel for this subject.
+
+        Resolution prefers the subject's channel ordering (so 'R4' maps to its
+        actual column, not the literal digit 4); falls back to trailing digits.
+        """
+        names = self._ordered_channel_names(data)
+        if name in names:
+            return names.index(name)
+        m = re.search(r'(\d+)$', str(name))
+        return int(m.group(1)) if m else 0
+
+    # ---- beh_synced column layout (channel-count-agnostic) ----------------
+    # Layout: [0=frame, 1=timestamp, 2=X_cm, 3=Y_cm, 4-5=spare,
+    #          6 .. 6+N-1 = photometry channels (z-score),
+    #          6+N+0 = elapsed_min, +1 = velocity, +2 = dist_per_frame,
+    #          +3 = dist_from_center_x, +4 = dist_from_center_y].
+    # The kinematics block sits AFTER the channels so any channel count fits
+    # without the 5th+ channel colliding with elapsed/position columns.
+    BEH_KIN_FIELDS = ('elapsed', 'velocity', 'dist', 'xc', 'yc')
+
+    def _beh_channel_count(self, data):
+        """Number of photometry channels packed into beh_synced (cols 6..6+N-1)."""
+        n = data.get('num_photometry_channels')
+        if n:
+            try:
+                return int(n)
+            except (TypeError, ValueError):
+                pass
+        z = data.get('zscore')
+        if isinstance(z, np.ndarray) and z.ndim == 2 and z.shape[1] > 2:
+            return z.shape[1] - 2
+        return self.get_num_channels(data)
+
+    def _beh_kin_base(self, n_channels):
+        """First kinematics column index in beh_synced for the given channel count."""
+        return 6 + int(n_channels)
+
+    def _beh_width(self, n_channels):
+        """Total beh_synced columns for the given channel count (meta+channels+kinematics)."""
+        return 6 + int(n_channels) + len(self.BEH_KIN_FIELDS)
+
+    def _reconstruct_beh_synced(self, df, n_channels=None):
+        """Rebuild the canonical beh_synced array from a saved behavior CSV by NAME.
+
+        Maps columns by name so projects saved with either the old fixed layout
+        (G0/G1/photo_ch2/photo_ch3 + kinematics at cols 10-14) or the new dynamic
+        layout (Ch{i}_zscore + kinematics after the channels) both load into the
+        same in-memory layout, regardless of channel count.
+        """
+        n_rows = len(df)
+
+        def grab(*nms):
+            for nm in nms:
+                if nm in df.columns:
+                    return pd.to_numeric(df[nm], errors='coerce').to_numpy(dtype=float)
+            return np.full(n_rows, np.nan)
+
+        # If the file has no recognizable named columns (very old/headerless),
+        # fall back to the raw positional values.
+        known = any(c in df.columns for c in
+                    ('frame', 'X_cm', 'elapsed_min', 'G0_zscore', 'Ch0_zscore'))
+        if not known:
+            return df.values
+
+        # Channel columns in order: prefer v2 Ch{i}_zscore, else legacy names.
+        chan = []
+        i = 0
+        while f'Ch{i}_zscore' in df.columns:
+            chan.append(pd.to_numeric(df[f'Ch{i}_zscore'], errors='coerce').to_numpy(dtype=float))
+            i += 1
+        if not chan:
+            for nm in ('G0_zscore', 'G1_zscore', 'photo_ch2', 'photo_ch3'):
+                if nm in df.columns:
+                    chan.append(pd.to_numeric(df[nm], errors='coerce').to_numpy(dtype=float))
+
+        if n_channels:
+            n_channels = int(n_channels)
+            chan = chan[:n_channels]
+            while len(chan) < n_channels:
+                chan.append(np.full(n_rows, np.nan))
+
+        N = len(chan)
+        base = 6 + N
+        arr = np.full((n_rows, base + len(self.BEH_KIN_FIELDS)), np.nan)
+        arr[:, 0] = grab('frame')
+        arr[:, 1] = grab('timestamp')
+        arr[:, 2] = grab('X_cm')
+        arr[:, 3] = grab('Y_cm')
+        arr[:, 4] = grab('col_4')
+        arr[:, 5] = grab('col_5')
+        for k, ca in enumerate(chan):
+            arr[:, 6 + k] = ca
+        arr[:, base + 0] = grab('elapsed_min')
+        arr[:, base + 1] = grab('velocity_cm_per_sec')
+        arr[:, base + 2] = grab('dist_per_frame')
+        arr[:, base + 3] = grab('dist_from_center_x')
+        arr[:, base + 4] = grab('dist_from_center_y')
+        return arr
+
+    def _combine_by_wavelength(self, result, base_key):
+        """Build a per-channel matrix that takes each channel from the wavelength
+        matrix matching its G/R designation (G->470nm, R->560/570nm).
+
+        Multi-wavelength recordings interleave one green and one red sample per
+        cycle, so the 470 and 570 deinterleaved matrices are row-aligned by cycle
+        index.  The single-wavelength "primary" arrays (data/dff/corrected/zscore)
+        feed the behaviour-synced pipeline (bouts, zone/kinematics), so each
+        channel must carry its OWN wavelength here instead of all-470.
+
+        ``base_key`` is one of data/dff/corrected/zscore.  'data' and 'dff' hold
+        signal+isosbestic pairs (2 cols/channel); 'corrected'/'zscore' hold
+        1 col/channel.  The columns-per-channel is derived from the matrix width
+        and the channel count so the pairing is detected, not assumed.
+        """
+        m470 = result.get(f'{base_key}_470')
+        m570 = result.get(f'{base_key}_570')
+        if m470 is None:
+            return m570
+        if m570 is None:
+            return m470
+
+        names = result.get('channel_names')
+        # Channel count from a known 1-col/channel matrix (zscore/corrected).
+        ref = None
+        for _k in ('zscore_470', 'zscore_570', 'corrected_470', 'corrected_570'):
+            if isinstance(result.get(_k), np.ndarray):
+                ref = result[_k]
+                break
+        n_ch = (ref.shape[1] - 2) if ref is not None else (m470.shape[1] - 2)
+        if n_ch <= 0:
+            return m470
+        per = max(1, (m470.shape[1] - 2) // n_ch)   # 1 (corrected/zscore) or 2 (data/dff)
+        n_rows = min(m470.shape[0], m570.shape[0])
+        out = np.full((n_rows, 2 + n_ch * per), np.nan)
+        out[:, 0:2] = m470[:n_rows, 0:2]       # elapsed/timestamp from the green frames
+        for ch in range(n_ch):
+            nm = names[ch] if isinstance(names, list) and ch < len(names) else ''
+            src = m570 if str(nm).upper().startswith('R') else m470
+            for k in range(per):
+                col = 2 + ch * per + k
+                if col < src.shape[1]:
+                    out[:n_rows, col] = src[:n_rows, col]
+        return out
+
     def _get_channel_signal(self, data, channel_name):
         """
-        Extract a 1-D signal array for a named channel.
+        Extract a 1-D signal array for a named channel (e.g. 'G0', 'R4', 'Ch2').
 
         Channel layout inside the processed matrices
-        (corrected_470 / zscore_470 / dff_470 etc.):
-            col 0  – elapsed time
-            col 1  – computer timestamp
-            col 2  – first photometry fiber  → G0
-            col 3  – second photometry fiber  → G1  (dual-fiber recordings)
+        (corrected_470 / zscore_470 / dff_470 and the _570 variants):
+            col 0        – elapsed time
+            col 1        – computer timestamp
+            col 2 + pos  – photometry fiber at ordering position ``pos``
 
-        In single-wavelength (470 nm only) dual-fiber rigs the second fiber
-        (G1) lives in col 3 of the 470 nm matrix, NOT in corrected_570.
-        corrected_570 only exists when "Process Red (570 nm)" was checked
-        during data processing.
+        Every wavelength matrix holds ALL photometry columns; a channel's real
+        signal lives in the matrix matching its G/R designation (G→470nm,
+        R→570nm) at column ``2 + position``.  The position is the channel's
+        index in the per-subject channel ordering — NOT the digit in its name
+        (e.g. 'R4' may be the 3rd column).  This resolves any number of
+        channels with arbitrary region indices.
         """
+        if channel_name is None:
+            return None
+
+        import re
+
         def _col(mat, col_idx):
             """Return a 1-D view of column col_idx from a 2-D matrix."""
             if mat is None:
@@ -32533,46 +33374,54 @@ cat("OK\n")
                 return arr   # already 1-D (legacy)
             return None
 
-        if channel_name in ('G0', 'Ch0'):
-            # First photometry column (col 2) of any available processed matrix
-            for key in ['corrected_470', 'zscore_470', 'dff_470',
-                        'corrected', 'zscore', 'dff']:
-                sig = _col(data.get(key), 2)
-                if sig is not None:
-                    return sig
-            # Fall back to 570 nm if only red was processed
-            for key in ['corrected_570', 'zscore_570', 'dff_570']:
-                sig = _col(data.get(key), 2)
-                if sig is not None:
-                    return sig
+        name = str(channel_name).strip()
+        names = self._ordered_channel_names(data)
 
-        elif channel_name in ('G1', 'Ch1'):
-            # Second photometry column (col 3) of the 470 nm matrix first.
-            # This is the correct location for the second fiber in a
-            # dual-fiber 470 nm-only recording.
-            for key in ['corrected_470', 'zscore_470', 'dff_470',
-                        'corrected', 'zscore', 'dff']:
-                sig = _col(data.get(key), 3)
-                if sig is not None:
-                    return sig
-            # If a dedicated 570 nm channel was processed, use its col 2
-            for key in ['corrected_570', 'zscore_570', 'dff_570']:
-                sig = _col(data.get(key), 2)
-                if sig is not None:
-                    return sig
+        # Resolve the channel's column position (0-based among photometry channels).
+        pos = None
+        if name in names:
+            pos = names.index(name)
+        else:
+            m = re.match(r'^Ch(\d+)$', name, re.IGNORECASE)
+            if m:
+                pos = int(m.group(1))
+            elif name.upper().startswith('G'):
+                # Legacy positional request (e.g. 'G1') on data without an
+                # explicit designation map: treat the digit as the position.
+                m2 = re.match(r'^G(\d+)$', name, re.IGNORECASE)
+                if m2:
+                    pos = int(m2.group(1))
 
-        elif channel_name == 'R1':
-            # Isosbestic / 570 nm reference channel
-            for key in ['corrected_570', 'zscore_570', 'dff_570']:
-                sig = _col(data.get(key), 2)
-                if sig is not None:
-                    return sig
-            for key in ['data_isosbestic', 'isosbestic']:
-                v = data.get(key)
-                if v is not None:
-                    arr = np.asarray(v)
-                    return arr[:, 2] if (arr.ndim == 2 and arr.shape[1] > 2) else arr
+        if pos is None:
+            return None
+        col = 2 + pos
 
+        upper = name.upper()
+        has470 = bool(data.get('has_470', False))
+        has570 = bool(data.get('has_570', False))
+        flags_known = ('has_470' in data) or ('has_570' in data)
+
+        if upper.startswith('R'):
+            keys = ['corrected_570', 'zscore_570', 'dff_570']
+            # The un-suffixed 'corrected'/'zscore'/'dff' alias the 570 matrix
+            # only when green was NOT processed; otherwise it is the 470 matrix
+            # and would yield the wrong wavelength, so guard against that.
+            if (has570 and not has470) or not flags_known:
+                keys += ['corrected', 'zscore', 'dff']
+        elif upper.startswith('G'):
+            keys = ['corrected_470', 'zscore_470', 'dff_470']
+            if has470 or not flags_known:
+                keys += ['corrected', 'zscore', 'dff']
+        else:
+            # Unknown designation (e.g. bare 'Ch2'): try everything by position.
+            keys = ['corrected', 'zscore', 'dff',
+                    'corrected_470', 'zscore_470', 'dff_470',
+                    'corrected_570', 'zscore_570', 'dff_570']
+
+        for key in keys:
+            sig = _col(data.get(key), col)
+            if sig is not None:
+                return sig
         return None
     
     def _display_connectivity_results(self):
@@ -32605,8 +33454,8 @@ cat("OK\n")
     def create_decision_probability_tab(self):
         """Tab for computing the probability of explore/retreat decisions
         based on current photometry signal, binned into z-score ranges."""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Decision Probability")
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Decision Probability")
 
         # ── Outer layout: fixed-width left panel + expanding right plot area ──
         outer = ttk.Frame(tab)
@@ -32773,6 +33622,9 @@ cat("OK\n")
             self.dec_prob_subject_listbox.insert('end', subj)
             if subj in sel:
                 self.dec_prob_subject_listbox.selection_set(i)
+        # Keep the Kinematics tab's selectors in sync at every project-load point.
+        if hasattr(self, 'kin_subject_listbox'):
+            self.update_kin_subjects()
 
     def update_dec_prob_groups(self):
         """Refresh the group listbox on the Decision Probability tab."""
@@ -33622,8 +34474,1991 @@ cat("OK\n")
             messagebox.showerror("Export Error",
                                  f"Could not export data:\n{exc}")
 
+    # ============================ Kinematics ============================
+    #
+    # Relationship of locomotor kinematics (velocity, acceleration) and
+    # spatial movement vectors to the photometry signal. All data is read
+    # from the already-aligned ``data['beh_synced']`` array built by
+    # process_position_data()/synchronize_behavior():
+    #   col 2,3 = X,Y (cm)   col 6,7 = synced z-score G0,G1
+    #   col 11  = velocity (cm/s)   col 13,14 = distance-from-center X,Y
+    # so velocity, signal and position already share one timeline.
+
+    # Analyses offered in the Analysis dropdown.
+    KIN_ANALYSES = [
+        "Velocity vs Signal (overlay)",
+        "Velocity vs Signal (scatter)",
+        "Velocity–Signal cross-correlation",
+        "Velocity–Signal coupling (summary bars)",
+        "Signal by velocity bin",
+        "Acceleration vs Signal (overlay)",
+        "Acceleration vs Signal (scatter)",
+        "Signal by acceleration bin",
+        "Accelerating vs decelerating",
+        "Radial velocity vs Signal",
+        "Center vs Perimeter coupling",
+        "Arena heatmap: Signal",
+        "Arena heatmap: Velocity",
+        "Arena heatmap: Acceleration",
+        "3D arena map (height=velocity, color=signal)",
+        "Velocity×Acceleration phase map (signal)",
+        "Movement-onset triggered signal",
+        "Distance-from-center vs Signal",
+        "Kinematic–Signal coupling by zone",
+        "Velocity & acceleration distribution",
+    ]
+
+    # Analyses that aggregate cleanly across subjects in Group mode.
+    KIN_GROUP_CAPABLE = {
+        "Signal by velocity bin",
+        "Signal by acceleration bin",
+        "Accelerating vs decelerating",
+        "Center vs Perimeter coupling",
+        "Distance-from-center vs Signal",
+        "Velocity–Signal cross-correlation",
+        "Velocity–Signal coupling (summary bars)",
+        "Kinematic–Signal coupling by zone",
+        "Velocity & acceleration distribution",
+    }
+
+    # Per-analysis explainers shown by the Info button: what each plot shows
+    # and how to read it. Note on "acceleration": TRACY's velocity is *speed*
+    # (a scalar, sqrt(dx²+dy²)/dt), so acceleration here is the rate of change
+    # of speed (d|v|/dt). It is signed by definition — negative simply means the
+    # animal is slowing down (decelerating). This does NOT require knowing which
+    # way the mouse faces, because speed has no direction.
+    KIN_EXPLAIN = {
+        "Velocity vs Signal (overlay)":
+            "Dual-axis time series: locomotor speed (left axis) and the photometry "
+            "z-score (right axis) over the session.\n\nHow to read: look for the two "
+            "traces moving oppositely (signal up when speed drops). The title reports "
+            "the Pearson r between them — a strong negative r confirms inverse coupling.",
+        "Velocity vs Signal (scatter)":
+            "Each point is one frame: x = speed, y = signal. A fitted regression line "
+            "and Pearson r (linear) and Spearman ρ (rank/monotonic) are shown.\n\n"
+            "How to read: a downward cloud / negative r means faster movement coincides "
+            "with lower signal. Spearman is robust to non-linearity.",
+        "Velocity–Signal cross-correlation":
+            "Correlation between signal and speed computed at a range of time lags. "
+            "Lag 0 = same frame; positive lag = signal sampled AFTER velocity "
+            "(signal lags movement).\n\nHow to read: the red dot marks the most "
+            "negative (most inverse) group-mean correlation. A trough at a positive lag "
+            "means the signal change trails the movement change by that delay.\n\n"
+            "Statistics (box on plot): for each subject the lag of its own cross-"
+            "correlation extremum is the estimated delay; a one-sample t-test asks "
+            "whether that delay differs from 0 (is the trough/peak truly delayed from "
+            "movement onset). With groups, the per-subject delays are compared between "
+            "groups (Welch t / Mann–Whitney for two groups, one-way ANOVA for more), "
+            "and trough depth is compared too. Tick marks at the bottom show each "
+            "subject's peak lag. Runs at frame resolution regardless of the temporal "
+            "bin, since the statistical unit here is the subject, not the frame.",
+        "Velocity–Signal coupling (summary bars)":
+            "A robust, no-trace summary of how strongly speed and signal are "
+            "(inversely) coupled, designed for weak/flat cross-correlations where the "
+            "trough LAG is unreliable. Three metrics per subject, each a bar per group "
+            "(mean ± SEM) with every subject shown as a dot:\n"
+            "  • Instantaneous r (lag 0) — coupling with no time shift (fully robust).\n"
+            "  • Mean r over 0–2 s — average coupling just after movement.\n"
+            "  • Negative-lobe area — total inverse coupling at positive lags.\n\n"
+            "How to read: negative values = inverse coupling (signal down when fast). "
+            "A star over a bar = that group's coupling differs from 0 (one-sample t). "
+            "A bracket = groups differ (Welch t / Mann–Whitney; ANOVA for >2). These "
+            "avoid picking a single lag entirely, so they don't suffer the trough-lag "
+            "instability. A warning is shown when coupling is too weak to interpret "
+            "individual or group differences.",
+        "Signal by velocity bin":
+            "Speed is split into bins; the mean ± SEM signal is plotted per bin "
+            "(optionally using velocity z-score).\n\nHow to read: a downward staircase "
+            "= signal falls monotonically as the animal moves faster. Flat = no speed "
+            "dependence.",
+        "Acceleration vs Signal (overlay)":
+            "Like the velocity overlay but the left axis is acceleration = rate of "
+            "change of speed (negative = decelerating).\n\nHow to read: compare the "
+            "acceleration trace against the signal; the reported r quantifies their "
+            "instantaneous relationship.",
+        "Acceleration vs Signal (scatter)":
+            "Per-frame scatter of acceleration (d speed/dt; <0 = decelerating) vs "
+            "signal, with regression, Pearson r and Spearman ρ.\n\nHow to read: a "
+            "positive r would mean signal is higher while speeding up; negative while "
+            "slowing.",
+        "Signal by acceleration bin":
+            "Mean ± SEM signal across bins of acceleration (negative = decelerating, "
+            "positive = accelerating).\n\nHow to read: tells you whether the signal "
+            "tracks speeding-up vs slowing-down rather than absolute speed.",
+        "Accelerating vs decelerating":
+            "Mean signal during frames where the animal is speeding up (accel > 0) vs "
+            "slowing down (accel < 0). Uses signed acceleration regardless of the "
+            "'magnitude' display setting. Paired t-test across subjects when n>1.\n\n"
+            "How to read: a higher deceleration bar suggests the signal rises as the "
+            "animal arrests movement.",
+        "Radial velocity vs Signal":
+            "Radial velocity = the component of the movement vector pointing toward "
+            "(−) or away from (+) the arena center. Scatter vs signal with correlation."
+            "\n\nHow to read: negative x = moving inward (approach), positive x = moving "
+            "outward (avoidance/perimeter). A relationship here links signal to "
+            "approach vs avoidance movement.",
+        "Center vs Perimeter coupling":
+            "The velocity–signal Pearson r computed separately for frames in the inner "
+            "vs outer arena (split at the median distance from center).\n\nHow to read: "
+            "compare the two bars — is the inverse coupling tighter when the animal is "
+            "in the center vs zooming the perimeter?",
+        "Arena heatmap: Signal":
+            "2-D spatial map: the arena is binned into squares, colored by the mean "
+            "signal recorded while the animal occupied each square.\n\nHow to read: "
+            "warm/cool regions show where signal tends to be high/low. Color limits and "
+            "map are configurable in Settings.",
+        "Arena heatmap: Velocity":
+            "Spatial map colored by mean speed per arena bin.\n\nHow to read: highlights "
+            "where the animal moves fast (e.g. perimeter runs) vs lingers.",
+        "Arena heatmap: Acceleration":
+            "Spatial map colored by mean acceleration (rate of change of speed) per "
+            "bin.\n\nHow to read: shows where the animal tends to speed up vs slow down.",
+        "3D arena map (height=velocity, color=signal)":
+            "A 3-D surface over the arena: bar/surface HEIGHT = mean speed in each x,y "
+            "bin, surface COLOR = mean signal there. Unvisited locations are left blank."
+            "\n\nHow to read: tall regions = fast movement; the color on top tells you "
+            "what the signal was doing in those fast (or slow) locations.",
+        "Velocity×Acceleration phase map (signal)":
+            "A 2-D map over the speed (x) × acceleration (y) plane, colored by mean "
+            "signal.\n\nHow to read: the bottom-left (slow + decelerating) corner tests "
+            "whether signal peaks during behavioral arrest; the right side is fast "
+            "movement.",
+        "Movement-onset triggered signal":
+            "Average signal aligned to the moment the animal starts moving (speed "
+            "crosses the movement threshold), ± SEM across all onset events.\n\nHow to "
+            "read: a dip after t=0 means signal drops when movement begins; a rise "
+            "before/after marks pre/post-movement dynamics.",
+        "Distance-from-center vs Signal":
+            "Mean ± SEM signal binned by radial distance from the arena center.\n\nHow "
+            "to read: a trend shows whether signal depends on how peripheral the animal "
+            "is, independent of speed.",
+        "Velocity & acceleration distribution":
+            "Distribution (histogram + smooth density curve) of speed and of "
+            "acceleration, with a rug of every individual datapoint along the bottom. "
+            "Dotted vertical lines mark z-score thresholds (mean and ±1/±2/±3 SD).\n\n"
+            "How to read: the spread and skew show the animal's movement profile; the "
+            "z-lines let you see what speed/acceleration corresponds to, e.g., a +2 SD "
+            "event. With groups selected, each group is drawn in its own row of panels "
+            "so their distributions can be compared. Uses the temporal bin, so each "
+            "point is one time bin.",
+        "Kinematic–Signal coupling by zone":
+            "For every user-defined zone, the correlation between the chosen kinematic "
+            "(velocity or acceleration, set in the controls) and the signal is computed "
+            "and shown as one bar per zone.\n\nHow to read: compare bars across zones to "
+            "see where movement–signal coupling is strongest. Uses the same zones as the "
+            "other zone-based analyses.",
+    }
+
+    def create_kinematics_tab(self):
+        """Data subtab: velocity / acceleration / spatial vectors vs signal."""
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Kinematics")
+
+        outer = ttk.Frame(tab)
+        outer.pack(fill='both', expand=True, padx=5, pady=5)
+
+        ctrl_panel = ttk.Frame(outer, width=290)
+        ctrl_panel.pack(side='left', fill='y', padx=(0, 5))
+        ctrl_panel.pack_propagate(False)
+
+        # Prominent BETA badge — this tab is new/experimental.
+        beta_badge = tk.Label(ctrl_panel, text="BETA",
+                              font=('Segoe UI', 26, 'bold'),
+                              fg='white', bg='#e67e22', padx=10, pady=2)
+        beta_badge.pack(fill='x', pady=(0, 6))
+
+        self.kin_plot_frame = ttk.Frame(outer)
+        self.kin_plot_frame.pack(side='left', fill='both', expand=True)
+
+        # ── Variables ──────────────────────────────────────────────────────
+        self.kin_by_var        = tk.StringVar(value="Subject")
+        self.kin_channel_var   = tk.StringVar(value="G0")
+        self.kin_analysis_var  = tk.StringVar(value=self.KIN_ANALYSES[0])
+        self.kin_tbin_var      = tk.StringVar(value="1.0")
+        self.kin_smooth_win_var = tk.StringVar(value="11")
+        self.kin_smooth_poly_var = tk.StringVar(value="3")
+        self.kin_nbins_var     = tk.StringVar(value="10")
+        self.kin_vel_zscore_var = tk.BooleanVar(value=False)
+        self.kin_maxlag_var    = tk.StringVar(value="5")
+        self.kin_spatial_bin_var = tk.StringVar(value=str(self.params.get('spatial_bin_size', 5)))
+        self.kin_move_thresh_var = tk.StringVar(value="2.0")
+        self.kin_zone_kinematic_var = tk.StringVar(value="Velocity")
+        self.kin_figure        = None
+        self.kin_canvas_widget = None
+        self.kin_last_table    = None   # DataFrame backing the current plot/summary
+
+        # Graphics / display settings (editable via the Settings button).
+        if not hasattr(self, 'kin_gfx'):
+            self.kin_gfx = {
+                'cmap_div':   'coolwarm',   # diverging map (signal, acceleration)
+                'cmap_seq':   'viridis',    # sequential map (velocity, occupancy)
+                'auto_limits': True,        # auto color limits from data percentiles
+                'vmin':       '',           # manual heatmap min (when auto off)
+                'vmax':       '',           # manual heatmap max
+                'symmetric':  True,         # symmetric limits about 0 for diverging maps
+                'point_size': 4.0,          # scatter marker size
+                'point_alpha': 0.15,        # scatter marker alpha
+                'accel_abs':  False,        # display acceleration as magnitude |d speed/dt|
+                'blank_unvisited': True,    # leave never-visited bins blank in maps
+                'z_auto':     True,         # 3-D map: auto z-axis (height) limits
+                'zmin':       '',           # 3-D map manual z min (when auto off)
+                'zmax':       '',           # 3-D map manual z max
+            }
+
+        # ── Selection mode ─────────────────────────────────────────────────
+        mode_frame = ttk.LabelFrame(ctrl_panel, text="Selection Mode", padding=5)
+        mode_frame.pack(fill='x', pady=(0, 5))
+        ttk.Radiobutton(mode_frame, text="Subject", variable=self.kin_by_var,
+                        value="Subject", command=self._kin_toggle_mode).pack(side='left')
+        ttk.Radiobutton(mode_frame, text="Group", variable=self.kin_by_var,
+                        value="Group", command=self._kin_toggle_mode).pack(side='left', padx=(10, 0))
+
+        # ── Subject selector ───────────────────────────────────────────────
+        self._kin_subj_container = ttk.LabelFrame(ctrl_panel, text="Subjects", padding=5)
+        subj_inner = ttk.Frame(self._kin_subj_container)
+        subj_inner.pack(fill='both')
+        self.kin_subject_listbox = tk.Listbox(
+            subj_inner, selectmode='extended', height=8, exportselection=False)
+        _ks = ttk.Scrollbar(subj_inner, orient='vertical',
+                            command=self.kin_subject_listbox.yview)
+        self.kin_subject_listbox.pack(side='left', fill='both', expand=True)
+        _ks.pack(side='right', fill='y')
+        self.kin_subject_listbox.config(yscrollcommand=_ks.set)
+
+        # ── Group selector ─────────────────────────────────────────────────
+        self._kin_grp_container = ttk.LabelFrame(ctrl_panel, text="Groups", padding=5)
+        grp_inner = ttk.Frame(self._kin_grp_container)
+        grp_inner.pack(fill='both')
+        self.kin_group_listbox = tk.Listbox(
+            grp_inner, selectmode='extended', height=8, exportselection=False)
+        _kg = ttk.Scrollbar(grp_inner, orient='vertical',
+                            command=self.kin_group_listbox.yview)
+        self.kin_group_listbox.pack(side='left', fill='both', expand=True)
+        _kg.pack(side='right', fill='y')
+        self.kin_group_listbox.config(yscrollcommand=_kg.set)
+
+        self._kin_toggle_mode()
+
+        # ── Channel + analysis ─────────────────────────────────────────────
+        sel_frame = ttk.LabelFrame(ctrl_panel, text="Signal & Analysis", padding=5)
+        sel_frame.pack(fill='x', pady=(0, 5))
+        ttk.Label(sel_frame, text="Channel:").grid(row=0, column=0, sticky='w', padx=3, pady=2)
+        self.kin_channel_combo = ttk.Combobox(
+            sel_frame, textvariable=self.kin_channel_var,
+            values=["G0", "G1"], state='readonly', width=8)
+        self.kin_channel_combo.grid(row=0, column=1, sticky='w', padx=3, pady=2)
+        ttk.Label(sel_frame, text="Analysis:").grid(row=1, column=0, sticky='w', padx=3, pady=2)
+        ttk.Combobox(sel_frame, textvariable=self.kin_analysis_var,
+                     values=self.KIN_ANALYSES, state='readonly', width=30).grid(
+            row=1, column=1, sticky='w', padx=3, pady=2)
+        ttk.Label(sel_frame, text="Zone-plot kinematic:").grid(row=2, column=0, sticky='w', padx=3, pady=2)
+        ttk.Combobox(sel_frame, textvariable=self.kin_zone_kinematic_var,
+                     values=["Velocity", "Acceleration"], state='readonly', width=12).grid(
+            row=2, column=1, sticky='w', padx=3, pady=2)
+
+        # ── Parameters ─────────────────────────────────────────────────────
+        param_frame = ttk.LabelFrame(ctrl_panel, text="Parameters", padding=5)
+        param_frame.pack(fill='x', pady=(0, 5))
+
+        def _prow(label, var, r, width=8):
+            ttk.Label(param_frame, text=label).grid(row=r, column=0, sticky='w', padx=3, pady=2)
+            ttk.Entry(param_frame, textvariable=var, width=width).grid(
+                row=r, column=1, sticky='w', padx=3, pady=2)
+
+        _prow("Temporal bin (s):", self.kin_tbin_var, 0)
+        _prow("Smoothing window (frames):", self.kin_smooth_win_var, 1)
+        _prow("Smoothing poly order:", self.kin_smooth_poly_var, 2)
+        _prow("# bins:", self.kin_nbins_var, 3)
+        _prow("Max lag (s):", self.kin_maxlag_var, 4)
+        _prow("Spatial bin (cm):", self.kin_spatial_bin_var, 5)
+        _prow("Movement threshold (cm/s):", self.kin_move_thresh_var, 6)
+        ttk.Checkbutton(param_frame, text="Bin by velocity z-score",
+                        variable=self.kin_vel_zscore_var).grid(
+            row=7, column=0, columnspan=2, sticky='w', padx=3, pady=2)
+        ttk.Label(param_frame,
+                  text="Temporal bin averages frames before correlating, so each\n"
+                       "bin (not each frame) is one datapoint — avoids inflated n /\n"
+                       "spurious significance. Set 0 to disable. (Movement-onset\n"
+                       "stays at frame resolution.)",
+                  foreground='gray', font=('TkDefaultFont', 7), justify='left').grid(
+            row=8, column=0, columnspan=2, sticky='w', padx=3, pady=(2, 0))
+
+        # ── Actions ────────────────────────────────────────────────────────
+        btn_frame = ttk.Frame(ctrl_panel)
+        btn_frame.pack(fill='x', pady=(0, 5))
+        ttk.Button(btn_frame, text="Run", command=self.run_kinematics).pack(side='left', padx=(0, 3))
+        ttk.Button(btn_frame, text="Summarize", command=self.summarize_kinematics).pack(side='left', padx=3)
+        ttk.Button(btn_frame, text="Export", command=self.export_kinematics).pack(side='left', padx=3)
+
+        btn_frame2 = ttk.Frame(ctrl_panel)
+        btn_frame2.pack(fill='x', pady=(0, 5))
+        ttk.Button(btn_frame2, text="Graph Settings…",
+                   command=self.open_kin_graph_settings).pack(side='left', padx=(0, 3))
+        ttk.Button(btn_frame2, text="ⓘ Explain plot",
+                   command=self.show_kin_explainer).pack(side='left', padx=3)
+
+        # ── Results readout ────────────────────────────────────────────────
+        self.kin_results_label = ttk.Label(ctrl_panel, text="", wraplength=270,
+                                            foreground='gray', justify='left')
+        self.kin_results_label.pack(fill='x', pady=(2, 0))
+
+        self.update_kin_subjects()
+        self._kin_show_placeholder()
+
+    # ── Kinematics UI helpers ───────────────────────────────────────────────
+
+    def _kin_toggle_mode(self):
+        """Switch the selector panel between Subject and Group mode."""
+        if self.kin_by_var.get() == "Group":
+            self._kin_subj_container.pack_forget()
+            self._kin_grp_container.pack(fill='x', pady=(0, 5))
+            self.update_kin_groups()
+        else:
+            self._kin_grp_container.pack_forget()
+            self._kin_subj_container.pack(fill='x', pady=(0, 5))
+
+    def update_kin_subjects(self):
+        """Refresh the Kinematics subject listbox (position-data subjects only)."""
+        if not hasattr(self, 'kin_subject_listbox'):
+            return
+        sel = {self.kin_subject_listbox.get(i)
+               for i in self.kin_subject_listbox.curselection()}
+        self.kin_subject_listbox.delete(0, 'end')
+        subjects = sorted(s for s, d in self.processed_data.items()
+                          if d.get('has_position', False))
+        for i, subj in enumerate(subjects):
+            self.kin_subject_listbox.insert('end', subj)
+            if subj in sel:
+                self.kin_subject_listbox.selection_set(i)
+        # Refresh channel options from the first available subject.
+        if subjects:
+            data = self.processed_data[subjects[0]]
+            n_ch = 2
+            bs = data.get('beh_synced')
+            try:
+                if bs is not None:
+                    n_ch = max(1, min(2, bs.shape[1] - 6))
+            except Exception:
+                n_ch = 2
+            names = [self.get_channel_name(data, i) for i in range(max(1, n_ch))]
+            if names and hasattr(self, 'kin_channel_combo'):
+                self.kin_channel_combo['values'] = names
+                if self.kin_channel_var.get() not in names:
+                    self.kin_channel_var.set(names[0])
+
+    def update_kin_groups(self):
+        """Refresh the Kinematics group listbox."""
+        if not hasattr(self, 'kin_group_listbox'):
+            return
+        sel = {self.kin_group_listbox.get(i)
+               for i in self.kin_group_listbox.curselection()}
+        self.kin_group_listbox.delete(0, 'end')
+        for i, gname in enumerate(self.groups.keys()):
+            self.kin_group_listbox.insert('end', gname)
+            if gname in sel:
+                self.kin_group_listbox.selection_set(i)
+
+    def open_kin_graph_settings(self):
+        """Dialog to adjust Kinematics graph display: colormaps, heatmap limits,
+        scatter appearance, acceleration sign, and blanking of unvisited bins."""
+        existing = getattr(self, '_kin_settings_win', None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift(); existing.focus_force(); return
+            except Exception:
+                pass
+        win = tk.Toplevel(self.root)
+        win.title("Kinematics Graph Settings")
+        win.geometry("420x520")
+        win.transient(self.root)
+        self._kin_settings_win = win
+        g = self.kin_gfx
+
+        # Local tk variables seeded from the persistent gfx dict.
+        v_cmap_div  = tk.StringVar(value=g['cmap_div'])
+        v_cmap_seq  = tk.StringVar(value=g['cmap_seq'])
+        v_auto      = tk.BooleanVar(value=g['auto_limits'])
+        v_vmin      = tk.StringVar(value=str(g['vmin']))
+        v_vmax      = tk.StringVar(value=str(g['vmax']))
+        v_sym       = tk.BooleanVar(value=g['symmetric'])
+        v_psize     = tk.StringVar(value=str(g['point_size']))
+        v_palpha    = tk.StringVar(value=str(g['point_alpha']))
+        v_accel_abs = tk.BooleanVar(value=g['accel_abs'])
+        v_blank     = tk.BooleanVar(value=g['blank_unvisited'])
+        v_zauto     = tk.BooleanVar(value=g['z_auto'])
+        v_zmin      = tk.StringVar(value=str(g['zmin']))
+        v_zmax      = tk.StringVar(value=str(g['zmax']))
+
+        main = ttk.Frame(win, padding=12)
+        main.pack(fill='both', expand=True)
+
+        cmaps = ['coolwarm', 'RdBu_r', 'bwr', 'seismic', 'viridis', 'plasma',
+                 'magma', 'inferno', 'turbo', 'jet']
+
+        cf = ttk.LabelFrame(main, text="Colormaps", padding=8)
+        cf.pack(fill='x', pady=(0, 8))
+        ttk.Label(cf, text="Diverging (signal, acceleration):").grid(row=0, column=0, sticky='w', pady=3)
+        ttk.Combobox(cf, textvariable=v_cmap_div, values=cmaps, state='readonly',
+                     width=12).grid(row=0, column=1, padx=6, pady=3)
+        ttk.Label(cf, text="Sequential (velocity, occupancy):").grid(row=1, column=0, sticky='w', pady=3)
+        ttk.Combobox(cf, textvariable=v_cmap_seq, values=cmaps, state='readonly',
+                     width=12).grid(row=1, column=1, padx=6, pady=3)
+
+        lf = ttk.LabelFrame(main, text="Heatmap color limits", padding=8)
+        lf.pack(fill='x', pady=(0, 8))
+        ttk.Checkbutton(lf, text="Auto (from data percentiles)",
+                        variable=v_auto).grid(row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(lf, text="Min:").grid(row=1, column=0, sticky='e', pady=3)
+        ttk.Entry(lf, textvariable=v_vmin, width=10).grid(row=1, column=1, sticky='w', padx=6)
+        ttk.Label(lf, text="Max:").grid(row=2, column=0, sticky='e', pady=3)
+        ttk.Entry(lf, textvariable=v_vmax, width=10).grid(row=2, column=1, sticky='w', padx=6)
+        ttk.Checkbutton(lf, text="Symmetric about 0 (diverging maps)",
+                        variable=v_sym).grid(row=3, column=0, columnspan=2, sticky='w', pady=(3, 0))
+        ttk.Label(lf, text="Values outside the limits are drawn in the colormap's\n"
+                           "end color (saturated), not clipped away.",
+                  foreground='gray', font=('TkDefaultFont', 8)).grid(
+            row=4, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        sf = ttk.LabelFrame(main, text="Scatter appearance", padding=8)
+        sf.pack(fill='x', pady=(0, 8))
+        ttk.Label(sf, text="Point size:").grid(row=0, column=0, sticky='e', pady=3)
+        ttk.Entry(sf, textvariable=v_psize, width=8).grid(row=0, column=1, sticky='w', padx=6)
+        ttk.Label(sf, text="Point alpha:").grid(row=1, column=0, sticky='e', pady=3)
+        ttk.Entry(sf, textvariable=v_palpha, width=8).grid(row=1, column=1, sticky='w', padx=6)
+
+        of = ttk.LabelFrame(main, text="Other", padding=8)
+        of.pack(fill='x', pady=(0, 8))
+        ttk.Checkbutton(of, text="Show acceleration as magnitude |Δspeed/dt|",
+                        variable=v_accel_abs).pack(anchor='w')
+        ttk.Label(of, text="Off (default): signed — negative means decelerating.\n"
+                           "(The accelerating-vs-decelerating plot always uses the sign.)",
+                  foreground='gray', font=('TkDefaultFont', 8)).pack(anchor='w')
+        ttk.Checkbutton(of, text="Leave never-visited locations blank in arena maps",
+                        variable=v_blank).pack(anchor='w', pady=(4, 0))
+
+        zf = ttk.LabelFrame(main, text="3-D map z-axis (height)", padding=8)
+        zf.pack(fill='x', pady=(0, 8))
+        ttk.Checkbutton(zf, text="Auto z limits (from data)",
+                        variable=v_zauto).grid(row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(zf, text="Z min:").grid(row=1, column=0, sticky='e', pady=3)
+        ttk.Entry(zf, textvariable=v_zmin, width=10).grid(row=1, column=1, sticky='w', padx=6)
+        ttk.Label(zf, text="Z max:").grid(row=2, column=0, sticky='e', pady=3)
+        ttk.Entry(zf, textvariable=v_zmax, width=10).grid(row=2, column=1, sticky='w', padx=6)
+        ttk.Label(zf, text="Height = mean speed (cm/s). Used only when Auto is off.",
+                  foreground='gray', font=('TkDefaultFont', 8)).grid(
+            row=3, column=0, columnspan=2, sticky='w')
+
+        def _apply():
+            def _f(s):
+                try:
+                    return float(s)
+                except Exception:
+                    return ''
+            g['cmap_div'] = v_cmap_div.get()
+            g['cmap_seq'] = v_cmap_seq.get()
+            g['auto_limits'] = bool(v_auto.get())
+            g['vmin'] = _f(v_vmin.get())
+            g['vmax'] = _f(v_vmax.get())
+            g['symmetric'] = bool(v_sym.get())
+            g['point_size'] = _f(v_psize.get()) or 4.0
+            g['point_alpha'] = _f(v_palpha.get()) or 0.15
+            g['accel_abs'] = bool(v_accel_abs.get())
+            g['blank_unvisited'] = bool(v_blank.get())
+            g['z_auto'] = bool(v_zauto.get())
+            g['zmin'] = _f(v_zmin.get())
+            g['zmax'] = _f(v_zmax.get())
+            win.destroy()
+            # Re-render the current plot with new settings if one is showing.
+            if self.kin_figure is not None:
+                self.run_kinematics()
+
+        bf = ttk.Frame(main)
+        bf.pack(fill='x', pady=(4, 0))
+        ttk.Button(bf, text="Apply", command=_apply).pack(side='right', padx=4)
+        ttk.Button(bf, text="Cancel", command=win.destroy).pack(side='right')
+
+    def show_kin_explainer(self):
+        """Show the explainer for the currently selected analysis."""
+        analysis = self.kin_analysis_var.get()
+        text = self.KIN_EXPLAIN.get(analysis, "No description available for this analysis.")
+        win = tk.Toplevel(self.root)
+        win.title(f"About: {analysis}")
+        win.geometry("560x340")
+        win.transient(self.root)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text=analysis, font=('TkDefaultFont', 12, 'bold'),
+                  wraplength=520, justify='left').pack(anchor='w', pady=(0, 8))
+        body = tk.Text(frame, wrap='word', font=('TkDefaultFont', 10),
+                       relief='flat', height=12)
+        body.insert('1.0', text)
+        body.config(state='disabled', background=win.cget('background'))
+        body.pack(fill='both', expand=True)
+        ttk.Button(frame, text="Close", command=win.destroy).pack(pady=(8, 0))
+
+    # ── Shared plotting helpers (style + colormap) ──────────────────────────
+
+    def _kin_style_ax(self, ax):
+        """Apply a consistent, clean look to a 2-D axis."""
+        for side in ('top', 'right'):
+            ax.spines[side].set_visible(False)
+        ax.grid(True, linestyle=':', linewidth=0.6, alpha=0.4)
+        ax.set_axisbelow(True)
+
+    def _kin_heat_norm_cmap(self, values, diverging):
+        """Return (cmap, vmin, vmax) honoring the user's color-limit settings.
+
+        Out-of-range values render in the colormap's saturated end colors
+        (set_under/set_over) rather than being dropped.
+        """
+        import matplotlib as mpl
+        g = self.kin_gfx
+        finite = values[np.isfinite(values)]
+        cmap_name = g['cmap_div'] if diverging else g['cmap_seq']
+        cmap = mpl.cm.get_cmap(cmap_name).copy()
+        cmap.set_bad(alpha=0.0)  # NaN (unvisited) -> transparent
+        if g['auto_limits'] or g['vmin'] == '' or g['vmax'] == '':
+            if finite.size:
+                lo, hi = np.percentile(finite, [2, 98])
+            else:
+                lo, hi = 0.0, 1.0
+            if diverging and g['symmetric']:
+                m = max(abs(lo), abs(hi)) or 1.0
+                lo, hi = -m, m
+        else:
+            lo, hi = g['vmin'], g['vmax']
+        if lo == hi:
+            hi = lo + 1e-6
+        cmap.set_under(cmap(0.0))
+        cmap.set_over(cmap(1.0))
+        return cmap, lo, hi
+
+    def _kin_show_placeholder(self, msg=None):
+        """Tear down any embedded canvas and show instructional text."""
+        if self.kin_canvas_widget is not None:
+            try:
+                self.kin_canvas_widget.get_tk_widget().destroy()
+            except Exception:
+                pass
+            self.kin_canvas_widget = None
+        if self.kin_figure is not None:
+            try:
+                plt.close(self.kin_figure)
+            except Exception:
+                pass
+            self.kin_figure = None
+        for w in self.kin_plot_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        ttk.Label(self.kin_plot_frame,
+                  text=msg or "Select subject(s) or group(s), choose an analysis, and click 'Run'",
+                  font=('TkDefaultFont', 11)).pack(expand=True)
+
+    def _kin_embed(self, fig):
+        """Embed a freshly built figure into the plot frame (replacing prior)."""
+        if self.kin_canvas_widget is not None:
+            try:
+                self.kin_canvas_widget.get_tk_widget().destroy()
+            except Exception:
+                pass
+            self.kin_canvas_widget = None
+        if self.kin_figure is not None:
+            try:
+                plt.close(self.kin_figure)
+            except Exception:
+                pass
+            self.kin_figure = None
+        for w in self.kin_plot_frame.winfo_children():
+            w.destroy()
+        canvas_frame = ttk.Frame(self.kin_plot_frame)
+        canvas_frame.pack(fill='both', expand=True)
+        # Some figures manage their own spacing (e.g. multi-panel with suptitle);
+        # they set _kin_no_tight so tight_layout doesn't undo it.
+        if not getattr(fig, '_kin_no_tight', False):
+            fig.tight_layout()
+        self.kin_figure = fig
+        self.kin_canvas_widget = self._embed_plot_canvas(fig, canvas_frame)
+
+    # ── Kinematics computation ──────────────────────────────────────────────
+
+    def _kin_channel_index(self):
+        """Map the selected channel label to a beh_synced signal column offset."""
+        label = (self.kin_channel_var.get() or "G0").upper()
+        # G0 -> col 6, G1 -> col 7 (see synchronize_behavior layout).
+        return 1 if label.endswith("1") else 0
+
+    def _kin_settings(self):
+        """Read and sanity-clamp the parameter entries."""
+        def _int(v, default):
+            try:
+                return int(float(v))
+            except Exception:
+                return default
+        def _float(v, default):
+            try:
+                return float(v)
+            except Exception:
+                return default
+        return {
+            'win': max(5, _int(self.kin_smooth_win_var.get(), 11)),
+            'poly': max(1, _int(self.kin_smooth_poly_var.get(), 3)),
+            'nbins': max(2, _int(self.kin_nbins_var.get(), 10)),
+            'maxlag_s': max(0.1, _float(self.kin_maxlag_var.get(), 5.0)),
+            'spatial_bin': max(0.5, _float(self.kin_spatial_bin_var.get(), 5.0)),
+            'move_thresh': max(0.0, _float(self.kin_move_thresh_var.get(), 2.0)),
+            'vel_zscore': bool(self.kin_vel_zscore_var.get()),
+            'accel_abs': bool(self.kin_gfx.get('accel_abs', False)),
+            'zone_kinematic': self.kin_zone_kinematic_var.get(),
+            'bin_s': max(0.0, _float(self.kin_tbin_var.get(), 1.0)),
+        }
+
+    def _compute_kinematics(self, data, ch_index, settings):
+        """Return a dict of frame-aligned kinematic arrays for one subject.
+
+        Keys: t, vel, accel, sig, x, y, radial_vel, dist_center, zone (list).
+        Returns None if the subject lacks usable position/signal data.
+        """
+        bs = data.get('beh_synced')
+        if bs is None or not data.get('has_position', False):
+            return None
+        nch = self._beh_channel_count(data)
+        kin_base = self._beh_kin_base(nch)
+        if bs.shape[1] < self._beh_width(nch):
+            return None
+
+        fps = float(self.params.get('fps', 30) or 30)
+        dt = 1.0 / fps
+        n = len(bs)
+        if n < 5:
+            return None
+
+        x = bs[:, 2].astype(float)
+        y = bs[:, 3].astype(float)
+        vel = bs[:, kin_base + 1].astype(float)
+        vel = np.nan_to_num(vel, nan=0.0)
+        sig_col = 6 + ch_index
+        sig = bs[:, sig_col].astype(float) if bs.shape[1] > sig_col else np.full(n, np.nan)
+
+        # Smoothed velocity + acceleration via Savitzky-Golay.
+        win = settings['win']
+        if win % 2 == 0:
+            win += 1
+        win = min(win, n if n % 2 == 1 else n - 1)
+        poly = min(settings['poly'], max(1, win - 2))
+        try:
+            if win >= 5 and win > poly:
+                accel = savgol_filter(vel, win, poly, deriv=1, delta=dt)
+            else:
+                accel = np.gradient(vel, dt)
+        except Exception:
+            accel = np.gradient(vel, dt)
+        # accel is the rate of change of SPEED (a signed scalar): negative means
+        # the animal is slowing down. This needs no heading because speed has no
+        # direction. Keep the signed copy for sign-dependent analyses; optionally
+        # display the magnitude elsewhere.
+        accel_signed = accel.copy()
+        if settings.get('accel_abs'):
+            accel = np.abs(accel)
+
+        # Radial velocity: velocity-vector component along outward radial unit.
+        cx, cy = self._get_center_point()
+        vx = np.gradient(x, dt)
+        vy = np.gradient(y, dt)
+        rx = x - cx
+        ry = y - cy
+        rnorm = np.sqrt(rx ** 2 + ry ** 2)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            radial_vel = (vx * rx + vy * ry) / rnorm
+        radial_vel[~np.isfinite(radial_vel)] = np.nan
+
+        dist_center = np.sqrt(np.nan_to_num(bs[:, kin_base + 3], nan=np.nan) ** 2 +
+                              np.nan_to_num(bs[:, kin_base + 4], nan=np.nan) ** 2)
+        # Fall back to euclidean from center if center columns unavailable.
+        if not np.isfinite(dist_center).any():
+            dist_center = rnorm
+
+        t = bs[:, kin_base].astype(float)
+        if not np.isfinite(t).any():
+            t = np.arange(n) * dt
+
+        return {
+            't': t, 'vel': vel, 'accel': accel, 'accel_signed': accel_signed,
+            'sig': sig, 'x': x, 'y': y, 'radial_vel': radial_vel,
+            'dist_center': dist_center, 'fps': fps,
+        }
+
+    def _kin_bin_record(self, k, bin_s):
+        """Average a per-frame kinematics record into fixed temporal bins.
+
+        Each bin (default 1 s) becomes one datapoint, so downstream correlations
+        are computed over independent-ish samples rather than every frame. This
+        avoids the inflated n / autocorrelation that makes frame-wise Pearson r
+        appear significant on essentially any pair of slow signals.
+        """
+        fps = k.get('fps', 30.0) or 30.0
+        bin_frames = int(round(bin_s * fps))
+        n = len(k['vel'])
+        if bin_s <= 0 or bin_frames <= 1 or n // max(1, bin_frames) < 2:
+            return k  # binning disabled or not enough data — use frames as-is
+        nb = n // bin_frames
+
+        def _agg(a):
+            seg = np.asarray(a, dtype=float)[:nb * bin_frames].reshape(nb, bin_frames)
+            with np.errstate(invalid='ignore'):
+                return np.nanmean(seg, axis=1)
+
+        out = dict(k)
+        for key in ('t', 'vel', 'accel', 'accel_signed', 'sig', 'x', 'y',
+                    'radial_vel', 'dist_center'):
+            if key in k:
+                out[key] = _agg(k[key])
+        out['fps'] = fps / bin_frames          # effective sample rate after binning
+        out['bin_s'] = bin_frames / fps        # actual bin width in seconds
+        return out
+
+    def _kin_bin_records(self, records, bin_s):
+        """Temporally bin every record; returns a new list (records unchanged)."""
+        return [self._kin_bin_record(k, bin_s) for k in records]
+
+    @staticmethod
+    def _kin_finite(*arrays):
+        """Boolean mask where every supplied array is finite."""
+        m = np.isfinite(arrays[0])
+        for a in arrays[1:]:
+            m = m & np.isfinite(a)
+        return m
+
+    def _kin_xcorr(self, sig, vel, max_lag_frames):
+        """Cross-correlation of signal vs velocity over integer lags.
+
+        Returns (lags_frames, r). Lag L = signal sampled L frames *after*
+        velocity (positive lag -> signal lags velocity).
+        """
+        a = sig.astype(float)
+        b = vel.astype(float)
+        m = self._kin_finite(a, b)
+        a, b = a[m], b[m]
+        if len(a) < 5:
+            return np.array([]), np.array([])
+        a = (a - a.mean()) / (a.std() + 1e-12)
+        b = (b - b.mean()) / (b.std() + 1e-12)
+        max_lag_frames = int(min(max_lag_frames, len(a) - 3))
+        lags = np.arange(-max_lag_frames, max_lag_frames + 1)
+        rs = []
+        for L in lags:
+            if L < 0:
+                xa, xb = a[:L], b[-L:]
+            elif L > 0:
+                xa, xb = a[L:], b[:-L]
+            else:
+                xa, xb = a, b
+            if len(xa) > 2:
+                rs.append(float(np.corrcoef(xa, xb)[0, 1]))
+            else:
+                rs.append(np.nan)
+        return lags, np.array(rs)
+
+    def _kin_selected_subjects(self):
+        """Return (mode, list-of-(subject, group_label)) from the active selector."""
+        if self.kin_by_var.get() == "Group":
+            idxs = self.kin_group_listbox.curselection()
+            groups = [self.kin_group_listbox.get(i) for i in idxs]
+            pairs = []
+            seen = set()
+            for g in groups:
+                for s in self.groups.get(g, []):
+                    if s in self.processed_data and s not in seen and \
+                            self.processed_data[s].get('has_position', False):
+                        pairs.append((s, g))
+                        seen.add(s)
+            return "Group", pairs
+        else:
+            idxs = self.kin_subject_listbox.curselection()
+            subs = [self.kin_subject_listbox.get(i) for i in idxs]
+            return "Subject", [(s, self.processed_data[s].get('group', '')) for s in subs]
+
+    def _kin_collect(self, pairs, ch_index, settings):
+        """Compute per-subject kinematics for each (subject, group) pair.
+
+        Returns list of dicts each with 'subject', 'group', and the arrays from
+        _compute_kinematics. Skips subjects with no usable data.
+        """
+        out = []
+        for subject, group in pairs:
+            k = self._compute_kinematics(self.processed_data[subject], ch_index, settings)
+            if k is None:
+                continue
+            k = dict(k)
+            k['subject'] = subject
+            k['group'] = group
+            out.append(k)
+        return out
+
+    # ── Kinematics dispatch ─────────────────────────────────────────────────
+
+    def run_kinematics(self):
+        """Gather selection, run the chosen analysis, embed the figure."""
+        mode, pairs = self._kin_selected_subjects()
+        if not pairs:
+            self._kin_show_placeholder("Select at least one subject or group with position data.")
+            return
+        analysis = self.kin_analysis_var.get()
+        settings = self._kin_settings()
+        ch_index = self._kin_channel_index()
+        ch_label = self.kin_channel_var.get()
+
+        records_raw = self._kin_collect(pairs, ch_index, settings)
+        if not records_raw:
+            self._kin_show_placeholder("No usable position/signal data for the current selection.")
+            return
+        # Temporal binning: aggregate frames into bins (default 1 s) so each bin,
+        # not each frame, is a datapoint for correlations. Spatial maps and the
+        # movement-onset average keep frame resolution (passed as records_raw).
+        records = self._kin_bin_records(records_raw, settings.get('bin_s', 1.0))
+
+        try:
+            fig, info = self._kin_dispatch(analysis, mode, records, settings, ch_label,
+                                           records_raw=records_raw)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self._kin_show_placeholder(f"Error running '{analysis}':\n{exc}")
+            self.kin_results_label.config(text="")
+            return
+
+        if fig is None:
+            self._kin_show_placeholder(info or "Nothing to plot.")
+            self.kin_results_label.config(text="")
+            return
+        self._kin_embed(fig)
+        # Show the effective temporal bin (some analyses run at frame resolution).
+        frame_level = (analysis == "Movement-onset triggered signal"
+                       or analysis == "Velocity–Signal cross-correlation"
+                       or analysis.startswith("Arena heatmap")
+                       or analysis.startswith("3D arena map"))
+        bin_used = records[0].get('bin_s')
+        if frame_level or bin_used is None:
+            bin_note = "frame-resolution"
+        else:
+            bin_note = f"temporal bin = {bin_used:.3g} s"
+        self.kin_results_label.config(text=f"{info or ''}\n[{bin_note}]")
+
+    def _kin_dispatch(self, analysis, mode, records, settings, ch_label, records_raw=None):
+        """Return (figure, info-text). May set self.kin_last_table for export.
+
+        `records` are temporally binned (one point per bin); `records_raw` are
+        the frame-level records, used by analyses that need full resolution
+        (spatial maps, movement-onset).
+        """
+        self.kin_last_table = None
+        if records_raw is None:
+            records_raw = records
+        a = analysis
+        if a == "Velocity vs Signal (overlay)":
+            return self._kin_overlay(records, settings, ch_label, 'vel')
+        if a == "Acceleration vs Signal (overlay)":
+            return self._kin_overlay(records, settings, ch_label, 'accel')
+        if a == "Velocity vs Signal (scatter)":
+            return self._kin_scatter(records, settings, ch_label, 'vel')
+        if a == "Acceleration vs Signal (scatter)":
+            return self._kin_scatter(records, settings, ch_label, 'accel')
+        if a == "Radial velocity vs Signal":
+            return self._kin_scatter(records, settings, ch_label, 'radial_vel')
+        if a == "Velocity–Signal cross-correlation":
+            # Frame-level for fine lag resolution; the lag stats use per-subject
+            # peaks (n = subjects), so frame autocorrelation is not the unit here.
+            return self._kin_crosscorr(records_raw, settings, ch_label, mode)
+        if a == "Velocity–Signal coupling (summary bars)":
+            # Frame-level curves; the statistical unit is the subject.
+            return self._kin_coupling_bars(records_raw, settings, ch_label, mode)
+        if a == "Signal by velocity bin":
+            return self._kin_signal_by_bin(records, settings, ch_label, mode, 'vel')
+        if a == "Signal by acceleration bin":
+            return self._kin_signal_by_bin(records, settings, ch_label, mode, 'accel')
+        if a == "Distance-from-center vs Signal":
+            return self._kin_signal_by_bin(records, settings, ch_label, mode, 'dist_center')
+        if a == "Accelerating vs decelerating":
+            return self._kin_accel_decel(records, settings, ch_label, mode)
+        if a == "Center vs Perimeter coupling":
+            return self._kin_center_perimeter(records, settings, ch_label, mode)
+        if a.startswith("Arena heatmap"):
+            field = {'Signal': 'sig', 'Velocity': 'vel', 'Acceleration': 'accel'}[a.split(": ")[1]]
+            # Spatial maps keep frame resolution for full arena coverage.
+            return self._kin_arena_heatmap(records_raw, settings, ch_label, field, mode)
+        if a.startswith("3D arena map"):
+            return self._kin_arena_3d(records_raw, settings, ch_label, mode)
+        if a.startswith("Velocity×Acceleration phase map"):
+            return self._kin_phase_map(records, settings, ch_label, mode)
+        if a == "Movement-onset triggered signal":
+            # Needs sub-second resolution → frame-level data.
+            return self._kin_movement_onset(records_raw, settings, ch_label, mode)
+        if a == "Kinematic–Signal coupling by zone":
+            return self._kin_coupling_by_zone(records, settings, ch_label, mode)
+        if a == "Velocity & acceleration distribution":
+            return self._kin_distribution(records, settings, ch_label, mode)
+        return None, f"Analysis '{a}' is not implemented."
+
+    # ── Part 1/2: overlays & scatters ───────────────────────────────────────
+
+    def _kin_overlay(self, records, settings, ch_label, field):
+        # Time-series overlay is inherently single-session; use the first record.
+        rec = records[0]
+        k = rec
+        t = k['t'] - np.nanmin(k['t'])
+        y2 = k[field]
+        sig = k['sig']
+        fig, ax = plt.subplots(figsize=(9.5, 4.5))
+        c1, c2 = '#1f77b4', '#d62728'
+        lab = 'Speed (cm/s)' if field == 'vel' else 'Acceleration (cm/s²; <0 = decel)'
+        ax.plot(t, y2, color=c1, linewidth=0.8, label=lab)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(lab, color=c1)
+        ax.tick_params(axis='y', labelcolor=c1)
+        ax.margins(x=0.01)
+        for side in ('top',):
+            ax.spines[side].set_visible(False)
+        ax2 = ax.twinx()
+        ax2.plot(t, sig, color=c2, linewidth=0.8, alpha=0.8, label=f"{ch_label} z-score")
+        ax2.set_ylabel(f"{ch_label} z-score", color=c2)
+        ax2.tick_params(axis='y', labelcolor=c2)
+        m = self._kin_finite(y2, sig)
+        info = ""
+        if m.sum() > 5:
+            r, p = stats.pearsonr(y2[m], sig[m])
+            ax.set_title(f"{rec['subject']} — {lab} vs {ch_label}   (Pearson r={r:.3f}, p={p:.1e})")
+            info = f"{rec['subject']}: Pearson r = {r:.3f} (p={p:.1e}), n={int(m.sum())}"
+        # Export table
+        self.kin_last_table = pd.DataFrame({'time_s': t, field: y2, 'signal': sig})
+        return fig, info
+
+    def _kin_scatter(self, records, settings, ch_label, field):
+        xs, ys = [], []
+        for k in records:
+            m = self._kin_finite(k[field], k['sig'])
+            xs.append(k[field][m]); ys.append(k['sig'][m])
+        x = np.concatenate(xs) if xs else np.array([])
+        y = np.concatenate(ys) if ys else np.array([])
+        if len(x) < 5:
+            return None, "Not enough finite samples for a scatter."
+        g = self.kin_gfx
+        fig, ax = plt.subplots(figsize=(6.5, 5.5))
+        ax.scatter(x, y, s=g.get('point_size', 4), alpha=g.get('point_alpha', 0.15),
+                   color='#1f77b4', edgecolors='none')
+        # Regression line
+        b1, b0 = np.polyfit(x, y, 1)
+        xx = np.linspace(np.min(x), np.max(x), 100)
+        ax.plot(xx, b0 + b1 * xx, color='black', linewidth=1.8)
+        r, p = stats.pearsonr(x, y)
+        rho, _ = stats.spearmanr(x, y)
+        xlabel = {'vel': 'Speed (cm/s)',
+                  'accel': 'Acceleration (cm/s²; <0 = decelerating)',
+                  'radial_vel': 'Radial velocity (cm/s; + = toward perimeter)'}[field]
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(f"{ch_label} z-score")
+        scope = records[0]['subject'] if len(records) == 1 else f"{len(records)} subjects pooled"
+        ax.set_title(f"{scope}\nPearson r={r:.3f} (p={p:.1e}), Spearman ρ={rho:.3f}")
+        if field == 'radial_vel':
+            ax.axvline(0, color='gray', linestyle='--', linewidth=1, alpha=0.6)
+        self._kin_style_ax(ax)
+        self.kin_last_table = pd.DataFrame({field: x, 'signal': y})
+        info = f"r={r:.3f} (p={p:.1e}), ρ={rho:.3f}, n={len(x)}"
+        return fig, info
+
+    def _kin_crosscorr(self, records, settings, ch_label, mode):
+        fps = records[0]['fps']
+        max_lag_frames = int(settings['maxlag_s'] * fps)
+        per_subject = []
+        lag_axis = None
+        for k in records:
+            lags, rs = self._kin_xcorr(k['sig'], k['vel'], max_lag_frames)
+            if len(lags) == 0:
+                continue
+            if lag_axis is None or len(lags) > len(lag_axis):
+                lag_axis = lags
+            per_subject.append((k['subject'], k['group'], lags, rs))
+        if not per_subject:
+            return None, "Not enough data for cross-correlation."
+        lag_s = lag_axis / fps
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        # Align all to the common (longest) lag axis by trimming to min length.
+        min_len = min(len(rs) for _, _, _, rs in per_subject)
+        mat = np.array([rs[:min_len] for _, _, _, rs in per_subject])
+        lag_s = (per_subject[0][2][:min_len]) / fps
+        if mode == "Group":
+            # mean +/- SEM across subjects, per group
+            groups = {}
+            for (subj, grp, _, rs), row in zip(per_subject, mat):
+                groups.setdefault(grp, []).append(row)
+            for grp, rows in groups.items():
+                rows = np.array(rows)
+                mean = np.nanmean(rows, axis=0)
+                sem = np.nanstd(rows, axis=0) / np.sqrt(max(1, rows.shape[0]))
+                ax.fill_between(lag_s, mean - sem, mean + sem, alpha=0.2)
+                ax.plot(lag_s, mean, linewidth=2, label=f"{grp} (n={rows.shape[0]})")
+            ax.legend(fontsize=9)
+        else:
+            for (subj, grp, _, _), row in zip(per_subject, mat):
+                ax.plot(lag_s, row, linewidth=1.2, alpha=0.8, label=subj)
+            if len(per_subject) <= 8:
+                ax.legend(fontsize=8)
+        mean_all = np.nanmean(mat, axis=0)
+        peak_i = int(np.nanargmin(mean_all))  # most negative (inverse) correlation
+        peak_lag = lag_s[peak_i]
+        peak_r = mean_all[peak_i]
+        ax.axvline(0, color='gray', linestyle=':', linewidth=1)
+        ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+        ax.scatter([peak_lag], [peak_r], color='red', zorder=5)
+        ax.set_xlabel("Lag (s)  [signal relative to velocity]")
+        ax.set_ylabel("Correlation (signal vs velocity)")
+        ax.set_title(f"Velocity–{ch_label} cross-correlation\n"
+                     f"peak (most inverse) r={peak_r:.3f} at lag {peak_lag:+.2f}s")
+        self._kin_style_ax(ax)
+
+        # ── Per-subject peak lag + statistics ────────────────────────────────
+        # For each subject, the lag of its own cross-correlation extremum (the
+        # |r|-max within the window) is the estimated delay between movement and
+        # the signal trough/peak. The statistical unit is the subject.
+        subj_names  = [s for (s, _, _, _) in per_subject]
+        subj_groups = [g for (_, g, _, _) in per_subject]
+        peak_rows = []
+        for ri in range(mat.shape[0]):
+            row = mat[ri]
+            if not np.isfinite(row).any():
+                continue
+            j = int(np.nanargmax(np.abs(row)))
+            peak_rows.append({'subject': subj_names[ri], 'group': subj_groups[ri],
+                              'peak_lag_s': float(lag_s[j]), 'peak_r': float(row[j])})
+        peak_df = pd.DataFrame(peak_rows)
+        self.kin_last_table = peak_df
+
+        stat_lines = []
+
+        def _delay_test(lags_arr, label):
+            la = np.asarray([v for v in lags_arr if np.isfinite(v)], float)
+            if len(la) < 3:
+                note = f"(n={len(la)}, need ≥3)"
+            elif np.std(la) == 0:
+                note = f"(n={len(la)}, no spread — all peaks identical)"
+            else:
+                tval, pval = stats.ttest_1samp(la, 0.0)
+                stat_lines.append(
+                    f"{label}: delay = {np.mean(la):+.2f}±{np.std(la, ddof=1)/np.sqrt(len(la)):.2f}s "
+                    f"(n={len(la)}), vs 0: p={pval:.3g} {self._sig_stars(pval)}".rstrip())
+                return np.mean(la), pval
+            stat_lines.append(f"{label}: delay = {np.mean(la):+.2f}s {note}")
+            return (np.mean(la) if len(la) else np.nan), np.nan
+
+        if mode == "Group" and peak_df['group'].nunique() >= 1:
+            grp_names = list(dict.fromkeys(subj_groups))  # preserve order
+            grp_lags = {}
+            for g in grp_names:
+                gl = peak_df[peak_df['group'] == g]['peak_lag_s'].values
+                grp_lags[g] = gl
+                _delay_test(gl, f"{g} delay≠0")
+            # Between-group comparison of the delay.
+            present = [g for g in grp_names if len(grp_lags[g]) >= 2]
+            if len(present) == 2:
+                a, b = grp_lags[present[0]], grp_lags[present[1]]
+                tval, pval = stats.ttest_ind(a, b, equal_var=False, nan_policy='omit')
+                try:
+                    u, pmw = stats.mannwhitneyu(a, b, alternative='two-sided')
+                except Exception:
+                    pmw = np.nan
+                stat_lines.append(
+                    f"{present[0]} vs {present[1]} delay: Welch t p={pval:.3g} "
+                    f"{self._sig_stars(pval)} | Mann–Whitney p={pmw:.3g}".rstrip())
+                # Also compare trough depth (peak r).
+                ra = peak_df[peak_df['group'] == present[0]]['peak_r'].values
+                rb = peak_df[peak_df['group'] == present[1]]['peak_r'].values
+                _, pdr = stats.ttest_ind(ra, rb, equal_var=False, nan_policy='omit')
+                stat_lines.append(
+                    f"{present[0]} vs {present[1]} trough depth: Welch t p={pdr:.3g} "
+                    f"{self._sig_stars(pdr)}".rstrip())
+            elif len(present) > 2:
+                lists = [grp_lags[g] for g in present]
+                fval, pval = stats.f_oneway(*lists)
+                stat_lines.append(
+                    f"Delay across {len(present)} groups: one-way ANOVA p={pval:.3g} "
+                    f"{self._sig_stars(pval)}".rstrip())
+        else:
+            _delay_test(peak_df['peak_lag_s'].values, "Delay≠0")
+
+        # Per-subject peak-lag markers (rug) along the bottom so the spread is visible.
+        ymin, _ = ax.get_ylim()
+        ax.scatter(peak_df['peak_lag_s'], np.full(len(peak_df), ymin),
+                   marker='|', color='black', alpha=0.5, zorder=4,
+                   label='per-subject peak')
+
+        stat_text = "\n".join(stat_lines)
+        if stat_text:
+            ax.text(0.015, 0.04, stat_text, transform=ax.transAxes,
+                    ha='left', va='bottom', fontsize=7.5,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.85,
+                              edgecolor='0.7'))
+
+        info = f"Peak inverse r={peak_r:.3f} at lag {peak_lag:+.2f}s"
+        if stat_lines:
+            info += "  ·  " + stat_lines[0]
+        return fig, info
+
+    def _kin_coupling_bars(self, records, settings, ch_label, mode):
+        """Robust bar-graph summary of speed↔signal coupling.
+
+        Avoids the unreliable cross-correlation *lag* entirely. For each subject
+        we compute three lag-window scalars from the cross-correlation curve:
+          • instantaneous r at lag 0,
+          • mean r over 0–W s (W = min(2 s, max-lag)),
+          • negative-lobe area over 0–max-lag (total inverse coupling).
+        Each is shown as a bar per group (mean ± SEM) with individual subjects as
+        dots; one-sample stars (coupling ≠ 0) and a between-group bracket are added.
+        A warning is shown when coupling is too weak to interpret.
+        """
+        fps = records[0]['fps']
+        max_lag_frames = int(settings['maxlag_s'] * fps)
+        win_s = min(2.0, settings['maxlag_s'])
+
+        rows = []
+        for k in records:
+            lags, r = self._kin_xcorr(k['sig'], k['vel'], max_lag_frames)
+            if len(lags) == 0:
+                continue
+            lag_s = lags / fps
+            # Instantaneous coupling (nearest lag to 0).
+            r0 = float(r[int(np.argmin(np.abs(lag_s)))])
+            # Mean over the near-movement window [0, win_s].
+            wsel = (lag_s >= 0) & (lag_s <= win_s)
+            r_win = float(np.nanmean(r[wsel])) if wsel.any() else np.nan
+            # Negative-lobe area over positive lags (integrated inverse coupling).
+            psel = lag_s >= 0
+            seg = r[psel].copy()
+            seg[seg > 0] = 0.0
+            neg_area = float(-np.trapz(seg, lag_s[psel]))
+            rows.append({'subject': k['subject'], 'group': k['group'],
+                         'r_lag0': r0, 'r_win': r_win, 'neg_area': neg_area})
+        if not rows:
+            return None, "Not enough data for coupling summary."
+        df = pd.DataFrame(rows)
+        self.kin_last_table = df
+
+        metrics = [('r_lag0', "Instantaneous r\n(lag 0)"),
+                   ('r_win', f"Mean r\n(0–{win_s:g} s)"),
+                   ('neg_area', "Negative-lobe\narea (0–max lag)")]
+
+        # Group order.
+        if mode == "Group":
+            groups = list(dict.fromkeys(df['group']))
+        else:
+            df = df.assign(group="Selected")
+            groups = ["Selected"]
+        gcolors = plt.cm.tab10(np.linspace(0, 1, max(3, len(groups))))
+
+        fig, axes = plt.subplots(1, len(metrics), figsize=(4.6 * len(metrics), 5),
+                                 squeeze=False)
+        axes = axes[0]
+        warnings = []
+        for mi, (key, title) in enumerate(metrics):
+            ax = axes[mi]
+            xbase = np.arange(len(groups))
+            group_vals = []
+            for gi, g in enumerate(groups):
+                vals = df[df['group'] == g][key].dropna().values
+                group_vals.append(vals)
+                mean = np.nanmean(vals) if len(vals) else np.nan
+                sem = (np.nanstd(vals) / np.sqrt(len(vals))) if len(vals) > 1 else 0.0
+                ax.bar(gi, mean, 0.6, yerr=sem, capsize=4, color=gcolors[gi],
+                       alpha=0.75, zorder=1)
+                # individual subjects
+                jit = np.random.uniform(-0.12, 0.12, len(vals))
+                ax.scatter(gi + jit, vals, color='black', s=20, zorder=3, alpha=0.8)
+                # one-sample: coupling ≠ 0
+                p0 = self._zone_bar_pvalue(vals, None)
+                star = self._sig_stars(p0)
+                if star and len(vals):
+                    top = mean + np.sign(mean if mean else 1) * (sem + 0)
+                    ax.annotate(star, (gi, top), textcoords="offset points",
+                                xytext=(0, 6 if mean >= 0 else -12), ha='center',
+                                fontsize=12, fontweight='bold')
+            # between-group test
+            if len(groups) == 2 and all(len(v) >= 2 for v in group_vals):
+                _, pt = stats.ttest_ind(group_vals[0], group_vals[1],
+                                        equal_var=False, nan_policy='omit')
+                try:
+                    _, pmw = stats.mannwhitneyu(group_vals[0], group_vals[1],
+                                                alternative='two-sided')
+                except Exception:
+                    pmw = np.nan
+                ax.set_xlabel(f"Welch p={pt:.3f} {self._sig_stars(pt)}\n"
+                              f"Mann–Whitney p={pmw:.3f}".rstrip(), fontsize=8)
+            elif len(groups) > 2 and all(len(v) >= 2 for v in group_vals):
+                _, pa = stats.f_oneway(*group_vals)
+                ax.set_xlabel(f"ANOVA p={pa:.3f} {self._sig_stars(pa)}".rstrip(),
+                              fontsize=8)
+            ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+            ax.set_xticks(xbase)
+            ax.set_xticklabels([f"{g}\n(n={len(group_vals[gi])})" for gi, g in enumerate(groups)],
+                               fontsize=8)
+            ax.set_title(title, fontsize=10)
+            self._kin_style_ax(ax)
+            if mi == 0:
+                ax.set_ylabel("coupling (negative = inverse)")
+
+        # Reliability warning when coupling is weak (|instantaneous r| small).
+        all_r0 = np.abs(df['r_lag0'].dropna().values)
+        all_rw = np.abs(df['r_win'].dropna().values)
+        if all_r0.size and np.nanmedian(np.concatenate([all_r0, all_rw])) < 0.10:
+            warnings.append("⚠ Coupling is weak (median |r| < 0.10): group and individual "
+                            "differences may not be meaningful, and the cross-correlation "
+                            "lag is unreliable for this data.")
+        small = [g for g in groups if (df['group'] == g).sum() < 3]
+        if small:
+            warnings.append(f"⚠ Small n ({', '.join(small)}): tests are underpowered.")
+
+        fig.suptitle(f"Speed–{ch_label} coupling summary  "
+                     f"(lag-free; statistical unit = subject)", fontsize=11, y=0.995)
+        if warnings:
+            fig.text(0.5, 0.005, "\n".join(warnings), ha='center', va='bottom',
+                     fontsize=8, color='#b30000', wrap=True)
+        fig.subplots_adjust(top=0.82, bottom=0.20 if warnings else 0.13,
+                            wspace=0.3, left=0.08, right=0.97)
+        fig._kin_no_tight = True
+        info = f"{len(df)} subject(s); lag-free coupling metrics"
+        if warnings:
+            info += "  ·  ⚠ weak coupling — see plot"
+        return fig, info
+
+    # ── Binned signal curves (velocity / acceleration / distance) ────────────
+
+    def _kin_signal_by_bin(self, records, settings, ch_label, mode, field):
+        nbins = settings['nbins']
+        # Decide bin edges from pooled data for a common axis.
+        pooled = []
+        for k in records:
+            v = k[field].copy()
+            if field == 'vel' and settings['vel_zscore']:
+                m = self._kin_finite(v)
+                if m.sum() > 2:
+                    v = (v - np.nanmean(v[m])) / (np.nanstd(v[m]) + 1e-12)
+            pooled.append(v)
+            k['_binfield'] = v
+        allv = np.concatenate([p[self._kin_finite(p)] for p in pooled]) if pooled else np.array([])
+        if len(allv) < nbins:
+            return None, "Not enough data to bin."
+        lo, hi = np.percentile(allv, [1, 99])
+        edges = np.linspace(lo, hi, nbins + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+
+        def subject_curve(k):
+            v = k['_binfield']; s = k['sig']
+            m = self._kin_finite(v, s)
+            v, s = v[m], s[m]
+            idx = np.clip(np.digitize(v, edges) - 1, 0, nbins - 1)
+            means = np.full(nbins, np.nan)
+            for b in range(nbins):
+                sel = idx == b
+                if sel.sum() > 0:
+                    means[b] = np.nanmean(s[sel])
+            return means
+
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        xlabel = {'vel': 'Speed', 'accel': 'Acceleration (cm/s²; <0 = decelerating)',
+                  'dist_center': 'Distance from center (cm)'}[field]
+        if field == 'vel':
+            xlabel = 'Speed (z-score)' if settings['vel_zscore'] else 'Speed (cm/s)'
+
+        if mode == "Group":
+            groups = {}
+            for k in records:
+                groups.setdefault(k['group'], []).append(subject_curve(k))
+            rows = []
+            for grp, curves in groups.items():
+                cm = np.array(curves)
+                mean = np.nanmean(cm, axis=0)
+                sem = np.nanstd(cm, axis=0) / np.sqrt(max(1, cm.shape[0]))
+                ax.errorbar(centers, mean, yerr=sem, marker='o', capsize=3,
+                            linewidth=2, label=f"{grp} (n={cm.shape[0]})")
+                for ci, c in enumerate(centers):
+                    rows.append({'group': grp, 'bin_center': c,
+                                 'mean_signal': mean[ci], 'sem': sem[ci]})
+            ax.legend(fontsize=9)
+            self.kin_last_table = pd.DataFrame(rows)
+        else:
+            rows = []
+            for k in records:
+                curve = subject_curve(k)
+                ax.plot(centers, curve, marker='o', linewidth=1.5, alpha=0.85, label=k['subject'])
+                for ci, c in enumerate(centers):
+                    rows.append({'subject': k['subject'], 'bin_center': c, 'mean_signal': curve[ci]})
+            if len(records) <= 10:
+                ax.legend(fontsize=8)
+            self.kin_last_table = pd.DataFrame(rows)
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(f"Mean {ch_label} z-score")
+        ax.set_title(f"Mean {ch_label} signal by {xlabel.split(' (')[0].lower()}")
+        ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+        self._kin_style_ax(ax)
+        return fig, f"{len(records)} subject(s), {nbins} bins"
+
+    def _kin_accel_decel(self, records, settings, ch_label, mode):
+        rows = []
+        for k in records:
+            # Always use signed acceleration here so the up/down split is meaningful
+            # even when the display setting shows acceleration as magnitude.
+            a, s = k['accel_signed'], k['sig']
+            m = self._kin_finite(a, s)
+            a, s = a[m], s[m]
+            if len(a) < 5:
+                continue
+            up = s[a > 0]; dn = s[a < 0]
+            rows.append({'subject': k['subject'], 'group': k['group'],
+                         'accelerating': np.nanmean(up) if len(up) else np.nan,
+                         'decelerating': np.nanmean(dn) if len(dn) else np.nan})
+        if not rows:
+            return None, "Not enough data."
+        df = pd.DataFrame(rows)
+        self.kin_last_table = df
+        info = f"{len(df)} subject(s)"
+        fig, ax = plt.subplots(figsize=(6.5, 5))
+        cats = ['accelerating', 'decelerating']
+        if mode == "Group":
+            groups = sorted(df['group'].unique())
+            width = 0.8 / max(1, len(groups))
+            xbase = np.arange(len(cats))
+            for gi, grp in enumerate(groups):
+                sub = df[df['group'] == grp]
+                means = [np.nanmean(sub[c]) for c in cats]
+                sems = [np.nanstd(sub[c]) / np.sqrt(max(1, len(sub))) for c in cats]
+                ax.bar(xbase + gi * width, means, width, yerr=sems, capsize=3,
+                       label=f"{grp} (n={len(sub)})")
+            ax.set_xticks(xbase + width * (len(groups) - 1) / 2)
+            ax.legend(fontsize=9)
+        else:
+            means = [np.nanmean(df[c]) for c in cats]
+            sems = [np.nanstd(df[c]) / np.sqrt(max(1, len(df))) for c in cats]
+            ax.bar(np.arange(len(cats)), means, 0.6, yerr=sems, capsize=4,
+                   color=['#2ca02c', '#d62728'])
+            ax.set_xticks(np.arange(len(cats)))
+            # paired test across subjects if >1
+            if len(df) > 1:
+                try:
+                    _, pval = stats.ttest_rel(df['accelerating'], df['decelerating'],
+                                              nan_policy='omit')
+                    info += f"  paired t p={pval:.3g}"
+                except Exception:
+                    pass
+        ax.set_xticklabels(['Accelerating', 'Decelerating'])
+        ax.set_ylabel(f"Mean {ch_label} z-score")
+        ax.set_title(f"Signal during acceleration vs deceleration ({ch_label})")
+        ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+        self._kin_style_ax(ax)
+        return fig, info
+
+    def _kin_center_perimeter(self, records, settings, ch_label, mode):
+        """Velocity-signal correlation computed separately for center vs perimeter."""
+        def zone_class(k):
+            # Center if within named 'center' zone radius, else perimeter, using
+            # distance from center vs median split as a robust fallback.
+            d = k['dist_center']
+            m = self._kin_finite(d)
+            if m.sum() < 5:
+                return None
+            thr = np.nanmedian(d[m])
+            center_mask = d <= thr
+            return center_mask
+        rows = []
+        for k in records:
+            cm = zone_class(k)
+            if cm is None:
+                continue
+            for region, sel in [('center', cm), ('perimeter', ~cm)]:
+                mm = self._kin_finite(k['vel'], k['sig']) & sel
+                if mm.sum() > 5:
+                    r, _ = stats.pearsonr(k['vel'][mm], k['sig'][mm])
+                    rows.append({'subject': k['subject'], 'group': k['group'],
+                                 'region': region, 'r': r, 'n': int(mm.sum())})
+        if not rows:
+            return None, "Not enough data for center/perimeter split."
+        df = pd.DataFrame(rows)
+        self.kin_last_table = df
+        fig, ax = plt.subplots(figsize=(6.5, 5))
+        regions = ['center', 'perimeter']
+        if mode == "Group":
+            groups = sorted(df['group'].unique())
+            width = 0.8 / max(1, len(groups))
+            xbase = np.arange(len(regions))
+            for gi, grp in enumerate(groups):
+                sub = df[df['group'] == grp]
+                means = [np.nanmean(sub[sub['region'] == reg]['r']) for reg in regions]
+                sems = [np.nanstd(sub[sub['region'] == reg]['r']) /
+                        np.sqrt(max(1, len(sub[sub['region'] == reg]))) for reg in regions]
+                ax.bar(xbase + gi * width, means, width, yerr=sems, capsize=3,
+                       label=f"{grp}")
+            ax.set_xticks(xbase + width * (len(groups) - 1) / 2)
+            ax.legend(fontsize=9)
+        else:
+            means = [np.nanmean(df[df['region'] == reg]['r']) for reg in regions]
+            ax.bar(np.arange(len(regions)), means, 0.6, color=['#1f77b4', '#ff7f0e'])
+            # overlay individual subject points
+            for reg_i, reg in enumerate(regions):
+                yv = df[df['region'] == reg]['r'].values
+                ax.scatter(np.full(len(yv), reg_i) + np.random.uniform(-0.05, 0.05, len(yv)),
+                           yv, color='black', s=15, zorder=5)
+            ax.set_xticks(np.arange(len(regions)))
+        ax.set_xticklabels(['Center', 'Perimeter'])
+        ax.set_ylabel("Speed–signal Pearson r")
+        ax.set_title(f"Speed–{ch_label} coupling by arena region")
+        ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+        self._kin_style_ax(ax)
+        return fig, f"{df['subject'].nunique()} subject(s)"
+
+    @staticmethod
+    def _sig_stars(p):
+        """Significance marker for a p-value (''/*/**/***)."""
+        if p is None or not np.isfinite(p):
+            return ''
+        if p < 0.001:
+            return '***'
+        if p < 0.01:
+            return '**'
+        if p < 0.05:
+            return '*'
+        return ''
+
+    def _zone_bar_pvalue(self, r_values, single_p):
+        """P-value that a zone's coupling differs from 0.
+
+        With several subjects: one-sample t-test of their r-values vs 0.
+        With a single subject: that subject's Pearson p for the zone.
+        """
+        rs = np.asarray([v for v in r_values if np.isfinite(v)], dtype=float)
+        if len(rs) >= 2 and np.nanstd(rs) > 0:
+            try:
+                return float(stats.ttest_1samp(rs, 0.0).pvalue)
+            except Exception:
+                return np.nan
+        if len(rs) == 1 and single_p is not None and np.isfinite(single_p):
+            return float(single_p)
+        return np.nan
+
+    @staticmethod
+    def _kin_base_zone(zone):
+        """Merge directional arm halves into one base zone, matching the
+        aggregation used by the zone-rate analyses: open arms combine up/down,
+        closed arms combine left/right (suffix form), and the older prefix form
+        (top_/bottom_/left_/right_) is handled too. e.g. 'open_proximal_up' and
+        'open_proximal_down' both map to 'open_proximal'."""
+        z = str(zone)
+        for suf in ('_up', '_down', '_left', '_right'):
+            if z.endswith(suf):
+                return z[:-len(suf)]
+        for pre in ('top_', 'bottom_', 'left_', 'right_'):
+            if z.startswith(pre):
+                return z[len(pre):]
+        return z
+
+    def _kin_zone_of_frame(self, x, y):
+        """Exclusive per-frame zone assignment, matching classify_zone's
+        first-match priority but vectorized over all frames."""
+        n = len(x)
+        zone_of = np.full(n, 'unknown', dtype=object)
+        assigned = np.zeros(n, dtype=bool)
+        for zname, zd in self.zones.items():
+            inz = (np.isfinite(x) & np.isfinite(y) &
+                   (x >= zd['x_min']) & (x <= zd['x_max']) &
+                   (y >= zd['y_min']) & (y <= zd['y_max']) & ~assigned)
+            zone_of[inz] = zname
+            assigned |= inz
+        return zone_of
+
+    def _kin_coupling_by_zone(self, records, settings, ch_label, mode):
+        """Per-zone correlation between a kinematic (velocity or acceleration)
+        and the signal, one bar per user-defined zone."""
+        if not self.zones:
+            return None, ("No zones defined. Define zones for this project first "
+                          "(same zones used by the other zone-based analyses).")
+        kin = settings.get('zone_kinematic', 'Velocity')
+        field = 'vel' if kin == 'Velocity' else 'accel'
+        zone_names = [z for z in self.zones.keys() if z != 'unknown']
+        # Group raw zones under their merged base name so paired arm halves
+        # (open up/down, closed left/right) are pooled at the frame level before
+        # the correlation is computed (cleaner than averaging two r values).
+        base_groups = {}
+        for z in zone_names:
+            base_groups.setdefault(self._kin_base_zone(z), []).append(z)
+        rows = []
+        for k in records:
+            zof = self._kin_zone_of_frame(k['x'], k['y'])
+            kv, s = k[field], k['sig']
+            for base, raws in base_groups.items():
+                mm = self._kin_finite(kv, s) & np.isin(zof, raws)
+                if mm.sum() > 5:
+                    r, p = stats.pearsonr(kv[mm], s[mm])
+                    rows.append({'subject': k['subject'], 'group': k['group'],
+                                 'zone': base, 'r': r, 'p': p, 'n': int(mm.sum())})
+        if not rows:
+            return None, "No zone had enough samples for the current selection."
+        df = pd.DataFrame(rows)
+        self.kin_last_table = df
+        zones_present = [z for z in base_groups.keys() if z in set(df['zone'])]
+        fig, ax = plt.subplots(figsize=(max(6.5, 0.9 * len(zones_present) + 3), 5))
+        xbase = np.arange(len(zones_present))
+        kin_label = "Speed" if field == 'vel' else "Acceleration"
+        # Collect (x, bar_top, p) for significance annotation after drawing.
+        star_marks = []
+        if mode == "Group":
+            groups = sorted(df['group'].unique())
+            width = 0.8 / max(1, len(groups))
+            for gi, grp in enumerate(groups):
+                sub = df[df['group'] == grp]
+                means, sems = [], []
+                for zi, z in enumerate(zones_present):
+                    zr = sub[sub['zone'] == z]
+                    rv = zr['r'].values
+                    mean = np.nanmean(rv) if len(rv) else np.nan
+                    sem = (np.nanstd(rv) / np.sqrt(len(rv))) if len(rv) else 0.0
+                    means.append(mean); sems.append(sem)
+                    single_p = zr['p'].values[0] if len(rv) == 1 else None
+                    p = self._zone_bar_pvalue(rv, single_p)
+                    if np.isfinite(mean):
+                        top = mean + np.sign(mean if mean else 1) * (sem)
+                        star_marks.append((xbase[zi] + gi * width, mean, top, p))
+                ax.bar(xbase + gi * width, means, width, yerr=sems, capsize=3, label=grp)
+            ax.set_xticks(xbase + width * (len(groups) - 1) / 2)
+            ax.legend(fontsize=9, title="Group")
+        else:
+            means = [np.nanmean(df[df['zone'] == z]['r']) for z in zones_present]
+            ax.bar(xbase, means, 0.62, color=plt.cm.tab10(np.linspace(0, 1, len(zones_present))))
+            for zi, z in enumerate(zones_present):
+                zr = df[df['zone'] == z]
+                yv = zr['r'].values
+                if len(yv) > 1:
+                    ax.scatter(np.full(len(yv), zi) + np.random.uniform(-0.07, 0.07, len(yv)),
+                               yv, color='black', s=16, zorder=5)
+                single_p = zr['p'].values[0] if len(yv) == 1 else None
+                p = self._zone_bar_pvalue(yv, single_p)
+                mean = means[zi]
+                if np.isfinite(mean):
+                    sem = (np.nanstd(yv) / np.sqrt(len(yv))) if len(yv) > 1 else 0.0
+                    top = mean + np.sign(mean if mean else 1) * sem
+                    star_marks.append((zi, mean, top, p))
+            ax.set_xticks(xbase)
+        ax.set_xticklabels(zones_present, rotation=30, ha='right')
+        ax.set_ylabel(f"{kin_label}–signal Pearson r")
+        ax.set_title(f"{kin_label}–{ch_label} coupling by zone")
+        ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+        self._kin_style_ax(ax)
+        # Annotate significance stars just beyond each bar tip (outward from 0).
+        y0, y1 = ax.get_ylim()
+        pad = 0.03 * (y1 - y0)
+        placed = False
+        for x, mean, top, p in star_marks:
+            star = self._sig_stars(p)
+            if not star:
+                continue
+            placed = True
+            if mean >= 0:
+                ax.text(x, top + pad, star, ha='center', va='bottom',
+                        fontsize=12, fontweight='bold')
+            else:
+                ax.text(x, top - pad, star, ha='center', va='top',
+                        fontsize=12, fontweight='bold')
+        # Give the stars headroom so they aren't clipped.
+        if placed:
+            ax.set_ylim(y0 - 2 * pad, y1 + 3 * pad)
+        # Footnote on the significance convention.
+        ax.text(0.99, 0.02, "* p<0.05  ** p<0.01  *** p<0.001",
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=8, color='gray')
+        return fig, f"{kin_label} vs {ch_label} per zone, {df['subject'].nunique()} subject(s)"
+
+    # ── Spatial maps ────────────────────────────────────────────────────────
+
+    def _kin_arena_grid(self, records, field, bin_cm):
+        """Accumulate a 2-D arena grid of mean(field) across the given records."""
+        xs = np.concatenate([k['x'] for k in records])
+        ys = np.concatenate([k['y'] for k in records])
+        vs = np.concatenate([k[field] for k in records])
+        m = self._kin_finite(xs, ys, vs)
+        xs, ys, vs = xs[m], ys[m], vs[m]
+        if len(xs) < 5:
+            return None
+        xedges = np.arange(np.min(xs), np.max(xs) + bin_cm, bin_cm)
+        yedges = np.arange(np.min(ys), np.max(ys) + bin_cm, bin_cm)
+        if len(xedges) < 2 or len(yedges) < 2:
+            return None
+        sum_grid, _, _ = np.histogram2d(xs, ys, bins=[xedges, yedges], weights=vs)
+        cnt_grid, _, _ = np.histogram2d(xs, ys, bins=[xedges, yedges])
+        with np.errstate(invalid='ignore', divide='ignore'):
+            mean_grid = sum_grid / cnt_grid
+        return {'mean': mean_grid, 'count': cnt_grid, 'xedges': xedges, 'yedges': yedges}
+
+    def _kin_arena_heatmap(self, records, settings, ch_label, field, mode):
+        recs = records  # pool all selected records (subjects or group members)
+        grid = self._kin_arena_grid(recs, field, settings['spatial_bin'])
+        if grid is None:
+            return None, "Not enough spatial data."
+        fig, ax = plt.subplots(figsize=(6.8, 6))
+        extent = [grid['xedges'][0], grid['xedges'][-1], grid['yedges'][0], grid['yedges'][-1]]
+        label = {'sig': f"Mean {ch_label} z-score", 'vel': "Mean speed (cm/s)",
+                 'accel': "Mean acceleration (Δspeed/dt)"}[field]
+        diverging = field in ('sig', 'accel')
+        # Mask unvisited bins so they render transparent (blank), not as 0.
+        mean_grid = np.ma.masked_invalid(grid['mean'].T)
+        cmap, vmin, vmax = self._kin_heat_norm_cmap(grid['mean'], diverging)
+        # Default Normalize(clip=False) routes out-of-range values to the
+        # set_under/set_over (saturated end) colors rather than dropping them.
+        im = ax.imshow(mean_grid, origin='lower', extent=extent, aspect='equal',
+                       cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest')
+        fig.colorbar(im, ax=ax, label=label, shrink=0.85, extend='both')
+        ax.set_xlabel("X (cm)"); ax.set_ylabel("Y (cm)")
+        ax.set_facecolor('#f2f2f2')  # backdrop so blank bins read as "not visited"
+        scope = recs[0]['subject'] if len(recs) == 1 else f"{len(recs)} subjects pooled"
+        ax.set_title(f"Arena · {label}\n{scope}  (bin {settings['spatial_bin']:g} cm)")
+        return fig, f"{label}, bin={settings['spatial_bin']}cm"
+
+    def _kin_arena_3d(self, records, settings, ch_label, mode):
+        grid_v = self._kin_arena_grid(records, 'vel', settings['spatial_bin'])
+        grid_s = self._kin_arena_grid(records, 'sig', settings['spatial_bin'])
+        if grid_v is None or grid_s is None:
+            return None, "Not enough spatial data for 3-D map."
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers projection)
+        import matplotlib as mpl
+        xedges, yedges = grid_v['xedges'], grid_v['yedges']
+        xc = 0.5 * (xedges[:-1] + xedges[1:])
+        yc = 0.5 * (yedges[:-1] + yedges[1:])
+        X, Y = np.meshgrid(xc, yc)
+        Z = grid_v['mean'].T          # height = mean velocity
+        C = grid_s['mean'].T          # color  = mean signal
+        # A quad is "visited" only if all four of its corner bins have data; that
+        # keeps never-visited locations blank instead of collapsing them to zero.
+        visited = np.isfinite(Z) & np.isfinite(C)
+        cmap, vmin, vmax = self._kin_heat_norm_cmap(grid_s['mean'], diverging=True)
+        norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        facecolors = cmap(norm(np.nan_to_num(C, nan=0.0)))
+        blank = self.kin_gfx.get('blank_unvisited', True)
+        if blank:
+            facecolors[..., 3] = np.where(visited, 1.0, 0.0)   # alpha 0 = blank
+        # Heights: keep visited bins at their velocity; unvisited -> NaN so the
+        # surface leaves a hole there rather than a zero-height floor.
+        Zsurf = np.where(visited, Z, np.nan) if blank else np.nan_to_num(Z, nan=0.0)
+        fig = plt.figure(figsize=(8.5, 6.5))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.plot_surface(X, Y, Zsurf, facecolors=facecolors,
+                        rstride=1, cstride=1, linewidth=0, antialiased=True, shade=False)
+        mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        mappable.set_array(grid_s['mean'])
+        fig.colorbar(mappable, ax=ax, label=f"Mean {ch_label} z-score",
+                     shrink=0.6, extend='both', pad=0.08)
+        ax.set_xlabel("X (cm)"); ax.set_ylabel("Y (cm)")
+        ax.set_zlabel("Mean speed (cm/s)")
+        # Honor manual z-axis (height) limits from Graph Settings.
+        g = self.kin_gfx
+        if not g.get('z_auto', True) and g.get('zmin') != '' and g.get('zmax') != '':
+            try:
+                ax.set_zlim(float(g['zmin']), float(g['zmax']))
+            except Exception:
+                pass
+        ax.view_init(elev=35, azim=-60)
+        scope = records[0]['subject'] if len(records) == 1 else f"{len(records)} subjects pooled"
+        ax.set_title(f"Arena: height = speed, color = {ch_label} signal\n{scope}")
+        return fig, "3-D arena map (height=speed, color=signal; unvisited bins blank)"
+
+    def _kin_phase_map(self, records, settings, ch_label, mode):
+        xs = np.concatenate([k['vel'] for k in records])
+        ys = np.concatenate([k['accel'] for k in records])
+        cs = np.concatenate([k['sig'] for k in records])
+        m = self._kin_finite(xs, ys, cs)
+        xs, ys, cs = xs[m], ys[m], cs[m]
+        if len(xs) < 20:
+            return None, "Not enough data for phase map."
+        nb = settings['nbins']
+        xlo, xhi = np.percentile(xs, [1, 99])
+        ylo, yhi = np.percentile(ys, [1, 99])
+        xedges = np.linspace(xlo, xhi, nb + 1)
+        yedges = np.linspace(ylo, yhi, nb + 1)
+        sum_g, _, _ = np.histogram2d(xs, ys, bins=[xedges, yedges], weights=cs)
+        cnt_g, _, _ = np.histogram2d(xs, ys, bins=[xedges, yedges])
+        with np.errstate(invalid='ignore', divide='ignore'):
+            mean_g = sum_g / cnt_g
+        fig, ax = plt.subplots(figsize=(7.2, 6))
+        cmap, vmin, vmax = self._kin_heat_norm_cmap(mean_g, diverging=True)
+        im = ax.imshow(np.ma.masked_invalid(mean_g.T), origin='lower', aspect='auto',
+                       cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest',
+                       extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
+        fig.colorbar(im, ax=ax, label=f"Mean {ch_label} z-score", shrink=0.85, extend='both')
+        ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.6)
+        ax.set_facecolor('#f2f2f2')
+        ax.set_xlabel("Speed (cm/s)")
+        ax.set_ylabel("Acceleration (Δspeed/dt; <0 = decelerating)")
+        ax.set_title(f"Signal over speed × acceleration plane ({ch_label})\n"
+                     f"bottom-left = slow & decelerating (arrest)")
+        return fig, "Phase map (signal over speed×acceleration)"
+
+    def _kin_movement_onset(self, records, settings, ch_label, mode):
+        fps = records[0]['fps']
+        thr = settings['move_thresh']
+        win = int(2.0 * fps)  # +/- 2 s window
+        traces = []
+        for k in records:
+            vel = k['vel']; sig = k['sig']
+            moving = vel > thr
+            # rising edges: not moving -> moving
+            onsets = np.where((~moving[:-1]) & (moving[1:]))[0] + 1
+            for o in onsets:
+                if o - win >= 0 and o + win < len(sig):
+                    seg = sig[o - win:o + win + 1]
+                    if np.isfinite(seg).all():
+                        traces.append(seg)
+        if len(traces) < 3:
+            return None, "Too few movement-onset events."
+        mat = np.array(traces)
+        mean = np.nanmean(mat, axis=0)
+        sem = np.nanstd(mat, axis=0) / np.sqrt(mat.shape[0])
+        tt = (np.arange(-win, win + 1)) / fps
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        ax.fill_between(tt, mean - sem, mean + sem, alpha=0.25, color='#1f77b4')
+        ax.plot(tt, mean, color='#1f77b4', linewidth=2)
+        ax.axvline(0, color='red', linestyle='--', linewidth=1, label='movement onset')
+        ax.set_xlabel("Time from movement onset (s)")
+        ax.set_ylabel(f"Mean {ch_label} z-score")
+        ax.set_title(f"Movement-onset triggered {ch_label} signal "
+                     f"({mat.shape[0]} events, thr={thr} cm/s)")
+        ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+        ax.legend(fontsize=9)
+        self._kin_style_ax(ax)
+        self.kin_last_table = pd.DataFrame({'time_s': tt, 'mean_signal': mean, 'sem': sem})
+        return fig, f"{mat.shape[0]} onset events"
+
+    # ── Distributions ────────────────────────────────────────────────────────
+
+    def _kin_distribution(self, records, settings, ch_label, mode):
+        """Distribution of speed and acceleration: histogram + density curve,
+        z-score threshold lines, and a rug of every datapoint. In Group mode each
+        group gets its own row of panels."""
+        metrics = [('vel', 'Speed (cm/s)'),
+                   ('accel', 'Acceleration (cm/s²; <0 = decelerating)')]
+
+        # Organize records into rows: one row per group, or a single pooled row.
+        if mode == "Group":
+            rows = []
+            for grp in dict.fromkeys(k['group'] for k in records):
+                rows.append((grp, [k for k in records if k['group'] == grp]))
+        else:
+            label = (records[0]['subject'] if len(records) == 1
+                     else f"{len(records)} subjects pooled")
+            rows = [(label, records)]
+
+        nrows, ncols = len(rows), len(metrics)
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(6.0 * ncols, 3.7 * nrows + 0.5),
+                                 squeeze=False)
+        export_rows = []
+        colors = plt.cm.tab10(np.linspace(0, 1, max(3, nrows)))
+
+        for ri, (row_label, recs) in enumerate(rows):
+            for ci, (field, xlabel) in enumerate(metrics):
+                ax = axes[ri][ci]
+                vals = np.concatenate([np.asarray(k[field], float) for k in recs])
+                vals = vals[np.isfinite(vals)]
+                if len(vals) < 5:
+                    ax.text(0.5, 0.5, "Not enough data", ha='center', va='center',
+                            transform=ax.transAxes, color='gray')
+                    ax.set_title(f"{row_label} — {xlabel.split(' (')[0]}")
+                    continue
+                col = colors[ri % len(colors)]
+                mu, sd = float(np.mean(vals)), float(np.std(vals))
+
+                # Histogram (density) + smooth density (KDE) "bell" curve.
+                ax.hist(vals, bins=40, density=True, color=col, alpha=0.35,
+                        edgecolor='white', linewidth=0.3)
+                try:
+                    kde = stats.gaussian_kde(vals)
+                    xs = np.linspace(vals.min(), vals.max(), 300)
+                    ax.plot(xs, kde(xs), color=col, linewidth=2)
+                    ymax = float(max(kde(xs).max(), 1e-9))
+                except Exception:
+                    ymax = ax.get_ylim()[1]
+
+                # z-score threshold lines (mean and ±1/±2/±3 SD). Labels are placed
+                # in axes-fraction y (just under the top) so they never collide with
+                # the subplot title.
+                ztrans = ax.get_xaxis_transform()  # x in data coords, y in axes fraction
+                if sd > 0:
+                    xlo, xhi = vals.min(), vals.max()
+                    for z in (-3, -2, -1, 0, 1, 2, 3):
+                        xv = mu + z * sd
+                        if not (xlo - 0.05 * (xhi - xlo) <= xv <= xhi + 0.05 * (xhi - xlo)):
+                            continue  # skip threshold lines outside the data range
+                        ax.axvline(xv, color='0.4', linestyle=':', linewidth=1,
+                                   alpha=0.85 if z == 0 else 0.55)
+                        ax.text(xv, 0.94, ("μ" if z == 0 else f"{z:+d}σ"),
+                                transform=ztrans, ha='center', va='top',
+                                fontsize=7, color='0.35')
+
+                # Rug of every individual datapoint along the bottom.
+                rug_y = -0.06 * ymax
+                ax.plot(vals, np.full(len(vals), rug_y), '|', color=col,
+                        alpha=0.25, markersize=7)
+                ax.set_ylim(rug_y * 1.6, ymax * 1.10)
+
+                ax.set_xlabel(xlabel)
+                if ci == 0:
+                    ax.set_ylabel(f"{row_label}\ndensity", fontsize=9)
+                else:
+                    ax.set_ylabel("density", fontsize=9)
+                ax.set_title(f"{xlabel.split(' (')[0]}  (μ={mu:.2f}, σ={sd:.2f}, n={len(vals)})",
+                             fontsize=10)
+                self._kin_style_ax(ax)
+
+                for v in vals:
+                    export_rows.append({'group_or_scope': row_label, 'metric': field,
+                                        'value': float(v),
+                                        'zscore': (float((v - mu) / sd) if sd > 0 else np.nan)})
+
+        fig.suptitle("Speed & acceleration distributions", fontsize=12)
+        fig.subplots_adjust(hspace=0.5, wspace=0.22, top=0.92, bottom=0.09,
+                            left=0.09, right=0.97)
+        fig._kin_no_tight = True  # keep our spacing; don't let _kin_embed re-pack it
+        self.kin_last_table = pd.DataFrame(export_rows)
+        return fig, f"{nrows} group/scope row(s); z-thresholds at ±1/±2/±3σ"
+
+    # ── Summary table & export ──────────────────────────────────────────────
+
+    def summarize_kinematics(self):
+        """Per-subject summary table of headline coupling metrics."""
+        mode, pairs = self._kin_selected_subjects()
+        if not pairs:
+            messagebox.showwarning("Kinematics", "Select subject(s) or group(s) first.")
+            return
+        settings = self._kin_settings()
+        ch_index = self._kin_channel_index()
+        ch_label = self.kin_channel_var.get()
+        records = self._kin_collect(pairs, ch_index, settings)
+        if not records:
+            messagebox.showinfo("Kinematics", "No usable position/signal data.")
+            return
+        # Use the same temporal binning as the plots so summary r's are computed
+        # over bins, not frames.
+        records = self._kin_bin_records(records, settings.get('bin_s', 1.0))
+        fps = records[0]['fps']
+        max_lag_frames = int(settings['maxlag_s'] * fps)
+        rows = []
+        for k in records:
+            mv = self._kin_finite(k['vel'], k['sig'])
+            ma = self._kin_finite(k['accel'], k['sig'])
+            mr = self._kin_finite(k['radial_vel'], k['sig'])
+            r_v = stats.pearsonr(k['vel'][mv], k['sig'][mv])[0] if mv.sum() > 5 else np.nan
+            r_a = stats.pearsonr(k['accel'][ma], k['sig'][ma])[0] if ma.sum() > 5 else np.nan
+            r_r = stats.pearsonr(k['radial_vel'][mr], k['sig'][mr])[0] if mr.sum() > 5 else np.nan
+            lags, rs = self._kin_xcorr(k['sig'], k['vel'], max_lag_frames)
+            if len(rs):
+                pi = int(np.nanargmin(rs))
+                peak_lag = lags[pi] / fps
+                peak_r = rs[pi]
+            else:
+                peak_lag = peak_r = np.nan
+            rows.append({
+                'subject': k['subject'], 'group': k['group'],
+                'vel_signal_r': round(float(r_v), 4) if np.isfinite(r_v) else '',
+                'accel_signal_r': round(float(r_a), 4) if np.isfinite(r_a) else '',
+                'radial_signal_r': round(float(r_r), 4) if np.isfinite(r_r) else '',
+                'xcorr_peak_r': round(float(peak_r), 4) if np.isfinite(peak_r) else '',
+                'xcorr_peak_lag_s': round(float(peak_lag), 3) if np.isfinite(peak_lag) else '',
+            })
+        df = pd.DataFrame(rows)
+        self.kin_last_table = df
+        self._kin_show_table_window(df)
+
+    def _kin_show_table_window(self, df):
+        win = tk.Toplevel(self.root)
+        win.title("Kinematics Summary")
+        win.geometry("720x360")
+        cols = list(df.columns)
+        tree = ttk.Treeview(win, columns=cols, show='headings')
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=110, anchor='center')
+        for _, r in df.iterrows():
+            tree.insert('', 'end', values=[r[c] for c in cols])
+        tree.pack(fill='both', expand=True, side='top')
+        ttk.Button(win, text="Export CSV…",
+                   command=lambda: self._kin_export_df(df)).pack(pady=4)
+
+    def _kin_export_df(self, df):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Excel", "*.xlsx")],
+            title="Export Kinematics Data")
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".xlsx"):
+                df.to_excel(path, index=False)
+            else:
+                df.to_csv(path, index=False)
+            messagebox.showinfo("Exported", f"Saved to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Export Error", f"Could not export:\n{exc}")
+
+    def export_kinematics(self):
+        """Export the data behind the current plot, or save the figure as PNG."""
+        if self.kin_last_table is not None and len(self.kin_last_table):
+            self._kin_export_df(self.kin_last_table)
+        elif self.kin_figure is not None:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".png", filetypes=[("PNG", "*.png")],
+                title="Save Kinematics Figure")
+            if path:
+                try:
+                    self.kin_figure.savefig(path, dpi=150, bbox_inches='tight')
+                    messagebox.showinfo("Saved", f"Figure saved to:\n{path}")
+                except Exception as exc:
+                    messagebox.showerror("Save Error", f"Could not save figure:\n{exc}")
+        else:
+            messagebox.showinfo("Kinematics", "Run an analysis first.")
+
+
+def _enable_dpi_awareness():
+    """Declare per-monitor DPI awareness BEFORE the Tk window/icon exist.
+
+    Why this is required (not optional): when a process is DPI-unaware, Windows
+    bitmap-UPSCALES its taskbar icon at >100% scaling, giving the fuzzy edges --
+    crisp apps like VS Code simply declare awareness at startup. matplotlib's
+    TkAgg backend ALREADY flips this whole process to per-monitor aware the
+    moment the first plot is drawn (see matplotlib issue #21875); doing it here
+    just makes that consistent and early enough for the icon to render sharp.
+    """
+    import ctypes
+    try:                                  # Per-Monitor v2 (Win10 1703+): best
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:                                  # Per-Monitor (Win 8.1+) -- matches matplotlib
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:                                  # System DPI aware (legacy fallback)
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 
 def main():
+    if os.name == "nt":
+        # Crisp icon/rendering on scaled displays -- MUST run before tk.Tk().
+        _enable_dpi_awareness()
+        # Give the process its own taskbar identity so Windows shows the TRACY
+        # icon (and groups its windows) instead of Python's default.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("tracy.fp.analysis")
+        except Exception:
+            pass
     root = tk.Tk()
     app = FPAnalysisGUI(root)
     root.mainloop()
