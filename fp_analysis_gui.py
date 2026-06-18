@@ -34,8 +34,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.4.0"
-APP_VERSION_DATE = "June 17, 2026"
+APP_VERSION = "1.4.1"
+APP_VERSION_DATE = "June 18, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -1132,6 +1132,12 @@ class FPAnalysisGUI:
         self.bout_exclude_min_dur_var = tk.StringVar(value='0')
         self.bout_exclude_max_dur_var = tk.StringVar(value='0')
         self.bout_exclude_min_gap_var = tk.StringVar(value='0')
+
+        # Global "show gridlines" toggle. Applies to every embedded/popped-out
+        # plot via _embed_plot_canvas; a "Grid" checkbox on each plot's toolbar
+        # flips it and live-updates all currently displayed figures.
+        self.show_gridlines = tk.BooleanVar(value=True)
+        self._active_plot_canvases = []
 
         # Exclusion toggles for each tab
         self.use_exclusions_viz = tk.BooleanVar(value=False)
@@ -2637,21 +2643,28 @@ class FPAnalysisGUI:
         canvas = tk.Canvas(tab, highlightthickness=0)
         scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
-        
+
         scrollable_frame.bind(
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        _scroll_win_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-        
+        # Pin the scrollable content to the visible canvas width so a wide child
+        # (the many-column metrics table below) can't stretch the whole frame
+        # past the viewport, which would push centered plots off to the right.
+        canvas.bind(
+            "<Configure>",
+            lambda e, _id=_scroll_win_id: canvas.itemconfigure(_id, width=e.width)
+        )
+
         # Pack canvas and scrollbar
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        
+
         self._register_tab_mousewheel(tab, canvas, scrollable_frame)
-        
+
         # Control panel
         control_frame = ttk.LabelFrame(scrollable_frame, text="Analysis Controls", padding=5)
         control_frame.pack(fill='x', padx=5, pady=5)
@@ -9238,6 +9251,22 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Gridlines on/off toggle for plots. Every plot's navigation toolbar now
+    has a "Grid" checkbox (also in Advanced Graph Settings); toggling it instantly
+    shows/hides gridlines on all open graphs and applies to new ones.
+  • Fix — Processing summary bout count was wrong (counted channel/alias/metadata
+    dict keys, e.g. 27 instead of 15). It now reports the true number of extracted
+    bouts per behavior.
+  • Fix — Behavioral Data tab plots rendered half off-screen to the right. The
+    scrollable content is now pinned to the visible width so the wide metrics
+    table can't push centered plots out of view.
+  • Change — Auto-saves after processing / bout re-extraction now show the
+    responsive "Saving Project" progress window (no more silent freeze) instead of
+    saving invisibly; no extra completion popup. The summary also appears
+    immediately rather than waiting on the disk save.
+
+Version 1.4.0  •  June 17, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — UI & graphing cohesion overhaul. All plots now render at a consistent,
     capped, centered size instead of stretching across the window, share one
     matplotlib style (fonts/colors/grid), and pop-outs open in a uniform
@@ -10046,18 +10075,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showwarning("Warning", "Project folder found but no saved data detected.\n"
                                                  "This may be a new or empty project.")
     
-    def save_project(self, quiet=False, subjects=None):
+    def save_project(self, quiet=False, subjects=None, show_completion=None):
         """Save project configuration and data.
 
         quiet=True suppresses the modal progress window and the completion dialog
         so the save can run automatically right after processing / re-extraction
         without interrupting the user.
 
+        show_completion controls only the final "Save Complete" dialog; when None
+        it defaults to (not quiet). Automatic saves pass quiet=False,
+        show_completion=False so the user sees the responsive progress window
+        (the save pumps the event loop per step, so the app no longer looks
+        frozen) without an interrupting completion popup.
+
         subjects, when given, limits the per-subject disk write to that list of
         subject IDs (the project config and .tracy file are always refreshed).
         This lets a single-subject reprocess overwrite just that subject's files
         instead of rewriting the whole cohort.
         """
+        if show_completion is None:
+            show_completion = not quiet
         if not self.current_project:
             if not quiet:
                 messagebox.showwarning("No Project", "No project is currently open")
@@ -10463,7 +10500,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.log_message(f"✓ Saved data for {subjects_saved} subject(s)")
         self.log_message(f"✓ Optimized save: z-scores + behavioral data only")
 
-        if quiet or progress_window is None:
+        if progress_window is None:
             return
 
         # Complete progress
@@ -10472,14 +10509,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         progress_detail.config(text=f"Successfully saved {subjects_saved} subject(s)")
         progress_window.update()
 
-        # Close progress window after a brief delay and show completion message
+        # Close the progress window after a brief delay. Only interactive saves
+        # confirm with a dialog; auto-saves (show_completion=False) just close.
         self.root.after(1000, progress_window.destroy)
-        self.root.after(1100, lambda: messagebox.showinfo(
-            "Save Complete",
-            f"Project '{self.current_project}' saved successfully!\n\n"
-            f"Subjects saved: {subjects_saved}\n"
-            f"Location: {project_path}"
-        ))
+        if show_completion:
+            self.root.after(1100, lambda: messagebox.showinfo(
+                "Save Complete",
+                f"Project '{self.current_project}' saved successfully!\n\n"
+                f"Subjects saved: {subjects_saved}\n"
+                f"Location: {project_path}"
+            ))
     
     def _show_loading_dialog(self, message):
         """Show a modal 'please wait' dialog with an indeterminate progress bar.
@@ -12114,6 +12153,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.update_dec_prob_subjects()
             self.update_conn_listbox()
 
+            # Show the colour-coded summary popup of what processed / failed /
+            # warned FIRST, so the user gets immediate feedback. It reads only
+            # in-memory results, so it's fast and doesn't need to wait on the
+            # disk auto-save below. Guarded so a display hiccup never breaks the
+            # run itself.
+            try:
+                self.show_processing_summary()
+                self.root.update_idletasks()  # paint the popup before saving
+            except Exception as summary_exc:
+                self.log_message(
+                    f"  Warning: could not display processing summary: {summary_exc}")
+
             # Persist the freshly processed subjects to disk so they overwrite
             # any prior processing for those subjects (including stale bout files
             # from an older pre/post window).  Without this the new results live
@@ -12122,21 +12173,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.processing_summary.get('subjects_processed', [])))
             if _just_processed:
                 try:
-                    self.save_project(quiet=True, subjects=_just_processed)
+                    self.save_project(quiet=False, subjects=_just_processed,
+                                      show_completion=False)
                     self.log_message(
                         f"  Saved updated results for {len(_just_processed)} "
                         f"subject(s) to disk.")
                 except Exception as save_exc:
                     self.log_message(
                         f"  Warning: could not auto-save processed data: {save_exc}")
-
-            # Show the colour-coded summary popup of what processed / failed /
-            # warned.  Guarded so a display hiccup never breaks the run itself.
-            try:
-                self.show_processing_summary()
-            except Exception as summary_exc:
-                self.log_message(
-                    f"  Warning: could not display processing summary: {summary_exc}")
         except Exception as e:
             self.log_message(f"ERROR: {str(e)}")
             messagebox.showerror("Error", f"Processing failed:\n{str(e)}")
@@ -12362,12 +12406,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         try:
             bouts = d.get('bouts')
             if isinstance(bouts, dict) and bouts:
+                # Each behavior entry is a dict holding one trace-list per channel
+                # (Ch0/Ch1 + real-name + G0/G1 aliases all pointing at the SAME
+                # bouts) plus metadata keys. The true per-behavior bout count is
+                # the number of onset frames; fall back to a single channel's
+                # trace count. Summing len() over the dict's keys (the old bug)
+                # double/triple-counted aliases and counted metadata as bouts.
                 total = 0
-                for v in bouts.values():
-                    try:
-                        total += len(v)
-                    except TypeError:
-                        pass
+                for entry in bouts.values():
+                    if not isinstance(entry, dict):
+                        continue
+                    onset = entry.get('onset_frames')
+                    if onset is not None:
+                        try:
+                            total += len(onset)
+                            continue
+                        except TypeError:
+                            pass
+                    # No onset_frames (e.g. bouts reloaded from disk): count the
+                    # traces of the first real channel key, skipping aliases.
+                    for key, val in entry.items():
+                        if key.startswith('_') or key in (
+                                'onset_frames', 'end_frames', 'durations'):
+                            continue
+                        if isinstance(val, list):
+                            total += len(val)
+                            break
                 parts.append(f"{len(bouts)} behavior(s), {total} bout(s)")
         except Exception:
             pass
@@ -17305,7 +17369,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # reload instead of living only in memory.
                 if ok_subjects and self.current_project:
                     try:
-                        self.save_project(quiet=True, subjects=ok_subjects)
+                        self.save_project(quiet=False, subjects=ok_subjects,
+                                          show_completion=False)
                         self.log_message(
                             f"  Saved re-extracted bouts for {len(ok_subjects)} "
                             f"subject(s) to disk.")
@@ -19181,6 +19246,80 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.bout_stats_text.delete('1.0', 'end')
             self.bout_stats_text.config(state='disabled')
     
+    @staticmethod
+    def _axis_grid_state(ax):
+        """Return (x_grid_on, y_grid_on) for an axis as the plotting code left it.
+
+        Reads the tick-keyword 'gridOn' flag matplotlib sets in ax.grid(), with a
+        gridline-visibility fallback, so we can faithfully restore a plot's own
+        grid choice (e.g. y-only bar grids) after the user toggles gridlines off
+        and back on."""
+        def _on(axis):
+            kw = getattr(axis, '_major_tick_kw', None)
+            if isinstance(kw, dict) and 'gridOn' in kw:
+                return bool(kw['gridOn'])
+            try:
+                gl = axis.get_gridlines()
+                return bool(gl) and any(l.get_visible() for l in gl)
+            except Exception:
+                return False
+        return _on(ax.xaxis), _on(ax.yaxis)
+
+    def _apply_gridlines_to_figure(self, fig, force=False):
+        """Apply the global show-gridlines setting to every axis in `fig`.
+
+        When gridlines are ON we leave each axis exactly as the plotting code
+        styled it (preserving per-plot alpha / y-only grids), unless `force` is
+        set (a live toggle back on), in which case we restore the captured state.
+        When OFF we hide all grids. The original per-axis state is captured once
+        so it survives repeated toggling."""
+        try:
+            show = bool(self.show_gridlines.get())
+        except Exception:
+            show = True
+        for ax in fig.axes:
+            if not hasattr(ax, '_tracy_grid_state'):
+                ax._tracy_grid_state = self._axis_grid_state(ax)
+            if show:
+                if force:
+                    xon, yon = ax._tracy_grid_state
+                    ax.grid(xon, axis='x')
+                    ax.grid(yon, axis='y')
+                # else: leave the caller's grid styling untouched
+            else:
+                ax.grid(False)
+
+    def _prune_plot_canvases(self):
+        """Drop registered canvases whose Tk widget has been destroyed."""
+        alive = []
+        for c in self._active_plot_canvases:
+            try:
+                if c.get_tk_widget().winfo_exists():
+                    alive.append(c)
+            except Exception:
+                pass
+        self._active_plot_canvases = alive
+
+    def _toggle_gridlines(self):
+        """Re-apply the gridline setting to every live figure (all tabs + pop-outs)."""
+        self._prune_plot_canvases()
+        for canvas in list(self._active_plot_canvases):
+            try:
+                self._apply_gridlines_to_figure(canvas.figure, force=True)
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+    def _add_grid_toolbar_button(self, toolbar):
+        """Add a 'Grid' on/off checkbox to a matplotlib navigation toolbar so the
+        gridline toggle is available on every plot, everywhere."""
+        try:
+            ttk.Checkbutton(toolbar, text="Grid", variable=self.show_gridlines,
+                            command=self._toggle_gridlines,
+                            takefocus=False).pack(side='left', padx=(8, 2))
+        except Exception:
+            pass
+
     def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True):
         """Embed a matplotlib figure (+ optional toolbar) in `parent`, rendered
         at a sensible, readable scale and centered horizontally so it does not
@@ -19206,16 +19345,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.set_dpi(new_dpi)
             dpi = new_dpi
 
+        # Honour the global gridline toggle before drawing (and remember this
+        # figure so the toggle can live-update it later).
+        self._apply_gridlines_to_figure(fig)
+        self._prune_plot_canvases()
+
         # Centering container: fills the parent so the canvas, packed without
         # fill, is centered horizontally with margins on wide windows.
         holder = ttk.Frame(parent)
         canvas = FigureCanvasTkAgg(fig, holder)
+        self._active_plot_canvases.append(canvas)
 
         if add_toolbar:
             # Create the toolbar first so it reserves the bottom strip of the
             # parent; the holder then fills the space above it.
             toolbar = NavigationToolbar2Tk(canvas, parent)
             toolbar.update()
+            self._add_grid_toolbar_button(toolbar)
 
         holder.pack(side='top', fill='both', expand=True)
         canvas.draw_idle()
@@ -19267,6 +19413,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         canvas = self._embed_plot_canvas(fig, inner, add_toolbar=False)
         toolbar = NavigationToolbar2Tk(canvas, toolbar_holder)
         toolbar.update()
+        self._add_grid_toolbar_button(toolbar)
 
         # Mouse-wheel scrolls the pop-out while the pointer is over it.
         def _wheel(event):
@@ -19903,6 +20050,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Entry(trace_frame, textvariable=self.trace_linewidth_var, width=10).grid(row=0, column=3, padx=5, pady=3)
         ttk.Label(trace_frame, text="Individual Trace Opacity:").grid(row=0, column=4, sticky='w', padx=15, pady=3)
         ttk.Entry(trace_frame, textvariable=self.trace_alpha_var, width=10).grid(row=0, column=5, padx=5, pady=3)
+        # Global gridline toggle (also available as a "Grid" button on every
+        # plot's navigation toolbar). Flipping it live-updates all open plots.
+        ttk.Checkbutton(trace_frame, text="Show gridlines on graphs",
+                        variable=self.show_gridlines,
+                        command=self._toggle_gridlines).grid(
+            row=1, column=0, columnspan=3, sticky='w', padx=5, pady=(6, 3))
 
         heatmap_frame = ttk.LabelFrame(main, text="Heatmap Styling", padding=8)
         heatmap_frame.pack(fill='x', pady=(0, 8))
