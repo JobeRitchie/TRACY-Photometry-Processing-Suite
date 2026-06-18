@@ -9254,6 +9254,10 @@ Version {APP_VERSION}  •  {APP_VERSION_DATE}
   • New — Rebuilt the Info → Overview page with a clickable section navigator and
     concise, up-to-date documentation (multi-channel, file naming, per-tab guide,
     troubleshooting).
+  • Fix — In-app updater is more robust: if "git pull" fails because local/untracked
+    files would be overwritten, it now sets them aside in a recoverable git stash
+    and retries automatically. Failures are reported clearly (with the git output)
+    instead of a generic message, and the app is left unchanged on failure.
 
 Version 1.3.0  •  June 17, 2026
 ────────────────────────────────────────────────────────────────────────────────
@@ -31931,34 +31935,73 @@ cat("OK\n")
             # (otherwise git pull aborts with 'dubious ownership').
             self._ensure_git_safe_directory(repo_dir)
 
-            process = subprocess.Popen(
-                ['git', 'pull', 'origin', 'main'],
-                cwd=repo_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=SUBPROCESS_NO_WINDOW
-            )
+            def _run_git(args):
+                """Run a git command in the repo, streaming output to the log.
+                Returns (returncode, captured_output_text)."""
+                lines = []
+                proc = subprocess.Popen(
+                    ['git'] + args, cwd=repo_dir,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, creationflags=SUBPROCESS_NO_WINDOW)
+                for ln in proc.stdout:
+                    lines.append(ln)
+                    self.system_text.insert('end', ln)
+                    self.system_text.see('end')
+                    self.root.update()
+                proc.wait()
+                return proc.returncode, ''.join(lines)
 
-            for line in process.stdout:
-                self.system_text.insert('end', line)
+            rc, out = _run_git(['pull', 'origin', 'main'])
+
+            # A pull commonly fails because local or untracked files in the app
+            # folder would be overwritten (e.g. a user's own copy of files now
+            # tracked in the repo, like assets/). Set those changes aside in a
+            # RECOVERABLE git stash and retry once, so the update applies without
+            # the user needing the command line.
+            stashed = False
+            if rc != 0:
+                self.system_text.insert(
+                    'end', "\nPull failed — setting local changes aside "
+                           "(recoverable git stash) and retrying...\n")
                 self.system_text.see('end')
                 self.root.update()
+                stash_rc, _ = _run_git(
+                    ['stash', 'push', '--include-untracked',
+                     '-m', 'TRACY auto-update stash'])
+                stashed = (stash_rc == 0)
+                rc, out = _run_git(['pull', 'origin', 'main'])
 
-            process.wait()
-
-            if process.returncode == 0:
+            if rc == 0:
                 self.system_text.insert('end', "\n" + "=" * 60 + "\n")
                 self.system_text.insert('end', "✓ Update successful!\n")
+                if stashed:
+                    self.system_text.insert(
+                        'end', "Note: your previous local changes were saved to a "
+                               "git stash. Run 'git stash pop' in the app folder to "
+                               "restore them if needed.\n")
                 self.system_text.insert('end', "Restarting application in 2 seconds...\n")
                 self.system_text.see('end')
                 self.root.update()
+                if stashed:
+                    messagebox.showinfo(
+                        "Update Installed",
+                        "Update installed successfully.\n\n"
+                        "Some local changes in the app folder were set aside into a "
+                        "git stash so the update could apply — they are NOT lost. "
+                        "Run 'git stash pop' in the app folder to restore them.\n\n"
+                        "The application will now restart.")
                 self.root.after(2000, self._restart_app)
             else:
                 self.system_text.insert('end', "\n✗ Update failed. See output above.\n")
+                tail = '\n'.join(out.strip().splitlines()[-12:]) or "(no output)"
                 messagebox.showerror(
                     "Update Failed",
-                    "git pull reported an error.\nCheck the Installation Log for details."
+                    "The update could not be installed and the app was NOT changed.\n\n"
+                    "git reported:\n\n"
+                    f"{tail}\n\n"
+                    "You can update manually by running 'git pull origin main' in the "
+                    "application folder, or re-download the latest version from GitHub. "
+                    "Full details are in the Installation Log on this tab."
                 )
 
         except FileNotFoundError:
