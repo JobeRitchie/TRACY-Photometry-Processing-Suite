@@ -34,8 +34,23 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_VERSION_DATE = "June 17, 2026"
+
+# ── Shared UI layout constants ──────────────────────────────────────────────
+# A single source of truth for sizing so every tab looks cohesive.
+#   MAX_PLOT_WIDTH_IN : embedded/pop-out figures are never shown wider than this
+#                       (inches @ the figure's dpi). Wider figures are scaled
+#                       down proportionally so they stay a sensible, readable
+#                       size instead of stretching across a maximized window.
+#   CONTROL_PANEL_W   : standard width (px) for the left control column of the
+#                       data tabs, so panels line up tab-to-tab and buttons in
+#                       them are not clipped.
+#   SECTION_PAD / WIDGET_PAD : standard outer / inter-widget padding.
+MAX_PLOT_WIDTH_IN = 13.0
+CONTROL_PANEL_W = 320
+SECTION_PAD = 5
+WIDGET_PAD = 3
 
 
 class ZoneEditor:
@@ -1003,7 +1018,9 @@ class FPAnalysisGUI:
         
         # Apply theme
         self.apply_theme()
-        
+        # Shared matplotlib look so every embedded/pop-out figure matches the app.
+        self._apply_plot_style()
+
         # Default parameters
         self.params = {
             'preboutframes': 90,  # 3 seconds at 30fps
@@ -1521,7 +1538,69 @@ class FPAnalysisGUI:
         style.configure('TCombobox', fieldbackground='white',
                        background=self.colors['accent_blue'],
                        foreground=self.colors['text_dark'])
-        
+
+        # Compact button variant for dense control panels, so a row of buttons
+        # fits without clipping the last label. The roomy default 'TButton' is
+        # kept for primary / standalone actions.
+        style.configure('Compact.TButton',
+                       background=self.colors['accent_blue'],
+                       foreground='white',
+                       borderwidth=0, relief='raised', focuscolor='none',
+                       font=('Segoe UI', 9, 'bold'),
+                       padding=[8, 4])
+        style.map('Compact.TButton',
+                 background=[('active', self.colors['accent_dark_blue']),
+                           ('pressed', self.colors['bg_medium'])],
+                 relief=[('pressed', 'sunken'), ('active', 'raised')])
+
+    def _apply_plot_style(self):
+        """Apply a single, app-wide matplotlib style so every figure (embedded
+        or popped out) shares fonts, colors, grid and spines and visually
+        matches the application chrome instead of looking like 20 different
+        plots."""
+        try:
+            accent = self.colors['accent_blue']
+            accent_dark = self.colors['accent_dark_blue']
+            text_dark = self.colors['text_dark']
+            cycle = [accent, '#e67e22', '#2ca02c', '#9467bd',
+                     '#d62728', '#17becf', '#8c564b', accent_dark]
+            plt.rcParams.update({
+                'font.family': ['Segoe UI', 'DejaVu Sans', 'sans-serif'],
+                'font.size': 9,
+                'axes.titlesize': 11,
+                'axes.titleweight': 'bold',
+                'axes.labelsize': 9,
+                'axes.labelcolor': text_dark,
+                'axes.edgecolor': '#b8c2cc',
+                'axes.linewidth': 0.8,
+                'axes.titlecolor': text_dark,
+                'axes.spines.top': False,
+                'axes.spines.right': False,
+                'axes.grid': True,
+                'axes.axisbelow': True,
+                'grid.color': '#d9e0e7',
+                'grid.linewidth': 0.6,
+                'grid.alpha': 0.8,
+                'xtick.color': text_dark,
+                'ytick.color': text_dark,
+                'xtick.labelsize': 8,
+                'ytick.labelsize': 8,
+                'legend.fontsize': 8,
+                'legend.frameon': True,
+                'legend.framealpha': 0.9,
+                'legend.edgecolor': '#d9e0e7',
+                'figure.facecolor': 'white',
+                'figure.titlesize': 12,
+                'figure.titleweight': 'bold',
+                'axes.facecolor': 'white',
+                'savefig.facecolor': 'white',
+                'savefig.dpi': 150,
+                'axes.prop_cycle': plt.cycler(color=cycle),
+            })
+        except Exception:
+            # Styling is cosmetic; never let it block startup.
+            pass
+
     def create_notebook(self):
         """Create tabbed interface"""
         self.notebook = ttk.Notebook(self.root)
@@ -4111,13 +4190,8 @@ class FPAnalysisGUI:
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
 
-        win = tk.Toplevel(self.root)
-        win.title("Group Coherence Spectra Comparison")
-        win.geometry("1050x560")
-        cw = FigureCanvasTkAgg(fig, master=win)
-        cw.draw()
-        cw.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(cw, win).update()
+        win, cw = self._embed_plot_window(
+            fig, "Group Coherence Spectra Comparison", "1050x560")
 
     def visualize_group_coherence_bands(self):
         """Bar chart comparing group mean coherence per frequency band, with optional stats."""
@@ -4221,13 +4295,9 @@ class FPAnalysisGUI:
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-        win = tk.Toplevel(self.root)
-        win.title("Group Coherence Band Comparison")
-        win.geometry(f"{min(1200, n_bands * 140 + 300)}x580")
-        cw = FigureCanvasTkAgg(fig, master=win)
-        cw.draw()
-        cw.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(cw, win).update()
+        win, cw = self._embed_plot_window(
+            fig, "Group Coherence Band Comparison",
+            f"{min(1200, n_bands * 140 + 300)}x580")
 
     def export_group_coherence_comparison(self):
         """Export per-subject per-band coherence data for all groups to CSV."""
@@ -4667,13 +4737,8 @@ class FPAnalysisGUI:
             f"|  Behavior: {r0['behavior']}  |  Method: {r0['method']}",
             fontsize=11, fontweight='bold', y=0.99)
 
-        win = tk.Toplevel(self.root)
-        win.title("Bout-Epoch Group Coherence Spectra")
-        win.geometry("1200x820")
-        cw = FigureCanvasTkAgg(fig, master=win)
-        cw.draw()
-        cw.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(cw, win).update()
+        win, cw = self._embed_plot_window(
+            fig, "Bout-Epoch Group Coherence Spectra", "1200x820")
 
     def visualize_beg_band_bars(self):
         """
@@ -4830,13 +4895,9 @@ class FPAnalysisGUI:
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-        win = tk.Toplevel(self.root)
-        win.title("Bout-Epoch Group Band Bars")
-        win.geometry(f"{min(1400, max(700, n_band * 320))}x{min(900, 500 * nrows)}")
-        cw = FigureCanvasTkAgg(fig, master=win)
-        cw.draw()
-        cw.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(cw, win).update()
+        win, cw = self._embed_plot_window(
+            fig, "Bout-Epoch Group Band Bars",
+            f"{min(1400, max(700, n_band * 320))}x{min(900, 500 * nrows)}")
 
     def visualize_beg_delta(self):
         """
@@ -4963,13 +5024,9 @@ class FPAnalysisGUI:
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-        win = tk.Toplevel(self.root)
-        win.title("Δ Coherence by Group")
-        win.geometry(f"{min(1200, n_band * 140 + 300)}x560")
-        cw = FigureCanvasTkAgg(fig, master=win)
-        cw.draw()
-        cw.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(cw, win).update()
+        win, cw = self._embed_plot_window(
+            fig, "Δ Coherence by Group",
+            f"{min(1200, n_band * 140 + 300)}x560")
 
     # ------------------------------------------------------------------ #
     #  BEG Peri-Event Spectrogram (group-level, with contrast option)     #
@@ -5314,15 +5371,10 @@ class FPAnalysisGUI:
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-        win = tk.Toplevel(self.root)
-        win.title("BEG Peri-Event Wavelet Coherence")
         win_w = min(1600, max(700, int((panel_w * ncols + 1.5) * 100 + 40)))
         win_h = min(1000, max(450, int((panel_h * nrows + 0.8) * 100 + 60)))
-        win.geometry(f"{win_w}x{win_h}")
-        cw = FigureCanvasTkAgg(fig, master=win)
-        cw.draw()
-        cw.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(cw, win).update()
+        win, cw = self._embed_plot_window(
+            fig, "BEG Peri-Event Wavelet Coherence", f"{win_w}x{win_h}")
 
     def export_beg_comparison(self):
         """Export per-subject pre/post/delta coherence per band and per frequency to CSV."""
@@ -5963,10 +6015,6 @@ class FPAnalysisGUI:
         group_names = list(group_map.keys())
         n_groups = len(group_names)
 
-        viz_window = tk.Toplevel(self.root)
-        viz_window.title("Bout Epoch Coherence — Baseline vs. Post-Onset")
-        viz_window.geometry("1200x720")
-
         # ── Helper: build grand-mean spectrum for a list of subjects ──
         def _group_grand_mean(subj_list):
             common_freqs = results[subj_list[0]]['pre_freqs']
@@ -6103,10 +6151,8 @@ class FPAnalysisGUI:
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.94])
 
-        canvas_widget = FigureCanvasTkAgg(fig, master=viz_window)
-        canvas_widget.draw()
-        canvas_widget.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(canvas_widget, viz_window)
+        self._embed_plot_window(
+            fig, "Bout Epoch Coherence — Baseline vs. Post-Onset", "1200x720")
 
     def visualize_bout_epoch_spectrogram(self):
         """Peri-event time\u2013frequency coherence heatmap for bout epoch analysis.
@@ -6385,13 +6431,8 @@ class FPAnalysisGUI:
             _draw_epoch_panel(ax, r0['times'], r0['freqs'], grand_mean, title)
             fig.tight_layout(pad=1.5)
 
-            win = tk.Toplevel(self.root)
-            win.title("Bout Epoch Wavelet Coherence — Grand Mean")
-            win.geometry("1300x550")
-            cw = FigureCanvasTkAgg(fig, master=win)
-            cw.draw()
-            cw.get_tk_widget().pack(fill='both', expand=True)
-            NavigationToolbar2Tk(cw, win).update()
+            win, cw = self._embed_plot_window(
+                fig, "Bout Epoch Wavelet Coherence — Grand Mean", "1300x550")
 
         else:
             # ── Individual panels ─────────────────────────────────────
@@ -6409,13 +6450,9 @@ class FPAnalysisGUI:
                 _draw_epoch_panel(ax, m['times'], m['freqs'], m['coh_tf'], title)
 
             fig.tight_layout(pad=1.5)
-            win = tk.Toplevel(self.root)
-            win.title("Bout Epoch Wavelet Coherence Spectrogram")
-            win.geometry("1300x{}".format(min(900, max(500, int(fig_h * 100)))))
-            cw = FigureCanvasTkAgg(fig, master=win)
-            cw.draw()
-            cw.get_tk_widget().pack(fill='both', expand=True)
-            NavigationToolbar2Tk(cw, win).update()
+            win, cw = self._embed_plot_window(
+                fig, "Bout Epoch Wavelet Coherence Spectrogram",
+                "1300x{}".format(min(900, max(500, int(fig_h * 100)))))
 
     def export_bout_epoch_coherence(self):
         """Export per-frequency bout epoch coherence to CSV."""
@@ -6576,10 +6613,6 @@ class FPAnalysisGUI:
         fig_w = max(6, 5 * ncols)
         fig_h = max(4, 4 * nrows)
 
-        win = tk.Toplevel(self.root)
-        win.title(f"Power Spectral Density — {ch1} vs {ch2}")
-        win.geometry(f"{min(fig_w * 100, 1600)}x{min(fig_h * 100 + 60, 900)}")
-
         fig = Figure(figsize=(fig_w, fig_h), dpi=100)
         fig.subplots_adjust(hspace=0.45, wspace=0.35,
                             left=0.10, right=0.97, top=0.93, bottom=0.10)
@@ -6624,11 +6657,9 @@ class FPAnalysisGUI:
             f"range {fmin}\u2013{fmax} Hz",
             fontsize=9)
 
-        canvas = FigureCanvasTkAgg(fig, master=win)
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        toolbar = NavigationToolbar2Tk(canvas, win)
-        toolbar.update()
-        canvas.draw()
+        win, canvas = self._embed_plot_window(
+            fig, f"Power Spectral Density — {ch1} vs {ch2}",
+            f"{min(fig_w * 100, 1600)}x{min(fig_h * 100 + 60, 900)}")
 
     def visualize_connectivity(self):
         """Create visualization of connectivity analysis results"""
@@ -6699,20 +6730,9 @@ class FPAnalysisGUI:
                 means.append(float(np.mean(coh[mask])) if np.any(mask) else np.nan)
             return means
         
-        # Create visualization window
-        viz_window = tk.Toplevel(self.root)
-        viz_window.title("Connectivity Analysis Visualization")
-        viz_window.geometry("1400x800")
-        
-        # Create figure
+        # Create figure (embedded in its pop-out window at the end, once built)
         fig = Figure(figsize=(14, 8), dpi=100)
-        canvas = FigureCanvasTkAgg(fig, master=viz_window)
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        
-        # Add toolbar
-        toolbar = NavigationToolbar2Tk(canvas, viz_window)
-        toolbar.update()
-        
+
         # Plot results
         num_results = len(self.connectivity_results)
         if num_results == 0:
@@ -6770,7 +6790,7 @@ class FPAnalysisGUI:
             ax.set_ylim([self.conn_params.get('corr_ymin', -3), self.conn_params.get('corr_ymax', 3)])
 
         fig.tight_layout()
-        canvas.draw()
+        self._embed_plot_window(fig, "Connectivity Analysis Visualization", "1400x800")
 
     def visualize_connectivity_band_bars(self):
         """Plot baseline vs post-onset coherence bars by frequency range for bout epoch results."""
@@ -6813,10 +6833,6 @@ class FPAnalysisGUI:
 
         band_labels = [b[0] for b in bands]
         x = np.arange(len(band_labels))
-
-        win = tk.Toplevel(self.root)
-        win.title("Bout Epoch Coherence — Frequency-Band Bars")
-        win.geometry("1200x700")
 
         fig = Figure(figsize=(12, 7), dpi=100)
         ax = fig.add_subplot(1, 1, 1)
@@ -6862,11 +6878,8 @@ class FPAnalysisGUI:
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-        canvas = FigureCanvasTkAgg(fig, master=win)
-        canvas.get_tk_widget().pack(fill='both', expand=True)
-        toolbar = NavigationToolbar2Tk(canvas, win)
-        toolbar.update()
-        canvas.draw()
+        win, canvas = self._embed_plot_window(
+            fig, "Bout Epoch Coherence — Frequency-Band Bars", "1200x700")
 
     # ------------------------------------------------------------------ #
     #  Wavelet Coherence Spectrogram (time × frequency heatmap)           #
@@ -7024,13 +7037,8 @@ class FPAnalysisGUI:
                               f'Wavelet Coherence — Grand Mean (n={n_valid} subjects)')
             fig.tight_layout(pad=1.5)
 
-            win = tk.Toplevel(self.root)
-            win.title("Wavelet Coherence Spectrogram — Grand Mean")
-            win.geometry("1300x550")
-            cw = FigureCanvasTkAgg(fig, master=win)
-            cw.draw()
-            cw.get_tk_widget().pack(fill='both', expand=True)
-            NavigationToolbar2Tk(cw, win).update()
+            win, cw = self._embed_plot_window(
+                fig, "Wavelet Coherence Spectrogram — Grand Mean", "1300x550")
 
         else:
             # ── Individual panels path ────────────────────────────────
@@ -7063,13 +7071,9 @@ class FPAnalysisGUI:
                         pass
 
             fig.tight_layout(pad=1.5)
-            win = tk.Toplevel(self.root)
-            win.title("Wavelet Coherence Spectrogram")
-            win.geometry("1300x{}".format(min(900, max(500, int(fig_h * 100)))))
-            cw = FigureCanvasTkAgg(fig, master=win)
-            cw.draw()
-            cw.get_tk_widget().pack(fill='both', expand=True)
-            NavigationToolbar2Tk(cw, win).update()
+            win, cw = self._embed_plot_window(
+                fig, "Wavelet Coherence Spectrogram",
+                "1300x{}".format(min(900, max(500, int(fig_h * 100)))))
 
     def export_connectivity_results(self):
         """Export connectivity analysis results"""
@@ -7535,17 +7539,11 @@ class FPAnalysisGUI:
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Spike Analysis")
 
-        # ── Horizontal split: left = scrollable controls, right = live preview ──
-        paned = tk.PanedWindow(tab, orient=tk.HORIZONTAL, sashwidth=6,
-                               sashrelief='raised', bg='#cccccc')
-        paned.pack(fill=tk.BOTH, expand=True)
-
-        # ── LEFT PANE: scrollable controls ──────────────────────────────────
-        left_outer = ttk.Frame(paned)
-        paned.add(left_outer, minsize=430)
-
-        canvas = tk.Canvas(left_outer, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(left_outer, orient="vertical", command=canvas.yview)
+        # Single scrollable column (controls + results table). Spike graphs open
+        # in their own windows (Visualize Spike Data / Analyze Spikes by Zone),
+        # matching how the other analysis tabs plot — no in-tab live preview.
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
 
         scrollable_frame.bind(
@@ -7572,7 +7570,7 @@ class FPAnalysisGUI:
                  bg='#FFF3CD', fg='#856404').pack(anchor=tk.W)
         tk.Label(warning_content,
                  text="Only perform transient analysis on clean signal data.\n"
-                      "Use the Live Preview (right panel) to tune settings before running analysis.",
+                      "Tune the detection parameters below, then run the analysis.",
                  font=('Segoe UI', 8), bg='#FFF3CD', fg='#856404',
                  justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
 
@@ -7647,10 +7645,7 @@ class FPAnalysisGUI:
         param_btn_frame = ttk.Frame(top_frame)
         param_btn_frame.pack(pady=(5, 0))
         ttk.Button(param_btn_frame, text="Apply Parameters",
-                   command=self._apply_spike_params_and_preview).pack(side=tk.LEFT, padx=3)
-        self.spike_auto_preview_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(param_btn_frame, text="Auto-update preview on apply",
-                        variable=self.spike_auto_preview_var).pack(side=tk.LEFT, padx=3)
+                   command=self.update_spike_parameters).pack(side=tk.LEFT, padx=3)
 
         # ── Analysis Mode + Channels + Subject Selection ─────────────────────
         control_frame = ttk.Frame(main_frame)
@@ -7702,17 +7697,25 @@ class FPAnalysisGUI:
         self.spike_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_list.config(command=self.spike_listbox.yview)
 
+        # 2x2 grid of compact buttons so the four actions always fit the control
+        # pane (a single row overflowed it, clipping the last buttons).
         btn_frame = ttk.Frame(selection_frame)
-        btn_frame.pack(pady=(5, 0))
+        btn_frame.pack(fill=tk.X, pady=(5, 0))
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
 
-        ttk.Button(btn_frame, text="Run Spike Analysis",
-                   command=self.run_spike_analysis).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Visualize Spike Data",
-                   command=self.visualize_spike_data).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Analyze Spikes by Zone",
-                   command=self.visualize_spikes_by_zone).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Export Results",
-                   command=self.export_spike_results).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Run Spike Analysis", style='Compact.TButton',
+                   command=self.run_spike_analysis).grid(
+            row=0, column=0, sticky='ew', padx=2, pady=2)
+        ttk.Button(btn_frame, text="Visualize Spike Data", style='Compact.TButton',
+                   command=self.visualize_spike_data).grid(
+            row=0, column=1, sticky='ew', padx=2, pady=2)
+        ttk.Button(btn_frame, text="Analyze Spikes by Zone", style='Compact.TButton',
+                   command=self.visualize_spikes_by_zone).grid(
+            row=1, column=0, sticky='ew', padx=2, pady=2)
+        ttk.Button(btn_frame, text="Export Results", style='Compact.TButton',
+                   command=self.export_spike_results).grid(
+            row=1, column=1, sticky='ew', padx=2, pady=2)
 
         # ── Results Table ────────────────────────────────────────────────────
         results_frame = ttk.LabelFrame(main_frame, text="Spike Analysis Results", padding=5)
@@ -7746,60 +7749,13 @@ class FPAnalysisGUI:
         self.spike_tree.bind("<Button-3>",
                              lambda e: self.spike_context_menu.post(e.x_root, e.y_root))
 
-        # ── RIGHT PANE: Live preview plot ────────────────────────────────────
-        right_frame = ttk.LabelFrame(paned, text="Live Spike Preview", padding=5)
-        paned.add(right_frame, minsize=320)
-
-        # Preview selector controls
-        preview_ctrl = ttk.Frame(right_frame)
-        preview_ctrl.pack(fill=tk.X, padx=2, pady=(2, 4))
-
-        ttk.Label(preview_ctrl, text="Subject:").pack(side=tk.LEFT)
-        self.spike_preview_subject_var = tk.StringVar()
-        self.spike_preview_subject_combo = ttk.Combobox(
-            preview_ctrl, textvariable=self.spike_preview_subject_var,
-            state='readonly', width=18)
-        self.spike_preview_subject_combo.pack(side=tk.LEFT, padx=3)
-
-        ttk.Label(preview_ctrl, text="Ch:").pack(side=tk.LEFT, padx=(6, 0))
-        self.spike_preview_channel_var = tk.StringVar()
-        self.spike_preview_channel_combo = ttk.Combobox(
-            preview_ctrl, textvariable=self.spike_preview_channel_var,
-            state='readonly', width=8)
-        self.spike_preview_channel_combo.pack(side=tk.LEFT, padx=3)
-
-        ttk.Button(preview_ctrl, text="▶ Preview",
-                   command=self.update_spike_preview).pack(side=tk.LEFT, padx=(6, 0))
-
-        self.spike_preview_subject_combo.bind(
-            '<<ComboboxSelected>>', self._on_spike_preview_subject_changed)
-
-        # Embedded matplotlib figure
-        self.spike_preview_fig = Figure(figsize=(5, 4), dpi=90)
-        self.spike_preview_canvas = FigureCanvasTkAgg(
-            self.spike_preview_fig, master=right_frame)
-        self.spike_preview_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        toolbar_frame = ttk.Frame(right_frame)
-        toolbar_frame.pack(fill=tk.X)
-        NavigationToolbar2Tk(self.spike_preview_canvas, toolbar_frame)
-
-        # Placeholder text
-        _ax = self.spike_preview_fig.add_subplot(111)
-        _ax.text(0.5, 0.5,
-                 'Load data, select a subject\nand press ▶ Preview',
-                 ha='center', va='center', transform=_ax.transAxes,
-                 fontsize=11, color='gray', style='italic')
-        _ax.set_axis_off()
-        self.spike_preview_canvas.draw()
-
         # Initialize spike results storage
         self.spike_results = {}
         self.spike_zone_results = {}
 
         # Initial population
         self.update_spike_selection_mode()
-    
+
     def update_spike_parameters(self):
         """Update spike detection parameters from UI"""
         try:
@@ -7811,12 +7767,6 @@ class FPAnalysisGUI:
             self.log_message("Transient detection parameters updated")
         except ValueError as e:
             messagebox.showerror("Invalid Input", f"Please enter valid numeric values:\n{str(e)}")
-
-    def _apply_spike_params_and_preview(self):
-        """Apply parameters from the UI, then optionally refresh the preview plot."""
-        self.update_spike_parameters()
-        if getattr(self, 'spike_auto_preview_var', None) and self.spike_auto_preview_var.get():
-            self.update_spike_preview()
 
     def _rebuild_spike_channel_checkboxes(self, channel_names):
         """Rebuild the channel checkbox widgets from a list of channel name strings."""
@@ -7845,172 +7795,6 @@ class FPAnalysisGUI:
             key=lambda x: (x[0].upper(), int(x[1:]) if x[1:].isdigit() else 0)
         )
         self._rebuild_spike_channel_checkboxes(sorted_chs)
-        self._populate_spike_preview_subjects()
-
-    def _populate_spike_preview_subjects(self):
-        """Populate the preview subject combo with available subjects."""
-        if not hasattr(self, 'spike_preview_subject_combo'):
-            return
-        subjects = sorted(self.processed_data.keys())
-        self.spike_preview_subject_combo['values'] = subjects
-        cur = self.spike_preview_subject_var.get()
-        if subjects and (not cur or cur not in subjects):
-            self.spike_preview_subject_var.set(subjects[0])
-            self._on_spike_preview_subject_changed()
-
-    def _on_spike_preview_subject_changed(self, event=None):
-        """When the preview subject combo changes, refresh the channel combo."""
-        if not hasattr(self, 'spike_preview_channel_combo'):
-            return
-        subject = self.spike_preview_subject_var.get()
-        if not subject or subject not in self.processed_data:
-            return
-        data = self.processed_data[subject]
-        n = self.get_num_channels(data)
-        channels = [self.get_channel_name(data, i) for i in range(n)]
-        if not channels:
-            channels = ['G0']
-        self.spike_preview_channel_combo['values'] = channels
-        cur = self.spike_preview_channel_var.get()
-        if not cur or cur not in channels:
-            self.spike_preview_channel_var.set(channels[0])
-
-    def update_spike_preview(self):
-        """Render the live preview plot with current parameters applied to the selected subject/channel."""
-        if not hasattr(self, 'spike_preview_fig'):
-            return
-
-        subject = self.spike_preview_subject_var.get()
-        ch_name = self.spike_preview_channel_var.get()
-
-        self.spike_preview_fig.clear()
-        ax = self.spike_preview_fig.add_subplot(111)
-
-        if not subject or subject not in self.processed_data:
-            ax.text(0.5, 0.5, 'Select a subject to preview',
-                    ha='center', va='center', transform=ax.transAxes,
-                    fontsize=11, color='gray', style='italic')
-            ax.set_axis_off()
-            self.spike_preview_canvas.draw()
-            return
-
-        data = self.processed_data[subject]
-        n_ch = self.get_num_channels(data)
-
-        # Resolve channel index from name
-        ch_idx = None
-        for i in range(n_ch):
-            if self.get_channel_name(data, i) == ch_name:
-                ch_idx = i
-                break
-        if ch_idx is None and n_ch > 0:
-            ch_idx = 0
-            ch_name = self.get_channel_name(data, 0)
-
-        if ch_idx is None:
-            ax.text(0.5, 0.5, f'No signal found for\n{subject}',
-                    ha='center', va='center', transform=ax.transAxes,
-                    fontsize=10, color='gray')
-            ax.set_axis_off()
-            self.spike_preview_canvas.draw()
-            return
-
-        # Get signal: corrected → dff → zscore
-        signal = None
-        sig_kind = None
-        for kind in ('corrected', 'dff', 'zscore'):
-            s = self.get_channel_signal(data, ch_idx, kind=kind)
-            if s is not None:
-                signal = s
-                sig_kind = kind
-                break
-
-        if signal is None or len(signal) == 0:
-            ax.text(0.5, 0.5, f'No signal available for\n{subject} / {ch_name}',
-                    ha='center', va='center', transform=ax.transAxes,
-                    fontsize=10, color='gray')
-            ax.set_axis_off()
-            self.spike_preview_canvas.draw()
-            return
-
-        # Read current UI param values without permanently committing them
-        try:
-            threshold_mad = float(self.spike_threshold_var.get())
-            min_width     = int(self.spike_min_width_var.get())
-            max_width     = int(self.spike_max_width_var.get())
-            min_prom      = float(self.spike_prominence_var.get())
-            min_interval  = int(self.spike_min_interval_var.get())
-        except ValueError:
-            threshold_mad = self.params['spike_threshold_mad']
-            min_width     = self.params['spike_min_width']
-            max_width     = self.params['spike_max_width']
-            min_prom      = self.params['spike_min_prominence']
-            min_interval  = self.params['spike_min_interval']
-
-        # Temporarily override params, detect, then restore
-        _saved = {k: self.params[k] for k in (
-            'spike_threshold_mad', 'spike_min_width', 'spike_max_width',
-            'spike_min_prominence', 'spike_min_interval')}
-        self.params.update({
-            'spike_threshold_mad': threshold_mad,
-            'spike_min_width':     min_width,
-            'spike_max_width':     max_width,
-            'spike_min_prominence': min_prom,
-            'spike_min_interval':  min_interval,
-        })
-        fps = self.params['fps']
-        result = self.detect_spikes(signal, fps)
-        self.params.update(_saved)
-
-        # ── Plot ──────────────────────────────────────────────────────────
-        time_s = np.arange(len(signal)) / fps
-        color = '#2e86c1' if ch_name.upper().startswith('G') else '#c0392b'
-
-        ax.plot(time_s, signal, color=color, linewidth=0.7, alpha=0.85,
-                label=f'{ch_name}  [{sig_kind}]')
-
-        # Threshold line
-        thr = result['threshold_value']
-        if not np.isnan(thr):
-            ax.axhline(thr, color='darkorange', linestyle='--', linewidth=1.2, alpha=0.9,
-                       label=f'Threshold  {thr:.3f}  ({threshold_mad:.1f}×MAD)')
-
-        # Median baseline
-        valid = signal[~np.isnan(signal)]
-        if len(valid):
-            ax.axhline(np.median(valid), color='gray', linestyle=':', linewidth=0.8,
-                       alpha=0.5, label='Median baseline')
-
-        # Detected events
-        n_ev = result['total_spikes']
-        rate = result['spike_rate_per_min']
-        if n_ev > 0:
-            idx  = result['spike_indices']
-            amps = result['spike_amplitudes']
-            ax.scatter(time_s[idx], amps, color='red', s=60, zorder=5,
-                       edgecolors='darkred', linewidth=0.8,
-                       label=f'{n_ev} events  ({rate:.1f}/min)')
-        else:
-            ax.text(0.98, 0.96, 'No events detected', ha='right', va='top',
-                    transform=ax.transAxes, fontsize=8, color='red',
-                    bbox=dict(boxstyle='round,pad=0.2', facecolor='#ffe0e0', alpha=0.75))
-
-        ylabel_map = {'corrected': 'ΔF/F', 'dff': 'ΔF/F', 'zscore': 'Z-score'}
-        ax.set_xlabel('Time (s)', fontsize=9)
-        ax.set_ylabel(ylabel_map.get(sig_kind, 'Signal'), fontsize=9)
-        ax.set_title(f'{subject}  ·  {ch_name}', fontsize=10, fontweight='bold')
-        ax.legend(fontsize=7, loc='upper right', framealpha=0.8)
-        ax.grid(True, alpha=0.25, linewidth=0.5)
-        ax.axhline(0, color='black', linewidth=0.4, alpha=0.3)
-
-        # MAD annotation
-        mad_val = result['mad']
-        if not np.isnan(mad_val):
-            ax.text(0.01, 0.98, f'MAD = {mad_val:.4f}', ha='left', va='top',
-                    transform=ax.transAxes, fontsize=7, color='dimgray')
-
-        self.spike_preview_fig.tight_layout(pad=0.6)
-        self.spike_preview_canvas.draw()
 
     def update_spike_selection_mode(self):
         """Update the listbox based on selected mode (Subject or Group), then refresh channels."""
@@ -8684,20 +8468,9 @@ class FPAnalysisGUI:
             messagebox.showinfo("No Data", "Please run spike analysis first")
             return
         
-        # Create new window
-        viz_window = tk.Toplevel(self.root)
-        viz_window.title("Spike Analysis Visualization")
-        viz_window.geometry("1200x800")
-        
         # Create figure
         fig = Figure(figsize=(12, 8), dpi=100)
-        canvas = FigureCanvasTkAgg(fig, master=viz_window)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Add toolbar
-        toolbar = NavigationToolbar2Tk(canvas, viz_window)
-        toolbar.update()
-        
+
         # Plot spike metrics
         try:
             self._plot_spike_metrics(fig)
@@ -8707,7 +8480,7 @@ class FPAnalysisGUI:
                      fontsize=11, color='red', wrap=True)
             import traceback
             self.log_message(f"[ERROR] visualize_spike_data: {traceback.format_exc()}")
-        canvas.draw()
+        self._embed_plot_window(fig, "Spike Analysis Visualization", "1200x800")
     
     def _plot_spike_metrics(self, fig):
         """Plot spike analysis metrics — channel-agnostic (handles G0/G1/G2/R0/Ch0 etc.)"""
@@ -8953,23 +8726,12 @@ class FPAnalysisGUI:
             messagebox.showinfo("No Zone Data", "Could not analyze spikes by zone for any subjects")
             return
         
-        # Create visualization window
-        viz_window = tk.Toplevel(self.root)
-        viz_window.title("Spike Frequency by Zone")
-        viz_window.geometry("1400x900")
-        
         # Create figure
         fig = Figure(figsize=(14, 9), dpi=100)
-        canvas = FigureCanvasTkAgg(fig, master=viz_window)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Add toolbar
-        toolbar = NavigationToolbar2Tk(canvas, viz_window)
-        toolbar.update()
-        
+
         # Plot zone-specific spike rates
         self._plot_spike_rates_by_zone(fig)
-        canvas.draw()
+        self._embed_plot_window(fig, "Spike Frequency by Zone", "1400x900")
     
     def _plot_spike_rates_by_zone(self, fig):
         """Plot spike rates by zone for each subject/group"""
@@ -9232,600 +8994,44 @@ class FPAnalysisGUI:
         info_frame = ttk.Frame(overview_tab)
         info_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
-        text = tk.Text(info_frame, wrap='word', font=('Segoe UI', 10))
-        scrollbar = ttk.Scrollbar(info_frame, command=text.yview)
-        text.config(yscrollcommand=scrollbar.set)
+        # Left: clickable section navigation. Right: scrollable styled content.
+        nav_frame = ttk.LabelFrame(info_frame, text="Contents", padding=4)
+        nav_frame.pack(side='left', fill='y', padx=(0, 8))
+        self.info_nav_listbox = tk.Listbox(
+            nav_frame, width=24, height=24, activestyle='dotbox',
+            font=('Segoe UI', 10), exportselection=False,
+            highlightthickness=0, bd=0)
+        self.info_nav_listbox.pack(fill='y', expand=True)
 
+        content_frame = ttk.Frame(info_frame)
+        content_frame.pack(side='left', fill='both', expand=True)
+        text = tk.Text(content_frame, wrap='word', font=('Segoe UI', 10),
+                       padx=16, pady=8, bd=0, highlightthickness=0,
+                       cursor='arrow', background='white')
+        scrollbar = ttk.Scrollbar(content_frame, command=text.yview)
+        text.config(yscrollcommand=scrollbar.set)
         text.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        # Add information content
-        info_content = """
-╔════════════════════════════════════════════════════════════════════════════════╗
-║                    FIBER PHOTOMETRY ANALYSIS GUI - INFO                        ║
-╚════════════════════════════════════════════════════════════════════════════════╝
+        sections = self._info_sections()
+        marks = self._populate_info_text(text, sections)
+        text.config(state='disabled')  # read-only
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📁 REQUIRED FILE NAMING SCHEMES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Build the navigation list and wire click-to-jump (section to top).
+        for title, _ in sections:
+            self.info_nav_listbox.insert('end', title)
 
-1. FPData Files:
-   Format: {SubjectID}FPData0.csv
-   Example: DG01FPData0.csv, DG02FPData0.csv
-   
-   Required Columns (minimum 5, maximum 8):
-   • FrameCounter (column 0)
-   • SystemTimestamp (column 1)
-   • LedState (column 2) - values: 1 (415nm), 2 (470nm), 4 (570nm), 7 (both/calibration)
-   • ComputerTimestamp (column 3)
-   • Photometry Data (columns 4+) - 1 to 4 photometry channels
-   
-   Flexible Channel Configuration:
-   - 1 channel: Single fiber recording (column 4)
-   - 2 channels: Dual fiber recording (columns 4-5)
-   - 3 channels: Triple fiber recording (columns 4-6)
-   - 4 channels: Quad fiber recording (columns 4-7)
-   
-   Note: The system automatically detects the number of available channels
-
-2. Timestamp Files (ComputerTS or AnimalPosition):
-   Format: {SubjectID}ComputerTS0.csv OR {SubjectID}AnimalPosition0.csv
-   Example: DG01ComputerTS0.csv, DG01AnimalPosition0.csv
-   
-   Required Columns:
-   • Frame number (column 0)
-   • Computer timestamp (column 1)
-   • X position (column 2, optional)
-   • Y position (column 3, optional)
-   
-   Note: 
-   • The system accepts EITHER ComputerTS or AnimalPosition files
-   • AnimalPosition files may have additional columns (X, Y coordinates, etc.)
-   • Timestamp file is OPTIONAL - processing can be done without behavior data
-   • If columns 2 and 3 contain position data, they will be preserved in output
-   • Additional columns beyond X, Y are also preserved
-
-3. Boutframes File (OPTIONAL):
-   Format: boutframes.xlsx (Excel file)
-   
-   Note: This file is only required if you want bout-aligned analysis
-   
-   Structure:
-   • Each subject has its own worksheet
-   • Worksheet name must match SubjectID
-   • Each column represents a different behavior
-   • Column header = behavior name
-   • Values = frame numbers when behavior occurred
-   
-   Example sheet for "DG01":
-   ┌──────────┬──────────┬──────────┬──────────┐
-   │ Open Arm │ Closed   │ Center   │ Rearing  │
-   ├──────────┼──────────┼──────────┼──────────┤
-   │ 150      │ 45       │ 300      │ 120      │
-   │ 890      │ 245      │ 1200     │ 450      │
-   │ 1450     │ 567      │ 2100     │ 780      │
-   └──────────┴──────────┴──────────┴──────────┘
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔧 CUSTOM FILE NAMING CONFIGURATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-The system supports CUSTOMIZABLE file naming patterns to handle different naming schemes
-and avoid case sensitivity issues!
-
-Default Settings:
-  • FPData Pattern: 'FPData' (case-insensitive keyword to identify data files)
-  • FPData Suffix: '0.csv' (text after SubjectID in data files)
-  • Timestamp Pattern: 'ComputerTS|AnimalPosition' (alternatives separated by |)
-  • Timestamp Suffix: '0.csv' (text after SubjectID in timestamp files)
-
-How It Works:
-  The system extracts the SubjectID by finding the pattern in the filename and
-  removing everything from the pattern onward. Trailing underscores/dashes are removed.
-
-Examples:
-  
-  EXAMPLE 1 - Default naming:
-    Files: DG01FPData0.csv, DG01ComputerTS0.csv
-    Settings: Pattern='FPData', Suffix='0.csv'
-    Result: SubjectID = 'DG01'
-  
-  EXAMPLE 2 - Lowercase with underscores:
-    Files: mouse1_fpdata.csv, mouse1_timestamps.csv
-    Settings: 
-      FPData Pattern='fpdata', FPData Suffix='.csv'
-      Timestamp Pattern='timestamps', Timestamp Suffix='.csv'
-    Result: SubjectID = 'mouse1'
-  
-  EXAMPLE 3 - Different separators:
-    Files: Subject-A-FiberPhotometry.csv, Subject-A-Behavior.csv
-    Settings:
-      FPData Pattern='FiberPhotometry', FPData Suffix='.csv'
-      Timestamp Pattern='Behavior', Timestamp Suffix='.csv'
-    Result: SubjectID = 'Subject-A'
-  
-  EXAMPLE 4 - No separators:
-    Files: M123data.csv, M123time.csv
-    Settings:
-      FPData Pattern='data', FPData Suffix='.csv'
-      Timestamp Pattern='time', Timestamp Suffix='.csv'
-    Result: SubjectID = 'M123'
-
-Where to Configure:
-  1. Go to "Processing" tab
-  2. Find "File Naming Configuration" section
-  3. Enter your patterns and suffixes
-  4. Click "Apply File Naming Settings"
-  5. Patterns are saved with your project!
-
-Benefits:
-  ✓ Case-insensitive matching (handles FPData, fpdata, FPDATA, etc.)
-  ✓ Flexible naming schemes (underscores, dashes, no separators)
-  ✓ Multiple timestamp file types (use | to separate alternatives)
-  ✓ Saved per project for consistency
-  ✓ No need to rename existing files!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✨ KEY FEATURES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-PROJECT MANAGEMENT:
-  ✓ Create organized projects with automatic folder structure
-  ✓ All projects stored in customizable directory
-  ✓ Automatic saving of processing parameters and results
-  ✓ Load previously processed projects
-
-PROCESSING MODES:
-  ✓ Single Subject: Process one animal at a time
-  ✓ Batch Mode: Process entire folder of subjects automatically
-  ✓ Customizable File Naming: Configure patterns for your naming scheme
-  ✓ Case-Insensitive Matching: Works with any capitalization
-  ✓ Auto-detection of matching FPData and timestamp files
-
-SIGNAL PROCESSING PIPELINE:
-  1. Data Loading & Validation
-  2. LED State Deinterleaving (470nm vs 415nm)
-  3. Photobleaching Correction (Biexponential Fitting)
-  4. dF/F Normalization (ΔF/F × 100%)
-  5. Motion Artifact Correction (Isosbestic Regression)
-  6. Z-Score Normalization
-  7. Behavior Synchronization
-  8. Bout-Aligned Data Extraction
-
-BOUTFRAMES EDITOR:
-  ✓ View boutframes for all subjects
-  ✓ Edit frame numbers directly (double-click cells)
-  ✓ Add new behavior columns dynamically
-  ✓ Save changes back to Excel file
-  ✓ Real-time validation
-
-VISUALIZATION OPTIONS:
-  ✓ Raw Deinterleaved Data (both channels, both wavelengths)
-  ✓ Normalized Signals (dF/F%)
-  ✓ Motion-Corrected Signals
-  ✓ Z-Scored Signals
-  ✓ Bout Overlay Plots
-  ✓ Extracted Bouts (individual traces + average ± SEM + heatmaps)
-  ✓ Position Heatmap (X-Y position colored by z-score)
-  ✓ Multi-Subject Selection (Ctrl/Cmd + Click):
-    - Position Heatmap: Compare multiple subjects (subplots or overlay)
-    - Extracted Bouts: Combine bouts across subjects for group average
-  ✓ Export plots (PNG, PDF, SVG)
-  ✓ Interactive zoom/pan tools
-  ✓ Position data processing (when available):
-    - Pixel to cm calibration
-    - Velocity calculation with outlier removal
-    - Total distance traveled
-    - Distance from center calculations
-
-ANALYSIS TABS:
-  • Groups: Organize subjects into experimental groups for group-level
-    averages and comparisons. Groups can be mutually exclusive or overlapping.
-  • Exclusions: Mark individual channels (e.g. G0/G1) as excluded per subject
-    so bad data is left out of that tab's plots and exports.
-  • Behavioral Data: Position-derived metrics (velocity, distance traveled,
-    zone occupancy, distance from center) when tracking data is available.
-  • Coherence: Spectral coherence between two channels via Morlet wavelet or
-    Welch's method — static coherence, sliding/time-resolved coherence,
-    bout-epoch coherence (baseline vs. post-onset), and group comparisons.
-  • Spike Analysis: Detects calcium transients ("spikes") using a MAD-based
-    threshold and reports rate, amplitude, and width per channel.
-  • Bout Analysis: Summary statistics and histograms across extracted bouts,
-    grouped by subject or by group.
-  • Decision Probability: Probability of explore vs. retreat decisions binned
-    by the current z-score of the photometry signal.
-  • Signal Integrity: Per-subject quality metrics (SNR, CV, isosbestic
-    correlation, artifacts, photobleaching) with an overall quality score.
-
-ADJUSTABLE PARAMETERS:
-  • preboutframes: Frames before bout to include (default: 90)
-  • postboutframes: Frames after bout to include (default: 90)
-  • maxlengthframe: Maximum file length in frames (default: 20000000)
-  • precut: Initial frames to trim (default: 100)
-  • fps: Frame rate for time calculations (default: 30)
-  • exclude_frames_before: Exclude bouts before this frame number (default: 0)
-  • maze_width_cm: Known maze width in cm for position calibration (default: 76)
-  • velocity_outlier_threshold: Std devs for velocity outlier removal (default: 5)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 TYPICAL WORKFLOW
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. CREATE PROJECT
-   • Go to "Project" tab
-   • Enter project name (e.g., "EPM_Experiment_2025")
-   • Click "Create New Project"
-
-2. PREPARE BOUTFRAMES (Optional)
-   • Create Excel file named "boutframes.xlsx"
-   • Add worksheet for each subject
-   • Enter frame numbers for each behavior
-   • Or use the Bout Frames Editor to create/modify
-
-3. PROCESS DATA
-   • Go to "Processing" tab
-   • Choose Single Subject or Batch mode
-   • Select input files/folder
-   • Load boutframes file (if available)
-   • Adjust parameters if needed
-   • Click "Run Processing"
-
-4. EDIT BOUT FRAMES (Optional)
-   • Go to "Bout Frames Editor" tab
-   • Select subject from dropdown
-   • Double-click cells to edit frame numbers
-   • Add new behaviors with "Add Behavior" button
-   • Click "Save Changes" when done
-
-5. VISUALIZE RESULTS
-   • Go to "Visualization" tab
-   • Select subject and plot type
-   • Click "Generate Plot"
-   • Use toolbar to zoom/pan
-   • Export plot if desired
-
-6. SAVE PROJECT
-   • File → Save Project
-   • All processed data and parameters saved
-   • Can reload later to continue analysis
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔬 SIGNAL PROCESSING DETAILS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-PHOTOBLEACHING CORRECTION:
-  • Biexponential fitting: F(t) = a·e^(-b·t) + c·e^(-d·t)
-  • Fitted separately for each wavelength
-  • Normalizes fluorescence decay over time
-
-dF/F CALCULATION:
-  • Formula: dF/F = 100 × (F - F_fitted) / F_fitted
-  • Expressed as percentage
-  • Computed for both 470nm and 415nm signals
-
-MOTION CORRECTION:
-  • 415nm (isosbestic) regressed from 470nm (GCaMP)
-  • Robust linear regression
-  • Removes motion artifacts and hemodynamic signals
-  • Final signal = GCaMP_470 - fitted_415
-
-Z-SCORE NORMALIZATION:
-  • Standardizes signals across subjects
-  • Formula: z = (x - μ) / σ
-  • Enables cross-animal comparisons
-
-BOUT EXTRACTION:
-  • Extracts signal around behavior events
-  • Window: [frame - preboutframes : frame + postboutframes]
-  • Aligned to behavior onset
-  • Stored separately for each behavior type
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🩺 SIGNAL INTEGRITY ANALYSIS - INTERPRETATION GUIDE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-The Signal Integrity tab provides comprehensive analysis of your photometry signal quality.
-Below is a detailed explanation of each metric and how to interpret the results:
-
-OVERALL QUALITY SCORE (0-100):
-  The Overall Quality Score combines all metrics into a single number with color coding:
-  
-  ✓ 90-100 (GREEN - Excellent)
-    • Data is clean, stable, and highly reliable for analysis
-    • Minimal artifacts and motion contamination
-    • Use with confidence for quantitative comparisons
-  
-  ✓ 80-89 (YELLOW-GREEN - Good)
-    • Data quality is solid and acceptable for most analyses
-    • Minor artifacts or slight instability
-    • Suitable for standard neuroscience studies
-  
-  ✓ 70-79 (YELLOW - Fair)
-    • Data has notable issues but may still be usable
-    • Moderate motion artifacts or signal drift
-    • Consider carefully for critical analyses
-    • May need additional validation
-  
-  ✓ 60-69 (ORANGE - Poor)
-    • Significant signal quality issues present
-    • Substantial motion artifacts or instability
-    • Recommend excluding from analysis or troubleshooting recording
-  
-  ✓ 0-59 (RED - Bad)
-    • Data is severely compromised
-    • Not recommended for quantitative analysis
-    • Check recording setup, fiber placement, or animal health
-
-SIGNAL-TO-NOISE RATIO (SNR):
-  What it measures:
-    The ratio of true neural signal amplitude to noise, calculated on MOTION-CORRECTED signal.
-    
-    Calculation:
-    1. Fit 415nm (isosbestic) to 470nm signal to estimate motion component
-    2. Remove motion: Corrected_Signal = 470nm - (fitted 415nm)
-    3. Calculate SNR: SNR = Mean(|Corrected_Signal|) / StDev(Corrected_Signal)
-    
-    This is critical because:
-    • The 415nm channel responds to motion, not neural activity
-    • If SNR is calculated on raw 470nm with high 415nm correlation, it inflates SNR
-    • Motion-corrected SNR reflects ACTUAL neural signal, not artifact
-  
-  Interpretation:
-    SNR > 5     → GOOD: Usable neural signal
-    SNR 2-5     → FAIR: Noisy, but may be acceptable
-    SNR < 2     → POOR: Insufficient neural signal, mostly motion/noise
-  
-  Why it matters:
-    • Many recordings have high raw SNR but low motion-corrected SNR
-    • High correlation (0.7+) with 415nm means most signal is motion artifact
-    • Motion-corrected SNR reveals true data quality
-    • Data with low corrected SNR may not reliably detect biological responses
-  
-  What causes low SNR:
-    ✗ Poor fiber coupling or displacement
-    ✗ Misalignment of light source
-    ✗ Excessive motion artifact contamination (high 415nm correlation)
-    ✗ Fluorophore expression too low
-    ✗ Photodetector or amplifier noise
-  
-  Important distinction:
-    Raw SNR (Mean/StDev of 470nm):
-      • Can be artificially high due to slow drift/photobleaching
-      • Misleading if signal tracks motion (415nm)
-      • Reported for reference but not recommended for quality assessment
-    
-    Motion-Corrected SNR:
-      • Removes motion artifact component
-      • Reflects true neural signal quality
-      • Should be used for quality decisions
-      • High correlation (>0.7) with 415nm will cause low corrected SNR
-  
-  Typical values:
-    • Healthy GCaMP with stable fiber: Corrected SNR 3-8
-    • Good quality data: Corrected SNR > 2
-    • Motion-contaminated data: Corrected SNR < 1 despite high raw SNR
-    • WARNING: If correlation(415nm,470nm) > 0.8, be skeptical of SNR value
-
-COEFFICIENT OF VARIATION (CV):
-  What it measures:
-    The variability of the baseline fluorescence over time
-    Formula: CV = 100 × StDev(signal) / Mean(signal) [in %]
-  
-  Interpretation:
-    CV < 5%     → EXCELLENT: Very stable baseline
-    CV 5-10%    → GOOD: Reasonably stable
-    CV 10-15%   → FAIR: Moderate drift or fluctuations
-    CV > 15%    → POOR: Unstable, unreliable baseline
-  
-  Why it matters:
-    • Measures baseline stability throughout recording
-    • Lower CV = more reliable dF/F calculations
-    • High CV indicates systematic drift or movement
-  
-  What causes high CV:
-    ✗ Photobleaching (signal decay over time)
-    ✗ Animal movement during recording
-    ✗ Temperature drift affecting signal
-    ✗ Vibration or optical instability
-    ✗ Changes in tissue oxygenation
-  
-  Typical values:
-    • Excellent recordings: CV < 8%
-    • Acceptable recordings: CV < 12%
-    • Problematic recordings: CV > 15%
-
-SIGNAL-ISOSBESTIC CORRELATION:
-  What it measures:
-    How strongly the 470nm (GCaMP) signal tracks the 415nm (isosbestic) signal
-    Correlation ranges from -1 (opposite) to +1 (identical)
-  
-  Interpretation:
-    Correlation > 0.7  → STRONG MOTION/HEMODYNAMIC ARTIFACT
-                          Signal heavily contaminated with motion or blood volume changes
-    Correlation 0.3-0.7 → MODERATE: Some motion artifact present
-    Correlation < 0.3  → MINIMAL ARTIFACT: Good signal separation
-  
-  Why it matters:
-    • 415nm (isosbestic) responds to motion, not neural activity
-    • 470nm (GCaMP) responds to both calcium and motion
-    • Low correlation = signal is independent (motion-corrected)
-    • High correlation = signal follows motion instead of neural activity
-  
-  What it tells you:
-    ✓ Low correlation (< 0.3)
-      → Successful motion correction was applied
-      → Signal reflects neural activity, not movement
-      → Data is suitable for analysis
-    
-    ✗ High correlation (> 0.7)
-      → Signal strongly contaminated with motion artifact
-      → May reflect movement, not genuine neural responses
-      → Consider re-recording with better fiber stability
-  
-  Typical values:
-    • Good recordings: Correlation < 0.4
-    • Acceptable recordings: Correlation < 0.6
-    • Problematic recordings: Correlation > 0.7
-
-ARTIFACT DETECTION:
-  What it measures:
-    Extreme signal spikes detected using z-score analysis
-    Artifacts are RARE events with |z-score| > 15 (>15 standard deviations from mean)
-  
-  Interpretation:
-    0 artifacts   → EXCELLENT: No extreme spikes detected
-    1 artifact    → GOOD: Single rare event, likely acceptable
-    2-3 artifacts → FAIR: Multiple extreme events, review data
-    >5 artifacts  → POOR: Frequent extreme spikes, data quality compromised
-  
-  Why it matters:
-    • Artifacts distort signal shape and amplitude
-    • Can create false positives in event detection
-    • Visible as sharp spikes in the raw trace (e.g., z=25 spike in KOR14)
-  
-  Detection details:
-    • Uses z-scored motion-corrected signal (same as Analysis tab)
-    • Reports ALL signal channel artifacts (not just those in both channels)
-    • Shows frame number, timestamp, and z-score for each artifact
-    • Distinguishes between single-channel (fiber issue) and dual-channel (motion) artifacts
-  
-  What causes artifacts:
-    ✗ Sudden fiber displacement or connector issues (single-channel spikes)
-    ✗ Large subject movements (dual-channel artifacts)
-    ✗ Electrical interference or switch noise
-    ✗ Dust or debris on fiber optics
-    ✗ LED or photodiode anomalies
-  
-  How to minimize:
-    ✓ Ensure secure fiber holder and connector
-    ✓ Use well-shielded cables and grounded equipment
-    ✓ Minimize environmental light exposure
-    ✓ Check equipment for loose connections
-    ✓ Proper fiber implant depth and stability
-
-PHOTOBLEACHING ASSESSMENT:
-  What it measures:
-    The linear trend of signal decay over the recording session
-    Slope indicates % change per second
-  
-  Interpretation:
-    Slope near 0     → NO BLEACHING: Ideal
-    Slope -0.01 to 0 → MINIMAL: Acceptable for most studies
-    Slope -0.1 to -0.01 → MODERATE: Noticeable decay, use with caution
-    Slope < -0.1     → SEVERE: Significant signal loss, exclude from analysis
-  
-  Why it matters:
-    • Photobleaching causes fluorescence intensity to decrease
-    • Can confound with biological responses
-    • Biexponential correction helps but can't eliminate weak signals
-  
-  Tips to minimize photobleaching:
-    ✓ Use lowest laser power that still gives good SNR
-    ✓ Shorter recording sessions (< 60 min)
-    ✓ Use anti-fading mounting medium
-    ✓ Cooler recording chamber temperature (if possible)
-    ✓ Higher quality optics reduce unnecessary light exposure
-
-WAVELENGTH-SPECIFIC CONSIDERATIONS:
-
-  470nm Channel (GCaMP / Activity Signal):
-    • GCaMP fluorescence increases with intracellular calcium (neural firing)
-    • Also responds to motion, hemodynamic changes, temperature
-    • More biologically relevant but more contaminated signal
-  
-  415nm Channel (Isosbestic / Control Signal):
-    • Calcium-insensitive reference wavelength
-    • Responds to motion, hemodynamic changes, but NOT neural activity
-    • Used to detect and remove motion artifacts
-    • Should track 470nm if motion is the dominant artifact
-
-USING SIGNAL INTEGRITY FOR DATA QUALITY DECISIONS:
-
-  1. QUICK ASSESSMENT:
-     • Look at Overall Quality Score first
-     • Green (>80): Use without concern
-     • Yellow (50-65): Review other metrics before using
-     • Red (<50): Carefully evaluate need to include
-
-  2. DETAILED ASSESSMENT:
-     • SNR > 5: Usually sufficient
-     • CV < 12%: Acceptable baseline stability
-     • Correlation < 0.5: Good motion separation
-     • Artifacts < 3: Minimal extreme spikes (|z|>15)
-     • Photobleaching slope > -0.05: Reasonable signal preservation
-
-  3. TROUBLESHOOTING:
-     Problem: Overall score low but SNR is good?
-       → Check Correlation and Artifacts - may have motion issues
-     
-     Problem: Everything looks good except CV is high?
-       → May have photobleaching or slow baseline drift
-       → Consider shorter analysis windows
-     
-     Problem: High Correlation and high Artifacts?
-       → Recording has significant motion contamination
-       → May need better restraint or head fixation
-
-  4. DECISION TREE:
-     Overall Score > 80?
-       → YES: Use with confidence in all analyses
-       → NO: Check SNR
-     
-     SNR > 5?
-       → YES: Check Correlation
-       → NO: May be too noisy, consider exclusion
-     
-     Correlation < 0.5?
-       → YES: Check Artifacts
-       → NO: Strong motion artifact presence
-     
-     Artifacts < 0.5?
-       → YES: Data is usable
-       → NO: Significant artifacts present (now: <3 extreme events = usable)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💡 TIPS & TROUBLESHOOTING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-• File Naming: MUST match exactly - SubjectID must be identical in all files
-• Batch Processing: All files must be in the same folder
-• Missing Files: ComputerTS file must exist for each FPData file
-• Boutframes: Optional - analysis runs without it, but bout extraction won't occur
-• Large Files: Processing may take several minutes for large datasets
-• Memory: Close other applications if processing many subjects
-• Parameters: Adjust based on your frame rate and experimental design
-• Backup: Original files are never modified - always work on copies
-• Export: Processed data is saved in the project's 'processed' folder
-
-COMMON ERRORS:
-  ✗ "No timestamp file found" → Ensure you have ComputerTS OR AnimalPosition file
-  ✗ "File not found" → Check file naming matches exactly
-  ✗ "No boutframes sheet" → Ensure worksheet name = SubjectID
-  ✗ "Biexponential fit failed" → Signal may be too noisy; falls back to linear
-  ✗ "NaN values in output" → Check timestamp synchronization
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📞 SUPPORT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-For issues or questions:
-  • Check the System tab to verify dependencies
-  • Review the processing log for specific errors
-  • Ensure all file naming conventions are followed
-  • Verify data file formats match requirements
-
-Version: {APP_VERSION}
-Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
-        # Inject the live version without turning the whole block into an
-        # f-string (the text contains literal {SubjectID} placeholders).
-        info_content = info_content.replace("{APP_VERSION}", APP_VERSION)
-
-        text.insert('1.0', info_content)
-        text.config(state='disabled')  # Make read-only
+        def _on_info_nav(_e=None):
+            sel = self.info_nav_listbox.curselection()
+            if not sel:
+                return
+            try:
+                text.yview(marks[sel[0]])
+            except (tk.TclError, IndexError):
+                pass
+        self.info_nav_listbox.bind('<<ListboxSelect>>', _on_info_nav)
+        if sections:
+            self.info_nav_listbox.selection_set(0)
 
         # ── Changelog subtab ─────────────────────────────────────────────
         changelog_tab = ttk.Frame(self.info_notebook)
@@ -9843,6 +9049,186 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
         cl_text.insert('1.0', self._get_changelog_text())
         cl_text.config(state='disabled')  # Make read-only
 
+    def _populate_info_text(self, text, sections):
+        """Render a list of (title, body) sections into a styled, read-only Text
+        widget with typographic hierarchy (no ASCII-art boxes). Sets one mark
+        per section heading and returns the list of mark names so the Overview
+        nav list can jump to a section. ``body`` lines are styled by a light
+        convention: lines starting with •/-/✓/✗ become bullets, a short line
+        ending in ':' becomes a sub-header, lines starting with '> ' become a
+        monospace block (for filenames / examples), everything else is body."""
+        accent = self.colors['accent_dark_blue']
+        text.tag_configure('h1', font=('Segoe UI Semibold', 15, 'bold'),
+                            foreground=accent, spacing1=16, spacing3=8)
+        text.tag_configure('sub', font=('Segoe UI', 10, 'bold'),
+                            foreground=self.colors['text_dark'],
+                            spacing1=8, spacing3=2)
+        text.tag_configure('body', font=('Segoe UI', 10),
+                            foreground=self.colors['text_dark'],
+                            spacing1=1, spacing3=2, lmargin1=4, lmargin2=4)
+        text.tag_configure('bullet', font=('Segoe UI', 10),
+                            foreground=self.colors['text_dark'],
+                            lmargin1=20, lmargin2=34, spacing1=1, spacing3=1)
+        text.tag_configure('mono', font=('Consolas', 9),
+                            foreground='#2c3e50', lmargin1=20, lmargin2=20)
+
+        marks = []
+        text.config(state='normal')
+        text.delete('1.0', 'end')
+        for i, (title, body) in enumerate(sections):
+            mark = f'info_sec_{i}'
+            text.mark_set(mark, 'end-1c')
+            text.mark_gravity(mark, 'left')
+            marks.append(mark)
+            text.insert('end', title + '\n', 'h1')
+            for line in body.strip('\n').split('\n'):
+                stripped = line.strip()
+                if not stripped:
+                    text.insert('end', '\n', 'body')
+                elif stripped[0] in '•-✓✗':
+                    text.insert('end', stripped + '\n', 'bullet')
+                elif stripped.startswith('> '):
+                    text.insert('end', stripped[2:] + '\n', 'mono')
+                elif stripped.endswith(':') and len(stripped) < 48:
+                    text.insert('end', stripped + '\n', 'sub')
+                else:
+                    text.insert('end', stripped + '\n', 'body')
+            text.insert('end', '\n', 'body')
+        return marks
+
+    def _info_sections(self):
+        """Concise, current (v{ver}) Overview content for the Info tab, as a list
+        of (section title, body) tuples. One source of truth for both the
+        content pane and the clickable navigation list.""".format(ver=APP_VERSION)
+        v = APP_VERSION
+        return [
+            ("Welcome to TRACY", f"""
+TRACY is a fiber-photometry analysis suite for behavioral neuroscience
+(currently v{v}). It takes raw photometry recordings plus optional behavior /
+position tracking and turns them into normalized signals, bout-aligned traces,
+spectral coherence, transient (spike) metrics, decision-probability curves and
+kinematics — all from one project workspace.
+
+Use the navigation list on the left to jump to a topic. A typical first-time
+path is: read 'Required Files', set up a project on the Project tab, then run
+Processing.
+"""),
+            ("Required Files & Naming", """
+TRACY identifies a subject's files by a keyword pattern in the filename (see
+'Custom File Naming' to change the defaults).
+
+1. Photometry data  (required):
+> {SubjectID}FPData0.csv
+Columns: FrameCounter, SystemTimestamp, LedState, ComputerTimestamp, then 1–4
+photometry data columns. LedState codes: 1 = 415 nm, 2 = 470 nm, 4 = 570 nm,
+7 = both / calibration. The channel count is detected automatically.
+
+2. Timestamp / position  (optional):
+> {SubjectID}ComputerTS0.csv   or   {SubjectID}AnimalPosition0.csv
+Columns: frame number, computer timestamp, and optionally X / Y position (kept
+for zone, heatmap and kinematics analyses). Processing also runs without this.
+
+3. Boutframes  (optional):
+> boutframes.xlsx
+One worksheet per subject (worksheet name = SubjectID); each column is a
+behavior, each cell a frame number where that behavior occurred. Needed only
+for bout-aligned analysis. TTL onset/offset files are also supported.
+"""),
+            ("Custom File Naming", """
+File naming is fully configurable on the Processing tab, so you don't have to
+rename existing data. Matching is case-insensitive.
+
+How it works:
+TRACY finds the pattern in a filename and strips everything from the pattern
+onward to recover the SubjectID; trailing separators are removed.
+
+• FPData Pattern / Suffix — identifies the photometry file (default 'FPData' / '0.csv').
+• Timestamp Pattern / Suffix — identifies the behavior file; use '|' for
+  alternatives (default 'ComputerTS|AnimalPosition' / '0.csv').
+
+Examples:
+> DG01FPData0.csv          -> SubjectID 'DG01'   (pattern 'FPData')
+> mouse1_fpdata.csv        -> SubjectID 'mouse1' (pattern 'fpdata', suffix '.csv')
+> Subject-A-Behavior.csv   -> SubjectID 'Subject-A'
+Patterns are saved with the project.
+"""),
+            ("Multi-Channel & Wavelengths", """
+TRACY supports 1–4 photometry channels per recording (v1.3.0 added full
+multi-channel handling with per-channel wavelength routing).
+
+• Channels are auto-detected from the data columns and named by position
+  (e.g. G0, G1 … for green fibers; R-series for red).
+• Each channel can carry the 470 nm signal, the 570 nm signal, or both, routed
+  from the LedState column.
+• Channel / wavelength checkboxes on the Visualization (and other) tabs let you
+  overlay or isolate exactly the channels you want.
+• The Exclusions tab (and the auto-exclude by signal-integrity score) removes
+  bad channels from analyses non-destructively.
+"""),
+            ("Recommended Workflow", """
+1. Project — create or open a project; all results and parameters are saved here.
+2. Processing — point TRACY at your data folder, confirm file-naming, and run.
+   Single-subject or batch modes are available.
+3. Bout Frames — (optional) import / edit boutframes or TTLs and align them to
+   the photometry timeline.
+4. Groups — assign subjects to experimental groups for group comparisons.
+5. Analysis tabs (Data group) — Behavioral, Visualization, Coherence, Spike,
+   Bout Analysis, Decision Probability, Kinematics.
+6. Export — most tabs export plots (PNG/SVG) and the underlying data (CSV/XLSX).
+"""),
+            ("Tab Guide", """
+Project group:
+• Project — create / load projects and manage the workspace.
+• Processing — batch-process raw files into normalized signals.
+• Bout Frames — import, edit and time-align behavioral bouts / TTLs.
+• Groups — define subject groups for comparisons.
+• Exclusions — exclude specific subject/channel combinations from analyses.
+
+Data group:
+• Behavioral Data — per-subject behavioral metrics tables.
+• Visualization — traces, z-scores, bout overlays, heatmaps, zone averages,
+  out/back movement and more, by subject or group.
+• Coherence — spectral / wavelet coherence and rolling correlation between
+  channels, including bout-epoch (peri-event) analyses.
+• Spike Analysis — detect calcium transients; tune parameters with the live
+  preview before running; analyze spikes by zone.
+• Bout Analysis — quantify signal around bout onsets/offsets and bout windows.
+• Decision Probability — signal-conditioned probability of behavioral outcomes
+  (e.g. explore vs. retreat).
+• Kinematics (BETA) — relate velocity / acceleration / position to the signal.
+
+Info group:
+• Overview — this page.
+• Changelog — version history.
+• System Check — verify Python dependencies and environment.
+"""),
+            ("Tips & Troubleshooting", """
+Common issues:
+✗ 'No timestamp file found' — make sure a ComputerTS or AnimalPosition file
+  exists, or proceed without behavior data.
+✗ 'File not found' — confirm the file naming matches your Processing-tab patterns.
+✗ 'No boutframes sheet' — the worksheet name must equal the SubjectID exactly.
+✗ 'Biexponential fit failed' — signal may be noisy; TRACY falls back to a
+  linear fit automatically.
+✗ NaNs in output — usually a timestamp-synchronization problem between files.
+
+Tips:
+• Use the live preview on Spike Analysis to tune detection before a full run.
+• Drag the divider on split tabs (e.g. Spike Analysis) to resize panes.
+• Plots are exported at high resolution; use 'Export Plot' / 'Export Data'.
+• The System Check tab confirms all dependencies are installed.
+"""),
+            ("Support", f"""
+For issues or questions:
+• Check the System Check tab to verify dependencies.
+• Review the processing log for the specific error message.
+• Confirm file-naming conventions and data formats match the requirements above.
+
+Version: {v}
+Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
+"""),
+        ]
+
     def _get_changelog_text(self):
         """Concise, human-readable version history shown on the Changelog subtab."""
         return f"""
@@ -9851,6 +9237,25 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — UI & graphing cohesion overhaul. All plots now render at a consistent,
+    capped, centered size instead of stretching across the window, share one
+    matplotlib style (fonts/colors/grid), and pop-outs open in a uniform
+    scrollable window. Control panels size to their content so button labels are
+    no longer clipped (including at higher Windows display scaling).
+  • Change — Spike Analysis no longer has the in-tab "Live Preview" pane. The tab
+    is now a single, clean column (parameters → selection → results); spike plots
+    open via "Visualize Spike Data" / "Analyze Spikes by Zone", matching how the
+    other analysis tabs graph.
+  • New — Processing summary popup is far more informative: each successfully
+    processed subject lists what was produced (channels, wavelengths,
+    frames/duration, position data, bouts), failures show the full traceback, and
+    a "Copy report" button copies the whole summary to the clipboard.
+  • New — Rebuilt the Info → Overview page with a clickable section navigator and
+    concise, up-to-date documentation (multi-channel, file naming, per-tab guide,
+    troubleshooting).
+
+Version 1.3.0  •  June 17, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Full multi-channel support: TRACY now identifies, labels, and analyzes
     ANY number of photometry channels (green and red, with any region index such
@@ -12667,6 +12072,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.processing_summary = {
             'subjects_processed': [],
             'subjects_failed': [],
+            'failure_tracebacks': {},
             'warnings': [],
             'missing_behavior': [],
             'missing_ttl': [],
@@ -12772,9 +12178,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.processing_summary['subjects_processed'].append(subject_id)
             self.log_message(f"  ✓ Completed {subject_id}")
         except Exception as e:
+            import traceback as _tb
             self.processing_summary['subjects_failed'].append((subject_id, str(e)))
+            self.processing_summary['failure_tracebacks'][subject_id] = _tb.format_exc()
             self.log_message(f"  ✗ Error processing {subject_id}: {str(e)}")
-    
+            self.log_message(_tb.format_exc())
+
     def process_batch(self):
         """Process all subjects in a folder"""
         folder = self.batch_folder_var.get()
@@ -12890,17 +12299,84 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.processing_summary['subjects_processed'].append(subject_id)
                 self.log_message(f"  ✓ Completed {subject_id}")
             except Exception as e:
+                import traceback as _tb
                 self.processing_summary['subjects_failed'].append((subject_id, str(e)))
+                self.processing_summary['failure_tracebacks'][subject_id] = _tb.format_exc()
                 self.log_message(f"  ✗ Error processing {subject_id}: {str(e)}")
-            
+                self.log_message(_tb.format_exc())
+
             self.root.update_idletasks()  # Allow GUI to update after each subject
     
+    def _format_subject_processing_detail(self, subject_id):
+        """Human-readable one-liner describing what was produced for a
+        successfully processed subject (channels, wavelengths, frames/duration,
+        position data, bouts). Best-effort: every field is guarded so the
+        summary popup never breaks on an unexpected result shape."""
+        d = self.processed_data.get(subject_id)
+        if not isinstance(d, dict):
+            return ""
+        parts = []
+        try:
+            n_ch = d.get('num_photometry_channels')
+            names = d.get('channel_names') or []
+            if names:
+                parts.append(f"{len(names)} channel(s): {', '.join(map(str, names))}")
+            elif n_ch:
+                parts.append(f"{n_ch} channel(s)")
+        except Exception:
+            pass
+        try:
+            wl = [w for w, k in (('415', 'has_415'), ('470', 'has_470'),
+                                 ('570', 'has_570')) if d.get(k)]
+            if wl:
+                parts.append("wavelengths " + "/".join(wl) + " nm")
+        except Exception:
+            pass
+        try:
+            n_frames = None
+            for key in ('zscore_470', 'corrected_470', 'zscore_570', 'corrected_570'):
+                arr = d.get(key)
+                if arr is not None:
+                    try:
+                        n_frames = len(arr)
+                        break
+                    except TypeError:
+                        pass
+            fps = d.get('photometry_fps')
+            if n_frames and fps:
+                parts.append(f"{n_frames:,} frames (~{n_frames/float(fps):.0f}s @ {float(fps):.1f} fps)")
+            elif n_frames:
+                parts.append(f"{n_frames:,} frames")
+            elif fps:
+                parts.append(f"~{float(fps):.1f} fps")
+        except Exception:
+            pass
+        try:
+            parts.append("position data" if d.get('has_position') else "no position data")
+        except Exception:
+            pass
+        try:
+            bouts = d.get('bouts')
+            if isinstance(bouts, dict) and bouts:
+                total = 0
+                for v in bouts.values():
+                    try:
+                        total += len(v)
+                    except TypeError:
+                        pass
+                parts.append(f"{len(bouts)} behavior(s), {total} bout(s)")
+        except Exception:
+            pass
+        return " · ".join(parts)
+
     def show_processing_summary(self):
         """Display a colour-coded popup summarising the processing results.
 
         Green = succeeded, red = failed, amber = warnings (fallbacks applied,
         missing companion files, file-structure deviations).  Adapts to both
-        single-file and whole-folder runs.
+        single-file and whole-folder runs. Successful subjects show what was
+        produced; failures show the error and full traceback, and the whole
+        report can be copied to the clipboard.
         """
         if not hasattr(self, 'processing_summary'):
             return
@@ -12918,6 +12394,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # --- Gather and normalise the collected data -----------------------
         processed_subjects = _unique_preserve(summary.get('subjects_processed', []))
         failed_subjects = summary.get('subjects_failed', [])
+        tracebacks = summary.get('failure_tracebacks', {})
         attempted_subjects = _unique_preserve(summary.get('subjects_attempted', []))
         missing_behavior = _unique_preserve(summary.get('missing_behavior', []))
         missing_ttl = _unique_preserve(summary.get('missing_ttl', []))
@@ -13020,7 +12497,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Scrollable body
         body_wrap = tk.Frame(win, bg=bg_light)
         body_wrap.pack(fill='both', expand=True, padx=12, pady=(0, 6))
-        canvas = tk.Canvas(body_wrap, bg=bg_light, highlightthickness=0, width=600)
+        canvas = tk.Canvas(body_wrap, bg=bg_light, highlightthickness=0, width=640)
         vsb = ttk.Scrollbar(body_wrap, orient='vertical', command=canvas.yview)
         inner = tk.Frame(canvas, bg=bg_light)
         inner.bind('<Configure>',
@@ -13034,25 +12511,59 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
         canvas.bind_all('<MouseWheel>', _on_wheel)
 
-        def add_section(title, items, kind):
-            if not items:
-                return
+        def _card(title, count, kind):
             sbg, sfg = palette[kind]
             card = tk.Frame(inner, bg='white', highlightthickness=1,
                             highlightbackground='#e2e8f0')
             card.pack(fill='x', pady=6, padx=2)
-            tk.Label(card, text=f"{icon[kind]}  {title}  ({len(items)})",
+            tk.Label(card, text=f"{icon[kind]}  {title}  ({count})",
                      bg=sbg, fg=sfg, font=('Segoe UI', 10, 'bold'),
                      anchor='w', padx=12, pady=6).pack(fill='x')
+            return card
+
+        def add_section(title, items, kind):
+            if not items:
+                return
+            card = _card(title, len(items), kind)
             for it in items:
                 tk.Label(card, text=f"• {it}", bg='white', fg=text_dark,
                          font=('Segoe UI', 9), anchor='w', justify='left',
-                         wraplength=555).pack(fill='x', padx=14, pady=1)
+                         wraplength=600).pack(fill='x', padx=14, pady=1)
             tk.Frame(card, bg='white', height=4).pack()
 
-        add_section("Successfully processed", processed_subjects, 'good')
-        add_section("Failed to process",
-                    [f"{s}: {err}" for s, err in failed_subjects], 'bad')
+        def add_detail_section(title, rows, kind):
+            """rows: list of (headline, detail_or_None, mono_or_None)."""
+            if not rows:
+                return
+            card = _card(title, len(rows), kind)
+            for head, detail, mono in rows:
+                tk.Label(card, text=f"• {head}", bg='white', fg=text_dark,
+                         font=('Segoe UI', 9, 'bold'), anchor='w', justify='left',
+                         wraplength=610).pack(fill='x', padx=14, pady=(3, 0))
+                if detail:
+                    tk.Label(card, text=f"     {detail}", bg='white', fg=text_muted,
+                             font=('Segoe UI', 8), anchor='w', justify='left',
+                             wraplength=600).pack(fill='x', padx=14, pady=(0, 1))
+                if mono:
+                    mono_txt = mono.rstrip()
+                    nlines = min(25, mono_txt.count('\n') + 1)
+                    tb_box = tk.Text(card, height=nlines, wrap='none',
+                                     font=('Consolas', 8), bg='#f6f7f9',
+                                     fg='#8a1f1f', relief='flat', bd=0,
+                                     highlightthickness=1,
+                                     highlightbackground='#e2e8f0')
+                    tb_box.insert('1.0', mono_txt)
+                    tb_box.configure(state='disabled')
+                    tb_box.pack(fill='x', padx=16, pady=(1, 4))
+            tk.Frame(card, bg='white', height=4).pack()
+
+        add_detail_section(
+            "Successfully processed",
+            [(s, self._format_subject_processing_detail(s), None)
+             for s in processed_subjects], 'good')
+        add_detail_section(
+            "Failed to process",
+            [(s, str(err), tracebacks.get(s)) for s, err in failed_subjects], 'bad')
         add_section("Attempted but not completed", unresolved, 'bad')
         add_section("File-structure deviations", structure_items, 'warn')
         add_section("Missing companion files", companion_items, 'warn')
@@ -13066,9 +12577,38 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Size the canvas to its content (capped), then centre the window.
         inner.update_idletasks()
-        canvas.configure(height=min(inner.winfo_reqheight(), 380))
+        canvas.configure(height=min(inner.winfo_reqheight(), 460))
 
-        # Close button
+        # --- Plain-text report (for the clipboard / bug reports) -----------
+        def _build_report():
+            L = [f"{icon[status]} {headline}", "=" * 60, "   ·   ".join(sub), ""]
+
+            def blk(title, items):
+                if items:
+                    L.append(f"{title} ({len(items)}):")
+                    L.extend(f"  - {it}" for it in items)
+                    L.append("")
+
+            blk("Successfully processed",
+                [f"{s} — {self._format_subject_processing_detail(s)}".rstrip(' —')
+                 for s in processed_subjects])
+            if failed_subjects:
+                L.append(f"Failed to process ({len(failed_subjects)}):")
+                for s, err in failed_subjects:
+                    L.append(f"  - {s}: {err}")
+                    tb = tracebacks.get(s)
+                    if tb:
+                        L.append(f"    Traceback ({s}):")
+                        L.extend(f"      {ln}" for ln in tb.rstrip().splitlines())
+                L.append("")
+            blk("Attempted but not completed", unresolved)
+            blk("File-structure deviations", structure_items)
+            blk("Missing companion files", companion_items)
+            blk("Fallbacks applied", fallbacks)
+            blk("Subject ID collisions", collisions)
+            return "\n".join(L).rstrip() + "\n"
+
+        # Buttons
         btn_bar = tk.Frame(win, bg=bg_light)
         btn_bar.pack(fill='x', padx=12, pady=(4, 12))
 
@@ -13079,12 +12619,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 pass
             win.destroy()
 
+        def _copy():
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(_build_report())
+                copy_btn.configure(text="Copied ✓")
+                win.after(1500, lambda: copy_btn.configure(text="Copy report"))
+            except Exception:
+                pass
+
         ttk.Button(btn_bar, text="Close", command=_close).pack(side='right')
+        copy_btn = ttk.Button(btn_bar, text="Copy report", command=_copy)
+        copy_btn.pack(side='right', padx=(0, 6))
         win.protocol("WM_DELETE_WINDOW", _close)
 
         win.update_idletasks()
-        w = 640
-        h = min(win.winfo_reqheight(), 660)
+        w = 680
+        h = min(win.winfo_reqheight(), 740)
         try:
             x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
             y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
@@ -19628,33 +19179,111 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True):
         """Embed a matplotlib figure (+ optional toolbar) in `parent`, rendered
-        at the figure's natural pixel size so it does not stretch to fill the
-        whole window. This keeps plots at a sensible, readable scale instead of
-        ballooning to the full width/height of the tab.
+        at a sensible, readable scale and centered horizontally so it does not
+        stretch to fill the whole window.
+
+        The figure is shown at its natural pixel size, except that its on-screen
+        width is capped at MAX_PLOT_WIDTH_IN (figures wider than that are scaled
+        down proportionally, preserving aspect ratio, so nothing balloons across
+        a maximized monitor). The canvas sits in a centering container so wide
+        windows get neutral margins instead of a left-anchored plot.
 
         manual_height: optional pixel height for the graphing area; when None
         the figure's natural height (figsize x dpi) is used.
         Returns the FigureCanvasTkAgg.
         """
-        canvas = FigureCanvasTkAgg(fig, parent)
+        # Cap the figure width by scaling its dpi down (preserves layout/aspect
+        # and shrinks fonts uniformly). Done before drawing so the Agg buffer is
+        # rendered at the final size rather than clipped by the widget.
+        dpi = fig.get_dpi()
+        w_in, h_in = fig.get_size_inches()
+        if w_in > MAX_PLOT_WIDTH_IN:
+            new_dpi = max(40, dpi * (MAX_PLOT_WIDTH_IN / float(w_in)))
+            fig.set_dpi(new_dpi)
+            dpi = new_dpi
+
+        # Centering container: fills the parent so the canvas, packed without
+        # fill, is centered horizontally with margins on wide windows.
+        holder = ttk.Frame(parent)
+        canvas = FigureCanvasTkAgg(fig, holder)
+
+        if add_toolbar:
+            # Create the toolbar first so it reserves the bottom strip of the
+            # parent; the holder then fills the space above it.
+            toolbar = NavigationToolbar2Tk(canvas, parent)
+            toolbar.update()
+
+        holder.pack(side='top', fill='both', expand=True)
         canvas.draw_idle()
         widget = canvas.get_tk_widget()
 
-        dpi = fig.get_dpi()
-        w_px = int(fig.get_size_inches()[0] * dpi)
-        h_px = int(fig.get_size_inches()[1] * dpi)
+        w_px = int(w_in * dpi)
+        h_px = int(h_in * dpi)
         if manual_height is not None:
             h_px = max(100, int(manual_height))
         widget.configure(width=w_px, height=h_px)
-        # Anchor top-left with no fill/expand -> the canvas keeps its requested
-        # size rather than being stretched to the container.
-        widget.pack(anchor='nw')
+        # No fill/expand -> the canvas keeps its requested size; default top
+        # packing centers it horizontally within the holder.
+        widget.pack(anchor='n', pady=(0, 0))
 
-        if add_toolbar:
-            toolbar = NavigationToolbar2Tk(canvas, parent)
-            toolbar.update()
         canvas.draw_idle()
         return canvas
+
+    def _embed_plot_window(self, fig, title, geometry=None):
+        """Pop a matplotlib figure out into its own window, embedded in a
+        vertically-scrollable, width-capped, centered canvas with a navigation
+        toolbar. Replaces the repeated Toplevel + FigureCanvasTkAgg(fill=both,
+        expand=True) + NavigationToolbar2Tk boilerplate so every pop-out behaves
+        and looks the same. Returns (window, FigureCanvasTkAgg)."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+
+        # Toolbar lives at the bottom of the window, outside the scroll area.
+        toolbar_holder = ttk.Frame(win)
+        toolbar_holder.pack(side='bottom', fill='x')
+
+        outer = ttk.Frame(win)
+        outer.pack(side='top', fill='both', expand=True)
+        vscroll = ttk.Scrollbar(outer, orient='vertical')
+        sc_canvas = tk.Canvas(outer, highlightthickness=0,
+                              yscrollcommand=vscroll.set)
+        vscroll.config(command=sc_canvas.yview)
+        sc_canvas.pack(side='left', fill='both', expand=True)
+        vscroll.pack(side='right', fill='y')
+
+        inner = ttk.Frame(sc_canvas)
+        sc_canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _sync_scrollregion(_e=None):
+            sc_canvas.configure(scrollregion=sc_canvas.bbox('all'))
+        inner.bind('<Configure>', _sync_scrollregion)
+
+        # Reuse the in-tab embed for the cap/center logic, but keep the toolbar
+        # out of the scroll region.
+        canvas = self._embed_plot_canvas(fig, inner, add_toolbar=False)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_holder)
+        toolbar.update()
+
+        # Mouse-wheel scrolls the pop-out while the pointer is over it.
+        def _wheel(event):
+            try:
+                sc_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+            except tk.TclError:
+                pass
+        sc_canvas.bind('<Enter>', lambda e: sc_canvas.bind_all('<MouseWheel>', _wheel))
+        sc_canvas.bind('<Leave>', lambda e: sc_canvas.unbind_all('<MouseWheel>'))
+
+        # Size the window to the capped figure (plus toolbar / scrollbar) unless
+        # the caller asked for a specific geometry.
+        if geometry:
+            win.geometry(geometry)
+        else:
+            dpi = fig.get_dpi()
+            w_in, h_in = fig.get_size_inches()
+            w_px = int(w_in * dpi) + 40
+            h_px = min(900, int(h_in * dpi) + 90)
+            win.geometry(f"{max(400, w_px)}x{max(300, h_px)}")
+        return win, canvas
 
     def _bout_fig_width(self, n_items, per_item=0.9, base=3.5, minimum=5.5):
         """Content-aware figure width (inches) for the Bout Analysis plots.
@@ -19707,10 +19336,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                          "Z-scored", "Bouts Overlay"):
             return (10.5, 4.5)
 
-        # Bar / average style plots grow modestly with subject count.
+        # Bar / average style plots: these stack one subplot per visible
+        # photometry channel (G0 / G1), so size by channel ROWS for height and
+        # keep the width modest so a 2-category plot isn't wide-and-short.
         if any(t in plot_type for t in ("Zone Averages", "Distance from Center",
                                         "Out/Back", "Compare Across Bouts")):
-            return (min(12.0, 7.0 + (n - 1) * 0.5), 5.0)
+            try:
+                rows = (1 if self.show_g0.get() else 0) + (1 if self.show_g1.get() else 0)
+            except Exception:
+                rows = 2
+            rows = max(1, rows)
+            width = min(9.5, 6.5 + (n - 1) * 0.4)
+            return (width, 3.2 * rows + 0.8)
 
         # Sensible default.
         return (9.0, 5.0)
@@ -20525,6 +20162,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return sel
 
     
+    def _viz_channel_wavelengths(self, data, sel_chs, has_470, has_570):
+        """Map each selected channel to its OWN wavelength for plotting.
+
+        A green channel is shown only at 470 nm and a red channel only at
+        560/570 nm (gated by the wavelength checkboxes), so the overlay never
+        plots a channel against the wrong excitation wavelength.
+        Returns a list of (channel_index, '470'|'570') pairs.
+        """
+        pairs = []
+        for ch in sel_chs:
+            wl = self.resolve_channel_wavelength(data, ch)  # 470 or 570
+            if wl == 470 and has_470:
+                pairs.append((ch, '470'))
+            elif wl == 570 and has_570:
+                pairs.append((ch, '570'))
+        return pairs
+
     def plot_raw_data(self, fig, data):
         """Plot raw deinterleaved data with dynamic channel selection"""
         show_470 = self.show_470.get()
@@ -20550,52 +20204,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'No channels selected for plotting', ha='center', va='center', fontsize=14)
             return
 
-        # Count number of plots to arrange
-        num_wavelengths = (1 if has_470 else 0) + (1 if has_570 else 0)
-        num_channels = len(sel_chs)
-        total_plots = num_channels * num_wavelengths * 2
-
+        # One row per channel, each at its OWN wavelength (signal + isosbestic).
+        pairs = self._viz_channel_wavelengths(data, sel_chs, has_470, has_570)
+        if not pairs:
+            fig.text(0.5, 0.5, 'No channels match the selected wavelength(s)',
+                     ha='center', va='center', fontsize=14)
+            return
+        n_rows = len(pairs)
         plot_idx = 1
 
-        for wavelength in ['470', '570']:
-            if (wavelength == '470' and not has_470) or (wavelength == '570' and not has_570):
-                continue
-
+        for ch, wavelength in pairs:
             fp_data = data.get(f'data_{wavelength}')
             if fp_data is None:
                 continue
-
             wl_label = f"{wavelength}nm"
-            # choose colors but keep consistent naming
-            for ch in sel_chs:
-                ch_label = self.get_channel_name(data, ch)
-                sig_col = 2 + (ch * 2)
-                iso_col = sig_col + 1
+            ch_label = self.get_channel_name(data, ch)
+            sig_col = 2 + (ch * 2)
+            iso_col = sig_col + 1
 
-                # Signal subplot
-                ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
+            # Signal subplot
+            ax = fig.add_subplot(n_rows, 2, plot_idx)
+            if sig_col < fp_data.shape[1]:
                 signal = self._apply_visualizer_smoothing(fp_data[:, sig_col])
                 ax.plot(fp_data[:, 0], signal, label=f'{ch_label} {wl_label}')
-                ax.set_title(f'{ch_label} {wl_label} raw')
+            ax.set_title(f'{ch_label} {wl_label} raw')
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('F (a.u.)')
+            ax.legend()
+            plot_idx += 1
+
+            # Isosbestic subplot (if present)
+            ax = fig.add_subplot(n_rows, 2, plot_idx)
+            if iso_col < fp_data.shape[1]:
+                iso_signal = self._apply_visualizer_smoothing(fp_data[:, iso_col])
+                ax.plot(fp_data[:, 0], iso_signal, label=f'{ch_label} 415nm')
+                ax.set_title(f'{ch_label} 415nm isosbestic')
                 ax.set_xlabel('Time (s)')
                 ax.set_ylabel('F (a.u.)')
                 ax.legend()
-                plot_idx += 1
-
-                # Isosbestic subplot (if present)
-                if iso_col < fp_data.shape[1]:
-                    ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
-                    iso_signal = self._apply_visualizer_smoothing(fp_data[:, iso_col])
-                    ax.plot(fp_data[:, 0], iso_signal, label=f'{ch_label} 415nm')
-                    ax.set_title(f'{ch_label} 415nm isosbestic')
-                    ax.set_xlabel('Time (s)')
-                    ax.set_ylabel('F (a.u.)')
-                    ax.legend()
-                else:
-                    # placeholder empty subplot
-                    ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
-                    ax.text(0.5, 0.5, 'No isosbestic', ha='center', va='center')
-                plot_idx += 1
+            else:
+                ax.text(0.5, 0.5, 'No isosbestic', ha='center', va='center')
+            plot_idx += 1
 
         fig.tight_layout()
     
@@ -20622,46 +20271,46 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'No channels selected for plotting', ha='center', va='center', fontsize=14)
             return
 
-        num_wavelengths = (1 if has_470 else 0) + (1 if has_570 else 0)
-        num_channels = len(sel_chs)
+        # One row per channel, each at its OWN wavelength (signal + isosbestic).
+        pairs = self._viz_channel_wavelengths(data, sel_chs, has_470, has_570)
+        if not pairs:
+            fig.text(0.5, 0.5, 'No channels match the selected wavelength(s)',
+                     ha='center', va='center', fontsize=14)
+            return
+        n_rows = len(pairs)
 
         plot_idx = 1
-        for wavelength in ['470', '570']:
-            if (wavelength == '470' and not has_470) or (wavelength == '570' and not has_570):
-                continue
-
+        for ch, wavelength in pairs:
             dff = data.get(f'dff_{wavelength}')
             if dff is None:
                 continue
-
             wl_label = f"{wavelength}nm"
-            for ch in sel_chs:
-                ch_label = self.get_channel_name(data, ch)
-                sig_col = 2 + (ch * 2) if dff.shape[1] > 2 + ch else 2 + ch
+            ch_label = self.get_channel_name(data, ch)
+            sig_col = 2 + (ch * 2) if dff.shape[1] > 2 + ch else 2 + ch
 
-                # Signal
-                ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
-                signal = self._apply_visualizer_smoothing(dff[:, sig_col])
-                ax.plot(dff[:, 0], signal, label=f'{ch_label} {wl_label}')
-                ax.set_title(f'{ch_label} {wl_label} (dF/F%)')
-                ax.set_xlabel('Time (min)')
-                ax.set_ylabel('dF/F (%)')
-                ax.legend()
-                plot_idx += 1
+            # Signal
+            ax = fig.add_subplot(n_rows, 2, plot_idx)
+            signal = self._apply_visualizer_smoothing(dff[:, sig_col])
+            ax.plot(dff[:, 0], signal, label=f'{ch_label} {wl_label}')
+            ax.set_title(f'{ch_label} {wl_label} (dF/F%)')
+            ax.set_xlabel('Time (min)')
+            ax.set_ylabel('dF/F (%)')
+            ax.legend()
+            plot_idx += 1
 
-                # Iso (if exists)
-                iso_col = sig_col + 1
-                ax = fig.add_subplot(num_channels * num_wavelengths, 2, plot_idx)
-                if iso_col < dff.shape[1]:
-                    iso_signal = self._apply_visualizer_smoothing(dff[:, iso_col])
-                    ax.plot(dff[:, 0], iso_signal, label=f'{ch_label} 415nm')
-                else:
-                    ax.text(0.5, 0.5, 'No isosbestic', ha='center', va='center')
-                ax.set_title(f'{ch_label} 415nm (dF/F%)')
-                ax.set_xlabel('Time (min)')
-                ax.set_ylabel('dF/F (%)')
-                ax.legend()
-                plot_idx += 1
+            # Iso (if exists)
+            iso_col = sig_col + 1
+            ax = fig.add_subplot(n_rows, 2, plot_idx)
+            if iso_col < dff.shape[1]:
+                iso_signal = self._apply_visualizer_smoothing(dff[:, iso_col])
+                ax.plot(dff[:, 0], iso_signal, label=f'{ch_label} 415nm')
+            else:
+                ax.text(0.5, 0.5, 'No isosbestic', ha='center', va='center')
+            ax.set_title(f'{ch_label} 415nm (dF/F%)')
+            ax.set_xlabel('Time (min)')
+            ax.set_ylabel('dF/F (%)')
+            ax.legend()
+            plot_idx += 1
 
         fig.tight_layout()
     
@@ -20687,33 +20336,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'No channels selected for plotting', ha='center', va='center', fontsize=14)
             return
 
-        num_wavelengths = (1 if has_470 else 0) + (1 if has_570 else 0)
-        total_plots = len(sel_chs) * num_wavelengths
+        # One subplot per channel, each at its OWN wavelength.
+        pairs = self._viz_channel_wavelengths(data, sel_chs, has_470, has_570)
+        if not pairs:
+            fig.text(0.5, 0.5, 'No channels match the selected wavelength(s)',
+                     ha='center', va='center', fontsize=14)
+            return
+        total_plots = len(pairs)
 
         plot_idx = 1
-        for wavelength in ['470', '570']:
-            if (wavelength == '470' and not has_470) or (wavelength == '570' and not has_570):
-                continue
-
+        for ch, wavelength in pairs:
             corrected = data.get(f'corrected_{wavelength}')
             if corrected is None:
                 continue
-
-            for ch in sel_chs:
-                ch_label = self.get_channel_name(data, ch)
-                ax = fig.add_subplot(total_plots, 1, plot_idx)
-                col = 2 + ch
-                if col < corrected.shape[1]:
-                    signal = self._apply_visualizer_smoothing(corrected[:, col])
-                    ax.plot(corrected[:, 0], signal, label=f'{ch_label} {wavelength}nm')
-                else:
-                    ax.text(0.5, 0.5, 'No data for this channel', ha='center', va='center')
-                ax.set_title(f'Motion Corrected {ch_label} {wavelength}nm')
-                ax.set_xlabel('Time (min)')
-                ax.set_ylabel('dF/F (%)')
-                ax.grid(True, alpha=0.3)
-                ax.legend()
-                plot_idx += 1
+            ch_label = self.get_channel_name(data, ch)
+            ax = fig.add_subplot(total_plots, 1, plot_idx)
+            col = 2 + ch
+            if col < corrected.shape[1]:
+                signal = self._apply_visualizer_smoothing(corrected[:, col])
+                ax.plot(corrected[:, 0], signal, label=f'{ch_label} {wavelength}nm')
+            else:
+                ax.text(0.5, 0.5, 'No data for this channel', ha='center', va='center')
+            ax.set_title(f'Motion Corrected {ch_label} {wavelength}nm')
+            ax.set_xlabel('Time (min)')
+            ax.set_ylabel('dF/F (%)')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            plot_idx += 1
 
         fig.tight_layout()
     
@@ -20738,19 +20387,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'No channels selected for plotting', ha='center', va='center', fontsize=14)
             return
 
+        # Plot each channel only at its OWN wavelength (green->470, red->570),
+        # so the overlay never shows a channel against the wrong excitation.
         traces = []
-        for wavelength in ['470', '570']:
-            if (wavelength == '470' and not has_470) or (wavelength == '570' and not has_570):
-                continue
+        for ch, wavelength in self._viz_channel_wavelengths(data, sel_chs, has_470, has_570):
             zscore = data.get(f'zscore_{wavelength}')
             if zscore is None:
                 continue
-            wl_label = f"{wavelength}nm"
-            for ch in sel_chs:
-                col = 2 + ch
-                if col < zscore.shape[1]:
-                    signal = self._apply_visualizer_smoothing(zscore[:, col])
-                    traces.append((zscore[:, 0], signal, f'{self.get_channel_name(data, ch)} {wl_label}'))
+            col = 2 + ch
+            if col < zscore.shape[1]:
+                signal = self._apply_visualizer_smoothing(zscore[:, col])
+                traces.append((zscore[:, 0], signal,
+                               f'{self.get_channel_name(data, ch)} {wavelength}nm'))
 
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
 
@@ -22496,6 +22144,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                 for ch in range(actual_nch):
                     ch_name = self.get_channel_name(data, ch)
+                    # Only export each channel at its OWN wavelength (green->470,
+                    # red->570); skip the wrong-wavelength cross combinations.
+                    if self.resolve_channel_wavelength(data, ch) != int(wavelength):
+                        continue
                     # Skip excluded channels
                     if apply_excl and self.is_subject_channel_excluded(subject, ch_name):
                         continue
@@ -23181,53 +22833,40 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         continue
                     
                     dataset = data[wl_key]
-                    
-                    # Export G0 channel if selected
-                    if show_g0 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G0')):
-                        if dataset.shape[1] > 2:  # Has G0 data
-                            if data_key == 'data':  # Raw data
-                                cols = ['time_s', 'computer_ts', f'G0_{wavelength}nm']
-                                g0_data = dataset[:, [0, 1, 2]]
-                            elif data_key == 'zscore':
-                                cols = ['time_min', 'computer_ts', f'G0_{wavelength}nm_zscore']
-                                g0_data = dataset[:, [0, 1, 2]]
-                            else:  # dff or corrected
-                                cols = ['time_min', 'computer_ts', f'G0_{wavelength}nm_{data_suffix}']
-                                g0_data = dataset[:, [0, 1, 2]]
-                            
-                            df_g0 = pd.DataFrame(g0_data, columns=cols)
-                            if subject_to_group:
-                                df_g0.insert(0, 'group', subject_to_group.get(subject, 'Unknown'))
-                            df_g0['subject'] = subject
-                            df_g0['wavelength'] = f'{wavelength}nm'
-                            df_g0['channel'] = 'G0'
-                            all_data.append(df_g0)
-                    
-                    # Export G1 channel if selected
-                    if show_g1 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G1')):
-                        # Check if G1 data exists based on data type
-                        has_g1 = False
-                        if data_key == 'data' and dataset.shape[1] > 4:
-                            has_g1 = True
-                            cols = ['time_s', 'computer_ts', f'G1_{wavelength}nm']
-                            g1_data = dataset[:, [0, 1, 4]]
-                        elif data_key == 'zscore' and dataset.shape[1] > 3:
-                            has_g1 = True
-                            cols = ['time_min', 'computer_ts', f'G1_{wavelength}nm_zscore']
-                            g1_data = dataset[:, [0, 1, 3]]
-                        elif data_key in ['dff', 'corrected'] and dataset.shape[1] > 3:
-                            has_g1 = True
-                            cols = ['time_min', 'computer_ts', f'G1_{wavelength}nm_{data_suffix}']
-                            g1_data = dataset[:, [0, 1, 3]]
-                        
-                        if has_g1:
-                            df_g1 = pd.DataFrame(g1_data, columns=cols)
-                            if subject_to_group:
-                                df_g1.insert(0, 'group', subject_to_group.get(subject, 'Unknown'))
-                            df_g1['subject'] = subject
-                            df_g1['wavelength'] = f'{wavelength}nm'
-                            df_g1['channel'] = 'G1'
-                            all_data.append(df_g1)
+
+                    # Export every selected channel at its OWN wavelength.
+                    # 'data' and 'dff' store signal+iso pairs (2 cols/channel);
+                    # 'corrected'/'zscore' store 1 col/channel.
+                    per = 2 if data_key in ('data', 'dff') else 1
+                    n_ch = (dataset.shape[1] - 2) // per
+                    sel_chs = self.get_selected_viz_channels(data)
+                    time_label = 'time_s' if data_key == 'data' else 'time_min'
+                    for ch in range(n_ch):
+                        if sel_chs and ch not in sel_chs:
+                            continue
+                        # Each channel only at its own wavelength (green->470, red->570).
+                        if self.resolve_channel_wavelength(data, ch) != int(wavelength):
+                            continue
+                        ch_name = self.get_channel_name(data, ch)
+                        if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, ch_name):
+                            continue
+                        sig_col = 2 + ch * per
+                        if sig_col >= dataset.shape[1]:
+                            continue
+                        if data_key == 'data':
+                            col_name = f'{ch_name}_{wavelength}nm'
+                        elif data_key == 'zscore':
+                            col_name = f'{ch_name}_{wavelength}nm_zscore'
+                        else:  # dff or corrected
+                            col_name = f'{ch_name}_{wavelength}nm_{data_suffix}'
+                        cols = [time_label, 'computer_ts', col_name]
+                        df_ch = pd.DataFrame(dataset[:, [0, 1, sig_col]], columns=cols)
+                        if subject_to_group:
+                            df_ch.insert(0, 'group', subject_to_group.get(subject, 'Unknown'))
+                        df_ch['subject'] = subject
+                        df_ch['wavelength'] = f'{wavelength}nm'
+                        df_ch['channel'] = ch_name
+                        all_data.append(df_ch)
             
             if all_data:
                 # Check which format the data is in
@@ -33461,9 +33100,11 @@ cat("OK\n")
         outer = ttk.Frame(tab)
         outer.pack(fill='both', expand=True, padx=5, pady=5)
 
-        ctrl_panel = ttk.Frame(outer, width=270)
+        # Size the control column to its content (DPI-safe) so button labels
+        # aren't clipped by a hard-fixed pixel width.
+        ctrl_panel = ttk.Frame(outer, width=CONTROL_PANEL_W)
         ctrl_panel.pack(side='left', fill='y', padx=(0, 5))
-        ctrl_panel.pack_propagate(False)
+        ctrl_panel.pack_propagate(True)
 
         self.dec_prob_plot_frame = ttk.Frame(outer)
         self.dec_prob_plot_frame.pack(side='left', fill='both', expand=True)
@@ -33562,11 +33203,11 @@ cat("OK\n")
         # ── Action buttons ────────────────────────────────────────────────────
         btn_frame = ttk.Frame(ctrl_panel)
         btn_frame.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame, text="Settings",
+        ttk.Button(btn_frame, text="Settings", style='Compact.TButton',
                    command=self.open_dec_prob_settings).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_frame, text="Run Analysis",
+        ttk.Button(btn_frame, text="Run Analysis", style='Compact.TButton',
                    command=self.run_decision_probability).pack(side='left', padx=3)
-        ttk.Button(btn_frame, text="Export",
+        ttk.Button(btn_frame, text="Export", style='Compact.TButton',
                    command=self.export_decision_probability).pack(side='left', padx=3)
 
         # ── Placeholder ───────────────────────────────────────────────────────
@@ -34657,9 +34298,12 @@ cat("OK\n")
         outer = ttk.Frame(tab)
         outer.pack(fill='both', expand=True, padx=5, pady=5)
 
-        ctrl_panel = ttk.Frame(outer, width=290)
+        # Size the control column to its content (with a sensible minimum) so
+        # nothing is clipped — a hard-fixed pixel width overflowed at higher
+        # Windows DPI scaling, cutting off button labels.
+        ctrl_panel = ttk.Frame(outer, width=CONTROL_PANEL_W)
         ctrl_panel.pack(side='left', fill='y', padx=(0, 5))
-        ctrl_panel.pack_propagate(False)
+        ctrl_panel.pack_propagate(True)
 
         # Prominent BETA badge — this tab is new/experimental.
         beta_badge = tk.Label(ctrl_panel, text="BETA",
@@ -34786,15 +34430,18 @@ cat("OK\n")
         # ── Actions ────────────────────────────────────────────────────────
         btn_frame = ttk.Frame(ctrl_panel)
         btn_frame.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame, text="Run", command=self.run_kinematics).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_frame, text="Summarize", command=self.summarize_kinematics).pack(side='left', padx=3)
-        ttk.Button(btn_frame, text="Export", command=self.export_kinematics).pack(side='left', padx=3)
+        ttk.Button(btn_frame, text="Run", style='Compact.TButton',
+                   command=self.run_kinematics).pack(side='left', padx=(0, 3))
+        ttk.Button(btn_frame, text="Summarize", style='Compact.TButton',
+                   command=self.summarize_kinematics).pack(side='left', padx=3)
+        ttk.Button(btn_frame, text="Export", style='Compact.TButton',
+                   command=self.export_kinematics).pack(side='left', padx=3)
 
         btn_frame2 = ttk.Frame(ctrl_panel)
         btn_frame2.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame2, text="Graph Settings…",
+        ttk.Button(btn_frame2, text="Graph Settings…", style='Compact.TButton',
                    command=self.open_kin_graph_settings).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_frame2, text="ⓘ Explain plot",
+        ttk.Button(btn_frame2, text="ⓘ Explain plot", style='Compact.TButton',
                    command=self.show_kin_explainer).pack(side='left', padx=3)
 
         # ── Results readout ────────────────────────────────────────────────
