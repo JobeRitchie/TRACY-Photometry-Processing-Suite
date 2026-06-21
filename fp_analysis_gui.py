@@ -34,8 +34,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.4.1"
-APP_VERSION_DATE = "June 18, 2026"
+APP_VERSION = "1.5.0"
+APP_VERSION_DATE = "June 21, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -3070,6 +3070,18 @@ class FPAnalysisGUI:
         self.integrity_channel_combo.grid(row=3, column=5, padx=5, sticky='w')
         # Bind channel change to refresh plot (use after_idle to preserve selection)
         self.integrity_channel_combo.bind('<<ComboboxSelected>>', lambda e: self.root.after_idle(self.generate_plot))
+
+        # Sensor mode: ignore the 415 nm isosbestic when scoring integrity.
+        # GRAB-type sensors (e.g. GRABDA) have a 415 channel that does not act as a
+        # true motion control, so correlation/motion terms against 415 are dropped
+        # and quality is judged from the indicator channel alone.
+        self.integrity_sensor_mode_var = tk.BooleanVar(value=False)
+        self.integrity_sensor_check = ttk.Checkbutton(
+            control_frame, text="Sensor (ignore 415nm)",
+            variable=self.integrity_sensor_mode_var,
+            command=lambda: self.root.after_idle(self.generate_plot),
+            state='disabled')
+        self.integrity_sensor_check.grid(row=3, column=6, padx=5, sticky='w')
         
         # Spatial binning for heatmap
         ttk.Label(control_frame, text="Bin Size (cm):").grid(row=4, column=2, sticky='w', padx=5)
@@ -9251,6 +9263,24 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Signal Integrity scoring rebuilt from the ground up. A signal-fluctuation
+    SNR (sf-SNR) now drives the score, with explicit gating so genuinely bad
+    recordings score below 50 instead of being flattered by the old weighting.
+    Per-channel metrics are computed by a single shared engine and reported
+    consistently in both the single-subject and multi-subject views.
+  • New — "Sensor (ignore 415nm)" toggle on the Signal Integrity tab. GRAB-type
+    sensors (e.g. GRABDA) carry a 415 nm channel that is not a true motion control,
+    so when enabled the 415-based correlation / motion terms are dropped from the
+    score. Applies to both single- and multi-subject integrity views.
+  • Fix (correctness) — Behavior / position files without headers are now classified
+    by column CONTENT, not by column count. TRACY distinguishes a real X/Y
+    AnimalPosition track from a sequential frame index and from a timestamp-only
+    file. Previously blank or constant X/Y columns could be misread as real
+    position data, corrupting kinematics or crashing calibration; single-column
+    timestamp files are still aligned for behavior↔FP analysis.
+
+Version 1.4.1  •  June 18, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Gridlines on/off toggle for plots. Every plot's navigation toolbar now
     has a "Grid" checkbox (also in Advanced Graph Settings); toggling it instantly
     shows/hides gridlines on all open graphs and applies to new ones.
@@ -12951,53 +12981,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 self.processing_summary.setdefault('fallbacks_used', []).append(
                                     f"{subject_id}: position file has no timestamp column")
                     else:
-                        # Named columns but no X/Y found - use positional heuristic
+                        # Named columns but no recognized X/Y names — fall back to
+                        # content-based classification (same logic as the no-header
+                        # path) instead of trusting the column count.
                         beh_data = df_beh.apply(pd.to_numeric, errors='coerce').values
-                        if beh_data.shape[1] >= 4:
-                            has_position = True
-                            beh_raw = beh_data
-                            self.log_message(f"  Position data detected (4+ columns, assuming X/Y at positions 2-3)")
-                        elif beh_data.shape[1] == 1:
-                            # Single-column position file = per-frame timestamps only
-                            # (no X/Y). Build the standard [frame, timestamp] layout
-                            # so the sync code (reads column 1 as the timestamp) works.
-                            beh_raw = self._build_timestamp_only_beh(df_beh.iloc[:, 0])
-                            has_position = False
+                        beh_raw, has_position, info = self._standardize_behavior_array(beh_data)
+
+                        if has_position:
                             self.log_message(
-                                "  Single-column position file detected — treating it as "
-                                "per-frame timestamps (no X/Y); frame indices synthesized.")
-                            if hasattr(self, 'processing_summary'):
-                                self.processing_summary['no_position_data'].append(subject_id)
+                                f"  Position data detected by content ({beh_data.shape[1]} columns; "
+                                f"frame=col{info['frame_idx']}, timestamp=col{info['ts_idx']}, "
+                                f"X=col{info['x_idx']}, Y=col{info['y_idx']}).")
                         else:
-                            beh_raw = beh_data[:, :2] if beh_data.shape[1] >= 2 else beh_data
-                            self.log_message(f"  No position data (only {beh_data.shape[1]} columns)")
+                            ts_desc = ("synthesized" if info['ts_idx'] is None
+                                       else f"col{info['ts_idx']}")
+                            self.log_message(
+                                f"  No usable position data ({beh_data.shape[1]} column(s); "
+                                f"no coordinate-like X/Y pair found) — treating file as "
+                                f"per-frame timestamps ({ts_desc}) for FP alignment only.")
                             if hasattr(self, 'processing_summary'):
                                 self.processing_summary['no_position_data'].append(subject_id)
                 else:
-                    # No header - numeric data starts at first row
-                    # Standard format: frame(0), timestamp(1), X(2), Y(3), ...
+                    # No header - numeric data starts at first row. Classify the
+                    # columns by content rather than by count: blank/sparse trailing
+                    # columns must not be mistaken for real X/Y (which previously
+                    # crashed calibration on ComputerTS timestamp-only files).
                     df_beh = pd.read_csv(computerts_file, header=None)
-                    beh_data = df_beh.values
+                    beh_data = df_beh.apply(pd.to_numeric, errors='coerce').values
+                    beh_raw, has_position, info = self._standardize_behavior_array(beh_data)
 
-                    if beh_data.shape[1] >= 4:
-                        has_position = True
-                        beh_raw = beh_data
-                        self.log_message(f"  Position data detected (no header, {beh_data.shape[1]} columns, X/Y assumed at positions 2-3)")
-                    elif beh_data.shape[1] == 1:
-                        # Single-column position file = per-frame timestamps only
-                        # (no X/Y). Build the standard [frame, timestamp] layout so
-                        # the sync code, which reads column 1 as the timestamp,
-                        # works correctly. Frame indices are synthesized.
-                        beh_raw = self._build_timestamp_only_beh(df_beh.iloc[:, 0])
-                        has_position = False
+                    if has_position:
                         self.log_message(
-                            "  Single-column position file detected — treating it as "
-                            "per-frame timestamps (no X/Y); frame indices synthesized.")
-                        if hasattr(self, 'processing_summary'):
-                            self.processing_summary['no_position_data'].append(subject_id)
+                            f"  Position data detected (no header, {beh_data.shape[1]} columns; "
+                            f"frame=col{info['frame_idx']}, timestamp=col{info['ts_idx']}, "
+                            f"X=col{info['x_idx']}, Y=col{info['y_idx']}).")
                     else:
-                        beh_raw = beh_data[:, :2] if beh_data.shape[1] >= 2 else beh_data
-                        self.log_message(f"  No position data (only {beh_data.shape[1]} columns)")
+                        ts_desc = ("synthesized" if info['ts_idx'] is None
+                                   else f"col{info['ts_idx']}")
+                        self.log_message(
+                            f"  No usable position data ({beh_data.shape[1]} column(s); "
+                            f"no coordinate-like X/Y pair found) — treating file as "
+                            f"per-frame timestamps ({ts_desc}) for FP alignment only.")
                         if hasattr(self, 'processing_summary'):
                             self.processing_summary['no_position_data'].append(subject_id)
             except Exception as e:
@@ -13736,6 +13760,123 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return corrected
     
+    @staticmethod
+    def _looks_like_frame_index(col):
+        """True if a numeric column is a (near-)sequential row/frame index.
+
+        Frame columns look like 1,2,3,... or 0,1,2,... — integer-valued,
+        strictly increasing, step of ~1, starting at 0 or 1. This lets us tell
+        the row-number column apart from a time-of-day timestamp column (which is
+        also increasing but holds large non-unit-step floats).
+        """
+        v = col[~np.isnan(col)]
+        if len(v) < 3:
+            return False
+        if not np.allclose(v, np.round(v), atol=1e-6):
+            return False
+        d = np.diff(v)
+        return bool(v[0] in (0.0, 1.0) and np.all(d > 0) and np.median(d) == 1.0)
+
+    @staticmethod
+    def _looks_like_position_col(col, min_frac=0.5):
+        """True if a numeric column looks like an X/Y coordinate track.
+
+        A real position track is well-populated, non-constant, and — crucially —
+        reverses direction (the animal moves back and forth). Monotonic columns
+        (frame indices, time-of-day / hardware clocks) only ever increase, so the
+        direction-reversal test rejects them. Sparse marker columns (e.g. a column
+        that is empty except for a scattered constant ``1``) fail the populated /
+        non-constant tests. This is what distinguishes a genuine AnimalPosition
+        file from a ComputerTS timestamp-only file whose X/Y columns are blank.
+        """
+        n = len(col)
+        v = col[~np.isnan(col)]
+        if n == 0 or len(v) < 10 or (len(v) / n) < min_frac:
+            return False
+        if np.max(v) - np.min(v) <= 0:        # constant → not a coordinate
+            return False
+        d = np.diff(v)
+        increasing = np.all(d >= 0)
+        decreasing = np.all(d <= 0)
+        return not (increasing or decreasing)  # clocks/indices are monotonic
+
+    def _standardize_behavior_array(self, beh_data):
+        """Classify the columns of an un-named behavior/position file by content.
+
+        Acquisition files come in several shapes — a full AnimalPosition file
+        ([frame, timestamp, X, Y, hw-clock]), a ComputerTS file that is really
+        just [frame, timestamp] with blank/sparse trailing columns, or a single
+        bare timestamp column. Rather than guess from the column *count* (which
+        misread blank X/Y columns as real position data and crashed calibration),
+        we identify each role from what the column actually contains:
+
+          - frame index  → sequential integer column (``_looks_like_frame_index``)
+          - timestamp    → earliest well-populated monotonically-increasing,
+                           non-frame column (the FP-sync key)
+          - X / Y        → first adjacent pair of coordinate-like columns
+                           (``_looks_like_position_col``)
+
+        Returns ``(beh_raw, has_position, info)`` where ``beh_raw`` is in the
+        canonical layout the rest of the pipeline expects: [frame, timestamp,
+        X, Y, *rest] when position is present, or [frame, timestamp] when it is
+        a timestamp-only file (so behavior↔FP alignment still runs).
+        """
+        arr = np.asarray(beh_data, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        n, ncols = arr.shape
+        cols = [arr[:, i] for i in range(ncols)]
+
+        # 1. Frame/row index.
+        frame_idx = next((i for i, c in enumerate(cols)
+                          if self._looks_like_frame_index(c)), None)
+
+        # 2. Timestamp: earliest well-populated, increasing, non-frame column.
+        ts_idx = None
+        for i, c in enumerate(cols):
+            if i == frame_idx:
+                continue
+            v = c[~np.isnan(c)]
+            if len(v) >= max(2, 0.5 * n) and np.all(np.diff(v) >= 0) and np.max(v) > np.min(v):
+                ts_idx = i
+                break
+        if ts_idx is None:
+            # Fallback: first non-frame column that has any data at all.
+            ts_idx = next((i for i, c in enumerate(cols)
+                           if i != frame_idx and np.isfinite(c).any()), None)
+
+        # 3. Position: first adjacent pair of coordinate-like columns.
+        excluded = {frame_idx, ts_idx}
+        pos_like = [i for i in range(ncols)
+                    if i not in excluded and self._looks_like_position_col(cols[i])]
+        x_idx = y_idx = None
+        for i in pos_like:
+            if (i + 1) in pos_like:
+                x_idx, y_idx = i, i + 1
+                break
+        if x_idx is None and len(pos_like) >= 2:
+            x_idx, y_idx = pos_like[0], pos_like[1]
+
+        has_position = x_idx is not None and y_idx is not None
+
+        frame_col = cols[frame_idx] if frame_idx is not None else np.arange(n, dtype=float)
+        ts_col = cols[ts_idx] if ts_idx is not None else np.full(n, np.nan)
+
+        if has_position:
+            used = {frame_idx, ts_idx, x_idx, y_idx}
+            rest = [cols[i] for i in range(ncols) if i not in used]
+            beh_raw = np.column_stack([frame_col, ts_col, cols[x_idx], cols[y_idx]] + rest)
+        else:
+            # Timestamp-only file: keep [frame, timestamp] so alignment still runs
+            # but no (garbage) position analysis is attempted.
+            beh_raw = np.column_stack([frame_col, ts_col])
+
+        info = {
+            'frame_idx': frame_idx, 'ts_idx': ts_idx,
+            'x_idx': x_idx, 'y_idx': y_idx, 'has_position': has_position,
+        }
+        return beh_raw, has_position, info
+
     def _build_timestamp_only_beh(self, ts_series):
         """Build a standard [frame, timestamp] behavior array from a single column.
 
@@ -13942,7 +14083,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         valid_x = x_coords[~np.isnan(x_coords)]
         valid_y = y_coords[~np.isnan(y_coords)]
         
-        if len(valid_x) > 0:
+        # Both X and Y must have at least one numeric sample to calibrate. Some
+        # tracking exports (e.g. sessions where the video frame rate was wrong)
+        # drop the Y coordinate for the whole session, leaving an all-NaN Y
+        # column while X still has data. Calibrating then crashed on
+        # np.min(valid_y) ("zero-size array to reduction operation minimum").
+        # Skip calibration in that case so the photometry signal still processes.
+        x_range = (np.max(valid_x) - np.min(valid_x)) if len(valid_x) > 0 else 0.0
+        if len(valid_x) > 0 and len(valid_y) > 0 and x_range > 0:
             # Calculate conversion ratio
             x_min = np.min(valid_x)
             x_max = np.max(valid_x)
@@ -13975,7 +14123,25 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Apply conversion
             beh_synced[:, 2] = (x_coords - x_min) * conversion_ratio  # X in cm
             beh_synced[:, 3] = (y_coords - y_offset) * y_ratio         # Y in cm
-        
+        else:
+            # Unusable position data — leave X/Y as-is and skip calibration so the
+            # rest of processing (and the photometry signal) can still complete.
+            reason = (
+                "X column is empty" if len(valid_x) == 0
+                else "Y column is empty (tracking lost the animal for the whole session)"
+                if len(valid_y) == 0
+                else "X pixel range is zero (no movement / single value)"
+            )
+            self.log_message(
+                f"    Position calibration skipped — {reason} "
+                f"(valid samples: X={len(valid_x)}, Y={len(valid_y)}). "
+                f"Position/velocity/zone metrics will be unavailable for this "
+                f"subject; the photometry signal is unaffected."
+            )
+            if hasattr(self, 'processing_summary'):
+                self.processing_summary.setdefault('fallbacks_used', []).append(
+                    f"position calibration skipped ({reason})")
+
         # 2. Calculate velocity
         frame_rate = self.params['fps']
         time_per_frame = 1.0 / frame_rate
@@ -18914,9 +19080,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             else:
                 # Disable for multi-subject view
                 self.integrity_channel_combo['state'] = 'disabled'
+            # Sensor mode applies to both single- and multi-subject integrity views
+            self.integrity_sensor_check['state'] = 'normal'
         else:
             self.integrity_channel_combo['state'] = 'disabled'
-        
+            self.integrity_sensor_check['state'] = 'disabled'
+
         # Restore saved selections after a brief delay to ensure UI has updated
         if saved_groups is not None:
             self.root.after(10, lambda: self._restore_group_selections(saved_groups))
@@ -20248,6 +20417,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Only enable for single-subject Signal Integrity view
         if plot_type == "Signal Integrity":
+            # Sensor mode applies to both single- and multi-subject integrity views
+            self.integrity_sensor_check['state'] = 'normal'
             selected_indices = self.viz_subject_listbox.curselection()
             if len(selected_indices) == 1:
                 # Enable channel selector
@@ -20265,9 +20436,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if self.integrity_channel_var.get() not in available_channels:
                             self.integrity_channel_var.set(available_channels[0])
                 return
-        
+            self.integrity_channel_combo['state'] = 'disabled'
+            return
+
         # Disable for all other cases
         self.integrity_channel_combo['state'] = 'disabled'
+        self.integrity_sensor_check['state'] = 'disabled'
 
     def build_viz_channel_checkboxes(self, subject):
         """Create checkboxes for each available photometry channel for the given subject"""
@@ -20627,143 +20801,211 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return shifts
     
-    def calculate_signal_quality_score(self, snr_470, snr_570, cv_470, cv_570, 
-                                       artifacts_470_count, artifacts_570_count, 
-                                       correlation_470, correlation_570,
-                                       sustained_shifts_470=None, sustained_shifts_570=None,
-                                       corr_range_470=None, corr_range_570=None):
-        """  
-        Calculate an overall signal quality score (0-100) based on multiple metrics.
-        
-        Scoring based on empirical analysis with improved transient-based SNR:
-        - SNR (transient amplitude): >4.0 excellent, 3.5-4.0 good, 3.0-3.5 fair, <3.0 poor
-        - Signal Std (dF/F%): <0.5 excellent, 0.5-1.0 good, >1.0 poor (HIGH PENALTY for noise)
-        - Corrected Range (after motion correction): >3.5 excellent, 2.5-3.5 good, 1.5-2.5 fair, <1.5 poor
-        - Artifacts: 0 excellent, 1 good, 2-3 fair, >5 poor (Z-SCORE based: |z|>15)
-        - Correlation: <0.4 minimal, 0.4-0.6 moderate, >0.6 poor (HIGH PENALTY - main discriminator!)
-        - Sustained Shifts: Major baseline instabilities
-        
-        Weight distribution: SNR=30%, Std=15%, CorrRange=20%, Artifacts=10%, Correlation=20%, Shifts=5%
+    def integrity_series_stats(self, x, fps):
         """
-        scores = []
-        
-        # SNR Score (30% weight) - OPTIMIZED for transient-based SNR
-        # Based on empirical data: excellent signals >4.0, good 3.5-4.0, fair 3.0-3.5, poor <3.0
-        for snr in [snr_470, snr_570]:
-            if snr is not None:
-                if snr >= 4.0:
-                    scores.append(100 * 0.30)
-                elif snr >= 3.5:
-                    # Good: 80 at 3.5 to 100 at 4.0
-                    scores.append((80 + (snr - 3.5) * 40) * 0.30)
-                elif snr >= 3.0:
-                    # Fair: 60 at 3.0 to 80 at 3.5
-                    scores.append((60 + (snr - 3.0) * 40) * 0.30)
-                elif snr >= 2.5:
-                    # Poor: 40 at 2.5 to 60 at 3.0
-                    scores.append((40 + (snr - 2.5) * 40) * 0.30)
-                elif snr >= 2.0:
-                    # Very poor: 20 at 2.0 to 40 at 2.5
-                    scores.append((20 + (snr - 2.0) * 40) * 0.30)
-                else:
-                    # Fail: <20 for SNR < 2.0
-                    scores.append(max(0, snr * 10) * 0.30)
-                break  # Only use first available wavelength
-        
-        # Signal Std Score (15% weight) - lower is better, STRONG penalty for >1.0
-        # Reduced from 25% but with steeper penalty curve
-        for std in [cv_470, cv_570]:
-            if std is not None:
-                if std <= 0.5:
-                    scores.append(100 * 0.15)
-                elif std <= 1.0:
-                    scores.append((70 + (1.0 - std) * 60) * 0.15)
-                elif std <= 2.0:
-                    # Strong penalty: drops from 40 at 1.0 to 10 at 2.0
-                    scores.append((40 - (std - 1.0) * 30) * 0.15)
-                else:
-                    # Severe penalty for extremely noisy signals
-                    scores.append(max(0, 10 - (std - 2.0) * 5) * 0.15)
-                break
-        
-        # Corrected Dynamic Range Score (20% weight) - NEW METRIC
-        # Measures signal variation AFTER motion correction (key for detecting flat/poor signals)
-        for corr_range in [corr_range_470, corr_range_570]:
-            if corr_range is not None:
-                if corr_range >= 3.5:
-                    scores.append(100 * 0.20)
-                elif corr_range >= 2.5:
-                    # Linear scale from 70 at 2.5 to 100 at 3.5
-                    scores.append((70 + (corr_range - 2.5) * 30) * 0.20)
-                elif corr_range >= 1.5:
-                    # Poor range: 40 at 1.5 to 70 at 2.5
-                    scores.append((40 + (corr_range - 1.5) * 30) * 0.20)
-                else:
-                    # Very poor range: <1.5 is essentially flat
-                    scores.append(max(0, corr_range * 26.7) * 0.20)
-                break
-        
-        # Artifact Score (10% weight) - Z-score based detection (|z|>15), count-based
-        # With z-score detection, artifacts are RARE events: 0 excellent, 1 good, 2-3 fair, >5 poor
-        for artifacts_count in [artifacts_470_count, artifacts_570_count]:
-            if artifacts_count is not None:
-                if artifacts_count == 0:
-                    scores.append(100 * 0.10)  # Excellent: no artifacts
-                elif artifacts_count == 1:
-                    # Good: single rare artifact acceptable
-                    scores.append(85 * 0.10)
-                elif artifacts_count <= 3:
-                    # Fair: 60 at 3 to 85 at 1
-                    scores.append((60 + (3 - artifacts_count) * 12.5) * 0.10)
-                elif artifacts_count <= 5:
-                    # Poor: 30 at 5 to 60 at 3
-                    scores.append((30 + (5 - artifacts_count) * 15) * 0.10)
-                else:
-                    # Bad: <30 for >5 artifacts
-                    scores.append(max(0, (30 - (artifacts_count - 5) * 5)) * 0.10)
-                break
-        
-        # Correlation Score (20% weight) - INCREASED from 15% (main discriminator!)
-        # High correlation (>0.6) indicates motion artifacts not being corrected
-        for corr in [correlation_470, correlation_570]:
-            if corr is not None:
-                abs_corr = abs(corr)
-                if abs_corr <= 0.4:
-                    scores.append(100 * 0.20)
-                elif abs_corr <= 0.6:
-                    # Moderate: 70 at 0.6 to 100 at 0.4
-                    scores.append((70 + (0.6 - abs_corr) * 150) * 0.20)
-                elif abs_corr <= 0.8:
-                    # Poor: 30 at 0.8 to 70 at 0.6
-                    scores.append((30 + (0.8 - abs_corr) * 200) * 0.20)
-                else:
-                    # Very poor: <30 for very high correlation
-                    scores.append(max(0, (30 - (abs_corr - 0.8) * 150)) * 0.20)
-                break
-        
-        # Sustained Shifts Score (5% weight) - REDUCED from 10% but still penalizes
-        # These are major baseline instabilities
-        for shifts_list in [sustained_shifts_470, sustained_shifts_570]:
-            if shifts_list and len(shifts_list) > 0:
-                num_shifts = len(shifts_list)
-                if num_shifts == 0:
-                    scores.append(100 * 0.05)
-                elif num_shifts == 1:
-                    scores.append(70 * 0.05)
-                elif num_shifts == 2:
-                    scores.append(50 * 0.05)
-                elif num_shifts == 3:
-                    scores.append(30 * 0.05)
-                else:
-                    scores.append(10 * 0.05)
-                break
+        Core descriptive statistics for one signal-integrity assessment series
+        (either the motion-corrected signal for GCaMP, or the flattened signal
+        itself for sensors). All shape/noise metrics are derived here so the
+        single- and multi-subject views stay consistent.
+
+        Returns dict with:
+          - snr      : transient-amplitude SNR (legacy display metric)
+          - sf_snr   : slow/fast band ratio = amplitude of real (slow) dynamics
+                       divided by fast noise amplitude. THE core 'is there real
+                       biological signal' discriminator.
+          - hf_ratio : var(diff)/var ; ~2 for white noise, ~0 for smooth signal
+          - skew/kurt: distribution shape (dropouts -> very negative skew/high kurt)
+          - rng      : peak-to-peak range
+        """
+        from scipy.stats import skew, kurtosis
+        x = np.asarray(x, dtype=float)
+        if x.size < 4:
+            return dict(snr=0.0, sf_snr=0.0, hf_ratio=0.0, skew=0.0, kurt=0.0, rng=0.0)
+
+        baseline_median = np.median(x)
+        baseline_mask = x <= baseline_median
+        baseline_std = np.std(x[baseline_mask]) if np.sum(baseline_mask) > 10 else np.std(x)
+        if baseline_std > 0:
+            transient_mask = x > baseline_median + 2 * baseline_std
+            if np.sum(transient_mask) > 0:
+                snr = float(np.mean(x[transient_mask] - baseline_median) / baseline_std)
+            else:
+                snr = float(np.percentile(np.abs(x - baseline_median), 95) / baseline_std)
         else:
-            # No shifts detected
-            scores.append(100 * 0.05)
-        
-        # Return overall score
-        return sum(scores) if scores else 0
-    
+            snr = 0.0
+
+        var = np.var(x)
+        hf_ratio = float(np.var(np.diff(x)) / var) if var > 0 else 0.0
+
+        # Slow/fast decomposition: real dynamics live in the slow band (>~1.5 s),
+        # noise in the fast band.
+        w = max(3, int(round(fps * 1.5)))
+        slow = np.convolve(x, np.ones(w) / w, mode='same')
+        noise_amp = np.std(x - slow)
+        sf_snr = float(np.std(slow) / noise_amp) if noise_amp > 0 else 0.0
+
+        return dict(snr=snr, sf_snr=sf_snr, hf_ratio=hf_ratio,
+                    skew=float(skew(x)), kurt=float(kurtosis(x)),
+                    rng=float(np.max(x) - np.min(x)))
+
+    def calculate_signal_quality_score(self, metrics, sensor=False):
+        """
+        Calculate an overall signal-integrity score (0-100) from a metrics dict.
+
+        Philosophy (rebuilt from labelled good/bad/tangled example data):
+          - The recording must contain REAL biological dynamics (slow events), not
+            just noise. This is the dominant term (`sf_snr` -> dynamics).
+          - High-frequency noise, dropout/spike artifacts, and (for GCaMP) motion /
+            fibre-tangle each independently drag the score down.
+          - A single catastrophic failure GATES the score low even if every other
+            dimension looks clean — the old purely-additive score let good
+            sub-scores mask fatal problems, so bad data could never fall below ~50.
+
+        Sensor mode (`sensor=True`) ignores the 415 nm isosbestic entirely: the
+        correlation / motion terms are dropped (GRAB-type sensors have a 415 channel
+        that is not a valid motion control) and the indicator channel is judged on
+        its own dynamics, noise and artifacts.
+
+        Returns (score, components) where components is a dict of the 0-100
+        sub-scores {'dynamics','noise','dropout','motion'} ('motion' is None for
+        sensor mode).
+        """
+        def lin(x, x0, x1, y0, y1):
+            if x1 == x0:
+                return y0
+            t = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+            return y0 + t * (y1 - y0)
+
+        def piecewise(x, pts):
+            if x <= pts[0][0]:
+                x0, y0 = pts[0]
+                return max(0.0, y0 * (x / x0)) if x0 > 0 else y0
+            for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+                if x <= x1:
+                    return lin(x, x0, x1, y0, y1)
+            return pts[-1][1]
+
+        sf = metrics.get('sf_snr', 0.0) or 0.0
+        hf = metrics.get('hf_ratio', 0.0) or 0.0
+        skew = metrics.get('skew', 0.0) or 0.0
+        kurt = metrics.get('kurt', 0.0) or 0.0
+        corr = metrics.get('correlation', 0.0) or 0.0
+        var_removed = metrics.get('var_removed', 0.0) or 0.0
+        shifts = metrics.get('sustained_shifts_count', 0) or 0
+
+        # Dynamics (real signal) — breakpoints differ by mode because the sensor
+        # assessment series is the raw flattened signal (no motion correction to
+        # shrink it), so its slow/fast ratio sits higher than GCaMP's corrected one.
+        if sensor:
+            dynamics = piecewise(sf, [(1.0, 15), (1.6, 55), (2.5, 100)])
+        else:
+            dynamics = piecewise(sf, [(0.40, 12), (0.65, 58), (1.10, 100)])
+
+        # Noise from high-frequency fraction
+        if hf <= 0.30:
+            noise = 100.0
+        elif hf <= 0.70:
+            noise = lin(hf, 0.30, 0.70, 100, 70)
+        elif hf <= 1.20:
+            noise = lin(hf, 0.70, 1.20, 70, 30)
+        elif hf <= 1.60:
+            noise = lin(hf, 1.20, 1.60, 30, 8)
+        else:
+            noise = lin(hf, 1.60, 2.00, 8, 0)
+
+        # Dropout / spike artifacts: genuine transients are positively skewed, so
+        # only penalise NEGATIVE skew (dropouts) and extreme kurtosis paired with
+        # non-positive skew (spike artifacts, not real sharp calcium events).
+        dropout = 100.0
+        if skew < -0.5:
+            dropout = min(dropout, lin(skew, -0.5, -3.0, 100, 0))
+        if kurt > 20 and skew < 0.5:
+            dropout = min(dropout, lin(kurt, 20, 120, 80, 10))
+        dropout = max(0.0, dropout)
+
+        if sensor:
+            base = 0.50 * dynamics + 0.25 * noise + 0.25 * dropout
+            base -= min(45, shifts * 15)   # step / baseline-shift artifacts
+            motion = None
+        else:
+            abs_c = abs(corr)
+            corr_s = 100.0 if abs_c <= 0.5 else lin(abs_c, 0.5, 0.95, 100, 0)
+            vr_s = 100.0 if var_removed <= 0.4 else lin(var_removed, 0.4, 0.85, 100, 0)
+            motion = min(corr_s, vr_s) - min(40, shifts * 12)
+            motion = max(0.0, motion)
+            base = 0.40 * dynamics + 0.20 * noise + 0.18 * dropout + 0.22 * motion
+
+        base = max(0.0, base)
+
+        # Gating: any single catastrophic failure caps the score.
+        gate = 1.0
+        if dynamics < 25:   # no real dynamics -> noise-dominated / dead recording
+            gate *= 0.6
+        if noise < 30:      # noise-dominated recording
+            gate *= 0.7
+        if dropout < 25:    # severe dropouts / spike artifacts
+            gate *= 0.6
+        if (not sensor) and motion is not None and motion < 12:  # tangled / motion-dominated
+            gate *= 0.55
+
+        final = max(0.0, min(100.0, base * gate))
+        return final, {'dynamics': dynamics, 'noise': noise,
+                       'dropout': dropout, 'motion': motion}
+
+    def compute_channel_integrity(self, signal_raw, iso_raw, time_data, fps,
+                                  sensor=False, zscore_signal=None):
+        """
+        Compute the full signal-integrity metric set + overall score for a single
+        fibre channel. Single source of truth for both the single- and
+        multi-subject Signal Integrity views, the export, and the auto-exclude.
+        """
+        from scipy.stats import linregress
+        signal = self.flatten_signal_for_integrity(signal_raw, time_data)
+        isosbestic = self.flatten_signal_for_integrity(iso_raw, time_data)
+
+        slope, intercept, _, _, _ = linregress(isosbestic, signal)
+        motion_component = slope * isosbestic + intercept
+        corrected = signal - motion_component
+
+        correlation = float(np.corrcoef(signal, isosbestic)[0, 1])
+        var_signal = np.var(signal)
+        var_removed = float(1.0 - np.var(corrected) / var_signal) if var_signal > 0 else 0.0
+
+        # Sensor mode assesses the flattened signal itself (ignore 415); GCaMP
+        # assesses the motion-corrected signal.
+        assess = signal if sensor else corrected
+        stats_ = self.integrity_series_stats(assess, fps)
+
+        # Suspicious artifacts (|z|>15) from the motion-corrected signal
+        if zscore_signal is None:
+            cstd = np.std(corrected)
+            zscore_signal = (corrected - np.mean(corrected)) / cstd if cstd > 1e-12 else np.zeros_like(corrected)
+        artifacts_signal = np.where(np.abs(zscore_signal) > 15)[0]
+
+        # Baseline/step shifts: iso reference for GCaMP (motion), signal for sensor
+        shift_ref = signal if sensor else isosbestic
+        sustained_shifts = self.detect_sustained_shifts(shift_ref, fps=fps)
+
+        metrics = {
+            'snr': stats_['snr'],
+            'sf_snr': stats_['sf_snr'],
+            'hf_ratio': stats_['hf_ratio'],
+            'skew': stats_['skew'],
+            'kurt': stats_['kurt'],
+            'signal_std': float(np.std(signal)),
+            'correlation': correlation,
+            'var_removed': var_removed,
+            'corr_range': stats_['rng'],
+            'artifacts_count': int(len(artifacts_signal)),
+            'sustained_shifts_count': int(len(sustained_shifts)),
+            'sensor_mode': bool(sensor),
+        }
+        score, components = self.calculate_signal_quality_score(metrics, sensor)
+        metrics['overall_score'] = score
+        metrics['score_components'] = components
+        return metrics
+
+
     def plot_signal_integrity_multi(self, fig, subjects_list):
         """
         Generate a summary table of signal integrity metrics for multiple subjects.
@@ -20794,24 +21036,28 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                    ha='center', va='center', fontsize=14, transform=ax.transAxes)
             return
         
-        # Create table data
-        headers = ['Subject', 'Ch', 'SNR', 'Signal Std (%)', 'Corr Range', '415-470 Corr', 'Artifacts', 'Sus. Shifts', 
-                   'Overall Score', 'Quality']
-        
+        # Create table data. Columns reflect the rebuilt scoring: the four 0-100
+        # sub-scores that drive the overall score, plus artifact/shift counts.
+        headers = ['Subject', 'Ch', 'Mode', 'Dynamics', 'Noise', 'Dropout', 'Motion',
+                   'Artifacts', 'Shifts', 'Score', 'Quality']
+        score_col_idx = 9
+        quality_col_idx = 10
+
         table_data = []
         colors = []
-        
+
         for subject, metrics in subject_metrics:
             channel = metrics.get('channel', 'G0')
-            snr = metrics.get('snr', 0)
-            cv = metrics.get('cv', 0)
-            corr_range = metrics.get('corr_range', 0)
-            correlation = metrics.get('correlation', 0)
+            comps = metrics.get('score_components', {}) or {}
+            sensor_mode = metrics.get('sensor_mode', False)
+            dyn = comps.get('dynamics')
+            noise = comps.get('noise')
+            drop = comps.get('dropout')
+            motion = comps.get('motion')
             artifacts = metrics.get('artifacts_count', 0)
-            artifacts_pct = (artifacts / 16000) * 100 if artifacts > 0 else 0.0  # Approximate percentage
             sustained_shifts = metrics.get('sustained_shifts_count', 0)
             overall_score = metrics.get('overall_score', 0)
-            
+
             # Determine quality rating color
             if overall_score >= 90:
                 score_color = '#00AA00'  # Green
@@ -20822,28 +21068,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             elif overall_score >= 70:
                 score_color = '#CCAA00'  # Yellow
                 quality_text = 'Fair'
-            elif overall_score >= 60:
+            elif overall_score >= 50:
                 score_color = '#DD6600'  # Orange
                 quality_text = 'Poor'
             else:
                 score_color = '#DD0000'  # Red
                 quality_text = 'Bad'
-            
+
+            def _fmt(v):
+                return f'{v:.0f}' if v is not None else '—'
+
             # Format row
             row = [
                 subject,
                 channel,
-                f'{snr:.2f}',
-                f'{cv:.2f}',
-                f'{corr_range:.2f}',
-                f'{correlation:.3f}',
-                f'{artifacts}',  # Display as count, not percentage
+                'Sensor' if sensor_mode else 'GCaMP',
+                _fmt(dyn),
+                _fmt(noise),
+                _fmt(drop),
+                _fmt(motion),
+                f'{artifacts}',
                 f'{sustained_shifts}',
                 f'{overall_score:.1f}',
                 quality_text
             ]
             table_data.append(row)
-            
+
             # Color for this row (apply to quality score cell)
             colors.append(score_color)
         
@@ -20902,15 +21152,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 x_pos = 0.03 + col_idx * cell_width
                 
                 # Highlight quality score cell with color
-                if col_idx == 8:  # Overall Score column (shifted by 1 due to new Corr Range column)
-                    rect = Rectangle((x_pos - 0.01, y_pos - cell_height * 0.75), 
+                if col_idx == score_col_idx:  # Overall Score column
+                    rect = Rectangle((x_pos - 0.01, y_pos - cell_height * 0.75),
                                     cell_width * 0.9, cell_height * 0.8,
-                                    transform=ax.transAxes, 
+                                    transform=ax.transAxes,
                                     facecolor=color, alpha=0.25, edgecolor=color, linewidth=1.5)
                     ax.add_patch(rect)
                     ax.text(x_pos, y_pos, cell_value, fontsize=cell_fontsize, fontweight='bold',
                            ha='left', va='top', transform=ax.transAxes, color=color)
-                elif col_idx == 9:  # Quality Text column (shifted by 1)
+                elif col_idx == quality_col_idx:  # Quality Text column
                     ax.text(x_pos, y_pos, cell_value, fontsize=cell_fontsize, fontweight='bold',
                            ha='left', va='top', transform=ax.transAxes, color=color)
                 else:
@@ -20921,7 +21171,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Add legend at bottom
         legend_y = max(y_pos - 0.03, 0.01)
-        ax.text(0.03, legend_y, 'SNR: Motion-corrected | Signal Std: dF/F variability | Corr Range: Dynamic range after motion corr | Corr: 415-470 Correlation | Artifacts: Frame count | Sus. Shifts: Baseline shifts',
+        ax.text(0.03, legend_y, 'Sub-scores (0-100, higher=better): Dynamics=real slow signal vs noise | Noise=high-freq cleanliness | Dropout=artifact-free | Motion=415/baseline stability (GCaMP only; — in Sensor mode) | Artifacts/Shifts: counts',
                fontsize=legend_fontsize, style='italic', transform=ax.transAxes, wrap=True)
         
         # Add scroll hint if many entries
@@ -20933,147 +21183,69 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     fontsize=11, fontweight='bold', y=0.985)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
     
-    def _extract_signal_integrity_metrics(self, data):
+    def _extract_signal_integrity_metrics(self, data, sensor=None):
         """
         Extract signal integrity metrics for a single subject.
         Returns a list of dicts with key metrics for EACH FIBER CHANNEL (G0, G1, etc.).
-        CRITICAL: Uses same methodology as plot_signal_integrity for consistency.
+        Delegates all metric/score computation to compute_channel_integrity so the
+        single-subject view, multi-subject table, export and auto-exclude agree.
+
+        sensor: None -> read the 'Sensor (ignore 415nm)' toggle; otherwise force.
         """
         has_470 = data.get('has_470', False)
         has_570 = data.get('has_570', False)
-        
+
         if not has_470 and not has_570:
             return None
-        
+
+        if sensor is None:
+            sensor = bool(getattr(self, 'integrity_sensor_mode_var', None)
+                          and self.integrity_sensor_mode_var.get())
+
         all_channel_metrics = []
         fps = self.params.get('fps', 30)
-        
+
         # Process first available wavelength
         if has_470:
             fp_data = data.get('data_470')
-            wavelength = '470'
+            zscore_data = data.get('zscore_470')
         else:
             fp_data = data.get('data_570')
-            wavelength = '570'
-        
+            zscore_data = data.get('zscore_570')
+
         if fp_data is None or fp_data.shape[1] < 4:
             return None
-        
+
         time_data = fp_data[:, 0]
-        
+
         # Extract metrics for ALL channels (G0, G1, G2, ...)
         num_data_cols = fp_data.shape[1] - 2  # Subtract time columns
         num_channels = num_data_cols // 2  # Each channel has signal + isosbestic pair
-        
+
         for ch_idx in range(num_channels):
             ch_signal_col = 2 + (ch_idx * 2)
             ch_iso_col = 2 + (ch_idx * 2) + 1
-            
+
             if ch_iso_col >= fp_data.shape[1]:
                 continue
-            
+
             signal_raw = fp_data[:, ch_signal_col]
             isosbestic_raw = fp_data[:, ch_iso_col]
-            
-            # CRITICAL: Flatten signals by removing photobleaching (same as plot_signal_integrity)
-            signal = self.flatten_signal_for_integrity(signal_raw, time_data)
-            isosbestic = self.flatten_signal_for_integrity(isosbestic_raw, time_data)
-            
-            # Calculate SNR using transient-based approach (matches plot_signal_integrity)
-            from scipy.stats import linregress
-            slope, intercept, _, _, _ = linregress(isosbestic, signal)
-            motion_component = slope * isosbestic + intercept
-            corrected_signal = signal - motion_component
-            
-            # SNR: Transient amplitude vs baseline noise
-            baseline_median = np.median(corrected_signal)
-            baseline_mask = corrected_signal <= baseline_median
-            baseline_std = np.std(corrected_signal[baseline_mask]) if np.sum(baseline_mask) > 10 else np.std(corrected_signal)
-            
-            # Define transients as peaks >2 std above median
-            transient_threshold = baseline_median + 2 * baseline_std
-            transient_mask = corrected_signal > transient_threshold
-            
-            # Calculate SNR as (mean transient amplitude above baseline) / baseline_std
-            if np.sum(transient_mask) > 0:
-                transient_amplitudes = corrected_signal[transient_mask] - baseline_median
-                mean_transient_amplitude = np.mean(transient_amplitudes)
-                snr = mean_transient_amplitude / baseline_std if baseline_std > 0 else 0
-            else:
-                # No transients detected - fallback to 95th percentile approach
-                peak_signal = np.percentile(np.abs(corrected_signal - baseline_median), 95)
-                snr = peak_signal / baseline_std if baseline_std > 0 else 0
-            
-            # Calculate Signal Std (not CV - matches updated approach)
-            signal_std = np.std(signal)
-            
-            # Calculate Correlation
-            correlation = np.corrcoef(signal, isosbestic)[0, 1]
-            
-            # Detect suspicious artifacts using z-scored data
-            # Artifacts should be RARE: |z-score| > 15 (e.g., KOR14 G0 spike to z=25)
-            # CRITICAL: Use the STORED z-scored data (same as Analysis tab) for artifact detection
-            window = int(fps)
-            
-            # Try to get stored z-scored data (processed with Huber regression motion correction)
-            if has_470:
-                zscore_data = data.get('zscore_470')
-            else:
-                zscore_data = data.get('zscore_570')
-            
+
+            # Prefer the stored (Huber-corrected) z-score for artifact detection.
+            zsig = None
             if zscore_data is not None and zscore_data.shape[1] > (2 + ch_idx):
-                # Use stored z-scored data for this channel (column 2 + channel_index)
-                zscore_signal = zscore_data[:, 2 + ch_idx]
-                
-                # For isosbestic, z-score from dF/F data
-                # (isosbestic doesn't go through motion correction, so no stored z-score)
-                iso_z = (isosbestic - np.mean(isosbestic)) / np.std(isosbestic)
-            else:
-                # Fallback: calculate z-score from motion-corrected signal
-                # NOTE: This uses linregress motion correction, different from main pipeline!
-                zscore_signal = (corrected_signal - np.mean(corrected_signal)) / np.std(corrected_signal)
-                iso_z = (isosbestic - np.mean(isosbestic)) / np.std(isosbestic)
-            
-            # Find suspicious artifacts: |z-score| > 15
-            # Report ALL signal artifacts (not just those in both channels)
-            # Single-channel artifacts like fiber spikes should still be reported
-            artifacts_signal = np.where(np.abs(zscore_signal) > 15)[0]
-            artifacts_iso = np.where(np.abs(iso_z) > 15)[0]
-            
-            # For reference, track which artifacts appear in both channels (likely motion)
-            common_artifacts = []
-            for art_sig in artifacts_signal:
-                if np.any(np.abs(artifacts_iso - art_sig) < window):
-                    common_artifacts.append(art_sig)
-            
-            # Detect sustained shifts
-            sustained_shifts = self.detect_sustained_shifts(isosbestic, fps=fps)
-            
-            # Calculate corrected signal range (dynamic range after motion correction)
-            corrected_range = np.max(corrected_signal) - np.min(corrected_signal)
-            
-            # Calculate overall score using artifacts_count (ALL signal artifacts)
-            # Changed from common_artifacts to artifacts_signal to catch single-channel artifacts
-            artifacts_count = len(artifacts_signal)
-            overall_score = self.calculate_signal_quality_score(
-                snr, None, signal_std, None, artifacts_count, None, correlation, None, 
-                sustained_shifts, None, corrected_range, None
-            )
-            
-            metrics = {
-                'channel': self.get_channel_name(data, ch_idx),
-                'snr': snr,
-                'cv': signal_std,  # Actually signal std, kept variable name for compatibility
-                'correlation': correlation,
-                'artifacts_count': len(artifacts_signal),  # Report ALL signal artifacts
-                'artifacts_in_both': len(common_artifacts),  # Track motion-related artifacts
-                'sustained_shifts_count': len(sustained_shifts),
-                'corr_range': corrected_range,
-                'overall_score': overall_score
-            }
-            
+                zsig = zscore_data[:, 2 + ch_idx]
+
+            metrics = self.compute_channel_integrity(
+                signal_raw, isosbestic_raw, time_data, fps,
+                sensor=sensor, zscore_signal=zsig)
+            metrics['channel'] = self.get_channel_name(data, ch_idx)
+            # Back-compat alias: 'cv' historically held the signal std
+            metrics['cv'] = metrics['signal_std']
+
             all_channel_metrics.append(metrics)
-        
+
         return all_channel_metrics
     
     def flatten_signal_for_integrity(self, signal, time_arr):
@@ -21907,24 +22079,31 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ax6 = fig.add_subplot(4, 2, 8)
         ax6.axis('off')
         
-        # Add interpretation guidance
+        # Add interpretation guidance (matches the rebuilt score, shown at top)
+        sensor_mode = bool(getattr(self, 'integrity_sensor_mode_var', None)
+                           and self.integrity_sensor_mode_var.get())
         metrics_text.append("\n" + "="*35)
-        metrics_text.append("Quality Indicators:")
-        metrics_text.append("  SNR >2.0: Excellent")
-        metrics_text.append("  SNR 1.8-2.0: Good")
-        metrics_text.append("  SNR 1.5-1.8: Fair")
-        metrics_text.append("  SNR <1.5: Poor")
+        metrics_text.append("Score = Dynamics/Noise/Dropout")
+        if sensor_mode:
+            metrics_text.append("(Sensor mode: 415nm ignored,")
+            metrics_text.append(" no Motion term)")
+        else:
+            metrics_text.append(" + Motion (415/baseline)")
         metrics_text.append("")
-        metrics_text.append("  Signal Std <0.5: Stable")
-        metrics_text.append("  Signal Std 0.5-1.0: Moderate")
-        metrics_text.append("  Signal Std >1.0: Variable")
+        metrics_text.append("Sub-scores 0-100, higher=better:")
+        metrics_text.append("  Dynamics: real slow signal")
+        metrics_text.append("    vs fast noise (sf-SNR)")
+        metrics_text.append("  Noise: high-freq cleanliness")
+        metrics_text.append("  Dropout: free of spikes/")
+        metrics_text.append("    dropouts (skew/kurtosis)")
+        if not sensor_mode:
+            metrics_text.append("  Motion: low 415 corr +")
+            metrics_text.append("    stable baseline (tangle)")
         metrics_text.append("")
-        metrics_text.append("  Correlation >0.6:")
-        metrics_text.append("    Strong motion artifact")
-        metrics_text.append("  Correlation 0.4-0.6:")
-        metrics_text.append("    Moderate")
-        metrics_text.append("  Correlation <0.4:")
-        metrics_text.append("    Minimal motion")
+        metrics_text.append("Score bands:")
+        metrics_text.append("  >=90 Excellent  80-90 Good")
+        metrics_text.append("  70-80 Fair  50-70 Poor")
+        metrics_text.append("  <50 Bad (reject)")
         metrics_text.append("")
         metrics_text.append("Use zoom tool to view specific")
         metrics_text.append("sections of this report.")
@@ -21934,49 +22113,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 fontsize=7.5, verticalalignment='top', fontfamily='monospace',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
         
-        # Calculate corrected ranges for overall score
-        corr_range_470_val = None
-        corr_range_570_val = None
-        
-        if has_470 and 'corrected_signal' in locals():
-            # Use the corrected_signal from 470nm calculations above
-            fp_data_470 = data.get('data_470')
-            if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                time_470 = fp_data_470[:, 0]
-                signal_470_raw = fp_data_470[:, 2]
-                isosbestic_470_raw = fp_data_470[:, 3]
-                signal_470_flat = self.flatten_signal_for_integrity(signal_470_raw, time_470)
-                isosbestic_470_flat = self.flatten_signal_for_integrity(isosbestic_470_raw, time_470)
-                from scipy.stats import linregress
-                slope, intercept, _, _, _ = linregress(isosbestic_470_flat, signal_470_flat)
-                motion_comp = slope * isosbestic_470_flat + intercept
-                corr_470 = signal_470_flat - motion_comp
-                corr_range_470_val = float(np.max(corr_470) - np.min(corr_470))
-        
-        if has_570:
-            fp_data_570 = data.get('data_570')
-            if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                time_570 = fp_data_570[:, 0]
-                signal_570_raw = fp_data_570[:, 2]
-                isosbestic_570_raw = fp_data_570[:, 3]
-                signal_570_flat = self.flatten_signal_for_integrity(signal_570_raw, time_570)
-                isosbestic_570_flat = self.flatten_signal_for_integrity(isosbestic_570_raw, time_570)
-                from scipy.stats import linregress
-                slope, intercept, _, _, _ = linregress(isosbestic_570_flat, signal_570_flat)
-                motion_comp = slope * isosbestic_570_flat + intercept
-                corr_570 = signal_570_flat - motion_comp
-                corr_range_570_val = float(np.max(corr_570) - np.min(corr_570))
-        
-        # Calculate overall quality score (top of figure)
-        overall_score = self.calculate_signal_quality_score(
-            snr_470_val, snr_570_val, cv_470_val, cv_570_val,
-            artifacts_470_count, artifacts_570_count, correlation_470_val, correlation_570_val,
-            sustained_shifts_470, sustained_shifts_570,
-            corr_range_470_val, corr_range_570_val
-        )
-        
-        # Add channel information to title (use the real designation as selected)
+        # Calculate overall quality score (top of figure) using the unified metric
+        # engine on the SELECTED channel, so this score exactly matches the
+        # multi-subject table / export / auto-exclude (and honours Sensor mode).
+        sensor_mode = bool(getattr(self, 'integrity_sensor_mode_var', None)
+                           and self.integrity_sensor_mode_var.get())
         selected_channel_str = self.integrity_channel_var.get() or "G0"
+        all_metrics = self._extract_signal_integrity_metrics(data, sensor=sensor_mode) or []
+        chosen_metrics = next((m for m in all_metrics
+                               if m.get('channel') == selected_channel_str), None)
+        if chosen_metrics is None and all_metrics:
+            chosen_metrics = all_metrics[0]
+        overall_score = chosen_metrics.get('overall_score', 0) if chosen_metrics else 0
+        score_components = chosen_metrics.get('score_components', {}) if chosen_metrics else {}
+
+        # Add channel information to title (use the real designation as selected)
         if has_470 and has_570:
             channel_info = f"Both 470nm and 570nm - Channel {selected_channel_str}"
         elif has_470:
@@ -21998,15 +22149,27 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         elif overall_score >= 70:
             score_color = '#CCAA00'  # Yellow
             quality_text = 'Fair'
-        elif overall_score >= 60:
+        elif overall_score >= 50:
             score_color = '#DD6600'  # Orange
             quality_text = 'Poor'
         else:
             score_color = '#DD0000'  # Red
             quality_text = 'Bad'
-        
-        score_ax.text(0.5, 0.5, f'Overall Signal Quality Score: {overall_score:.1f}/100  ({quality_text})\n{channel_info}',
-                     ha='center', va='center', fontsize=16, fontweight='bold',
+
+        # Sub-score breakdown + mode so the user sees WHY the score is what it is.
+        mode_str = 'Sensor (415 ignored)' if sensor_mode else 'GCaMP'
+
+        def _c(v):
+            return f'{v:.0f}' if v is not None else '—'
+        comp_str = (f"Dynamics {_c(score_components.get('dynamics'))} | "
+                    f"Noise {_c(score_components.get('noise'))} | "
+                    f"Dropout {_c(score_components.get('dropout'))} | "
+                    f"Motion {_c(score_components.get('motion'))}")
+
+        score_ax.text(0.5, 0.5,
+                     f'Overall Signal Quality Score: {overall_score:.1f}/100  ({quality_text})\n'
+                     f'{channel_info}   [{mode_str}]\n{comp_str}',
+                     ha='center', va='center', fontsize=15, fontweight='bold',
                      color=score_color, transform=score_ax.transAxes,
                      bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor=score_color, linewidth=3))
         
@@ -22448,23 +22611,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         continue
                     
                     for metrics in channel_metrics_list:
+                        comps = metrics.get('score_components', {}) or {}
                         row = {
                             'Subject': subject,
                             'Channel': metrics.get('channel', 'G0'),
-                            'SNR': metrics.get('snr', 0),
-                            'Signal_Std_Percent': metrics.get('cv', 0),  # Actually signal std
+                            'Mode': 'Sensor' if metrics.get('sensor_mode') else 'GCaMP',
+                            'Dynamics_Score': comps.get('dynamics'),
+                            'Noise_Score': comps.get('noise'),
+                            'Dropout_Score': comps.get('dropout'),
+                            'Motion_Score': comps.get('motion'),
+                            'SlowFast_SNR': metrics.get('sf_snr', 0),
+                            'HF_Noise_Ratio': metrics.get('hf_ratio', 0),
+                            'Transient_SNR': metrics.get('snr', 0),
+                            'Signal_Std_Percent': metrics.get('cv', 0),
+                            'Skew': metrics.get('skew', 0),
+                            'Kurtosis': metrics.get('kurt', 0),
                             'Corr_Range': metrics.get('corr_range', 0),
                             '415_470_Correlation': metrics.get('correlation', 0),
                             'Artifacts_Count': metrics.get('artifacts_count', 0),
-                            'Artifacts_In_Both_Channels': metrics.get('artifacts_in_both', 0),
                             'Sustained_Shifts_Count': metrics.get('sustained_shifts_count', 0),
                             'Overall_Score': metrics.get('overall_score', 0)
                         }
-                        
+
                         # Add group info if available
                         if subject_to_group:
                             row['Group'] = subject_to_group.get(subject, 'Unknown')
-                        
+
                         # Determine quality rating
                         overall_score = metrics.get('overall_score', 0)
                         if overall_score >= 90:
@@ -22473,12 +22645,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             quality = 'Good'
                         elif overall_score >= 70:
                             quality = 'Fair'
-                        elif overall_score >= 60:
+                        elif overall_score >= 50:
                             quality = 'Poor'
                         else:
                             quality = 'Bad'
                         row['Quality'] = quality
-                        
+
                         export_rows.append(row)
                 
                 if not export_rows:
@@ -22489,15 +22661,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 df = pd.DataFrame(export_rows)
                 
                 # Reorder columns to match display order
+                base_order = ['Subject', 'Channel', 'Mode',
+                              'Dynamics_Score', 'Noise_Score', 'Dropout_Score', 'Motion_Score',
+                              'SlowFast_SNR', 'HF_Noise_Ratio', 'Transient_SNR',
+                              'Signal_Std_Percent', 'Skew', 'Kurtosis', 'Corr_Range',
+                              '415_470_Correlation', 'Artifacts_Count',
+                              'Sustained_Shifts_Count', 'Overall_Score', 'Quality']
                 if 'Group' in df.columns:
-                    column_order = ['Group', 'Subject', 'Channel', 'SNR', 'Signal_Std_Percent', 'Corr_Range', 
-                                   '415_470_Correlation', 'Artifacts_Count', 'Artifacts_In_Both_Channels', 
-                                   'Sustained_Shifts_Count', 'Overall_Score', 'Quality']
+                    column_order = ['Group'] + base_order
                 else:
-                    column_order = ['Subject', 'Channel', 'SNR', 'Signal_Std_Percent', 'Corr_Range', 
-                                   '415_470_Correlation', 'Artifacts_Count', 'Artifacts_In_Both_Channels', 
-                                   'Sustained_Shifts_Count', 'Overall_Score', 'Quality']
-                
+                    column_order = base_order
+
                 df = df[column_order]
                 df.to_csv(filename, index=False)
                 
