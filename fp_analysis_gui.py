@@ -34,8 +34,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.5.0"
-APP_VERSION_DATE = "June 21, 2026"
+APP_VERSION = "1.6.0"
+APP_VERSION_DATE = "June 29, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -3158,15 +3158,19 @@ class FPAnalysisGUI:
         
         # Signal Integrity threshold → auto-exclude row
         ttk.Separator(control_frame, orient='horizontal').grid(row=10, column=0, columnspan=8, sticky='ew', padx=5, pady=(6, 2))
-        ttk.Label(control_frame, text="Signal Integrity – Auto Exclude:", 
+        ttk.Label(control_frame, text="Signal Integrity – Auto Exclude:",
                  font=('Segoe UI', 9, 'bold')).grid(row=11, column=0, columnspan=2, sticky='w', padx=5)
+        ttk.Label(control_frame,
+                 text="(applies to the currently selected groups/subjects only)",
+                 foreground='#a05a00', font=('Segoe UI', 8, 'italic')).grid(
+                     row=11, column=2, columnspan=5, sticky='w', padx=5)
         ttk.Label(control_frame, text="Min. Integrity Score:").grid(row=12, column=0, sticky='w', padx=5, pady=(3, 5))
         self.integrity_threshold_var = tk.StringVar(value="70")
         ttk.Entry(control_frame, textvariable=self.integrity_threshold_var, width=8).grid(row=12, column=1, sticky='w', padx=5)
         ttk.Button(control_frame, text="Apply to Exclude",
                   command=self.apply_integrity_threshold_to_exclusions).grid(row=12, column=2, padx=5, pady=(3, 5))
         ttk.Label(control_frame,
-                 text="Channels with overall score below threshold are added to the Exclusions tab.",
+                 text="Channels in the selected group(s) with overall score below threshold are added to the Exclusions tab.",
                  foreground='gray', font=('Segoe UI', 8)).grid(row=12, column=3, columnspan=4, sticky='w', padx=5)
         
         # Axis / Heatmap / Trace-styling controls live in the "Advanced Graph
@@ -3196,6 +3200,11 @@ class FPAnalysisGUI:
         # Store current canvas and figure for axis updates
         self.current_viz_canvas = None
         self.current_viz_figure = None
+
+        # Cache for the (expensive) Signal Integrity graph so it can be
+        # re-viewed without recomputing when the selection/settings are
+        # unchanged. Holds {'sig', 'fig', 'refs'}.
+        self._integrity_plot_cache = None
 
         # Figure and canvas size variables
         self.viz_fig_width_var = tk.StringVar(value="auto")
@@ -9263,6 +9272,27 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix (correctness) — Single-channel (G0-only) recordings no longer show a phantom
+    G1 series in Zone Averages, Distance from Center (X / Y / Euclidean), and
+    Out/Back plots. Channel availability is now read from the actual photometry
+    channel count instead of the raw column width, so a kinematics column (e.g.
+    elapsed time) can no longer be mistaken for a second channel. NOTE: projects
+    saved before this fix must be reprocessed to clear already-stored phantom G1
+    values.
+  • Fix — Plots no longer render wider than the window. The on-screen width is now
+    capped to the available pixel width (not just a fixed inch limit), so dense
+    multi-subject graphs — e.g. the Signal Integrity dashboard — shrink to fit
+    instead of overflowing on smaller or DPI-scaled displays.
+  • New — Signal Integrity graph is cached. Re-viewing it (e.g. after switching plot
+    types and back) reuses the computed figure instantly instead of rerunning the
+    expensive scoring; the cache refreshes automatically when the selection,
+    settings, or processed data change.
+  • Change — Signal Integrity "Apply to Exclude" now evaluates only the currently
+    selected groups/subjects on the Visualization tab rather than the entire loaded
+    dataset, with a note on the control indicating the scoped behavior.
+
+Version 1.5.0  •  June 21, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Signal Integrity scoring rebuilt from the ground up. A signal-fluctuation
     SNR (sf-SNR) now drives the score, with explicit gating so genuinely bad
     recordings score below 50 instead of being flattered by the old weighting.
@@ -11218,7 +11248,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         zones.append(self.classify_zone(x, y))
                                     else:
                                         zones.append('unknown')
-                                outback_data = self.calculate_outback_movements(beh_synced, zones)
+                                outback_data = self.calculate_outback_movements(
+                                    beh_synced, zones,
+                                    n_channels=self._beh_channel_count(subject_data))
                                 if outback_data:
                                     subject_data['outback'] = outback_data
                                     self.log_message(f"    Regenerated Out/Back stats from behavior data")
@@ -13323,7 +13355,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     else:
                         zones.append('unknown')
                 
-                zone_averages = self.calculate_zone_averages(beh_synced, zones)
+                zone_averages = self.calculate_zone_averages(
+                    beh_synced, zones, n_channels=result.get('num_photometry_channels'))
                 result['zone_averages'] = zone_averages
                 
                 # Calculate distance-based averages
@@ -13336,7 +13369,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
                 # Calculate Out/Back movements in open arms
                 self.log_message(f"  Calculating Out/Back movements in open arms...")
-                outback_data = self.calculate_outback_movements(beh_synced, zones)
+                outback_data = self.calculate_outback_movements(
+                    beh_synced, zones, n_channels=result.get('num_photometry_channels'))
                 result['outback'] = outback_data
                 if outback_data:
                     if 'out' in outback_data and outback_data['out']['G0_n'] > 0:
@@ -14536,21 +14570,28 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return beh_synced, entry_frames_dict
     
-    def calculate_zone_averages(self, beh_synced, zones):
+    def calculate_zone_averages(self, beh_synced, zones, n_channels=None):
         """Calculate average z-score for each zone
-        
+
         Args:
             beh_synced: Synchronized behavior array with photometry data
             zones: List of zone classifications for each frame
-            
+            n_channels: Number of photometry channels (cols 6..6+N-1). When None,
+                inferred from the array width.
+
         Returns:
             Dictionary with average z-scores per zone for each channel
         """
         zone_averages = {}
-        
-        # Determine available photometry channels
-        has_g0 = beh_synced.shape[1] > 6
-        has_g1 = beh_synced.shape[1] > 7
+
+        # Determine available photometry channels from the CHANNEL COUNT, not the
+        # raw column count: kinematics columns sit after the channels, so a
+        # single-channel subject still has >7 columns and column 7 is actually a
+        # kinematics field — reading it as G1 produces a phantom second channel.
+        if n_channels is None:
+            n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
+        has_g0 = n_channels >= 1
+        has_g1 = n_channels >= 2
         
         # Calculate averages for each zone
         for zone_name in self.zones.keys():
@@ -14601,13 +14642,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Returns:
             Three dictionaries (X-axis, Y-axis, Euclidean) with distance bins and z-score averages
         """
-        has_g0 = beh_synced.shape[1] > 6
-        has_g1 = beh_synced.shape[1] > 7
+        # Channel availability is derived from the channel count (cols 6..6+N-1),
+        # NOT the raw width — kinematics columns follow the channels, so column 7
+        # is a kinematics field for single-channel subjects, not a real G1.
+        if n_channels is None:
+            n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
+        has_g0 = n_channels >= 1
+        has_g1 = n_channels >= 2
 
         # Distance from center lives in the kinematics block at 6+N (+3 = X, +4 = Y).
-        kin_base = self._beh_kin_base(
-            n_channels if n_channels is not None
-            else max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)))
+        kin_base = self._beh_kin_base(n_channels)
         x_distances = beh_synced[:, kin_base + 3]
         y_distances = beh_synced[:, kin_base + 4]
         # Euclidean distance derived from X and Y components
@@ -14751,10 +14795,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'frames_in_zone': int(np.sum(zone_mask))
         }
         
-        # Calculate photometry averages in this zone
-        has_g0 = beh_synced.shape[1] > 6
-        has_g1 = beh_synced.shape[1] > 7
-        
+        # Calculate photometry averages in this zone. Derive channel availability
+        # from the channel count, not the raw width (column 7 is a kinematics
+        # field for single-channel subjects, not a real G1).
+        n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
+        has_g0 = n_channels >= 1
+        has_g1 = n_channels >= 2
+
         if len(zone_frames) > 0:
             # G0 channel (column 6)
             if has_g0:
@@ -14860,7 +14907,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return entry_frames
     
-    def calculate_outback_movements(self, beh_synced, zones):
+    def calculate_outback_movements(self, beh_synced, zones, n_channels=None):
         """Calculate photometry averages for Out and Back movements in open arms
         
         Detects directional movement in open arms:
@@ -14894,10 +14941,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not open_zones:
             return {}
         
-        # Detect available channels
-        has_g0 = beh_synced.shape[1] > 6
-        has_g1 = beh_synced.shape[1] > 7
-        
+        # Detect available channels from the channel count, not the raw width:
+        # column 7 is a kinematics field for single-channel subjects, so testing
+        # shape[1] > 7 would invent a phantom G1.
+        if n_channels is None:
+            n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
+        has_g0 = n_channels >= 1
+        has_g1 = n_channels >= 2
+
         # Calculate velocity in Y-direction (open arms are on Y-axis)
         # Positive velocity = moving up (positive Y), negative = moving down (negative Y)
         y_velocity = np.zeros(len(beh_synced))
@@ -18724,10 +18775,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def apply_integrity_threshold_to_exclusions(self):
         """
-        Evaluate the integrity score of every loaded subject/channel and add any
-        combination whose overall score is below the user-specified threshold to the
-        Exclusions tab.  Existing exclusions are preserved; this only ever *adds*
-        new ones.
+        Evaluate the integrity score of the channels belonging to the *currently
+        selected groups/subjects* on the Visualization tab and add any combination
+        whose overall score is below the user-specified threshold to the Exclusions
+        tab.  Existing exclusions are preserved; this only ever *adds* new ones.
         """
         # Validate threshold
         try:
@@ -18741,9 +18792,27 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             messagebox.showwarning("No Data", "No subjects are loaded. Please process data first.")
             return
 
+        # Restrict the evaluation to the groups/subjects currently selected on the
+        # Visualization tab rather than the entire loaded dataset.
+        selected_subjects = self._get_selected_viz_subjects()
+        if not selected_subjects:
+            messagebox.showwarning(
+                "No Selection",
+                "Auto-exclude only evaluates the currently selected groups/subjects.\n\n"
+                "Please select one or more groups (or subjects) on the Visualization tab first.")
+            return
+
+        target_subjects = [s for s in selected_subjects if s in self.processed_data]
+        if not target_subjects:
+            messagebox.showwarning(
+                "No Data",
+                "None of the selected groups/subjects have processed data.")
+            return
+
         added = []   # list of (subject, channel) tuples newly excluded
 
-        for subject, data in self.processed_data.items():
+        for subject in target_subjects:
+            data = self.processed_data[subject]
             channel_metrics_list = self._extract_signal_integrity_metrics(data)
             if not channel_metrics_list:
                 continue
@@ -18763,18 +18832,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Refresh the Exclusions tab UI so the new ticks are visible
         self.refresh_exclusions_list()
 
+        scope_note = f"{len(target_subjects)} selected subject(s)"
         if added:
             summary_lines = [f"  • {subj}  –  {ch}" for subj, ch in sorted(added)]
             messagebox.showinfo(
                 "Exclusions Updated",
-                f"{len(added)} channel(s) added to the Exclusions tab "
-                f"(score < {threshold:.1f}):\n\n" + "\n".join(summary_lines)
+                f"{len(added)} channel(s) across {scope_note} added to the "
+                f"Exclusions tab (score < {threshold:.1f}):\n\n" + "\n".join(summary_lines)
             )
         else:
             messagebox.showinfo(
                 "No New Exclusions",
-                f"All channels meet the minimum integrity score of {threshold:.1f}.\n"
-                "No new exclusions were added."
+                f"All channels in {scope_note} meet the minimum integrity score of "
+                f"{threshold:.1f}.\nNo new exclusions were added."
             )
 
     def refresh_exclusions_list(self):
@@ -19489,6 +19559,37 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception:
             pass
 
+    def _available_plot_width_px(self, parent):
+        """Best estimate of the on-screen width (px) available for a plot canvas.
+
+        Prefers the realized width of the destination container, falling back to
+        the main window and finally a fraction of the screen width when nothing
+        is laid out yet. A small margin is reserved for the centering holder /
+        scrollbars so the plot never butts right up against the window edge.
+        """
+        try:
+            parent.update_idletasks()
+        except Exception:
+            pass
+        candidates = []
+        for w in (parent, getattr(self, 'root', None)):
+            if w is None:
+                continue
+            try:
+                px = w.winfo_width()
+                if px and px > 1:
+                    candidates.append(px)
+            except Exception:
+                pass
+        if candidates:
+            avail = min(candidates)
+        else:
+            try:
+                avail = int(parent.winfo_screenwidth() * 0.9)
+            except Exception:
+                avail = 1200
+        return max(320, avail - 24)
+
     def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True):
         """Embed a matplotlib figure (+ optional toolbar) in `parent`, rendered
         at a sensible, readable scale and centered horizontally so it does not
@@ -19507,10 +19608,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Cap the figure width by scaling its dpi down (preserves layout/aspect
         # and shrinks fonts uniformly). Done before drawing so the Agg buffer is
         # rendered at the final size rather than clipped by the widget.
+        #
+        # Two caps are applied and the smaller wins:
+        #   1. MAX_PLOT_WIDTH_IN — an absolute inch cap so fonts/layout stay sane
+        #      on very large monitors.
+        #   2. The actual available on-screen width in pixels — the inch cap is
+        #      meaningless on a DPI-scaled or smaller display, where 13in x dpi
+        #      can exceed the window and overflow (e.g. the multi-subject Signal
+        #      Integrity dashboard). Converting the available pixels back to
+        #      inches at the current dpi keeps the rendered plot inside the panel.
         dpi = fig.get_dpi()
         w_in, h_in = fig.get_size_inches()
-        if w_in > MAX_PLOT_WIDTH_IN:
-            new_dpi = max(40, dpi * (MAX_PLOT_WIDTH_IN / float(w_in)))
+        avail_px = self._available_plot_width_px(parent)
+        max_w_in = min(MAX_PLOT_WIDTH_IN, avail_px / float(dpi))
+        if w_in > max_w_in:
+            new_dpi = max(40, dpi * (max_w_in / float(w_in)))
             fig.set_dpi(new_dpi)
             dpi = new_dpi
 
@@ -19736,6 +19848,50 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.legend(handles, labels, loc='upper left', fontsize=fontsize,
                       ncol=ncol, title=title_txt, framealpha=0.9)
 
+    def _get_selected_viz_subjects(self):
+        """Return the subjects currently selected on the Visualization tab.
+
+        Honors Group vs Subject mode (in Group mode the members of the selected
+        groups are expanded, de-duplicated, order preserved). Returns an empty
+        list if nothing is selected. Does not show error dialogs — callers that
+        need user feedback handle the empty case themselves.
+        """
+        selected_subjects = []
+        try:
+            if self.plot_by_var.get() == "Group":
+                selected_indices = self.viz_group_listbox.curselection()
+                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                for group_name in selected_groups:
+                    selected_subjects.extend(self.groups.get(group_name, []))
+                seen = set()
+                selected_subjects = [s for s in selected_subjects
+                                     if not (s in seen or seen.add(s))]
+            else:
+                selected_indices = self.viz_subject_listbox.curselection()
+                selected_subjects = [self.viz_subject_listbox.get(i) for i in selected_indices]
+        except Exception:
+            return []
+        return selected_subjects
+
+    def _integrity_cache_signature(self, valid_subjects):
+        """Build a lightweight fingerprint of everything that affects the
+        Signal Integrity graph, so a cached figure can be safely reused.
+
+        Includes the selection, the identity of each subject's data dict
+        (reprocessing replaces the dict → new id → cache miss), the sensor-mode
+        and channel settings, and the figure/canvas size settings.
+        """
+        try:
+            sensor = bool(self.integrity_sensor_mode_var.get())
+        except Exception:
+            sensor = False
+        channel = self.integrity_channel_var.get() if len(valid_subjects) == 1 else "<multi>"
+        data_ids = tuple((s, id(self.processed_data.get(s))) for s in valid_subjects)
+        sizes = (self.viz_fig_width_var.get(),
+                 self.viz_fig_height_var.get(),
+                 self.viz_canvas_height_var.get())
+        return (self.plot_by_var.get(), tuple(valid_subjects), data_ids, sensor, channel, sizes)
+
     def generate_plot(self):
         """Generate selected plot type"""
         # Get selected subjects or groups
@@ -19782,6 +19938,28 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             widget.destroy()
 
         plot_type = self.plot_type_var.get()
+
+        # Signal Integrity is expensive to compute. Reuse a cached figure when
+        # the selection and settings are unchanged so it can be revisited
+        # instantly (e.g. after switching plot types and back).
+        si_cache_sig = None
+        if "Signal Integrity" in plot_type:
+            si_cache_sig = self._integrity_cache_signature(valid_subjects)
+            cached = self._integrity_plot_cache
+            if cached and cached.get('sig') == si_cache_sig:
+                fig = cached['fig']
+                self.current_viz_figure = fig
+                manual_height = None
+                try:
+                    ch_str = self.viz_canvas_height_var.get().strip().lower()
+                    if ch_str not in ('', 'auto'):
+                        manual_height = int(float(ch_str))
+                except (ValueError, AttributeError):
+                    manual_height = None
+                canvas = self._embed_plot_canvas(fig, self.fig_frame, manual_height=manual_height)
+                self.current_viz_canvas = canvas
+                self.log_message("Signal Integrity: showing cached graph (no recompute).")
+                return
 
         # Warn if the selected subjects' stored bouts span mismatched extraction
         # windows (a partial reprocess) — these plots realign onto the current
@@ -19831,6 +20009,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # For single subject plots, use first selected subject
         # EXCEPT for Signal Integrity, which can handle multiple subjects
+        plot_error = False
         try:
             if ("Signal Integrity" in plot_type and len(valid_subjects) > 1):
                 # Multi-subject Signal Integrity summary
@@ -19917,6 +20096,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # the canvas was embedded, so "no graph" appeared with no feedback).
             import traceback
             tb = traceback.format_exc()
+            plot_error = True
             self.log_message(f"Error generating '{plot_type}' plot: {e}")
             self.log_message(tb)
             fig.clear()
@@ -19927,6 +20107,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Store figure and canvas for axis control
         self.current_viz_figure = fig
+
+        # Cache the freshly-computed Signal Integrity figure so it can be
+        # re-viewed without recomputing. Pin the source data dicts in 'refs' so
+        # their object ids stay stable while cached (reprocessing replaces them).
+        if si_cache_sig is not None and not plot_error:
+            self._integrity_plot_cache = {
+                'sig': si_cache_sig,
+                'fig': fig,
+                'refs': [self.processed_data.get(s) for s in valid_subjects],
+            }
 
         # Keep legends from covering the plotted data across every graph type.
         try:
@@ -21284,898 +21474,228 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def plot_signal_integrity(self, fig, data, subject_name):
         """
-        Comprehensive signal integrity assessment for photometry data.
-        Analyzes signal quality, noise, artifacts, and other quality metrics.
-        
-        CRITICAL: Quality assessment is performed on FLATTENED (photobleaching-corrected) data
-        to avoid false positives caused by photobleaching trends in raw signals.
+        Single-subject Signal Integrity dashboard.
+
+        Everything shown here is derived from the SAME unified metric engine that
+        produces the score (compute_channel_integrity / _extract_signal_integrity_metrics),
+        so the panels, the numbers and the score can never disagree. The view
+        focuses on the SELECTED channel and honours the 'Sensor (ignore 415nm)'
+        toggle. Assessment is always done on photobleaching-flattened data.
         """
-        # Check if data exists
+        from matplotlib.gridspec import GridSpec
+        from scipy.stats import linregress
+
         has_470 = data.get('has_470', False)
         has_570 = data.get('has_570', False)
-        
         if not has_470 and not has_570:
             fig.text(0.5, 0.5, 'No photometry data available for signal integrity analysis',
-                    ha='center', va='center', fontsize=14)
+                     ha='center', va='center', fontsize=14)
             return
-        
-        # Create comprehensive layout: 4 rows x 2 columns (added row for score)
-        # Row 1: Overall quality score
-        # Row 2: Signal overlays (470nm and 570nm)
-        # Row 3: SNR and stability metrics  
-        # Row 4: Artifact detection and correlation
-        
-        metrics_text = []
-        plot_idx = 3  # Start at 3 to leave room for title score
-        
-        # Variables to store scores for overall calculation
-        snr_470_val = None
-        snr_570_val = None
-        cv_470_val = None
-        cv_570_val = None
-        artifacts_470_count = None
-        artifacts_570_count = None
-        correlation_470_val = None
-        correlation_570_val = None
-        sustained_shifts_470 = None
-        sustained_shifts_570 = None
-        
-        # === ASSESS ALL FIBER CHANNELS (G0, G1, etc.) ===
-        # Data structure: [time, computer_ts, G0_signal, G0_iso, G1_signal, G1_iso, ...]
-        channel_assessments_470 = []
-        channel_assessments_570 = []
-        
-        if has_470:
-            fp_data_470 = data.get('data_470')
-            if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                num_data_cols = fp_data_470.shape[1] - 2  # Subtract time columns
-                num_channels = num_data_cols // 2  # Each channel has signal + isosbestic pair
-                time_470 = fp_data_470[:, 0]
-                
-                # Assess each channel (G0, G1, G2, ...)
-                for ch_idx in range(num_channels):
-                    ch_signal_col = 2 + (ch_idx * 2)
-                    ch_iso_col = 2 + (ch_idx * 2) + 1
-                    
-                    if ch_iso_col < fp_data_470.shape[1]:
-                        ch_signal_raw = fp_data_470[:, ch_signal_col]
-                        ch_iso_raw = fp_data_470[:, ch_iso_col]
-                        
-                        # Flatten signals
-                        ch_signal = self.flatten_signal_for_integrity(ch_signal_raw, time_470)
-                        ch_iso = self.flatten_signal_for_integrity(ch_iso_raw, time_470)
-                        
-                        # Calculate basic metrics
-                        from scipy.stats import linregress
-                        slope, intercept, r_value, _, _ = linregress(ch_iso, ch_signal)
-                        motion_comp = slope * ch_iso + intercept
-                        corrected = ch_signal - motion_comp
-                        
-                        # SNR: Transient amplitude vs baseline noise
-                        baseline_median = np.median(corrected)
-                        baseline_mask = corrected <= baseline_median
-                        baseline_std = np.std(corrected[baseline_mask]) if np.sum(baseline_mask) > 10 else np.std(corrected)
-                        transient_thresh = baseline_median + 2 * baseline_std
-                        transient_mask = corrected > transient_thresh
-                        
-                        if np.sum(transient_mask) > 0:
-                            transient_amplitudes = corrected[transient_mask] - baseline_median
-                            mean_transient_amplitude = np.mean(transient_amplitudes)
-                            ch_snr = mean_transient_amplitude / baseline_std if baseline_std > 0 else 0
-                        else:
-                            # No transients - fallback to 95th percentile
-                            peak_signal = np.percentile(np.abs(corrected - baseline_median), 95)
-                            ch_snr = peak_signal / baseline_std if baseline_std > 0 else 0
-                        
-                        # Dynamic range check
-                        raw_range = np.max(ch_signal_raw) - np.min(ch_signal_raw)
-                        raw_mean = np.mean(ch_signal_raw)
-                        dynamic_range = (raw_range / raw_mean * 100) if raw_mean > 0 else 0
-                        
-                        # Transient detection (use same threshold from SNR calculation)
-                        transient_frames = np.where(transient_mask)[0]
-                        transient_pct = 100 * len(transient_frames) / len(corrected) if len(corrected) > 0 else 0
-                        
-                        # Quality flags
-                        ch_issues = []
-                        if dynamic_range < 5:
-                            ch_issues.append(f"Flat signal ({dynamic_range:.1f}% range)")
-                        if np.std(ch_signal) > 10:
-                            ch_issues.append(f"Excessive noise ({np.std(ch_signal):.1f}% std)")
-                        if transient_pct < 0.5:
-                            ch_issues.append(f"No activity ({transient_pct:.1f}% transients)")
-                        
-                        # Override SNR if pathological
-                        if len(ch_issues) >= 2:
-                            ch_snr = 0.0
-                        
-                        channel_assessments_470.append({
-                            'name': self.get_channel_name(data, ch_idx),
-                            'snr': ch_snr,
-                            'signal_std': np.std(ch_signal),
-                            'correlation': abs(r_value),
-                            'dynamic_range': dynamic_range,
-                            'transient_pct': transient_pct,
-                            'issues': ch_issues
-                        })
-        
-        if has_570:
-            fp_data_570 = data.get('data_570')
-            if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                num_data_cols = fp_data_570.shape[1] - 2
-                num_channels = num_data_cols // 2
-                time_570 = fp_data_570[:, 0]
-                
-                for ch_idx in range(num_channels):
-                    ch_signal_col = 2 + (ch_idx * 2)
-                    ch_iso_col = 2 + (ch_idx * 2) + 1
-                    
-                    if ch_iso_col < fp_data_570.shape[1]:
-                        ch_signal_raw = fp_data_570[:, ch_signal_col]
-                        ch_iso_raw = fp_data_570[:, ch_iso_col]
-                        
-                        ch_signal = self.flatten_signal_for_integrity(ch_signal_raw, time_570)
-                        ch_iso = self.flatten_signal_for_integrity(ch_iso_raw, time_570)
-                        
-                        from scipy.stats import linregress
-                        slope, intercept, r_value, _, _ = linregress(ch_iso, ch_signal)
-                        motion_comp = slope * ch_iso + intercept
-                        corrected = ch_signal - motion_comp
-                        
-                        # SNR: Transient amplitude vs baseline noise
-                        baseline_median = np.median(corrected)
-                        baseline_mask = corrected <= baseline_median
-                        baseline_std = np.std(corrected[baseline_mask]) if np.sum(baseline_mask) > 10 else np.std(corrected)
-                        transient_thresh = baseline_median + 2 * baseline_std
-                        transient_mask = corrected > transient_thresh
-                        
-                        if np.sum(transient_mask) > 0:
-                            transient_amplitudes = corrected[transient_mask] - baseline_median
-                            mean_transient_amplitude = np.mean(transient_amplitudes)
-                            ch_snr = mean_transient_amplitude / baseline_std if baseline_std > 0 else 0
-                        else:
-                            # No transients - fallback to 95th percentile
-                            peak_signal = np.percentile(np.abs(corrected - baseline_median), 95)
-                            ch_snr = peak_signal / baseline_std if baseline_std > 0 else 0
-                        
-                        raw_range = np.max(ch_signal_raw) - np.min(ch_signal_raw)
-                        raw_mean = np.mean(ch_signal_raw)
-                        dynamic_range = (raw_range / raw_mean * 100) if raw_mean > 0 else 0
-                        
-                        # Transient detection (use same threshold from SNR calculation)
-                        transient_frames = np.where(transient_mask)[0]
-                        transient_pct = 100 * len(transient_frames) / len(corrected) if len(corrected) > 0 else 0
-                        
-                        ch_issues = []
-                        if dynamic_range < 5:
-                            ch_issues.append(f"Flat signal ({dynamic_range:.1f}% range)")
-                        if np.std(ch_signal) > 10:
-                            ch_issues.append(f"Excessive noise ({np.std(ch_signal):.1f}% std)")
-                        if transient_pct < 0.5:
-                            ch_issues.append(f"No activity ({transient_pct:.1f}% transients)")
-                        
-                        if len(ch_issues) >= 2:
-                            ch_snr = 0.0
-                        
-                        channel_assessments_570.append({
-                            'name': self.get_channel_name(data, ch_idx),
-                            'snr': ch_snr,
-                            'signal_std': np.std(ch_signal),
-                            'correlation': abs(r_value),
-                            'dynamic_range': dynamic_range,
-                            'transient_pct': transient_pct,
-                            'issues': ch_issues
-                        })
-        
-        # Process 470nm data (for plotting - uses selected channel)
-        if has_470:
-            fp_data_470 = data.get('data_470')
-            if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                # Get selected channel index from UI (resolve by column position so
-                # red-named channels like R4 map to the correct column, not the digit).
-                selected_channel_str = self.integrity_channel_var.get()
-                selected_ch_idx = self._channel_position(data, selected_channel_str)
-                
-                # Calculate column indices for selected channel
-                # Data format: [time, computer_ts, G0_signal, G0_iso, G1_signal, G1_iso, ...]
-                ch_signal_col = 2 + (selected_ch_idx * 2)
-                ch_iso_col = 2 + (selected_ch_idx * 2) + 1
-                
-                # Check if channel exists in data
-                if ch_iso_col >= fp_data_470.shape[1]:
-                    selected_ch_idx = 0  # Fall back to G0 if selected channel doesn't exist
-                    ch_signal_col = 2
-                    ch_iso_col = 3
-                
-                # Extract time, signal, and isosbestic for selected channel
-                time_470 = fp_data_470[:, 0]
-                signal_470_raw = fp_data_470[:, ch_signal_col]
-                isosbestic_470_raw = fp_data_470[:, ch_iso_col]
-                
-                # CRITICAL: Flatten signals by removing photobleaching BEFORE quality assessment
-                # This prevents photobleaching trends from artificially inflating SNR
-                signal_470 = self.flatten_signal_for_integrity(signal_470_raw, time_470)
-                isosbestic_470 = self.flatten_signal_for_integrity(isosbestic_470_raw, time_470)
-                
-                # Store fitted baseline for overlay (fit to raw signal)
-                try:
-                    time_for_fit = time_470 - time_470[0]
-                    fitted_470 = self.fit_biexponential(time_for_fit, signal_470_raw)
-                    # Convert fitted curve to dF/F for overlay (should be ~0)
-                    fitted_470_dff = 100 * (signal_470_raw - fitted_470) / fitted_470
-                    # The fitted baseline in dF/F space is just zeros
-                    fitted_baseline_overlay = np.zeros_like(time_470)
-                except:
-                    fitted_baseline_overlay = None
-                
-                # Plot 1: 470nm Signal Overlay (show actual dF/F% data)
-                ax1 = fig.add_subplot(4, 2, plot_idx)
-                plot_idx += 1
-                
-                # Plot the ACTUAL dF/F% signal (not renormalized!)
-                ax1.plot(time_470, signal_470, 'g-', label='470nm Signal (dF/F%)', linewidth=1.2, alpha=0.8)
-                ax1.plot(time_470, isosbestic_470, color='#8B008B', label='415nm Isosbestic (dF/F%)', 
-                        linewidth=1.0, alpha=0.6)
-                
-                # Overlay the fitted baseline (should be at zero)
-                if fitted_baseline_overlay is not None:
-                    ax1.axhline(0, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, 
-                               label='Fitted Baseline (removed)')
-                
-                ax1.set_xlabel('Time (s)', fontsize=9)
-                ax1.set_ylabel('dF/F (%)', fontsize=9)
-                ax1.set_title(f'{subject_name} - 470nm G{selected_ch_idx} Channel - Signal Integrity (Photobleaching Removed)', fontweight='bold', fontsize=10)
-                ax1.legend(loc='upper right', fontsize=8)
-                ax1.grid(True, alpha=0.3)
-                
-                # Calculate metrics for 470nm
-                # 1. Signal-to-Noise Ratio (SNR) - calculated on motion-corrected signal
-                signal_mean = np.mean(signal_470)
-                signal_std = np.std(signal_470)
-                
-                # Fit isosbestic to signal to get motion component
-                from scipy.stats import linregress
-                slope, intercept, r_value, _, _ = linregress(isosbestic_470, signal_470)
-                motion_component = slope * isosbestic_470 + intercept
-                corrected_signal = signal_470 - motion_component
-                
-                # SNR calculation for transient signals: Transient peak amplitude vs baseline noise
-                # This approach specifically measures whether transients are significantly larger than baseline
-                # 1. Define baseline as lower 50th percentile (non-transient periods)
-                baseline_median = np.median(corrected_signal)
-                baseline_mask = corrected_signal <= baseline_median
-                baseline_std = np.std(corrected_signal[baseline_mask]) if np.sum(baseline_mask) > 10 else np.std(corrected_signal)
-                
-                # 2. Define transients as peaks >2 std above median
-                transient_threshold = baseline_median + 2 * baseline_std
-                transient_mask = corrected_signal > transient_threshold
-                
-                # 3. Calculate SNR as (mean transient amplitude above baseline) / baseline_std
-                if np.sum(transient_mask) > 0:
-                    transient_amplitudes = corrected_signal[transient_mask] - baseline_median
-                    mean_transient_amplitude = np.mean(transient_amplitudes)
-                    snr_470 = mean_transient_amplitude / baseline_std if baseline_std > 0 else 0
-                else:
-                    # No transients detected - fallback to 95th percentile approach
-                    peak_signal = np.percentile(np.abs(corrected_signal - baseline_median), 95)
-                    snr_470 = peak_signal / baseline_std if baseline_std > 0 else 0
-                
-                snr_470_val = snr_470
-                
-                # CRITICAL: Check for flat/noisy signals that should fail quality assessment
-                # Calculate dynamic range of RAW signal (before flattening)
-                raw_range = np.max(signal_470_raw) - np.min(signal_470_raw)
-                raw_mean = np.mean(signal_470_raw)
-                dynamic_range_pct = (raw_range / raw_mean * 100) if raw_mean > 0 else 0
-                
-                # Check for transients (activity)
-                transient_threshold = np.mean(corrected_signal) + 2 * np.std(corrected_signal)
-                transient_frames = np.where(corrected_signal > transient_threshold)[0]
-                transient_pct = 100 * len(transient_frames) / len(corrected_signal)
-                
-                # Quality flags for flat/bad signals
-                quality_issues = []
-                if dynamic_range_pct < 5:  # Less than 5% variation in raw signal
-                    quality_issues.append("FLAT SIGNAL: Dynamic range <5%")
-                if signal_std > 10:  # dF/F std >10% indicates noise, not signal
-                    quality_issues.append("EXCESSIVE NOISE: Signal std >10%")
-                if transient_pct < 0.5:  # Less than 0.5% of frames show activity
-                    quality_issues.append("NO ACTIVITY: <0.5% transients")
-                
-                # If signal is essentially flat/noise, set SNR to 0
-                if len(quality_issues) >= 2:  # Two or more critical issues
-                    snr_470 = 0.0
-                    snr_470_val = 0.0
-                
-                # 2. Detect suspicious artifacts using z-scored data
-                # Artifacts should be RARE: |z-score| > 15 (e.g., KOR14 G0 spike to z=25)
-                # CRITICAL: Use the STORED z-scored data (same as Analysis tab) for artifact detection
-                # This ensures consistency between what user sees and what we calculate
-                fps = self.params.get('fps', 30)
-                window = int(fps)  # 1 second window
-                
-                # Try to get stored z-scored data (processed with Huber regression motion correction)
-                zscore_470_data = data.get('zscore_470')
-                if zscore_470_data is not None and zscore_470_data.shape[1] > (2 + selected_ch_idx):
-                    # Use stored z-scored data for the selected channel (column 2 + channel_index)
-                    zscore_signal = zscore_470_data[:, 2 + selected_ch_idx]
-                    
-                    # For isosbestic, we need to z-score it from dF/F data
-                    # (isosbestic doesn't go through motion correction, so no stored z-score)
-                    iso_z = (isosbestic_470 - np.mean(isosbestic_470)) / np.std(isosbestic_470)
-                    
-                    self.log_message(f"  Using stored z-scored data for artifact detection (matches Analysis tab)")
-                else:
-                    # Fallback: calculate z-score from motion-corrected signal
-                    # NOTE: This uses linregress motion correction, different from main pipeline!
-                    zscore_signal = (corrected_signal - np.mean(corrected_signal)) / np.std(corrected_signal)
-                    iso_z = (isosbestic_470 - np.mean(isosbestic_470)) / np.std(isosbestic_470)
-                    
-                    self.log_message(f"  Warning: Stored z-scored data not available, recalculating (may differ from Analysis tab)")
-                
-                # Find suspicious artifacts: |z-score| > 15
-                # Report ALL signal artifacts (not just those in both channels)
-                artifacts_signal = np.where(np.abs(zscore_signal) > 15)[0]
-                artifacts_iso = np.where(np.abs(iso_z) > 15)[0]
-                
-                # Track which artifacts appear in both channels (likely motion-related)
-                common_artifacts = []
-                for art_sig in artifacts_signal:
-                    if np.any(np.abs(artifacts_iso - art_sig) < window):
-                        common_artifacts.append(art_sig)
-                
-                # 3. Photobleaching assessment (linear fit slope)
-                from scipy.stats import linregress
-                slope_signal, intercept_signal, r_signal, _, _ = linregress(time_470, signal_470)
-                slope_iso, intercept_iso, r_iso, _, _ = linregress(time_470, isosbestic_470)
-                
-                # 4. Signal stability (standard deviation for dF/F data)
-                # NOTE: CV is not useful for dF/F% data centered around zero
-                signal_std_val = signal_std  # Direct std of dF/F%
-                cv_iso = (np.std(isosbestic_470) / np.mean(isosbestic_470) * 100) if np.mean(isosbestic_470) > 0 else 0
-                cv_470_val = signal_std_val  # Pass signal std in cv_470_val variable
-                
-                # 5. Correlation between signal and isosbestic
-                correlation_470 = np.corrcoef(signal_470, isosbestic_470)[0, 1]
-                correlation_470_val = correlation_470
-                
-                # 6. Detect sustained level shifts (major artifacts)
-                # Store ALL signal artifacts for reporting (not just common ones)
-                artifacts_470_count = len(artifacts_signal)
-                artifacts_470_in_both = len(common_artifacts)  # Store as count, not percentage
-                sustained_shifts_iso = self.detect_sustained_shifts(isosbestic_470, fps=fps)
-                sustained_shifts_470 = sustained_shifts_iso
-                
-                # Mark artifacts on plot - show ALL signal artifacts (not just common ones)
-                if len(artifacts_signal) > 0:
-                    for art_idx in artifacts_signal[:15]:  # Show first 15
-                        ax1.axvline(time_470[art_idx], color='red', linestyle=':', 
-                                  alpha=0.5, linewidth=0.8)
-                
-                # Mark sustained shifts with red bands
-                if len(sustained_shifts_iso) > 0:
-                    for shift_start, shift_end, magnitude in sustained_shifts_iso:
-                        ax1.axvspan(time_470[shift_start], time_470[min(shift_end, len(time_470)-1)], 
-                                   alpha=0.15, color='red', label='Sustained Shift' if shift_start == sustained_shifts_iso[0][0] else '')
-                
-                # Add warning if sustained shifts detected
-                if len(sustained_shifts_iso) > 0:
-                    metrics_text.append(f"\nWARNING: {len(sustained_shifts_iso)} SUSTAINED LEVEL SHIFT(S)")
-                    metrics_text.append(f"   This data has significant")
-                    metrics_text.append(f"   baseline changes that may")
-                    metrics_text.append(f"   indicate motion artifact.")
-                
-                # Add warnings for flat/noisy signals
-                if quality_issues:
-                    metrics_text.append(f"\nCRITICAL QUALITY ISSUES:")
-                    for issue in quality_issues:
-                        metrics_text.append(f"   {issue}")
-                    metrics_text.append(f"   Dynamic range: {dynamic_range_pct:.1f}%")
-                    metrics_text.append(f"   Transients: {transient_pct:.1f}% of frames")
-                
-                # === Display Per-Channel Assessments ===
-                if len(channel_assessments_470) > 0:
-                    metrics_text.append(f"\n{'='*40}")
-                    metrics_text.append(f"*** 470nm FIBER CHANNEL QUALITY ***")
-                    metrics_text.append(f"{'='*40}")
-                    for ch_assess in channel_assessments_470:
-                        metrics_text.append(f"\n>>> {ch_assess['name']} <<<")
-                        metrics_text.append(f"  SNR: {ch_assess['snr']:.2f}")
-                        metrics_text.append(f"  Signal Std: {ch_assess['signal_std']:.2f}%")
-                        metrics_text.append(f"  Dynamic Range: {ch_assess['dynamic_range']:.1f}%")
-                        metrics_text.append(f"  Transients: {ch_assess['transient_pct']:.1f}%")
-                        metrics_text.append(f"  Correlation: {ch_assess['correlation']:.3f}")
-                        if ch_assess['issues']:
-                            metrics_text.append(f"  ** ISSUES: {', '.join(ch_assess['issues'])} **")
-                    
-                    # Use first channel (G0) for legacy overall score
-                    snr_470_val = channel_assessments_470[0]['snr']
-                    cv_470_val = channel_assessments_470[0]['signal_std']
-                    correlation_470_val = channel_assessments_470[0]['correlation']
-                
-                # Supplementary metrics (not specific to one channel)
-                metrics_text.append(f"\n470nm Supplementary Metrics:")
-                metrics_text.append(f"  Isosbestic CV: {cv_iso:.2f}%")
-                metrics_text.append(f"  Photobleaching Slope: {slope_signal:.4f} a.u./s")
-                metrics_text.append(f"  Sus. Artifacts (|z|>15): {artifacts_470_count} events")
-                if artifacts_470_count > 0:
-                    metrics_text.append(f"    (In both channels: {artifacts_470_in_both})")
-                    # Show details of first few artifacts
-                    if artifacts_470_count <= 10:
-                        for i, art_idx in enumerate(artifacts_signal):
-                            time_at_artifact = time_470[art_idx]
-                            z_at_artifact = zscore_signal[art_idx]
-                            metrics_text.append(f"    #{i+1}: Frame {art_idx}, t={time_at_artifact:.1f}s, z={z_at_artifact:.1f}")
-                    else:
-                        # Show first 5 and note there are more
-                        for i, art_idx in enumerate(artifacts_signal[:5]):
-                            time_at_artifact = time_470[art_idx]
-                            z_at_artifact = zscore_signal[art_idx]
-                            metrics_text.append(f"    #{i+1}: Frame {art_idx}, t={time_at_artifact:.1f}s, z={z_at_artifact:.1f}")
-                        metrics_text.append(f"    ... and {artifacts_470_count - 5} more")
-                metrics_text.append(f"  Sustained Shifts: {len(sustained_shifts_iso)}")
-        
-        # Process 570nm data (for plotting - uses selected channel)
-        if has_570:
-            fp_data_570 = data.get('data_570')
-            if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                # Get selected channel index from UI (resolve by column position).
-                selected_channel_str = self.integrity_channel_var.get()
-                selected_ch_idx = self._channel_position(data, selected_channel_str)
-                
-                # Calculate column indices for selected channel
-                ch_signal_col = 2 + (selected_ch_idx * 2)
-                ch_iso_col = 2 + (selected_ch_idx * 2) + 1
-                
-                # Check if channel exists in data
-                if ch_iso_col >= fp_data_570.shape[1]:
-                    selected_ch_idx = 0  # Fall back to G0 if selected channel doesn't exist
-                    ch_signal_col = 2
-                    ch_iso_col = 3
-                
-                # Extract time, signal, and isosbestic for selected channel
-                time_570 = fp_data_570[:, 0]
-                signal_570_raw = fp_data_570[:, ch_signal_col]
-                isosbestic_570_raw = fp_data_570[:, ch_iso_col]
-                
-                # CRITICAL: Flatten signals by removing photobleaching BEFORE quality assessment
-                signal_570 = self.flatten_signal_for_integrity(signal_570_raw, time_570)
-                isosbestic_570 = self.flatten_signal_for_integrity(isosbestic_570_raw, time_570)
-                
-                # Store fitted baseline for overlay
-                try:
-                    time_for_fit = time_570 - time_570[0]
-                    fitted_570 = self.fit_biexponential(time_for_fit, signal_570_raw)
-                    fitted_baseline_overlay = np.zeros_like(time_570)
-                except:
-                    fitted_baseline_overlay = None
-                
-                # Plot 2: 570nm Signal Overlay (show actual dF/F% data)
-                ax2 = fig.add_subplot(4, 2, plot_idx)
-                plot_idx += 1
-                
-                # Plot the ACTUAL dF/F% signal (not renormalized!)
-                ax2.plot(time_570, signal_570, 'r-', label='570nm Signal (dF/F%)', linewidth=1.2, alpha=0.8)
-                ax2.plot(time_570, isosbestic_570, color='#8B008B', label='415nm Isosbestic (dF/F%)', 
-                        linewidth=1.0, alpha=0.6)
-                
-                # Overlay the fitted baseline (should be at zero)
-                if fitted_baseline_overlay is not None:
-                    ax2.axhline(0, color='gray', linestyle='--', linewidth=1.5, alpha=0.7,
-                               label='Fitted Baseline (removed)')
-                
-                ax2.set_xlabel('Time (s)', fontsize=9)
-                ax2.set_ylabel('dF/F (%)', fontsize=9)
-                ax2.set_title(f'{subject_name} - 570nm G{selected_ch_idx} Channel - Signal Integrity (Photobleaching Removed)', fontweight='bold', fontsize=10)
-                ax2.legend(loc='upper right', fontsize=8)
-                ax2.grid(True, alpha=0.3)
-                
-                # Calculate metrics for 570nm
-                signal_mean = np.mean(signal_570)
-                signal_std = np.std(signal_570)
-                
-                # Fit isosbestic to signal to get motion component
-                from scipy.stats import linregress
-                slope, intercept, r_value, _, _ = linregress(isosbestic_570, signal_570)
-                motion_component = slope * isosbestic_570 + intercept
-                corrected_signal = signal_570 - motion_component
-                
-                # SNR calculation for transient signals: Transient peak amplitude vs baseline noise
-                # 1. Define baseline as lower 50th percentile (non-transient periods)
-                baseline_median = np.median(corrected_signal)
-                baseline_mask = corrected_signal <= baseline_median
-                baseline_std = np.std(corrected_signal[baseline_mask]) if np.sum(baseline_mask) > 10 else np.std(corrected_signal)
-                
-                # 2. Define transients as peaks >2 std above median
-                transient_threshold_570 = baseline_median + 2 * baseline_std
-                transient_mask = corrected_signal > transient_threshold_570
-                
-                # 3. Calculate SNR as (mean transient amplitude above baseline) / baseline_std
-                if np.sum(transient_mask) > 0:
-                    transient_amplitudes = corrected_signal[transient_mask] - baseline_median
-                    mean_transient_amplitude = np.mean(transient_amplitudes)
-                    snr_570 = mean_transient_amplitude / baseline_std if baseline_std > 0 else 0
-                else:
-                    # No transients detected - fallback to 95th percentile approach
-                    peak_signal = np.percentile(np.abs(corrected_signal - baseline_median), 95)
-                    snr_570 = peak_signal / baseline_std if baseline_std > 0 else 0
-                
-                # CRITICAL: Check for flat/noisy signals
-                raw_range_570 = np.max(signal_570_raw) - np.min(signal_570_raw)
-                raw_mean_570 = np.mean(signal_570_raw)
-                dynamic_range_pct_570 = (raw_range_570 / raw_mean_570 * 100) if raw_mean_570 > 0 else 0
-                
-                # Use transient count from SNR calculation (already computed above)
-                transient_frames_570 = np.where(transient_mask)[0]
-                transient_pct_570 = 100 * len(transient_frames_570) / len(corrected_signal)
-                
-                quality_issues_570 = []
-                if dynamic_range_pct_570 < 5:
-                    quality_issues_570.append("FLAT SIGNAL: Dynamic range <5%")
-                if signal_std > 10:
-                    quality_issues_570.append("EXCESSIVE NOISE: Signal std >10%")
-                if transient_pct_570 < 0.5:
-                    quality_issues_570.append("NO ACTIVITY: <0.5% transients")
-                
-                if len(quality_issues_570) >= 2:
-                    snr_570 = 0.0
-                
-                snr_570_val = snr_570
-                
-                # Detect suspicious artifacts using z-scored data
-                # Artifacts should be RARE: |z-score| > 10 (e.g., KOR14 G0 spike to z=25)
-                # CRITICAL: Use the STORED z-scored data (same as Analysis tab) for artifact detection
-                # This ensures consistency between what user sees and what we calculate
-                fps = self.params.get('fps', 30)
-                window = int(fps)  # 1 second window
-                
-                # Try to get stored z-scored data (processed with Huber regression motion correction)
-                zscore_570_data = data.get('zscore_570')
-                if zscore_570_data is not None and zscore_570_data.shape[1] > (2 + selected_ch_idx):
-                    # Use stored z-scored data for the selected channel (column 2 + channel_index)
-                    zscore_signal = zscore_570_data[:, 2 + selected_ch_idx]
-                    
-                    # For isosbestic, we need to z-score it from dF/F data
-                    # (isosbestic doesn't go through motion correction, so no stored z-score)
-                    iso_z = (isosbestic_570 - np.mean(isosbestic_570)) / np.std(isosbestic_570)
-                    
-                    self.log_message(f"  Using stored z-scored data for artifact detection (matches Analysis tab)")
-                else:
-                    # Fallback: calculate z-score from motion-corrected signal
-                    # NOTE: This uses linregress motion correction, different from main pipeline!
-                    zscore_signal = (corrected_signal - np.mean(corrected_signal)) / np.std(corrected_signal)
-                    iso_z = (isosbestic_570 - np.mean(isosbestic_570)) / np.std(isosbestic_570)
-                    
-                    self.log_message(f"  Warning: Stored z-scored data not available, recalculating (may differ from Analysis tab)")
-                
-                # Find suspicious artifacts: |z-score| > 10
-                artifacts_signal = np.where(np.abs(zscore_signal) > 10)[0]
-                artifacts_iso = np.where(np.abs(iso_z) > 10)[0]
-                
-                # Find common artifacts (present in both channels - likely non-biological)
-                common_artifacts = []
-                for art_sig in artifacts_signal:
-                    if np.any(np.abs(artifacts_iso - art_sig) < window):
-                        common_artifacts.append(art_sig)
-                
-                # Photobleaching assessment (linear fit slope)
-                slope_signal, intercept_signal, r_signal, _, _ = linregress(time_570, signal_570)
-                slope_iso, intercept_iso, r_iso, _, _ = linregress(time_570, isosbestic_570)
-                
-                # Signal stability
-                signal_std_val = signal_std
-                cv_iso = (np.std(isosbestic_570) / np.mean(isosbestic_570) * 100) if np.mean(isosbestic_570) > 0 else 0
-                cv_570_val = signal_std_val
-                
-                # Correlation
-                correlation_570 = np.corrcoef(signal_570, isosbestic_570)[0, 1]
-                correlation_570_val = correlation_570
-                
-                # Detect sustained level shifts
-                # Store ALL signal artifacts for reporting (not just common ones)
-                artifacts_570_count = len(artifacts_signal)
-                artifacts_570_in_both = len(common_artifacts)  # Store as count, not percentage
-                sustained_shifts_iso = self.detect_sustained_shifts(isosbestic_570, fps=fps)
-                sustained_shifts_570 = sustained_shifts_iso
-                
-                # Mark artifacts on plot - show ALL signal artifacts (not just common ones)
-                if len(artifacts_signal) > 0:
-                    for art_idx in artifacts_signal[:15]:
-                        ax2.axvline(time_570[art_idx], color='red', linestyle=':', 
-                                  alpha=0.5, linewidth=0.8)
-                
-                # Mark sustained shifts with red bands
-                if len(sustained_shifts_iso) > 0:
-                    for shift_start, shift_end, magnitude in sustained_shifts_iso:
-                        ax2.axvspan(time_570[shift_start], time_570[min(shift_end, len(time_570)-1)], 
-                                   alpha=0.15, color='red', label='Sustained Shift' if shift_start == sustained_shifts_iso[0][0] else '')
-                
-                # Add warning if sustained shifts detected
-                if len(sustained_shifts_iso) > 0:
-                    metrics_text.append(f"\nWARNING: {len(sustained_shifts_iso)} SUSTAINED LEVEL SHIFT(S)")
-                    metrics_text.append(f"   This data has significant")
-                    metrics_text.append(f"   baseline changes that may")
-                    metrics_text.append(f"   indicate motion artifact.")
-                
-                # Add warnings for flat/noisy signals
-                if quality_issues_570:
-                    metrics_text.append(f"\nCRITICAL QUALITY ISSUES:")
-                    for issue in quality_issues_570:
-                        metrics_text.append(f"   {issue}")
-                    metrics_text.append(f"   Dynamic range: {dynamic_range_pct_570:.1f}%")
-                    metrics_text.append(f"   Transients: {transient_pct_570:.1f}% of frames")
-                
-                # === Display Per-Channel Assessments ===
-                if len(channel_assessments_570) > 0:
-                    metrics_text.append(f"\n{'='*40}")
-                    metrics_text.append(f"*** 570nm FIBER CHANNEL QUALITY ***")
-                    metrics_text.append(f"{'='*40}")
-                    for ch_assess in channel_assessments_570:
-                        metrics_text.append(f"\n>>> {ch_assess['name']} <<<")
-                        metrics_text.append(f"  SNR: {ch_assess['snr']:.2f}")
-                        metrics_text.append(f"  Signal Std: {ch_assess['signal_std']:.2f}%")
-                        metrics_text.append(f"  Dynamic Range: {ch_assess['dynamic_range']:.1f}%")
-                        metrics_text.append(f"  Transients: {ch_assess['transient_pct']:.1f}%")
-                        metrics_text.append(f"  Correlation: {ch_assess['correlation']:.3f}")
-                        if ch_assess['issues']:
-                            metrics_text.append(f"  ** ISSUES: {', '.join(ch_assess['issues'])} **")
-                    
-                    # Use first channel (G0) for legacy overall score
-                    snr_570_val = channel_assessments_570[0]['snr']
-                    cv_570_val = channel_assessments_570[0]['signal_std']
-                    correlation_570_val = channel_assessments_570[0]['correlation']
-                
-                # Supplementary metrics (not specific to one channel)
-                metrics_text.append(f"\n570nm Supplementary Metrics:")
-                metrics_text.append(f"  Isosbestic CV: {cv_iso:.2f}%")
-                metrics_text.append(f"  Photobleaching Slope: {slope_signal:.4f} a.u./s")
-                metrics_text.append(f"  Sus. Artifacts (|z|>15): {artifacts_570_count} events")
-                if artifacts_570_count > 0:
-                    metrics_text.append(f"    (In both channels: {artifacts_570_in_both})")
-                    # Show details of first few artifacts
-                    if artifacts_570_count <= 10:
-                        for i, art_idx in enumerate(artifacts_signal):
-                            time_at_artifact = time_570[art_idx]
-                            z_at_artifact = zscore_signal[art_idx]
-                            metrics_text.append(f"    #{i+1}: Frame {art_idx}, t={time_at_artifact:.1f}s, z={z_at_artifact:.1f}")
-                    else:
-                        # Show first 5 and note there are more
-                        for i, art_idx in enumerate(artifacts_signal[:5]):
-                            time_at_artifact = time_570[art_idx]
-                            z_at_artifact = zscore_signal[art_idx]
-                            metrics_text.append(f"    #{i+1}: Frame {art_idx}, t={time_at_artifact:.1f}s, z={z_at_artifact:.1f}")
-                        metrics_text.append(f"    ... and {artifacts_570_count - 5} more")
-                metrics_text.append(f"  Sustained Shifts: {len(sustained_shifts_iso)}")
-        
-        # Plot 3: Signal Stability Over Time (Moving CV)
-        ax3 = fig.add_subplot(4, 2, 5)
-        
-        if has_470:
-            fp_data_470 = data.get('data_470')
-            if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                time_470 = fp_data_470[:, 0]
-                signal_470 = fp_data_470[:, 2]
-                
-                # Calculate moving coefficient of variation
-                window_size = int(self.params.get('fps', 30) * 60)  # 1 minute window
-                moving_cv = []
-                time_points = []
-                
-                for i in range(0, len(signal_470) - window_size, window_size // 2):
-                    window_data = signal_470[i:i+window_size]
-                    cv = (np.std(window_data) / np.mean(window_data) * 100) if np.mean(window_data) > 0 else 0
-                    moving_cv.append(cv)
-                    time_points.append(time_470[i + window_size // 2])
-                
-                ax3.plot(time_points, moving_cv, 'g-', label='470nm', linewidth=2)
-        
-        if has_570:
-            fp_data_570 = data.get('data_570')
-            if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                time_570 = fp_data_570[:, 0]
-                signal_570 = fp_data_570[:, 2]
-                
-                # Calculate moving coefficient of variation
-                window_size = int(self.params.get('fps', 30) * 60)
-                moving_cv = []
-                time_points = []
-                
-                for i in range(0, len(signal_570) - window_size, window_size // 2):
-                    window_data = signal_570[i:i+window_size]
-                    cv = (np.std(window_data) / np.mean(window_data) * 100) if np.mean(window_data) > 0 else 0
-                    moving_cv.append(cv)
-                    time_points.append(time_570[i + window_size // 2])
-                
-                ax3.plot(time_points, moving_cv, 'r-', label='570nm', linewidth=2)
-        
-        ax3.set_xlabel('Time (s)', fontsize=9)
-        ax3.set_ylabel('Coefficient of Variation (%)', fontsize=9)
-        ax3.set_title('Signal Stability Over Time (1-min windows)', fontweight='bold', fontsize=10)
-        ax3.legend(fontsize=8)
-        ax3.grid(True, alpha=0.3)
-        
-        # Plot 4: Photobleaching Trends
-        ax4 = fig.add_subplot(4, 2, 6)
-        
-        if has_470:
-            fp_data_470 = data.get('data_470')
-            if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                time_470 = fp_data_470[:, 0]
-                signal_470 = fp_data_470[:, 2]
-                
-                # Fit exponential decay or linear trend
-                from scipy.stats import linregress
-                slope, intercept, r_value, _, _ = linregress(time_470, signal_470)
-                fitted_line = slope * time_470 + intercept
-                
-                # Normalize to show as percentage of initial
-                signal_norm = (signal_470 / signal_470[0]) * 100
-                fitted_norm = (fitted_line / fitted_line[0]) * 100
-                
-                ax4.plot(time_470, signal_norm, 'g-', alpha=0.5, linewidth=0.8, label='470nm Signal')
-                ax4.plot(time_470, fitted_norm, 'g--', linewidth=2, label='470nm Trend')
-        
-        if has_570:
-            fp_data_570 = data.get('data_570')
-            if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                time_570 = fp_data_570[:, 0]
-                signal_570 = fp_data_570[:, 2]
-                
-                from scipy.stats import linregress
-                slope, intercept, r_value, _, _ = linregress(time_570, signal_570)
-                fitted_line = slope * time_570 + intercept
-                
-                # Normalize to show as percentage of initial
-                signal_norm = (signal_570 / signal_570[0]) * 100
-                fitted_norm = (fitted_line / fitted_line[0]) * 100
-                
-                ax4.plot(time_570, signal_norm, 'r-', alpha=0.5, linewidth=0.8, label='570nm Signal')
-                ax4.plot(time_570, fitted_norm, 'r--', linewidth=2, label='570nm Trend')
-        
-        ax4.set_xlabel('Time (s)', fontsize=9)
-        ax4.set_ylabel('Signal (% of initial)', fontsize=9)
-        ax4.set_title('Photobleaching Assessment', fontweight='bold', fontsize=10)
-        ax4.axhline(100, color='k', linestyle=':', alpha=0.5)
-        ax4.legend(fontsize=8)
-        ax4.grid(True, alpha=0.3)
-        
-        # Plot 5: Power Spectrum (Frequency Analysis)
-        ax5 = fig.add_subplot(4, 2, 7)
-        
+
         fps = self.params.get('fps', 30)
-        
-        if has_470:
-            fp_data_470 = data.get('data_470')
-            if fp_data_470 is not None and fp_data_470.shape[1] >= 4:
-                signal_470 = fp_data_470[:, 2]
-                
-                # Calculate power spectrum
-                from scipy import signal as scipy_signal
-                freqs, psd = scipy_signal.welch(signal_470, fs=fps, nperseg=min(256, len(signal_470)//4))
-                
-                ax5.semilogy(freqs[1:], psd[1:], 'g-', label='470nm', linewidth=2)
-        
-        if has_570:
-            fp_data_570 = data.get('data_570')
-            if fp_data_570 is not None and fp_data_570.shape[1] >= 4:
-                signal_570 = fp_data_570[:, 2]
-                
-                from scipy import signal as scipy_signal
-                freqs, psd = scipy_signal.welch(signal_570, fs=fps, nperseg=min(256, len(signal_570)//4))
-                
-                ax5.semilogy(freqs[1:], psd[1:], 'r-', label='570nm', linewidth=2)
-        ax5.set_xlabel('Frequency (Hz)', fontsize=9)
-        ax5.set_ylabel('Power Spectral Density', fontsize=9)
-        ax5.set_title('Frequency Analysis (detects periodic noise/oscillations)', fontweight='bold', fontsize=10)
-        ax5.legend(fontsize=8)
-        ax5.grid(True, alpha=0.3)
-        ax5.set_xlim([0, min(5, fps/2)])  # Show up to 5 Hz or Nyquist
-        # Add note about interpretation
-        ax5.text(0.98, 0.98, 'Peaks indicate periodic\nartifacts or oscillations,\nflat = broadband noise',
-                transform=ax5.transAxes, fontsize=7, va='top', ha='right',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-        
-        # Plot 6: Quality Metrics Summary (Text Box)
-        ax6 = fig.add_subplot(4, 2, 8)
-        ax6.axis('off')
-        
-        # Add interpretation guidance (matches the rebuilt score, shown at top)
         sensor_mode = bool(getattr(self, 'integrity_sensor_mode_var', None)
                            and self.integrity_sensor_mode_var.get())
-        metrics_text.append("\n" + "="*35)
-        metrics_text.append("Score = Dynamics/Noise/Dropout")
-        if sensor_mode:
-            metrics_text.append("(Sensor mode: 415nm ignored,")
-            metrics_text.append(" no Motion term)")
-        else:
-            metrics_text.append(" + Motion (415/baseline)")
-        metrics_text.append("")
-        metrics_text.append("Sub-scores 0-100, higher=better:")
-        metrics_text.append("  Dynamics: real slow signal")
-        metrics_text.append("    vs fast noise (sf-SNR)")
-        metrics_text.append("  Noise: high-freq cleanliness")
-        metrics_text.append("  Dropout: free of spikes/")
-        metrics_text.append("    dropouts (skew/kurtosis)")
-        if not sensor_mode:
-            metrics_text.append("  Motion: low 415 corr +")
-            metrics_text.append("    stable baseline (tangle)")
-        metrics_text.append("")
-        metrics_text.append("Score bands:")
-        metrics_text.append("  >=90 Excellent  80-90 Good")
-        metrics_text.append("  70-80 Fair  50-70 Poor")
-        metrics_text.append("  <50 Bad (reject)")
-        metrics_text.append("")
-        metrics_text.append("Use zoom tool to view specific")
-        metrics_text.append("sections of this report.")
-        
-        metrics_str = '\n'.join(metrics_text)
-        ax6.text(0.02, 0.98, metrics_str, transform=ax6.transAxes,
-                fontsize=7.5, verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-        
-        # Calculate overall quality score (top of figure) using the unified metric
-        # engine on the SELECTED channel, so this score exactly matches the
-        # multi-subject table / export / auto-exclude (and honours Sensor mode).
-        sensor_mode = bool(getattr(self, 'integrity_sensor_mode_var', None)
-                           and self.integrity_sensor_mode_var.get())
-        selected_channel_str = self.integrity_channel_var.get() or "G0"
+
+        # --- Unified metrics (same engine as the table/export/auto-exclude) ---
         all_metrics = self._extract_signal_integrity_metrics(data, sensor=sensor_mode) or []
-        chosen_metrics = next((m for m in all_metrics
-                               if m.get('channel') == selected_channel_str), None)
-        if chosen_metrics is None and all_metrics:
-            chosen_metrics = all_metrics[0]
-        overall_score = chosen_metrics.get('overall_score', 0) if chosen_metrics else 0
-        score_components = chosen_metrics.get('score_components', {}) if chosen_metrics else {}
+        if not all_metrics:
+            fig.text(0.5, 0.5, 'No channels available for signal integrity analysis',
+                     ha='center', va='center', fontsize=14)
+            return
 
-        # Add channel information to title (use the real designation as selected)
-        if has_470 and has_570:
-            channel_info = f"Both 470nm and 570nm - Channel {selected_channel_str}"
-        elif has_470:
-            channel_info = f"470nm Channel {selected_channel_str}"
-        else:
-            channel_info = f"570nm Channel {selected_channel_str}"
-        
-        # Add overall score at the top
-        score_ax = fig.add_subplot(4, 1, 1)
-        score_ax.axis('off')
-        
-        # Determine color based on score
-        if overall_score >= 90:
-            score_color = '#00AA00'  # Green
-            quality_text = 'Excellent'
-        elif overall_score >= 80:
-            score_color = '#88CC00'  # Yellow-green
-            quality_text = 'Good'
-        elif overall_score >= 70:
-            score_color = '#CCAA00'  # Yellow
-            quality_text = 'Fair'
-        elif overall_score >= 50:
-            score_color = '#DD6600'  # Orange
-            quality_text = 'Poor'
-        else:
-            score_color = '#DD0000'  # Red
-            quality_text = 'Bad'
+        sel_name = self.integrity_channel_var.get()
+        chosen = next((m for m in all_metrics if m.get('channel') == sel_name), all_metrics[0])
+        ch_name = chosen.get('channel', 'G0')
 
-        # Sub-score breakdown + mode so the user sees WHY the score is what it is.
-        mode_str = 'Sensor (415 ignored)' if sensor_mode else 'GCaMP'
+        # Primary wavelength = the one the metric engine assessed (470 preferred).
+        if has_470 and data.get('data_470') is not None:
+            wl, fp = '470', data.get('data_470')
+            sig_color = '#1f9e1f'
+        else:
+            wl, fp = '570', data.get('data_570')
+            sig_color = '#C8102E'
+
+        n_chan = (fp.shape[1] - 2) // 2
+        ch_idx = self._channel_position(data, ch_name)
+        if ch_idx is None or ch_idx < 0 or ch_idx >= n_chan:
+            ch_idx = 0
+
+        # --- Display series for the selected channel (matches what was scored) ---
+        time = fp[:, 0]
+        sig_raw = fp[:, 2 + ch_idx * 2]
+        iso_raw = fp[:, 2 + ch_idx * 2 + 1]
+        signal = self.flatten_signal_for_integrity(sig_raw, time)
+        iso = self.flatten_signal_for_integrity(iso_raw, time)
+        slope, intercept, _, _, _ = linregress(iso, signal)
+        corrected = signal - (slope * iso + intercept)
+        assess = signal if sensor_mode else corrected
+        assess_label = 'Flattened signal' if sensor_mode else 'Motion-corrected signal'
+
+        # Slow band (the "real dynamics" the Dynamics sub-score measures)
+        w = max(3, int(round(fps * 1.5)))
+        slow = np.convolve(assess, np.ones(w) / w, mode='same')
+
+        # Artifact frames + sustained shifts for on-trace marking (cheap recompute)
+        cstd = np.std(corrected)
+        zsig = (corrected - np.mean(corrected)) / cstd if cstd > 1e-12 else np.zeros_like(corrected)
+        artifact_idx = np.where(np.abs(zsig) > 15)[0]
+        shift_ref = signal if sensor_mode else iso
+        shifts = self.detect_sustained_shifts(shift_ref, fps=fps)
+
+        # --- Pull the scored numbers ---
+        score = chosen.get('overall_score', 0)
+        comps = chosen.get('score_components', {}) or {}
+        dyn, noise, drop, motion = (comps.get('dynamics'), comps.get('noise'),
+                                    comps.get('dropout'), comps.get('motion'))
+
+        if score >= 90:
+            score_color, quality = '#00AA00', 'Excellent'
+        elif score >= 80:
+            score_color, quality = '#5FA800', 'Good'
+        elif score >= 70:
+            score_color, quality = '#B59000', 'Fair'
+        elif score >= 50:
+            score_color, quality = '#DD6600', 'Poor'
+        else:
+            score_color, quality = '#DD0000', 'Bad'
+
+        # --- Layout: explicit gridspec so nothing overlaps ---
+        fig.clf()
+        gs = fig.add_gridspec(4, 2, height_ratios=[0.55, 1.35, 1.0, 0.95],
+                              left=0.07, right=0.97, top=0.99, bottom=0.06,
+                              hspace=0.62, wspace=0.20)
+
+        # =================== Header: score + sub-scores ===================
+        ax_head = fig.add_subplot(gs[0, :])
+        ax_head.axis('off')
+        mode_str = 'Sensor (415nm ignored)' if sensor_mode else 'GCaMP (415nm motion control)'
 
         def _c(v):
             return f'{v:.0f}' if v is not None else '—'
-        comp_str = (f"Dynamics {_c(score_components.get('dynamics'))} | "
-                    f"Noise {_c(score_components.get('noise'))} | "
-                    f"Dropout {_c(score_components.get('dropout'))} | "
-                    f"Motion {_c(score_components.get('motion'))}")
+        comp_str = (f"Dynamics {_c(dyn)}   ·   Noise {_c(noise)}   ·   "
+                    f"Dropout {_c(drop)}   ·   Motion {_c(motion)}")
+        ax_head.text(0.5, 0.78, f'Signal Integrity — {subject_name}',
+                     ha='center', va='center', fontsize=12, fontweight='bold',
+                     color='#333333', transform=ax_head.transAxes)
+        ax_head.text(0.5, 0.40,
+                     f'{ch_name} ({wl}nm) — Quality Score {score:.1f}/100  ({quality})    [{mode_str}]\n{comp_str}',
+                     ha='center', va='center', fontsize=13, fontweight='bold',
+                     color=score_color, transform=ax_head.transAxes,
+                     bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
+                               edgecolor=score_color, linewidth=2.5))
 
-        score_ax.text(0.5, 0.5,
-                     f'Overall Signal Quality Score: {overall_score:.1f}/100  ({quality_text})\n'
-                     f'{channel_info}   [{mode_str}]\n{comp_str}',
-                     ha='center', va='center', fontsize=15, fontweight='bold',
-                     color=score_color, transform=score_ax.transAxes,
-                     bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor=score_color, linewidth=3))
-        
-        fig.suptitle(f'Signal Integrity Assessment - {subject_name}', 
-                    fontsize=14, fontweight='bold', y=0.99)
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        # =================== Main trace ===================
+        ax_tr = fig.add_subplot(gs[1, :])
+        ax_tr.plot(time, assess, color=sig_color, lw=0.7, alpha=0.55,
+                   label=f'{assess_label} (dF/F%)')
+        ax_tr.plot(time, slow, color='#00204e', lw=1.6, alpha=0.9,
+                   label='Slow band (real dynamics)')
+        if not sensor_mode:
+            ax_tr.plot(time, iso, color='#8B008B', lw=0.6, alpha=0.35,
+                       label='415nm isosbestic (dF/F%)')
+        ax_tr.axhline(0, color='gray', ls='--', lw=1.0, alpha=0.6)
+
+        # Mark sustained shifts and artifacts
+        for k, (s0, s1, _mag) in enumerate(shifts):
+            ax_tr.axvspan(time[s0], time[min(s1, len(time) - 1)], color='red', alpha=0.12,
+                          label='Sustained shift' if k == 0 else None)
+        if len(artifact_idx) > 0:
+            ax_tr.plot(time[artifact_idx], np.full(len(artifact_idx), ax_tr.get_ylim()[0]),
+                       marker='|', ls='none', color='red', ms=8, alpha=0.7,
+                       label=f'Artifact (|z|>15) ×{len(artifact_idx)}')
+
+        ax_tr.set_xlabel('Time (s)', fontsize=9)
+        ax_tr.set_ylabel('dF/F (%)', fontsize=9)
+        ax_tr.set_title(f'Assessed signal for {ch_name} — this is what the score sees '
+                        f'(photobleaching removed)', fontsize=10, fontweight='bold')
+        ax_tr.legend(loc='upper right', fontsize=7.5, ncol=2, framealpha=0.85)
+        ax_tr.grid(True, alpha=0.3)
+        ax_tr.margins(x=0.01)
+
+        # =================== Power spectrum ===================
+        ax_psd = fig.add_subplot(gs[2, 0])
+        try:
+            from scipy import signal as scipy_signal
+            nperseg = int(min(1024, max(64, len(signal) // 4)))
+            freqs, psd = scipy_signal.welch(signal, fs=fps, nperseg=nperseg)
+            ax_psd.semilogy(freqs[1:], psd[1:], color=sig_color, lw=1.5)
+        except Exception:
+            ax_psd.text(0.5, 0.5, 'Spectrum unavailable', ha='center', va='center',
+                        transform=ax_psd.transAxes, fontsize=9)
+        ax_psd.set_xlabel('Frequency (Hz)', fontsize=9)
+        ax_psd.set_ylabel('Power', fontsize=9)
+        ax_psd.set_title('Frequency content', fontsize=9.5, fontweight='bold')
+        ax_psd.set_xlim([0, min(5, fps / 2)])
+        ax_psd.grid(True, alpha=0.3)
+        ax_psd.text(0.97, 0.95, 'real signal = low-freq\nnoise = flat/broadband',
+                    transform=ax_psd.transAxes, fontsize=7, va='top', ha='right',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35))
+
+        # =================== Amplitude distribution ===================
+        ax_hist = fig.add_subplot(gs[2, 1])
+        ax_hist.hist(assess, bins=60, color=sig_color, alpha=0.75)
+        ax_hist.axvline(float(np.median(assess)), color='k', ls=':', lw=1.2, alpha=0.7)
+        ax_hist.set_xlabel('dF/F (%)', fontsize=9)
+        ax_hist.set_ylabel('Count', fontsize=9)
+        ax_hist.set_title('Amplitude distribution', fontsize=9.5, fontweight='bold')
+        ax_hist.grid(True, alpha=0.3)
+        ax_hist.text(0.97, 0.95,
+                     f"skew {chosen.get('skew', 0):+.2f}\nkurtosis {chosen.get('kurt', 0):.1f}",
+                     transform=ax_hist.transAxes, fontsize=7.5, va='top', ha='right',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35))
+
+        # =================== Metrics + interpretation ===================
+        ax_txt = fig.add_subplot(gs[3, :])
+        ax_txt.axis('off')
+
+        if sensor_mode:
+            corr_line = '415-470 corr   : ignored (sensor)'
+        else:
+            corr_line = (f"415-470 corr   : {chosen.get('correlation', 0):+.3f}    "
+                         f"(motion var removed {chosen.get('var_removed', 0) * 100:.0f}%)")
+
+        left_lines = [
+            'SUB-SCORES (0-100, higher = better)',
+            f"  Dynamics : {_c(dyn):>4}   real slow signal vs noise",
+            f"  Noise    : {_c(noise):>4}   high-frequency cleanliness",
+            f"  Dropout  : {_c(drop):>4}   free of spikes / dropouts",
+            f"  Motion   : {_c(motion):>4}   415 / baseline stability",
+        ]
+        right_lines = [
+            'MEASUREMENTS',
+            f"  Slow/fast SNR  : {chosen.get('sf_snr', 0):.2f}    (drives Dynamics)",
+            f"  HF noise ratio : {chosen.get('hf_ratio', 0):.2f}    (drives Noise)",
+            f"  Transient SNR  : {chosen.get('snr', 0):.2f}",
+            f"  Signal std     : {chosen.get('signal_std', 0):.2f}%",
+            f"  {corr_line}",
+            f"  Artifacts |z|>15: {chosen.get('artifacts_count', 0)}     "
+            f"Sustained shifts: {chosen.get('sustained_shifts_count', 0)}",
+        ]
+
+        ax_txt.text(0.0, 1.0, '\n'.join(left_lines), transform=ax_txt.transAxes,
+                    fontsize=8.5, va='top', ha='left', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='#f4f4f4', alpha=0.9))
+        ax_txt.text(0.5, 1.0, '\n'.join(right_lines), transform=ax_txt.transAxes,
+                    fontsize=8.5, va='top', ha='left', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='#f4f4f4', alpha=0.9))
+
+        # Limiting-factor interpretation (the lowest sub-score)
+        named = [(n, v) for n, v in (('Dynamics', dyn), ('Noise', noise),
+                                     ('Dropout', drop), ('Motion', motion)) if v is not None]
+        worst_name, worst_val = min(named, key=lambda kv: kv[1])
+        reason = {
+            'Dynamics': 'weak real signal — recording is mostly noise / flat',
+            'Noise': 'high-frequency noise dominates the signal',
+            'Dropout': 'spike or dropout artifacts present',
+            'Motion': 'motion / fibre-tangle (415-correlated, baseline shifts)',
+        }[worst_name]
+        if worst_val >= 80:
+            verdict = 'All dimensions look healthy.'
+        else:
+            verdict = f'Limiting factor: {worst_name} ({worst_val:.0f}) — {reason}.'
+        ax_txt.text(0.0, 0.06, verdict, transform=ax_txt.transAxes,
+                    fontsize=9, va='bottom', ha='left', style='italic',
+                    color=score_color, fontweight='bold')
     
     def plot_bouts_overlay(self, fig, data, subject):
         """Plot z-scored signal with bout markers"""
@@ -23941,7 +23461,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 show_g0 = False
             if self.is_subject_channel_excluded(subject_name, 'G1'):
                 show_g1 = False
-        
+
+        # A single-channel subject has no G1 — never draw a phantom second bar.
+        if self._beh_channel_count(data) < 2:
+            show_g1 = False
+
         # Aggregate zones by category
         maze_type = self.params.get('maze_type', 'EPM')
         category_data = self._aggregate_zones_by_category(zone_averages, maze_type)
@@ -24038,7 +23562,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             else:
                 zones.append('unknown')
 
-        return self.calculate_zone_averages(beh_synced, zones)
+        return self.calculate_zone_averages(
+            beh_synced, zones, n_channels=self._beh_channel_count(data))
 
     def _aggregate_zones_by_category(self, zone_averages, maze_type):
         """Aggregate individual zones into categories (e.g., all open arms -> 'Open')"""
@@ -24162,7 +23687,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 show_g0 = False
             if self.is_subject_channel_excluded(subject_name, 'G1'):
                 show_g1 = False
-        
+
+        # A single-channel subject has no G1 — don't plot a phantom second trace.
+        if self._beh_channel_count(data) < 2:
+            show_g1 = False
+
         # X-axis subplot
         ax1 = fig.add_subplot(1, 2, 1)
         
@@ -24236,6 +23765,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if self.is_subject_channel_excluded(subject_name, 'G1'):
                 show_g1 = False
 
+        # A single-channel subject has no G1 — don't plot a phantom second trace.
+        if self._beh_channel_count(data) < 2:
+            show_g1 = False
+
         ax = fig.add_subplot(1, 1, 1)
         eucl_bins = self._sorted_distance_bins(data['distance_averages_euclidean'])
         distances = [b[0] for b in eucl_bins]
@@ -24280,6 +23813,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
+
+        # Suppress G1 when no selected subject has a 2nd channel.
+        if not self._any_subject_has_g1(subjects):
+            show_g1 = False
 
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
@@ -24351,6 +23888,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Plot Euclidean distance-from-center comparing multiple groups"""
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
+
+        # Suppress G1 when no subject across the compared groups has a 2nd channel.
+        if not self._any_subject_has_g1(
+                [s for g in group_names for s in self.groups.get(g, [])]):
+            show_g1 = False
 
         subjects_for_g0_by_group = {}
         subjects_for_g1_by_group = {}
@@ -24802,7 +24344,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         maze_type = self.params.get('maze_type', 'EPM')
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
-        
+
+        # Suppress G1 entirely when none of the selected subjects has a 2nd
+        # channel, so single-channel cohorts don't show a phantom G1 series.
+        if not self._any_subject_has_g1(subjects):
+            show_g1 = False
+
         # Apply exclusions if enabled - need to check both channels per subject
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
@@ -24921,7 +24468,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         maze_type = self.params.get('maze_type', 'EPM')
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
-        
+
+        # Suppress G1 when no subject across the compared groups has a 2nd channel.
+        if not self._any_subject_has_g1(
+                [s for g in group_names for s in self.groups.get(g, [])]):
+            show_g1 = False
+
         # Apply exclusions if enabled
         subjects_for_g0_by_group = {}
         subjects_for_g1_by_group = {}
@@ -25135,14 +24687,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
-        
+
+        # Suppress G1 when no selected subject has a 2nd channel.
+        if not self._any_subject_has_g1(subjects):
+            show_g1 = False
+
         # Apply exclusions if enabled - need to check both channels per subject
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
             subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
             subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
-        
+
         # Collect all distance data
         all_x_data = {}
         all_y_data = {}
@@ -25291,6 +24847,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Plot distance-from-center comparing multiple groups in a 2x2 grid"""
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
+
+        # Suppress G1 when no subject across the compared groups has a 2nd channel.
+        if not self._any_subject_has_g1(
+                [s for g in group_names for s in self.groups.get(g, [])]):
+            show_g1 = False
+
         maze_type = self.params.get('maze_type', 'EPM')
 
         if maze_type in ['EPM', 'EPM_Complex']:
@@ -25459,7 +25021,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         outback_data = data['outback']
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
-        
+
+        # A single-channel subject has no G1 — don't plot a phantom second bar.
+        if self._beh_channel_count(data) < 2:
+            show_g1 = False
+
         # Check if data exists
         has_out = 'out' in outback_data and outback_data['out'].get('G0_n', 0) > 0
         has_back = 'back' in outback_data and outback_data['back'].get('G0_n', 0) > 0
@@ -25541,7 +25107,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Single group mode - collect data across subjects
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
-        
+
+        # Suppress G1 when no selected subject has a 2nd channel.
+        if not self._any_subject_has_g1(subjects):
+            show_g1 = False
+
         out_g0_values = []
         out_g1_values = []
         back_g0_values = []
@@ -25643,7 +25213,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Compare Out/Back movements between multiple groups"""
         show_g0 = self.show_g0.get()
         show_g1 = self.show_g1.get()
-        
+
+        # Suppress G1 when no subject across the compared groups has a 2nd channel.
+        if not self._any_subject_has_g1(
+                [s for g in group_names for s in self.groups.get(g, [])]):
+            show_g1 = False
+
         # Collect data for each group
         group_data = {}
         for group_name in group_names:
@@ -33238,6 +32813,13 @@ cat("OK\n")
         if isinstance(z, np.ndarray) and z.ndim == 2 and z.shape[1] > 2:
             return z.shape[1] - 2
         return self.get_num_channels(data)
+
+    def _any_subject_has_g1(self, subjects):
+        """True if any of the given subjects was recorded on 2+ photometry
+        channels. Used to suppress a phantom G1 series in multi-subject / group
+        plots when the whole cohort is single-channel."""
+        return any(self._beh_channel_count(self.processed_data[s]) >= 2
+                   for s in subjects if s in self.processed_data)
 
     def _beh_kin_base(self, n_channels):
         """First kinematics column index in beh_synced for the given channel count."""
