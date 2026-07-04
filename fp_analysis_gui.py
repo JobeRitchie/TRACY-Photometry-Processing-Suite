@@ -34,8 +34,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.6.0"
-APP_VERSION_DATE = "June 29, 2026"
+APP_VERSION = "1.7.0"
+APP_VERSION_DATE = "July 4, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -9271,6 +9271,23 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Pairwise behavior comparison for the FLMM-style time-course stats (Bout
+    Analysis → Plot ▾ → "Time-Course Statistics" → "Pairwise matrix"). A popup with
+    behavior and channel checkboxes lets you compare every selected behavior against
+    every other. Each pair is tested with a global sup-t (max-statistic) functional
+    Wald test — the p-value companion of the simultaneous confidence band, which
+    corrects across the whole peri-event window — and the pair p-values are then
+    Benjamini-Hochberg FDR-corrected. Results render as a manuscript-ready
+    lower-triangular significance matrix (colour = −log₁₀ FDR p, stars per cell, grey
+    = ns) with a copy-to-clipboard table. Pure-Python engine; no R required.
+  • New — Pairwise comparison runs "within channel" (one behavior × behavior matrix
+    per selected channel) or "same behavior across channels" (each behavior compared
+    between channels, e.g. G0 vs G1, as a compact per-behavior panel). Multiple
+    panels are viewed one at a time with a channel/behavior selector; the
+    across-channel tests are jointly FDR-corrected across the whole family.
+
+Version 1.6.0  •  June 29, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix (correctness) — Single-channel (G0-only) recordings no longer show a phantom
     G1 series in Zone Averages, Distance from Center (X / Y / Euclidean), and
@@ -26983,6 +27000,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return (Z, np.array(subj_list, dtype=object),
                 np.array(fac_list, dtype=object), L)
 
+    def _collect_flmm_across_channels(self, subjects, behavior, channels):
+        """Collect ONE behavior's bouts across several channels, tagging each bout
+        with its channel (the factor). Used by the same-behavior-across-channels
+        pairwise mode. Returns (Z, subjects, channel_factor, L) or None."""
+        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        traces, subj_list, chan_list = [], [], []
+        for subject in subjects:
+            data = self.processed_data.get(subject, {})
+            if 'bouts' not in data or behavior not in data['bouts']:
+                continue
+            entry = data['bouts'][behavior]
+            for channel in channels:
+                bouts_data = entry.get(channel, [])
+                if not bouts_data:
+                    alt = 'G0' if channel == 'Ch0' else 'G1' if channel == 'Ch1' else None
+                    if alt:
+                        bouts_data = entry.get(alt, [])
+                if max_bouts is not None:
+                    bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
+                for bout in bouts_data:
+                    arr = np.asarray(bout, dtype=float)
+                    if arr.size == 0 or not np.any(np.isfinite(arr)):
+                        continue
+                    traces.append(arr)
+                    subj_list.append(subject)
+                    chan_list.append(channel)
+        if not traces:
+            return None
+        L = min(len(t) for t in traces)
+        if L < 3:
+            return None
+        Z = np.vstack([t[:L] for t in traces])
+        return (Z, np.array(subj_list, dtype=object),
+                np.array(chan_list, dtype=object), L)
+
     def _fit_timecourse(self, Z, subjects, groups, orders, reference, ref_level=None):
         """FUI step 1: fit a random-intercept mixed model at every timepoint.
 
@@ -27116,6 +27169,46 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         rng = np.random.default_rng(seed)
         sim = rng.multivariate_normal(np.zeros(L), corr, size=n_sim, method='cholesky')
         return float(np.percentile(np.max(np.abs(sim), axis=1), 95))
+
+    @staticmethod
+    def _flmm_supt_pvalue(cov, t_obs, n_sim=10000, seed=0):
+        """Global sup-t (max-statistic) functional test that a coefficient/contrast
+        function differs from zero *anywhere* over the window, corrected across
+        time. The p-value companion of the simultaneous band: standardize cov to a
+        correlation matrix, simulate MVN(0, corr), and compare the observed
+        sup_t |β/se| against the null distribution of max|z|. Returns (p, c_star),
+        c_star being the 95th-percentile joint-band multiplier (== _flmm_qn_from_cov)."""
+        L = cov.shape[0]
+        d = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+        S = np.diag(1.0 / d)
+        corr = S @ cov @ S
+        corr = (corr + corr.T) / 2.0
+        w, V = np.linalg.eigh(corr)
+        w = np.clip(w, 1e-8, None)
+        corr = V @ np.diag(w) @ V.T
+        rng = np.random.default_rng(seed)
+        sim_max = np.max(np.abs(rng.multivariate_normal(
+            np.zeros(L), corr, size=n_sim, method='cholesky')), axis=1)
+        c_star = float(np.percentile(sim_max, 95))
+        if not np.isfinite(t_obs):
+            return 1.0, c_star
+        # +1 smoothing keeps the empirical p strictly > 0 (permutation-p convention)
+        p = (1.0 + float(np.sum(sim_max >= t_obs))) / (n_sim + 1.0)
+        return float(min(1.0, p)), c_star
+
+    @staticmethod
+    def _bh_fdr(pvals):
+        """Benjamini-Hochberg FDR-adjusted p-values (step-up, monotone)."""
+        p = np.asarray(pvals, dtype=float)
+        m = p.size
+        if m == 0:
+            return p
+        order = np.argsort(p)
+        ranked = p[order] * m / (np.arange(m) + 1.0)
+        ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+        out = np.empty(m)
+        out[order] = np.clip(ranked, 0.0, 1.0)
+        return out
 
     def _flmm_gls_cov(self, fit):
         """GLS subject-clustered (CR0) covariance of the coefficient function.
@@ -27294,18 +27387,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 'ref_level': ref_level, 'eta': eta, 'tau2': tau2, 'sig2': sig2,
                 'X': X, 'subj_codes': subj_codes, 'n_subjects': n_subjects}
 
-    def _flmm_factor_qn(self, fitf, pointwise_only):
-        """Per-coefficient joint multipliers for the factor model (one GLS
-        subject-clustered covariance per coefficient). Returns list length K."""
+    def _flmm_factor_contribs(self, fitf):
+        """Per-subject contributions A[k, s, t] to each factor coefficient's GLS
+        estimate — the building block of every across-time covariance.
+
+        a_i,k(t) is subject i's clustered (CR0) contribution to coefficient k, so
+        A[k].T @ A[k] is the L×L covariance of coefficient k, and for any contrast
+        vector c the per-subject contributions c·A give the covariance of the
+        contrast function c'β(t). Returns (A, subs) with A shape (K, S, L)."""
         X = fitf['X']; subj_codes = fitf['subj_codes']; eta = fitf['eta']
         tau2 = fitf['tau2']; sig2 = fitf['sig2']
         n, L = eta.shape
         p = X.shape[1]
-        bonf = float(stats.norm.ppf(1 - 0.025 / max(1, L)))
-        if pointwise_only:
-            return [1.96] * p
-        if fitf['n_subjects'] < 3:
-            return [bonf] * p
         subs = np.unique(subj_codes)
         A = np.zeros((p, len(subs), L))   # per-subject contribution to each coef
         for t in range(L):
@@ -27335,6 +27428,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 continue
             for idx, Xi_Vinv, et in pieces:
                 A[:, idx, t] = B @ (Xi_Vinv @ et)
+        return A, subs
+
+    def _flmm_factor_qn(self, fitf, pointwise_only):
+        """Per-coefficient joint multipliers for the factor model (one GLS
+        subject-clustered covariance per coefficient). Returns list length K."""
+        p = fitf['X'].shape[1]
+        L = fitf['eta'].shape[1]
+        bonf = float(stats.norm.ppf(1 - 0.025 / max(1, L)))
+        if pointwise_only:
+            return [1.96] * p
+        if fitf['n_subjects'] < 3:
+            return [bonf] * p
+        A, _subs = self._flmm_factor_contribs(fitf)
         qns = []
         for j in range(p):
             cov = A[j].T @ A[j]
@@ -27629,6 +27735,8 @@ cat("OK\n")
              can_contrast),
             ('factor', "Factor: ALL behaviors vs a reference (one model — matches fastFMM)",
              can_contrast),
+            ('pairwise', "Pairwise matrix: every behavior vs every other (FDR-corrected)",
+             can_contrast),
         ]
         for val, label, enabled in opts:
             ttk.Radiobutton(dlg, text=label, variable=ref_var, value=val,
@@ -27877,6 +27985,11 @@ cat("OK\n")
             self._run_flmm_factor(selected_subjects, channel, available_behaviors,
                                   choice['ref_behavior'], engine, pointwise_only,
                                   factor_kind="behavior")
+            return
+
+        if reference == 'pairwise':
+            # Every behavior vs every other, FDR-corrected (Python FUI, no R).
+            self._run_flmm_pairwise(selected_subjects, channel, available_behaviors)
             return
 
         if reference == 'behavior_contrast':
@@ -28145,6 +28258,698 @@ cat("OK\n")
                       "within ~5–11% of fastFMM. Select the R engine for exact bands."]
         return lines
 
+    # ---- Pairwise: every behavior vs every other (FDR-corrected panel) --------
+
+    def _flmm_contrast_supt(self, betas, ses, A, c, n_sim=10000):
+        """Global sup-t (max|β/se|) functional Wald test for ONE contrast c'β(t)
+        from a factor fit. ``A`` is the (K,S,L) per-subject contribution tensor
+        (or None → delta-method Bonferroni fallback). Returns a record dict with
+        the RAW p-value (FDR is applied by the caller across a family of pairs)."""
+        bc = c @ betas                              # raw contrast β(t)
+        if A is not None:
+            ac = np.tensordot(c, A, axes=(0, 0))    # (S, L)
+            cov = ac.T @ ac                          # (L, L)
+            var = np.diag(cov).copy()
+        else:
+            cov = None
+            var = (c ** 2) @ (ses ** 2)             # delta method (fallback)
+        valid = np.isfinite(bc) & np.isfinite(var) & (var > 1e-15)
+        bc_in = np.where(valid, bc, np.nan)
+        se_in = np.where(valid, np.sqrt(np.clip(var, 1e-18, None)), np.nan)
+        bc_s, se_s = self._flmm_smooth(bc_in, se_in)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            tvec = np.abs(bc_s / se_s)
+        vt = np.where(valid)[0]
+        t_obs = float(np.max(tvec[vt])) if vt.size else np.nan
+        if cov is not None and vt.size >= 2:
+            cov_v = cov[np.ix_(vt, vt)]
+            pval, c_star = self._flmm_supt_pvalue(cov_v, t_obs, n_sim=n_sim)
+        else:
+            Lv = max(1, int(vt.size))
+            c_star = float(stats.norm.ppf(1 - 0.025 / Lv))
+            pval = (float(min(1.0, 2 * Lv * stats.norm.sf(t_obs)))
+                    if np.isfinite(t_obs) else 1.0)
+        sig_mask = np.zeros(len(bc), dtype=bool)
+        sig_mask[vt] = tvec[vt] > c_star
+        if vt.size:
+            kpk = vt[int(np.argmax(np.abs(bc_s[vt])))]
+            peak, peak_k = float(bc_s[kpk]), int(kpk)
+        else:
+            peak, peak_k = np.nan, -1
+        return {'p_raw': float(pval), 't_obs': t_obs, 'c_star': c_star,
+                'sig_mask': sig_mask, 'beta': bc_s, 'se': se_s,
+                'peak': peak, 'peak_k': peak_k}
+
+    def _flmm_pairwise_pmatrix(self, fitf, levels, ref_level, n_sim=10000):
+        """Every level-vs-level contrast from ONE joint factor fit.
+
+        For each unordered pair (A, B) build the contrast function β(t)=meanA−meanB
+        and run the global sup-t functional Wald test (_flmm_contrast_supt). Raw
+        p-values are Benjamini-Hochberg FDR corrected across all pairs. Returns a
+        dict of matrices/records, or None."""
+        betas = fitf['betas']              # (K, L)
+        ses = fitf['ses']                  # (K, L)
+        p_coef = betas.shape[0]
+        other = [lev for lev in levels if lev != ref_level]
+        pos = {lev: 1 + other.index(lev) for lev in other}  # coef col of each level
+        use_gls = fitf['n_subjects'] >= 3
+        A = self._flmm_factor_contribs(fitf)[0] if use_gls else None
+
+        n = len(levels)
+        pmat = np.full((n, n), np.nan)
+        records, pair_idx, raw_p = {}, [], []
+        for i in range(n):
+            for j in range(i):
+                x, y = levels[i], levels[j]
+                c = np.zeros(p_coef)
+                if x != ref_level:
+                    c[pos[x]] += 1.0
+                if y != ref_level:
+                    c[pos[y]] -= 1.0
+                rec = self._flmm_contrast_supt(betas, ses, A, c, n_sim=n_sim)
+                rec['x'], rec['y'] = x, y
+                records[(i, j)] = rec
+                pair_idx.append((i, j)); raw_p.append(rec['p_raw'])
+        if not pair_idx:
+            return None
+        fdr_p = self._bh_fdr(np.asarray(raw_p, float))
+        for k, (i, j) in enumerate(pair_idx):
+            records[(i, j)]['p_fdr'] = float(fdr_p[k])
+            pmat[i, j] = pmat[j, i] = fdr_p[k]
+        return {'p_fdr': pmat, 'records': records, 'ref_level': ref_level,
+                'n_pairs': len(pair_idx), 'gls': use_gls}
+
+    def _flmm_pairwise_dialog(self, behaviors, channels, default_behaviors,
+                              default_channel):
+        """Popup to pick behaviors (checkboxes), channels (checkboxes) and the
+        comparison mode. Returns {behaviors, channels, mode} or None."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Pairwise Comparison — behaviors, channels, mode")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        result = {'value': None}
+
+        body = ttk.Frame(dlg)
+        body.pack(fill='both', expand=True, padx=12, pady=10)
+
+        # --- Behaviors (checkboxes, scrollable if many so the dialog never
+        #     grows past the screen and hides the Run button) ---
+        ttk.Label(body, text="Behaviors to compare:",
+                  font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, sticky='w')
+        if len(behaviors) > 14:
+            wrap = ttk.Frame(body)
+            wrap.grid(row=1, column=0, sticky='nw', padx=(4, 24))
+            bcanvas = tk.Canvas(wrap, highlightthickness=0, borderwidth=0,
+                                width=200, height=340)
+            bscroll = ttk.Scrollbar(wrap, orient='vertical', command=bcanvas.yview)
+            beh_frame = ttk.Frame(bcanvas)
+            beh_frame.bind(
+                "<Configure>",
+                lambda e: bcanvas.configure(scrollregion=bcanvas.bbox("all")))
+            bcanvas.create_window((0, 0), window=beh_frame, anchor='nw')
+            bcanvas.configure(yscrollcommand=bscroll.set)
+            bcanvas.pack(side='left', fill='both', expand=True)
+            bscroll.pack(side='right', fill='y')
+        else:
+            beh_frame = ttk.Frame(body)
+            beh_frame.grid(row=1, column=0, sticky='nw', padx=(4, 24))
+        beh_vars = {}
+        preset = set(default_behaviors or behaviors)
+        for b in behaviors:
+            v = tk.BooleanVar(value=(b in preset))
+            beh_vars[b] = v
+            ttk.Checkbutton(beh_frame, text=b, variable=v).pack(anchor='w', pady=1)
+        btnrow = ttk.Frame(body)
+        btnrow.grid(row=2, column=0, sticky='w', pady=(4, 0))
+
+        def _set_all(state):
+            for v in beh_vars.values():
+                v.set(state)
+        ttk.Button(btnrow, text="All", width=6,
+                   command=lambda: _set_all(True)).pack(side='left')
+        ttk.Button(btnrow, text="None", width=6,
+                   command=lambda: _set_all(False)).pack(side='left', padx=(4, 0))
+
+        # --- Channels (checkboxes) ---
+        ttk.Label(body, text="Channels:",
+                  font=('Segoe UI', 9, 'bold')).grid(row=0, column=1, sticky='w')
+        chan_frame = ttk.Frame(body)
+        chan_frame.grid(row=1, column=1, sticky='nw')
+        chan_vars = {}
+        for ch in channels:
+            v = tk.BooleanVar(value=(ch == default_channel))
+            chan_vars[ch] = v
+            ttk.Checkbutton(chan_frame, text=ch, variable=v).pack(anchor='w', pady=1)
+        if default_channel not in channels and channels:
+            chan_vars[channels[0]].set(True)
+
+        # --- Mode ---
+        ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=(2, 6))
+        mode_frame = ttk.Frame(dlg)
+        mode_frame.pack(fill='x', padx=12)
+        ttk.Label(mode_frame, text="Comparison mode:",
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+        mode_var = tk.StringVar(value='within')
+        ttk.Radiobutton(
+            mode_frame, variable=mode_var, value='within',
+            text="Within channel — behavior × behavior (one matrix per channel)"
+        ).pack(anchor='w', padx=14, pady=1)
+        ttk.Radiobutton(
+            mode_frame, variable=mode_var, value='across_channels',
+            text="Same behavior across channels — channel × channel (needs ≥2 channels)"
+        ).pack(anchor='w', padx=14, pady=1)
+        ttk.Label(mode_frame,
+                  text=("Global sup-t functional Wald test per pair, "
+                        "Benjamini-Hochberg FDR-corrected.  Python FUI (no R)."),
+                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=(4, 2))
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill='x', padx=12, pady=10)
+
+        def _ok():
+            sel_beh = [b for b, v in beh_vars.items() if v.get()]
+            sel_chan = [c for c in channels if chan_vars[c].get()]
+            mode = mode_var.get()
+            if len(sel_beh) < 2 and mode == 'within':
+                messagebox.showerror("Error", "Select at least 2 behaviors.",
+                                     parent=dlg)
+                return
+            if not sel_beh:
+                messagebox.showerror("Error", "Select at least 1 behavior.",
+                                     parent=dlg)
+                return
+            if not sel_chan:
+                messagebox.showerror("Error", "Select at least 1 channel.",
+                                     parent=dlg)
+                return
+            if mode == 'across_channels' and len(sel_chan) < 2:
+                messagebox.showerror(
+                    "Error", "Same-behavior-across-channels needs ≥2 channels.",
+                    parent=dlg)
+                return
+            result['value'] = {'behaviors': sel_beh, 'channels': sel_chan,
+                               'mode': mode}
+            dlg.destroy()
+
+        ttk.Button(btns, text="Run", command=_ok).pack(side='right', padx=(4, 0))
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side='right')
+        dlg.update_idletasks()
+        self.root.wait_window(dlg)
+        return result['value']
+
+    def _run_flmm_pairwise(self, subjects_sel, default_channel, all_behaviors):
+        """Entry point for pairwise behavior comparison. Opens the behavior/channel/
+        mode popup, then dispatches to the within-channel or across-channel runner.
+        Python FUI engine (no R needed)."""
+        channels = self._all_channel_names()
+        choice = self._flmm_pairwise_dialog(
+            all_behaviors, channels, all_behaviors, default_channel)
+        if not choice:
+            return
+        if choice['mode'] == 'within':
+            self._run_pairwise_within(subjects_sel, choice['behaviors'],
+                                      choice['channels'])
+        else:
+            self._run_pairwise_across_channels(subjects_sel, choice['behaviors'],
+                                               choice['channels'])
+
+    def _run_pairwise_within(self, subjects_sel, behaviors, channels):
+        """Within-channel behavior × behavior matrix, one per selected channel.
+        Rendered one at a time with a channel selector."""
+        self.root.config(cursor="watch")
+        self.root.update()
+        panels, order = {}, []
+        try:
+            for channel in channels:
+                collected = self._collect_flmm_factor(subjects_sel, behaviors, channel)
+                if collected is None:
+                    continue
+                Z, subjects, factor, L = collected
+                levels = sorted(set(str(f) for f in factor))
+                if len(levels) < 2:
+                    continue
+                ref_level = levels[0]
+                fitf = self._fit_factor_timecourse(Z, subjects, factor,
+                                                   ref_level=ref_level)
+                result = self._flmm_pairwise_pmatrix(fitf, levels, ref_level)
+                if result is None:
+                    continue
+                fps = self.params['fps']
+                prebout = min(self.params['preboutframes'], L - 1)
+                panels[channel] = {
+                    'levels': levels, 'result': result,
+                    'n_bouts': int(Z.shape[0]),
+                    'n_subjects': len(set(subjects.tolist())),
+                    'time': (np.arange(L) - prebout) / fps}
+                order.append(channel)
+        finally:
+            self.root.config(cursor="")
+        if not order:
+            messagebox.showwarning(
+                "No Data", "No channel had ≥2 behaviors with usable bouts.")
+            return
+
+        store = {
+            'kind': 'pairwise_within', 'order': order, 'panels': panels,
+            'selector_label': 'Channel:',
+            'make_fig': lambda ch: self._build_flmm_pairwise_figure(
+                panels[ch]['levels'], ch, panels[ch]['result'],
+                panels[ch]['n_bouts'], panels[ch]['n_subjects']),
+            'make_lines': lambda ch: self._flmm_pairwise_stats_lines(
+                panels[ch]['levels'], ch, panels[ch]['result'],
+                panels[ch]['n_bouts'], panels[ch]['n_subjects'],
+                panels[ch]['time']),
+        }
+        self.flmm_timecourse_data = store
+        self._show_pairwise_panels(store)
+
+    def _run_pairwise_across_channels(self, subjects_sel, behaviors, channels):
+        """Same-behavior-across-channels: for each behavior fit Y~channel+(1|subj)
+        and test every channel pair with the sup-t functional Wald test. FDR is
+        applied jointly across the whole (behavior × channel-pair) family. With
+        two channels the result is one test per behavior (a forest-style panel);
+        with more channels it is a channel × channel matrix per behavior."""
+        self.root.config(cursor="watch")
+        self.root.update()
+        per_beh = {}          # behavior -> {levels, betas, ses, A, records, ...}
+        raw_records = []      # flat list for joint FDR: (beh, i, j, rec)
+        L_ref = None
+        try:
+            for beh in behaviors:
+                collected = self._collect_flmm_across_channels(
+                    subjects_sel, beh, channels)
+                if collected is None:
+                    continue
+                Z, subjects, factor, L = collected
+                levels = sorted(set(str(f) for f in factor))
+                if len(levels) < 2:
+                    continue
+                ref = levels[0]
+                fitf = self._fit_factor_timecourse(Z, subjects, factor, ref_level=ref)
+                betas, ses = fitf['betas'], fitf['ses']
+                A = (self._flmm_factor_contribs(fitf)[0]
+                     if fitf['n_subjects'] >= 3 else None)
+                other = [lv for lv in levels if lv != ref]
+                pos = {lv: 1 + other.index(lv) for lv in other}
+                recs = {}
+                for i in range(len(levels)):
+                    for j in range(i):
+                        x, y = levels[i], levels[j]
+                        c = np.zeros(betas.shape[0])
+                        if x != ref:
+                            c[pos[x]] += 1.0
+                        if y != ref:
+                            c[pos[y]] -= 1.0
+                        rec = self._flmm_contrast_supt(betas, ses, A, c)
+                        rec['x'], rec['y'] = x, y
+                        recs[(i, j)] = rec
+                        raw_records.append((beh, i, j))
+                fps = self.params['fps']
+                prebout = min(self.params['preboutframes'], L - 1)
+                per_beh[beh] = {
+                    'levels': levels, 'records': recs, 'ref_level': ref,
+                    'n_bouts': int(Z.shape[0]),
+                    'n_subjects': len(set(subjects.tolist())),
+                    'gls': A is not None,
+                    'time': (np.arange(L) - prebout) / fps}
+        finally:
+            self.root.config(cursor="")
+        if not per_beh:
+            messagebox.showwarning(
+                "No Data",
+                "No behavior had usable bouts in ≥2 of the selected channels.")
+            return
+
+        # Joint BH-FDR across every (behavior × channel-pair) test.
+        raw_p = np.array([per_beh[b]['records'][(i, j)]['p_raw']
+                          for (b, i, j) in raw_records], float)
+        fdr_p = self._bh_fdr(raw_p)
+        for k, (b, i, j) in enumerate(raw_records):
+            per_beh[b]['records'][(i, j)]['p_fdr'] = float(fdr_p[k])
+        for b in per_beh:
+            n = len(per_beh[b]['levels'])
+            pmat = np.full((n, n), np.nan)
+            for i in range(n):
+                for j in range(i):
+                    pmat[i, j] = pmat[j, i] = per_beh[b]['records'][(i, j)]['p_fdr']
+            per_beh[b]['p_fdr'] = pmat
+            per_beh[b]['n_pairs'] = n * (n - 1) // 2
+
+        beh_order = [b for b in behaviors if b in per_beh]
+        n_tests = len(raw_records)
+        # Forest panel only when EVERY behavior shares the same 2-channel pair;
+        # otherwise fall back to a per-behavior matrix so each panel is labelled
+        # with its own channel pair.
+        distinct_pairs = {tuple(v['levels']) for v in per_beh.values()}
+        forest = len(distinct_pairs) == 1 and len(next(iter(distinct_pairs))) == 2
+        if forest:
+            # One test per behavior → single forest-style panel, no selector.
+            store = {
+                'kind': 'pairwise_across', 'order': ['(all behaviors)'],
+                'per_beh': per_beh, 'beh_order': beh_order, 'n_tests': n_tests,
+                'selector_label': '',
+                'make_fig': lambda _=None: self._build_flmm_across_forest_figure(
+                    beh_order, per_beh, n_tests),
+                'make_lines': lambda _=None: self._flmm_across_stats_lines(
+                    beh_order, per_beh, n_tests),
+            }
+        else:
+            store = {
+                'kind': 'pairwise_across', 'order': beh_order, 'per_beh': per_beh,
+                'beh_order': beh_order, 'n_tests': n_tests, 'selector_label': 'Behavior:',
+                'make_fig': lambda b: self._build_flmm_pairwise_figure(
+                    per_beh[b]['levels'], b, per_beh[b],
+                    per_beh[b]['n_bouts'], per_beh[b]['n_subjects'],
+                    is_channel=True, fdr_family=n_tests),
+                'make_lines': lambda b: self._flmm_pairwise_stats_lines(
+                    per_beh[b]['levels'], b, per_beh[b], per_beh[b]['n_bouts'],
+                    per_beh[b]['n_subjects'], per_beh[b]['time'], is_channel=True,
+                    fdr_family=n_tests),
+            }
+        self.flmm_timecourse_data = store
+        self._show_pairwise_panels(store)
+
+    def _show_pairwise_panels(self, store):
+        """Render pairwise results into the bout canvas with a selector to switch
+        between panels (channels or behaviors). ``store`` supplies make_fig(key)
+        and make_lines(key) closures plus the ordered key list."""
+        for w in self.bout_histogram_frame.winfo_children():
+            w.destroy()
+        keys = store['order']
+        sel_var = tk.StringVar(value=keys[0])
+
+        top = ttk.Frame(self.bout_histogram_frame)
+        if len(keys) > 1 and store.get('selector_label'):
+            top.pack(fill='x', padx=6, pady=(6, 0))
+            ttk.Label(top, text=store['selector_label']).pack(side='left')
+            combo = ttk.Combobox(top, values=keys, textvariable=sel_var,
+                                 state='readonly', width=24)
+            combo.pack(side='left', padx=6)
+        else:
+            combo = None
+        holder = ttk.Frame(self.bout_histogram_frame)
+        holder.pack(fill='both', expand=True)
+
+        def _draw(*_):
+            self.root.update_idletasks()
+            for w in holder.winfo_children():
+                w.destroy()
+            key = sel_var.get()
+            fig = store['make_fig'](key)
+            canvas = self._embed_plot_canvas(fig, holder)
+            self.current_bout_canvas = canvas
+            self.current_bout_figure = fig
+            self.bout_histogram_frame.update_idletasks()
+            self.bout_histogram_canvas.configure(
+                scrollregion=self.bout_histogram_canvas.bbox("all"))
+            self._display_bout_stats(store['make_lines'](key))
+
+        if combo is not None:
+            combo.bind("<<ComboboxSelected>>", _draw)
+        self.bout_histogram_canvas.after(10, _draw)
+
+    @staticmethod
+    def _flmm_pairwise_stars(p):
+        """Significance stars from an (FDR) p-value."""
+        if not np.isfinite(p):
+            return "—"
+        return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+
+    def _build_flmm_pairwise_figure(self, levels, channel, result, n_bouts,
+                                    n_subjects, is_channel=False, fdr_family=None):
+        """Lower-triangular significance matrix: every level vs every other.
+
+        With ``is_channel=False`` levels are behaviors within one channel; with
+        ``is_channel=True`` levels are channels for one behavior (``channel`` then
+        names the behavior). ``fdr_family`` overrides the reported multiple-comparison
+        family size in the subtitle when FDR was applied jointly across more than this
+        panel's pairs. Cell colour = −log10(FDR p) on a single-hue sequential ramp
+        (magnitude); non-significant cells are neutral grey (status); each cell is
+        direct-labelled with stars + the FDR p-value."""
+        from matplotlib.patches import Rectangle
+        from matplotlib.colors import LinearSegmentedColormap, Normalize
+        from matplotlib.cm import ScalarMappable
+
+        recs = result['records']
+        pfdr = result['p_fdr']
+        n = len(levels)
+        cmap = LinearSegmentedColormap.from_list(
+            'tracy_sig', ['#DCEBFA', '#8FBEE0', '#3E82BE', '#1B5488', '#0A3355'])
+        NS_GREY = '#E6E9EC'
+        vmin = -np.log10(0.05)
+        sig_vals = [-np.log10(max(pfdr[i, j], 1e-12))
+                    for i in range(n) for j in range(i)
+                    if np.isfinite(pfdr[i, j]) and pfdr[i, j] < 0.05]
+        vmax = max(3.0, max(sig_vals) if sig_vals else 3.0)
+        norm = Normalize(vmin=vmin, vmax=vmax)
+
+        cell = 0.82
+        fig = Figure(figsize=(max(4.8, 1.9 + cell * n + 1.5),
+                              max(4.2, 1.5 + cell * n)), dpi=100)
+        ax = fig.add_subplot(1, 1, 1)
+        for i in range(n):
+            for j in range(i):
+                p = pfdr[i, j]
+                sig = np.isfinite(p) and p < 0.05
+                lp = -np.log10(max(p, 1e-12)) if np.isfinite(p) else 0.0
+                face = cmap(norm(lp)) if sig else NS_GREY
+                ax.add_patch(Rectangle((j, i), 1, 1, facecolor=face,
+                                       edgecolor='white', linewidth=1.4))
+                # white text on dark cells, dark ink otherwise
+                lum = (0.299 * face[0] + 0.587 * face[1] + 0.114 * face[2]
+                       if sig else 1.0)
+                txtc = 'white' if lum < 0.55 else '#1a1a1a'
+                star = self._flmm_pairwise_stars(p)
+                ax.text(j + 0.5, i + 0.42, star, ha='center', va='center',
+                        fontsize=12, fontweight='bold', color=txtc)
+                if np.isfinite(p):
+                    # APA convention: censored/tiny p as "<.001", else drop leading 0
+                    ptxt = "<.001" if p < 0.001 else f"{p:.3f}".lstrip("0")
+                    ax.text(j + 0.5, i + 0.72, ptxt, ha='center', va='center',
+                            fontsize=7.5, color=txtc)
+        ax.set_xlim(0, n - 1)
+        ax.set_ylim(n, 1)                    # y downward; lower triangle visible
+        ax.set_xticks(np.arange(n - 1) + 0.5)
+        ax.set_xticklabels(levels[:-1], rotation=40, ha='right', fontsize=9)
+        ax.set_yticks(np.arange(1, n) + 0.5)
+        ax.set_yticklabels(levels[1:], fontsize=9)
+        ax.set_aspect('equal')
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(length=0)
+
+        sm = ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('−log₁₀(FDR p)', fontsize=8)
+        ticks = [t for t in (-np.log10(0.05), -np.log10(0.01),
+                             -np.log10(0.001), -np.log10(1e-4)) if t <= vmax]
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([f"{10 ** (-t):.3g}" for t in ticks])
+        cbar.ax.tick_params(labelsize=7)
+
+        heading = (f"{channel}: across-channel comparison" if is_channel
+                   else f"{channel}: pairwise behavior comparison")
+        fig.suptitle(heading, fontsize=11, fontweight='bold', y=0.99)
+        n_family = result['n_pairs'] if fdr_family is None else fdr_family
+        ax.set_title(
+            f"global sup-t functional Wald · BH-FDR ({n_family} pairs)\n"
+            f"{n_subjects} subjects, {n_bouts} bouts · grey = ns · "
+            f"* p<.05  ** p<.01  *** p<.001",
+            fontsize=8, color='#444')
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        return fig
+
+    def _flmm_pairwise_stats_lines(self, levels, channel, result, n_bouts,
+                                   n_subjects, time_axis, is_channel=False,
+                                   fdr_family=None):
+        """Summary table: raw + FDR p, stars, and significant window for each pair.
+        ``is_channel`` swaps the behaviour/channel wording (channel × channel for a
+        single behaviour). ``fdr_family`` overrides the reported multiple-comparison
+        family size when FDR was applied jointly across more than this panel's pairs
+        (defaults to this panel's own pair count)."""
+        recs = result['records']
+        n = len(levels)
+        unit = "channel" if is_channel else "behavior"
+        head = (f"Behavior: {channel}" if is_channel else f"Channel: {channel}")
+        ca, cb = (f"{unit.capitalize()} A", f"{unit.capitalize()} B")
+        n_family = result['n_pairs'] if fdr_family is None else fdr_family
+
+        def _windows(mask):
+            out = []; i = 0
+            while i < len(mask):
+                if mask[i]:
+                    k = i
+                    while k + 1 < len(mask) and mask[k + 1]:
+                        k += 1
+                    out.append((time_axis[i], time_axis[k])); i = k + 1
+                else:
+                    i += 1
+            return out
+
+        lines = ["=" * 74,
+                 f"PAIRWISE {unit.upper()} COMPARISON  (one joint FLMM factor model)",
+                 f"{head}   |   {n_bouts} bouts, {n_subjects} subject(s), "
+                 f"{len(time_axis)} timepoints",
+                 f"Model baseline (reference level): {result['ref_level']}",
+                 "Test  : global sup-t (max|β/se|) functional Wald over the window,",
+                 "        subject-clustered joint covariance.  H0: β_A(t)=β_B(t) ∀t.",
+                 f"Correct: Benjamini-Hochberg FDR across {n_family} pair(s).",
+                 "=" * 74,
+                 "",
+                 f"{ca:<15}{cb:<15}{'p(raw)':>9}{'p(FDR)':>9}"
+                 f"{'sig':>5}   {'peak Δ':>8}   significant window(s), s"]
+        n_sig = 0
+        for i in range(n):
+            for j in range(i):
+                r = recs[(i, j)]
+                star = self._flmm_pairwise_stars(r['p_fdr'])
+                if np.isfinite(r['p_fdr']) and r['p_fdr'] < 0.05:
+                    n_sig += 1
+                wins = _windows(r['sig_mask'])
+                winstr = ", ".join(f"{a:+.2f}→{b:+.2f}" for a, b in wins) or "—"
+                peak = f"{r['peak']:+.2f}" if np.isfinite(r['peak']) else "—"
+                lines.append(
+                    f"{r['x']:<15}{r['y']:<15}{r['p_raw']:>9.4f}{r['p_fdr']:>9.4f}"
+                    f"{star:>5}   {peak:>8}   {winstr}")
+        lines += ["",
+                  f"{n_sig}/{result['n_pairs']} pair(s) differ at FDR p < 0.05 "
+                  "(traces differ somewhere in the window).",
+                  "peak Δ = largest meanA−meanB along the smoothed contrast (z-score units).",
+                  ""]
+        if result['gls']:
+            lines += [
+                "Python FUI engine (no R). β(t) matches lme4/fastFMM closely; the joint",
+                "covariance is subject-clustered (CR0) and can run ~5–10% anticonservative",
+                "with few subjects — treat borderline FDR p near 0.05 with caution."]
+        else:
+            lines += [
+                "Few subjects (<3): delta-method + Bonferroni-across-time fallback",
+                "(conservative). Add more subjects for the joint-covariance sup-t test."]
+        return lines
+
+    def _build_flmm_across_forest_figure(self, beh_order, per_beh, n_tests):
+        """Two-channel same-behavior comparison: one coloured cell per behavior
+        (channel A vs channel B), stacked as a single column — a compact
+        manuscript panel. Cell colour = −log10(FDR p); grey = ns; direct-labelled
+        with stars + p and the channel pair being contrasted."""
+        from matplotlib.patches import Rectangle
+        from matplotlib.colors import LinearSegmentedColormap, Normalize
+        from matplotlib.cm import ScalarMappable
+
+        cmap = LinearSegmentedColormap.from_list(
+            'tracy_sig', ['#DCEBFA', '#8FBEE0', '#3E82BE', '#1B5488', '#0A3355'])
+        NS_GREY = '#E6E9EC'
+        # every behavior here has exactly one channel pair (2 channels)
+        chan_a = chan_b = None
+        rows = []
+        for b in beh_order:
+            r = per_beh[b]['records'][(1, 0)]
+            rows.append((b, r))
+            chan_a, chan_b = r['y'], r['x']     # (i=1,j=0): x=levels[1], y=levels[0]
+        vmin = -np.log10(0.05)
+        sig_vals = [-np.log10(max(r['p_fdr'], 1e-12)) for _, r in rows
+                    if np.isfinite(r['p_fdr']) and r['p_fdr'] < 0.05]
+        vmax = max(3.0, max(sig_vals) if sig_vals else 3.0)
+        norm = Normalize(vmin=vmin, vmax=vmax)
+
+        m = len(rows)
+        fig = Figure(figsize=(4.6, max(2.4, 0.7 * m + 1.4)), dpi=100)
+        ax = fig.add_subplot(1, 1, 1)
+        for k, (b, r) in enumerate(rows):
+            p = r['p_fdr']
+            sig = np.isfinite(p) and p < 0.05
+            face = cmap(norm(-np.log10(max(p, 1e-12)))) if sig else NS_GREY
+            ax.add_patch(Rectangle((0, k), 1, 1, facecolor=face,
+                                   edgecolor='white', linewidth=1.6))
+            lum = (0.299 * face[0] + 0.587 * face[1] + 0.114 * face[2]
+                   if sig else 1.0)
+            txtc = 'white' if lum < 0.55 else '#1a1a1a'
+            ptxt = ("<.001" if (np.isfinite(p) and p < 0.001)
+                    else (f"{p:.3f}".lstrip("0") if np.isfinite(p) else "—"))
+            ax.text(0.5, k + 0.40, self._flmm_pairwise_stars(p), ha='center',
+                    va='center', fontsize=12, fontweight='bold', color=txtc)
+            ax.text(0.5, k + 0.70, ptxt, ha='center', va='center',
+                    fontsize=8, color=txtc)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(m, 0)
+        ax.set_xticks([0.5])
+        ax.set_xticklabels([f"{chan_a} vs {chan_b}"], fontsize=9)
+        ax.set_yticks(np.arange(m) + 0.5)
+        ax.set_yticklabels(beh_order, fontsize=9)
+        ax.set_aspect('equal')
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(length=0)
+
+        sm = ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.08, pad=0.06)
+        cbar.set_label('−log₁₀(FDR p)', fontsize=8)
+        ticks = [t for t in (-np.log10(0.05), -np.log10(0.01),
+                             -np.log10(0.001), -np.log10(1e-4)) if t <= vmax]
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([f"{10 ** (-t):.3g}" for t in ticks])
+        cbar.ax.tick_params(labelsize=7)
+
+        fig.suptitle(f"Same behavior across channels: {chan_a} vs {chan_b}",
+                     fontsize=11, fontweight='bold', y=0.99)
+        ax.set_title(
+            f"global sup-t functional Wald · BH-FDR ({n_tests} tests)\n"
+            f"grey = ns · * p<.05  ** p<.01  *** p<.001",
+            fontsize=8, color='#444')
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        return fig
+
+    def _flmm_across_stats_lines(self, beh_order, per_beh, n_tests):
+        """Summary table for the two-channel same-behavior comparison."""
+        r0 = per_beh[beh_order[0]]['records'][(1, 0)]
+        chan_a, chan_b = r0['y'], r0['x']
+
+        def _windows(mask, time):
+            out = []; i = 0
+            while i < len(mask):
+                if mask[i]:
+                    k = i
+                    while k + 1 < len(mask) and mask[k + 1]:
+                        k += 1
+                    out.append((time[i], time[k])); i = k + 1
+                else:
+                    i += 1
+            return out
+
+        lines = ["=" * 74,
+                 "SAME-BEHAVIOR ACROSS CHANNELS  (per behavior: Y ~ channel + (1|subj))",
+                 f"Channels contrasted: {chan_a} vs {chan_b}",
+                 "Test  : global sup-t (max|β/se|) functional Wald over the window.",
+                 f"Correct: Benjamini-Hochberg FDR across {n_tests} behavior test(s).",
+                 "=" * 74,
+                 "",
+                 f"{'Behavior':<15}{'n bouts':>8}{'p(raw)':>9}{'p(FDR)':>9}{'sig':>5}"
+                 f"   {'peak Δ':>8}   significant window(s), s"]
+        n_sig = 0
+        for b in beh_order:
+            info = per_beh[b]
+            r = info['records'][(1, 0)]
+            star = self._flmm_pairwise_stars(r['p_fdr'])
+            if np.isfinite(r['p_fdr']) and r['p_fdr'] < 0.05:
+                n_sig += 1
+            wins = _windows(r['sig_mask'], info['time'])
+            winstr = ", ".join(f"{a:+.2f}→{b2:+.2f}" for a, b2 in wins) or "—"
+            peak = f"{r['peak']:+.2f}" if np.isfinite(r['peak']) else "—"
+            lines.append(
+                f"{b:<15}{info['n_bouts']:>8}{r['p_raw']:>9.4f}{r['p_fdr']:>9.4f}"
+                f"{star:>5}   {peak:>8}   {winstr}")
+        lines += ["",
+                  f"{n_sig}/{len(beh_order)} behavior(s) differ between {chan_a} and "
+                  f"{chan_b} at FDR p < 0.05.",
+                  f"peak Δ = largest mean({chan_b})−mean({chan_a}) along the smoothed "
+                  "contrast (z-score units).",
+                  "",
+                  "Python FUI engine (no R). Bouts from both channels are pooled into",
+                  "one per-behavior model with a subject random intercept; the channel",
+                  "factor's joint covariance is subject-clustered (CR0)."]
+        return lines
+
     def _draw_flmm_plot(self, Z, groups, time_axis, reference, beta, ci_lo, ci_hi,
                         sci_lo, sci_hi, sig_sim, pointwise_only, behavior, channel,
                         groups_present):
@@ -28250,6 +29055,66 @@ cat("OK\n")
             messagebox.showinfo(
                 "No Data",
                 "Run Plot ▾ → Time-Course Statistics (FLMM-style)… first.")
+            return
+        if d.get('kind') in ('pairwise_within', 'pairwise_across'):
+            # Long table across every panel: one row per contrast with raw+FDR p.
+            def _wins(mask, time):
+                out = []; i = 0
+                while i < len(mask):
+                    if mask[i]:
+                        k = i
+                        while k + 1 < len(mask) and mask[k + 1]:
+                            k += 1
+                        out.append((time[i], time[k])); i = k + 1
+                    else:
+                        i += 1
+                return out
+
+            rows = ['\t'.join(['panel', 'unit_A', 'unit_B', 'p_raw', 'p_FDR',
+                               'significant', 'peak_delta', 'sig_windows_s'])]
+            n_rows = 0
+            if d['kind'] == 'pairwise_within':
+                for ch in d['order']:
+                    info = d['panels'][ch]
+                    recs = info['result']['records']; time = info['time']
+                    lv = info['levels']
+                    for i in range(len(lv)):
+                        for j in range(i):
+                            r = recs[(i, j)]
+                            wins = _wins(r['sig_mask'], time)
+                            winstr = "; ".join(f"{a:.3f}..{b:.3f}" for a, b in wins)
+                            peak = f"{r['peak']:.6f}" if np.isfinite(r['peak']) else ""
+                            rows.append('\t'.join([
+                                ch, r['x'], r['y'], f"{r['p_raw']:.6f}",
+                                f"{r['p_fdr']:.6f}",
+                                '1' if (np.isfinite(r['p_fdr']) and r['p_fdr'] < 0.05)
+                                else '0', peak, winstr]))
+                            n_rows += 1
+                label = f"{len(d['order'])} channel matrices"
+            else:
+                for b in d['beh_order']:
+                    info = d['per_beh'][b]
+                    recs = info['records']; time = info['time']; lv = info['levels']
+                    for i in range(len(lv)):
+                        for j in range(i):
+                            r = recs[(i, j)]
+                            wins = _wins(r['sig_mask'], time)
+                            winstr = "; ".join(f"{a:.3f}..{b2:.3f}" for a, b2 in wins)
+                            peak = f"{r['peak']:.6f}" if np.isfinite(r['peak']) else ""
+                            rows.append('\t'.join([
+                                b, r['x'], r['y'], f"{r['p_raw']:.6f}",
+                                f"{r['p_fdr']:.6f}",
+                                '1' if (np.isfinite(r['p_fdr']) and r['p_fdr'] < 0.05)
+                                else '0', peak, winstr]))
+                            n_rows += 1
+                label = f"{d['n_tests']} across-channel tests"
+            tsv = '\n'.join(rows)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(tsv)
+            messagebox.showinfo(
+                "Copied",
+                f"Pairwise comparison ({label}, {n_rows} rows) copied to "
+                f"clipboard.\nPaste into Excel or Prism.")
             return
         if d.get('kind') == 'factor':
             # Wide table: Time + per-coefficient beta/SE/sig
