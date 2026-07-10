@@ -13,6 +13,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.colors as mcolors
 from scipy.optimize import curve_fit
 from scipy import stats
 from scipy.signal import coherence, spectrogram, fftconvolve, butter, filtfilt, savgol_filter
@@ -34,8 +35,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.7.0"
-APP_VERSION_DATE = "July 4, 2026"
+APP_VERSION = "1.8.0"
+APP_VERSION_DATE = "July 10, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -51,6 +52,15 @@ MAX_PLOT_WIDTH_IN = 13.0
 CONTROL_PANEL_W = 320
 SECTION_PAD = 5
 WIDGET_PAD = 3
+
+# Sentinel: "read the max-bouts limit from the Tk entry" (vs. a value passed in
+# from a worker thread, which must not touch Tk variables).
+_MAX_BOUTS_UNSET = object()
+
+
+class _ProgressCancelled(Exception):
+    """Raised inside a background worker when the user hits Cancel on the
+    detailed progress window, so the run aborts cleanly (not as an error)."""
 
 
 class ZoneEditor:
@@ -1096,7 +1106,14 @@ class FPAnalysisGUI:
             'metrics_min_refractory_sec': 1.0,     # Min time between counted entries in metrics table
             # Position calibration
             'y_calibration_method': 'legacy',      # 'legacy' | 'normalize_y_min' | 'independent_y_scale'
-            'outback_velocity_threshold': 2.0  # cm/s - minimum velocity for out/back movement detection
+            'outback_velocity_threshold': 2.0,  # cm/s - minimum velocity for out/back movement detection
+            # Bout overlay plot styling (Visualization → Bouts Overlay).
+            # Line thickness (pt) for bout onset markers / span outlines; larger
+            # values make very short bouts (e.g. approach) clearly visible.
+            'bout_overlay_line_thickness': 1.2,
+            # Optional per-behavior colors: {behavior_name: '#rrggbb'}.  Empty ->
+            # automatic tab10 palette.  Set via the "Bout Overlay Style…" dialog.
+            'bout_overlay_colors': {}
         }
         
         # Zone definitions (stored as rectangles: x_min, x_max, y_min, y_max in cm)
@@ -1658,6 +1675,7 @@ class FPAnalysisGUI:
         self.create_bout_analysis_tab()
         self.create_decision_probability_tab()
         self.create_kinematics_tab()
+        self.create_signal_linkage_tab()
         # Info-group subtabs
         self.create_info_tab()
         self.create_system_tab()
@@ -2282,6 +2300,8 @@ class FPAnalysisGUI:
         ttk.Button(control_frame, text="Reload from File", command=self.reload_boutframes).pack(side='left', padx=5)
         ttk.Button(control_frame, text="Save Changes", command=self.save_boutframes).pack(side='left', padx=5)
         ttk.Button(control_frame, text="Add Behavior", command=self.add_behavior_column).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="Random Shuffle…",
+                   command=self.open_random_shuffle_dialog).pack(side='left', padx=5)
 
         # ── Apply / re-extract row ─────────────────────────────────────
         reextract_frame = ttk.Frame(tab)
@@ -3130,8 +3150,23 @@ class FPAnalysisGUI:
                        variable=self.viz_average_within_subject).grid(row=6, column=0, columnspan=2, sticky='w', padx=5, pady=5)
         
         # Exclusions checkbox
-        ttk.Checkbutton(control_frame, text="Apply exclusions (Exclusions tab)", 
+        ttk.Checkbutton(control_frame, text="Apply exclusions (Exclusions tab)",
                        variable=self.use_exclusions_viz).grid(row=6, column=2, columnspan=2, sticky='w', padx=5, pady=5)
+
+        # Behavior selection for the Bouts Overlay plot. None -> follow the
+        # Behavior dropdown (single behavior); otherwise a set of behavior names
+        # chosen via the pop-up selector below (may be several at once).
+        self.viz_overlay_behaviors = None
+        overlay_beh_frame = ttk.Frame(control_frame)
+        overlay_beh_frame.grid(row=6, column=4, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Button(overlay_beh_frame, text="Select Behaviors…",
+                   command=self._open_overlay_behavior_selector).pack(side='left')
+        ttk.Button(overlay_beh_frame, text="Bout Overlay Style…",
+                   command=self._open_bout_overlay_style_dialog).pack(side='left', padx=(6, 0))
+        self.viz_overlay_behaviors_label = ttk.Label(
+            overlay_beh_frame, text="(follows dropdown)", foreground='gray',
+            font=('Segoe UI', 8))
+        self.viz_overlay_behaviors_label.pack(side='left', padx=(6, 0))
         
         # Max bouts per subject control
         ttk.Label(control_frame, text="Max Bouts/Subject:").grid(row=7, column=0, sticky='w', padx=5, pady=5)
@@ -7483,6 +7518,8 @@ class FPAnalysisGUI:
         export_menu.add_separator()
         export_menu.add_command(label="Time-Course Stats — copy/paste (Prism, Excel)…",
                                 command=self.export_timecourse_flmm)
+        export_menu.add_command(label="Time-Course / Pairwise — full report (PDF)…",
+                                command=self.export_flmm_report)
         export_mb['menu'] = export_menu
         export_mb.pack(side='left', padx=3)
 
@@ -9272,6 +9309,39 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Signal Linkage tab (BETA, Data → Signal Linkage). Measures how tightly
+    each behavior's onset is coupled to a rapid change in signal: it takes the
+    peri-onset derivative (Savitzky-Golay dF/dt) and tests the peak against a
+    random-onset permutation null, so you can tell a genuine onset-locked
+    transient from background signal drift. Runs per-subject or grouped, with
+    configurable search / baseline / response windows, a reliability threshold
+    and permutation count, and reports a coupling index + verdict, a
+    copy-to-clipboard table, and a figure.
+  • New — Random-shuffle control bouts ("Random Shuffle…" on the Bout Analysis
+    controls). Generates pseudo-random, non-overlapping "null" bouts for every
+    subject as a control behavior for the FLMM stats. Bouts are placed in
+    photometry-frame space, kept clear of the session edges by the pre/post
+    window, spread across the whole session with jittered starts, and drawn with
+    a realistic spread of durations (p10–p90 of that subject's real scored
+    bouts). Seedable for reproducibility; written back into the boutframes
+    file(s) with a .bak backup. Raw signal is never modified.
+  • New — FLMM report export. FLMM time-course results (per-behavior and pairwise)
+    can be exported to a PDF/CSV report with peak-effect tables, figures, and a
+    method & references block that spells out the FUI / fastFMM basis, the joint
+    simultaneous-band multiplicity handling, and the across-family FDR axis.
+  • Change — Long FLMM and Signal Linkage analyses now run on a worker thread
+    behind a live progress bar with a Cancel button, so the app stays responsive
+    (and interruptible) during the heavy pairwise and permutation computations.
+  • Fix — "Clear Subject Data" (Project Setup) now works. The dialog's action
+    buttons never appeared because of an undefined-frame error, so there was no
+    way to confirm a deletion. The buttons are restored, and clearing a subject
+    now permanently removes it and all of its processed data — z-score / dF /
+    corrected traces, behavior, spikes, and bout folders — from both memory and
+    disk, and rewrites the project so it no longer reappears on reload. Prefix-safe
+    (clearing "DR22" leaves "DR220" untouched). Raw input files are never touched.
+
+Version 1.7.0  •  July 4, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Pairwise behavior comparison for the FLMM-style time-course stats (Bout
     Analysis → Plot ▾ → "Time-Course Statistics" → "Pairwise matrix"). A popup with
     behavior and channel checkboxes lets you compare every selected behavior against
@@ -10722,6 +10792,22 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if hasattr(self, 'bout_exclude_min_gap_var'):
                 self.bout_exclude_min_gap_var.set(str(self.params.get('bout_exclude_min_gap', 0)))
 
+            # Bout baseline-correction UI vars (otherwise the checkbox keeps its
+            # build-time default and appears to "turn back on" after reopening).
+            if hasattr(self, 'baseline_correct_bouts'):
+                self.baseline_correct_bouts.set(bool(self.params.get('baseline_correct_bouts', True)))
+            if hasattr(self, 'baseline_frames_var'):
+                self.baseline_frames_var.set(str(self.params.get('baseline_frames', 45)))
+
+            # Boutframes FPS-scaling UI vars (same load-side sync so these
+            # checkboxes don't revert to their build-time defaults on reopen).
+            if hasattr(self, 'auto_scale_boutframes_var'):
+                self.auto_scale_boutframes_var.set(bool(self.params.get('auto_scale_boutframes', False)))
+            if hasattr(self, 'precut_correct_boutframes_var'):
+                self.precut_correct_boutframes_var.set(bool(self.params.get('precut_correct_boutframes', True)))
+            if hasattr(self, 'boutframes_video_fps_var'):
+                self.boutframes_video_fps_var.set(str(self.params.get('boutframes_video_fps', 30)))
+
             # Signal smoothing UI vars
             if hasattr(self, 'processing_rolling_avg_enabled'):
                 self.processing_rolling_avg_enabled.set(bool(self.params.get('processing_rolling_avg_enabled', False)))
@@ -11607,8 +11693,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         
         if not self.processed_data:
+            messagebox.showinfo("No Subjects",
+                                "This project has no processed subjects to clear.")
             return
-        
+
         # Create dialog to select subjects to clear
         dialog = tk.Toplevel(self.root)
         dialog.title("Clear Subject Data")
@@ -11651,24 +11739,39 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if not selected_indices:
                 messagebox.showwarning("No Selection", "Please select at least one subject to clear")
                 return
-            
+
             selected_subjects = [subjects_listbox.get(i) for i in selected_indices]
-            
+
             # Confirm
             result = messagebox.askyesno(
                 "Confirm Clear",
-                f"Clear processed data for {len(selected_subjects)} subject(s)?\n\n"
+                f"Remove {len(selected_subjects)} subject(s) from this project?\n\n"
                 f"Subjects: {', '.join(selected_subjects)}\n\n"
-                f"This will remove their data from memory.\n"
-                f"You can reprocess them to get fresh data.",
+                f"This permanently deletes their processed data, bouts and\n"
+                f"figures from the project (in memory and on disk).\n"
+                f"Your raw input files are NOT touched — you can reprocess\n"
+                f"these subjects to add them back.\n\n"
+                f"This cannot be undone.",
+                icon='warning',
                 parent=dialog
             )
-            
+
             if result:
+                errors = []
                 for subject in selected_subjects:
-                    if subject in self.processed_data:
-                        del self.processed_data[subject]
-                
+                    try:
+                        self._remove_subject_from_project(subject)
+                    except Exception as e:
+                        errors.append(f"{subject}: {str(e)}")
+
+                # Persist the updated cohort (rewrites project_config.json /
+                # .tracy so the cleared subjects don't reappear on reload).
+                if self.current_project:
+                    try:
+                        self.save_project(quiet=True)
+                    except Exception as e:
+                        errors.append(f"save project config: {str(e)}")
+
                 # Update all displays
                 self.update_project_status()
                 self.update_bout_subjects()
@@ -11677,9 +11780,80 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.update_bout_analysis_subjects()
                 self.update_dec_prob_subjects()
                 self.update_conn_listbox()
+
+                dialog.destroy()
+
+                if errors:
+                    messagebox.showwarning(
+                        "Cleared With Warnings",
+                        f"Removed {len(selected_subjects)} subject(s), but some "
+                        f"items could not be deleted:\n\n" + "\n".join(errors))
+                else:
+                    messagebox.showinfo(
+                        "Subjects Cleared",
+                        f"Removed {len(selected_subjects)} subject(s) from the project.")
+
+        action_frame = ttk.Frame(dialog)
+        action_frame.pack(fill='x', padx=20, pady=(5, 15))
         ttk.Button(action_frame, text="Clear Selected Data", command=do_clear).pack(side='left', padx=5)
         ttk.Button(action_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
-    
+
+    def _remove_subject_from_project(self, subject):
+        """Remove a single subject and all of its derived data from the project.
+
+        Clears the subject from every in-memory store and deletes its files
+        under the project's processed/ (metadata, z-score/dff/corrected CSVs,
+        behavior, spike data, and the bouts/ + entry_bouts/ folders) and any
+        subject-prefixed files in figures/. RAW INPUT FILES ARE NOT TOUCHED —
+        only the project's processed output is removed, so the subject can be
+        reprocessed to add it back. The caller is responsible for persisting the
+        updated project config (e.g. via save_project) and refreshing displays.
+        """
+        import glob
+        import shutil
+
+        # --- In-memory stores -------------------------------------------------
+        self.processed_data.pop(subject, None)
+        if hasattr(self, 'spike_data'):
+            self.spike_data.pop(subject, None)
+        if hasattr(self, 'exclusions'):
+            self.exclusions.pop(subject, None)
+        if hasattr(self, 'per_subject_boutframe_shifts'):
+            self.per_subject_boutframe_shifts.pop(subject, None)
+        if hasattr(self, 'groups'):
+            for members in self.groups.values():
+                if isinstance(members, list) and subject in members:
+                    members.remove(subject)
+        if hasattr(self, 'per_subject_shifts_tree'):
+            try:
+                self._refresh_per_subject_shifts_list()
+            except Exception:
+                pass
+
+        # --- On-disk files ----------------------------------------------------
+        if not self.current_project:
+            return
+        project_path = os.path.join(self.project_dir, self.current_project)
+        processed_dir = os.path.join(project_path, 'processed')
+
+        # Subject-prefixed flat files under processed/ (and figures/). The
+        # trailing underscore keeps e.g. "DR22" from also matching "DR220_*".
+        for base_dir in (processed_dir, os.path.join(project_path, 'figures')):
+            if not os.path.isdir(base_dir):
+                continue
+            for path in glob.glob(os.path.join(base_dir, f'{subject}_*')):
+                if os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        # Per-subject bout folders.
+        for sub_dir in (os.path.join(processed_dir, 'bouts', subject),
+                        os.path.join(processed_dir, 'entry_bouts', subject)):
+            if os.path.isdir(sub_dir):
+                shutil.rmtree(sub_dir, ignore_errors=True)
+
     def edit_parameters(self):
         """Open dialog to edit processing parameters"""
         dialog = tk.Toplevel(self.root)
@@ -11700,12 +11874,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         canvas.configure(yscrollcommand=scrollbar.set)
         
         entries = {}
-        for i, (key, value) in enumerate(self.params.items()):
+        i = 0
+        for key, value in self.params.items():
+            # Skip structured params (dict/list) — e.g. bout_overlay_colors.
+            # They are edited via their own dialogs, not as free text, and
+            # str()'ing a dict here would break the numeric parser on Save.
+            if isinstance(value, (dict, list)):
+                continue
             ttk.Label(scrollable_frame, text=f"{key}:").grid(row=i, column=0, sticky='w', padx=10, pady=5)
             var = tk.StringVar(value=str(value))
             entry = ttk.Entry(scrollable_frame, textvariable=var, width=30)
             entry.grid(row=i, column=1, padx=10, pady=5)
             entries[key] = var
+            i += 1
         
         def save_params():
             try:
@@ -16684,6 +16865,84 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return frames.astype(int)
         return np.round(frames)
 
+    def _inverse_transform_boutframe_values(self, frames, subject_id, as_int=True):
+        """Inverse of :meth:`_transform_boutframe_values`.
+
+        Maps photometry-frame numbers back into raw boutframe (video-frame)
+        coordinates, undoing precut correction, the per-subject + manual shift,
+        and FPS scaling **in reverse order**.  The random-shuffle generator
+        places bouts in photometry-frame space (where the extraction window is
+        defined) and stores them as raw frames, so it needs this inverse.
+        """
+        frames = np.asarray(frames, dtype=float)
+        if frames.size == 0:
+            return frames.astype(int) if as_int else frames
+        subject_data = self.processed_data.get(subject_id, {})
+
+        # Undo precut correction (forward subtracted the offset)
+        if self.params.get('precut_correct_boutframes', True):
+            pc = int(self.params.get('precut', 0))
+            nl = int(subject_data.get('n_led_states', 1))
+            off = pc // max(1, nl)
+            if off > 0:
+                frames = frames + off
+
+        # Undo per-subject + manual shift
+        ps = self._get_per_subject_shift(subject_id)
+        if ps:
+            frames = frames - ps
+        ms = int(self.params.get('boutframe_manual_shift', 0))
+        if ms:
+            frames = frames - ms
+
+        # Undo FPS scaling
+        if self.params.get('auto_scale_boutframes', False):
+            vfps = float(self.params.get('boutframes_video_fps', 30))
+            pfps = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
+            if pfps and vfps > 0 and abs(pfps - vfps) > 0.1:
+                frames = frames * (vfps / pfps)
+
+        if as_int:
+            return np.round(frames).astype(int)
+        return np.round(frames)
+
+    @staticmethod
+    def _feasible_bout_count(span, min_spacing):
+        """Maximum number of starts that fit in *span* frames at *min_spacing*
+        apart using the jittered-grid layout (each of N bins must be at least
+        min_spacing wide)."""
+        if span <= 0 or min_spacing <= 0:
+            return 0
+        return max(0, int(span // min_spacing))
+
+    @staticmethod
+    def _generate_jittered_starts(lo, hi, n, min_spacing, rng):
+        """Place *n* start frames pseudo-randomly in ``[lo, hi]`` so they span the
+        range yet never overlap.
+
+        Uses a *jittered grid*: the range is split into ``n`` equal bins and one
+        start is drawn per bin, jittered by a bounded amount so that two adjacent
+        starts can never come closer than *min_spacing*.  This guarantees both
+        properties the user asked for — the bouts are spread across the whole
+        session (one per bin) and are non-overlapping (bounded jitter).
+
+        Returns a float array of length ``min(n, feasible_max)`` sorted ascending.
+        """
+        lo = float(lo); hi = float(hi)
+        span = hi - lo
+        if n < 1 or span <= 0 or min_spacing <= 0:
+            return np.array([], dtype=float)
+        n = min(int(n), max(1, int(span // min_spacing)))
+        if n == 1:
+            return np.array([lo + span / 2.0])
+        bin_w = span / n
+        # Bounded jitter: consecutive bin centres are bin_w apart and each moves
+        # by at most j, so the closest two starts can be is bin_w - 2j = min_spacing.
+        j = max(0.0, (bin_w - min_spacing) / 2.0)
+        centers = lo + bin_w * (np.arange(n) + 0.5)
+        jit = rng.uniform(-j, j, size=n) if j > 0 else np.zeros(n)
+        return centers + jit
+
     def _apply_bout_exclusions(self, start_frames, end_frames):
         """Apply the duration / proximity exclusion filter (frames; 0 = rule off).
 
@@ -17500,7 +17759,365 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 values = list(self.bout_tree.item(item)['values'])
                 values.append('')
                 self.bout_tree.item(item, values=values)
-    
+
+    # ── Random-shuffle (null / control) behavior generator ───────────
+
+    def open_random_shuffle_dialog(self):
+        """Dialog to generate a set of pseudo-random, non-overlapping bouts for
+        every processed subject — a control/"null" behavior for the FLMM analysis.
+
+        Bouts are placed in photometry-frame space (where the extraction window
+        lives), kept clear of the session edges by the pre/post window, spread
+        across the whole session, and written back as raw frames into the
+        boutframes file(s) with a ``.bak`` backup.
+        """
+        bf = self.boutframes_path_var.get()
+        if not bf or not os.path.exists(bf):
+            messagebox.showwarning(
+                "No Boutframes File",
+                "No boutframes file is loaded.\n\nSet one on the Processing tab, "
+                "then reload it here before generating random bouts.")
+            return
+
+        subjects = [sid for sid, d in self.processed_data.items()
+                    if isinstance(d, dict) and d.get('beh_synced') is not None]
+        if not subjects:
+            messagebox.showwarning(
+                "No Signal Data",
+                "Random shuffle needs each subject's synchronized signal so it "
+                "knows the session length.\n\nRun the analysis (or click "
+                "'Apply Settings & Re-extract Bouts') first, then try again.")
+            return
+
+        # Pre-scan the file for the start/end format and a sensible default
+        # duration (median of the real scored bouts, in raw frames).
+        has_end = False
+        durations = []
+        for sid in subjects:
+            try:
+                df = pd.read_excel(bf, sheet_name=sid)
+            except Exception:
+                continue
+            behs, he = self._parse_boutframes_dataframe(df)
+            has_end = has_end or he
+            for _name, s, e in behs:
+                if e is not None and len(e):
+                    d = np.asarray(e, float) - np.asarray(s, float)
+                    d = d[np.isfinite(d) & (d > 0)]
+                    if d.size:
+                        durations.append(d)
+
+        prebout = int(self.params.get('preboutframes', 150))
+        postbout = int(self.params.get('postboutframes', 150))
+        min_gap = int(self.params.get('bout_exclude_min_gap', 0) or 0)
+        min_dur = int(self.params.get('bout_exclude_min_duration', 0) or 0)
+
+        # Default duration RANGE from the real scored bouts (p10–p90 of the
+        # empirical distribution), so generated control bouts have a realistic
+        # spread of lengths rather than all being identical.  Clamped to the
+        # exclusion minimum so they survive extraction.
+        if durations:
+            all_dur = np.concatenate(durations)
+            dur_lo_def = int(round(float(np.percentile(all_dur, 10))))
+            dur_hi_def = int(round(float(np.percentile(all_dur, 90))))
+            med_dur = int(round(float(np.median(all_dur))))
+        else:
+            dur_lo_def = dur_hi_def = med_dur = prebout
+        dur_lo_def = max(dur_lo_def, min_dur, 1)
+        dur_hi_def = max(dur_hi_def, dur_lo_def)
+
+        # ── Build the dialog ─────────────────────────────────────────────
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Generate Random Bouts")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        intro = ("Generates non-overlapping, session-spanning random bouts for all "
+                 f"{len(subjects)} processed subject(s) — a control 'null' behavior "
+                 "for the FLMM comparison.  Bouts are kept clear of the session edges "
+                 "by the pre/post window.")
+        ttk.Label(dlg, text=intro, wraplength=420, justify='left',
+                  foreground='gray').pack(anchor='w', padx=14, pady=(12, 6))
+
+        form = ttk.Frame(dlg)
+        form.pack(fill='x', padx=14, pady=2)
+
+        n_var = tk.StringVar(value="30")
+        name_var = tk.StringVar(value="Random")
+        durmin_var = tk.StringVar(value=str(dur_lo_def))
+        durmax_var = tk.StringVar(value=str(dur_hi_def))
+        spacing_var = tk.StringVar(value=str(prebout + postbout))
+        margin_var = tk.StringVar(value="0")
+        seed_var = tk.StringVar(value="0")
+        reextract_var = tk.BooleanVar(value=True)
+
+        def _row(r, label, var, hint):
+            ttk.Label(form, text=label).grid(row=r, column=0, sticky='w', padx=(0, 8), pady=3)
+            ttk.Entry(form, textvariable=var, width=12).grid(row=r, column=1, sticky='w', pady=3)
+            ttk.Label(form, text=hint, foreground='gray',
+                      font=('Segoe UI', 8)).grid(row=r, column=2, sticky='w', padx=(8, 0))
+
+        _row(0, "Bouts per subject:", n_var, "count (capped to what fits)")
+        _row(1, "Behavior name:", name_var, "new column name")
+        r = 2
+        if has_end:
+            # Duration range: each bout gets a random length in [min, max] so the
+            # control behavior spans a realistic spread rather than a fixed length.
+            drow = ttk.Frame(form)
+            drow.grid(row=r, column=0, columnspan=3, sticky='w', pady=3)
+            ttk.Label(drow, text="Duration range:").pack(side='left', padx=(0, 8))
+            ttk.Entry(drow, textvariable=durmin_var, width=8).pack(side='left')
+            ttk.Label(drow, text="to").pack(side='left', padx=6)
+            ttk.Entry(drow, textvariable=durmax_var, width=8).pack(side='left')
+            ttk.Label(drow, text=f"frames  (real p10–p90 = {dur_lo_def}–{dur_hi_def}, "
+                                 f"median {med_dur})",
+                      foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
+            r += 1
+        _row(r, "Min spacing:", spacing_var, "frames between bout starts"); r += 1
+        _row(r, "Edge margin:", margin_var, "extra frames from session ends"); r += 1
+        _row(r, "Random seed:", seed_var, "same seed → same bouts"); r += 1
+
+        ttk.Checkbutton(form, text="Re-extract bouts after generating",
+                        variable=reextract_var).grid(row=r, column=0, columnspan=3,
+                                                      sticky='w', pady=(6, 0))
+
+        note = ("The behavior is written to the boutframes file (a .bak backup is "
+                "made first). Existing columns with this name are replaced.")
+        ttk.Label(dlg, text=note, wraplength=420, justify='left',
+                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=14, pady=(8, 4))
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill='x', padx=14, pady=(4, 12))
+
+        def _on_generate():
+            try:
+                n = int(float(n_var.get()))
+                name = name_var.get().strip()
+                dur_min = int(float(durmin_var.get())) if has_end else 0
+                dur_max = int(float(durmax_var.get())) if has_end else 0
+                user_spacing = int(float(spacing_var.get()))
+                margin = int(float(margin_var.get()))
+                seed = int(float(seed_var.get()))
+            except ValueError:
+                messagebox.showerror("Invalid Input",
+                                     "Counts, duration, spacing, margin and seed "
+                                     "must be numbers.", parent=dlg)
+                return
+            if n < 1:
+                messagebox.showerror("Invalid Input", "Need at least 1 bout.", parent=dlg)
+                return
+            if not name:
+                messagebox.showerror("Invalid Input", "Enter a behavior name.", parent=dlg)
+                return
+            if has_end:
+                if dur_min <= 0 or dur_max <= 0:
+                    messagebox.showerror("Invalid Input", "Durations must be > 0.", parent=dlg)
+                    return
+                if dur_max < dur_min:
+                    messagebox.showerror("Invalid Input",
+                                         "Duration max must be ≥ min.", parent=dlg)
+                    return
+                if min_dur and dur_min < min_dur:
+                    if not messagebox.askyesno(
+                            "Short Duration",
+                            f"Minimum duration {dur_min} is below the exclusion "
+                            f"minimum ({min_dur} frames), so the shortest bouts "
+                            "would be dropped on extraction.\n\nGenerate anyway?",
+                            parent=dlg):
+                        return
+            dlg.destroy()
+            self._generate_random_bouts(
+                subjects, name, n, dur_min, dur_max, user_spacing, margin, seed,
+                has_end, prebout, postbout, min_gap, reextract_var.get())
+
+        ttk.Button(btn_row, text="Generate", command=_on_generate).pack(side='right')
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='right', padx=(0, 8))
+
+        dlg.update_idletasks()
+        # Centre over the main window
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+    def _generate_random_bouts(self, subjects, name, n_req, dur_min, dur_max,
+                               user_spacing, margin, seed, has_end, prebout,
+                               postbout, min_gap, reextract):
+        """Do the actual generation + write for :meth:`open_random_shuffle_dialog`.
+
+        Each bout is given a random length in ``[dur_min, dur_max]`` (end-format
+        only).  Spacing and the edge margin are computed from ``dur_max`` — the
+        longest a bout can be — so the non-overlap, exclusion-survival, and
+        no-truncation guarantees hold no matter which length each bout draws.
+        """
+        import shutil
+
+        rng = np.random.default_rng(seed)
+
+        # Spacing that both spans the session and survives the exclusion filter:
+        # the next start must clear the previous bout's (longest possible) end by
+        # min_gap.  Using dur_max keeps every consecutive pair safe.
+        req_spacing = (dur_max + min_gap) if has_end else min_gap
+        min_spacing = max(1, int(user_spacing), int(req_spacing))
+        edge = max(postbout, dur_max)  # trailing space a start needs
+
+        # Feasible count per subject, then a common N so the design is balanced.
+        feasible = {}
+        for sid in subjects:
+            sess_len = int(self.processed_data[sid]['beh_synced'].shape[0])
+            lo = prebout + margin
+            hi = sess_len - edge - margin
+            feasible[sid] = self._feasible_bout_count(hi - lo, min_spacing)
+
+        n_feasible = min(feasible.values()) if feasible else 0
+        if n_feasible < 1:
+            worst = min(feasible, key=feasible.get)
+            messagebox.showerror(
+                "Session Too Short",
+                "No random bouts fit given the current window/spacing settings "
+                f"(subject '{worst}' has no room).\n\nReduce the min spacing, "
+                "max duration, or edge margin and try again.")
+            return
+        n_final = min(int(n_req), n_feasible)
+
+        # ── Generate raw start/end frames per subject ────────────────────
+        per_subject = {}
+        for sid in subjects:
+            sess_len = int(self.processed_data[sid]['beh_synced'].shape[0])
+            lo = prebout + margin
+            hi = sess_len - edge - margin
+            starts_ph = self._generate_jittered_starts(lo, hi, n_final, min_spacing, rng)
+            starts_ph = np.sort(starts_ph)
+            starts_raw = self._inverse_transform_boutframe_values(starts_ph, sid, as_int=True)
+            ends_raw = None
+            if has_end:
+                # Random per-bout length in [dur_min, dur_max] (inclusive).
+                if dur_max > dur_min:
+                    durs = rng.integers(dur_min, dur_max + 1, size=len(starts_ph))
+                else:
+                    durs = np.full(len(starts_ph), dur_min)
+                ends_raw = self._inverse_transform_boutframe_values(
+                    starts_ph + durs, sid, as_int=True)
+            per_subject[sid] = (starts_raw, ends_raw)
+
+        # ── Group subjects by the boutframes file they extract from ──────
+        global_bf = self.boutframes_path_var.get()
+
+        def _resolve(sid):
+            per = self.processed_data.get(sid, {}).get('boutframes_file')
+            if per and os.path.exists(per):
+                return per
+            return global_bf
+
+        files = {}
+        for sid in subjects:
+            files.setdefault(_resolve(sid), []).append(sid)
+
+        # ── Confirm ──────────────────────────────────────────────────────
+        cols = f"{name}__start / {name}__end" if has_end else name
+        msg = (f"Write {n_final} random bout(s) per subject as '{cols}' to:\n\n" +
+               "\n".join(f"  • {os.path.basename(f)}  ({len(s)} subj)"
+                         for f, s in files.items()) +
+               f"\n\nMin spacing: {min_spacing} frames" +
+               (f"\nDuration: random {dur_min}–{dur_max} frames"
+                if has_end and dur_max > dur_min
+                else (f"\nDuration: {dur_min} frames" if has_end else "")) +
+               "\n\nA .bak backup of each file is made first, and any existing "
+               f"'{name}' column is replaced.")
+        if n_final < n_req:
+            msg += (f"\n\nNote: requested {n_req} but only {n_final} fit every "
+                    "session at this spacing — using the common maximum.")
+        if not messagebox.askyesno("Confirm Random Bouts", msg):
+            return
+
+        # ── Write ────────────────────────────────────────────────────────
+        base_start = f"{name}__start"
+        base_end = f"{name}__end"
+        drop_names = {name.lower(), base_start.lower(), base_end.lower()}
+        written = 0
+        try:
+            for path, sids in files.items():
+                shutil.copy2(path, path + ".bak")
+                wb = load_workbook(path)
+                for sid in sids:
+                    starts_raw, ends_raw = per_subject[sid]
+                    columns = self._read_sheet_columns(wb, sid, drop_names)
+                    columns[base_start] = list(starts_raw)
+                    if has_end:
+                        columns[base_end] = list(ends_raw)
+                    self._rewrite_sheet_columns(wb, sid, columns)
+                    written += 1
+                wb.save(path)
+        except Exception as exc:
+            messagebox.showerror("Write Failed",
+                                 f"Could not write random bouts:\n\n{exc}\n\n"
+                                 "The .bak backup(s) are unchanged.")
+            return
+
+        self.log_message(
+            f"Random shuffle: wrote {n_final} '{name}' bout(s) for {written} "
+            f"subject(s) across {len(files)} file(s).")
+
+        # ── Refresh editor + optional re-extract ─────────────────────────
+        try:
+            self.update_bout_subjects()
+            self._on_bout_subject_selected()
+        except Exception:
+            pass
+
+        if reextract:
+            self._reextract_bouts_from_processed_data()
+        else:
+            messagebox.showinfo(
+                "Random Bouts Generated",
+                f"Wrote {n_final} '{name}' bout(s) for {written} subject(s).\n\n"
+                "Click 'Apply Settings & Re-extract Bouts' to make them available "
+                "to the analysis.")
+
+    @staticmethod
+    def _read_sheet_columns(wb, sheet, drop_names=None):
+        """Read a worksheet into an ordered {header: [values]} dict, dropping any
+        header whose lowercase name is in *drop_names*.  Ragged columns are kept
+        as-is (blank cells become None)."""
+        drop_names = drop_names or set()
+        columns = {}
+        if sheet not in wb.sheetnames:
+            return columns
+        ws = wb[sheet]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return columns
+        headers = [("" if h is None else str(h)) for h in rows[0]]
+        keep = [h for h in headers if h and h.lower() not in drop_names]
+        idx = {h: i for i, h in enumerate(headers)}
+        for h in keep:
+            i = idx[h]
+            col = [(r[i] if i < len(r) else None) for r in rows[1:]]
+            # Trim trailing all-None padding
+            while col and col[-1] is None:
+                col.pop()
+            columns[h] = col
+        return columns
+
+    @staticmethod
+    def _rewrite_sheet_columns(wb, sheet, columns):
+        """Replace *sheet* with the ordered {header: [values]} *columns* dict.
+        Columns may be ragged; NaN/None cells are left blank."""
+        if sheet in wb.sheetnames:
+            del wb[sheet]
+        ws = wb.create_sheet(sheet)
+        for ci, (header, values) in enumerate(columns.items(), 1):
+            ws.cell(1, ci, header)
+            for ri, v in enumerate(values, 2):
+                if v is None:
+                    continue
+                if isinstance(v, float) and np.isnan(v):
+                    continue
+                ws.cell(ri, ci, v)
+
     def _on_bout_subject_selected(self, event=None):
         """Called when subject changes in the boutframes editor — refresh both subtabs."""
         self.load_bout_subject(event)
@@ -17611,6 +18228,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     except Exception as save_exc:
                         self.log_message(
                             f"  Warning: could not save re-extracted bouts: {save_exc}")
+
+                # Refresh the behavior selectors on the other tabs so behaviors
+                # added since the last selection (e.g. a random-shuffle control,
+                # or any newly-scored column) become selectable immediately —
+                # without the user having to reopen the project or re-pick a
+                # subject.  These read live from processed_data but only rebuild
+                # their value lists when explicitly refreshed.
+                try:
+                    if hasattr(self, 'bout_analysis_behavior_combo'):
+                        self.update_bout_analysis_behaviors()
+                    if hasattr(self, 'behavior_combo'):
+                        self.update_behavior_list()
+                except Exception as refresh_exc:
+                    self.log_message(
+                        f"  Note: could not refresh behavior lists: {refresh_exc}")
 
                 if hasattr(self, '_reextract_status_var'):
                     self._reextract_status_var.set(status)
@@ -19443,6 +20075,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Update behavior combo and channel radiobuttons
         self.update_bout_analysis_behaviors()
         self.refresh_bout_analysis_channels()
+        # Keep the Signal Linkage tab's lists in sync with loaded data.
+        if hasattr(self, 'refresh_signal_linkage_controls'):
+            self.refresh_signal_linkage_controls()
 
     def refresh_bout_analysis_channels(self):
         """Rebuild the bout-analysis channel radiobuttons from the channels
@@ -21714,6 +22349,197 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     fontsize=9, va='bottom', ha='left', style='italic',
                     color=score_color, fontweight='bold')
     
+    def _open_overlay_behavior_selector(self):
+        """Pop-up with a tick box per behavior to choose which behaviors the
+        Bouts Overlay plot highlights.  Selection is stored in
+        ``self.viz_overlay_behaviors`` (a set of names, or None to follow the
+        Behavior dropdown)."""
+        behaviors = self._get_behavior_options_for_current_selection()
+        if not behaviors:
+            messagebox.showinfo(
+                "No Behaviors",
+                "No behaviors found for the current subject/group selection.\n\n"
+                "Select a processed subject (with a boutframes file) first.")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Select Behaviors to Overlay")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Highlight these behaviors on the trace:",
+                  font=('Segoe UI', 9)).pack(anchor='w', padx=12, pady=(10, 6))
+
+        current = getattr(self, 'viz_overlay_behaviors', None)
+        check_vars = {}
+
+        # Scrollable list so long behavior sets stay usable.
+        list_wrap = ttk.Frame(dlg)
+        list_wrap.pack(fill='both', expand=True, padx=12)
+        canvas = tk.Canvas(list_wrap, highlightthickness=0, height=min(300, 24 * len(behaviors) + 4))
+        scroll = ttk.Scrollbar(list_wrap, orient='vertical', command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        for beh in behaviors:
+            # Default: pre-tick the current selection, else everything.
+            checked = (beh in current) if current else True
+            var = tk.BooleanVar(value=checked)
+            check_vars[beh] = var
+            ttk.Checkbutton(inner, text=beh, variable=var).pack(anchor='w', pady=1)
+
+        def _set_all(state):
+            for v in check_vars.values():
+                v.set(state)
+
+        sel_row = ttk.Frame(dlg)
+        sel_row.pack(anchor='w', padx=12, pady=(6, 0))
+        ttk.Button(sel_row, text="Select all", command=lambda: _set_all(True)).pack(side='left', padx=(0, 4))
+        ttk.Button(sel_row, text="Select none", command=lambda: _set_all(False)).pack(side='left')
+
+        def _apply():
+            chosen = {b for b, v in check_vars.items() if v.get()}
+            if not chosen:
+                messagebox.showwarning("No Behaviors", "Tick at least one behavior, or press Cancel.")
+                return
+            # The pop-up selection is authoritative: ticking all shows all, so
+            # store the explicit set (use "Reset" to return to dropdown-follow).
+            self.viz_overlay_behaviors = chosen
+            self._update_overlay_behaviors_label()
+            dlg.destroy()
+            if self.plot_type_var.get() == "Bouts Overlay":
+                self.generate_plot()
+
+        def _clear():
+            self.viz_overlay_behaviors = None
+            self._update_overlay_behaviors_label()
+            dlg.destroy()
+            if self.plot_type_var.get() == "Bouts Overlay":
+                self.generate_plot()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=10)
+        ttk.Button(btn_row, text="Apply", command=_apply).pack(side='left', padx=4)
+        ttk.Button(btn_row, text="Reset (all)", command=_clear).pack(side='left', padx=4)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='left', padx=4)
+
+    def _update_overlay_behaviors_label(self):
+        """Refresh the little status label next to the Select Behaviors button."""
+        if not hasattr(self, 'viz_overlay_behaviors_label'):
+            return
+        chosen = getattr(self, 'viz_overlay_behaviors', None)
+        if not chosen:
+            self.viz_overlay_behaviors_label.config(text="(follows dropdown)")
+        else:
+            n = len(chosen)
+            self.viz_overlay_behaviors_label.config(
+                text=f"{n} behavior{'s' if n != 1 else ''} selected")
+
+    def _open_bout_overlay_style_dialog(self):
+        """Configure the Bouts Overlay plot appearance: line/marker thickness and
+        a per-behavior color.  Thickness makes very short bouts (e.g. approach)
+        stand out; explicit colors keep behaviors easy to tell apart.  Choices are
+        stored in ``self.params`` ('bout_overlay_line_thickness',
+        'bout_overlay_colors') and persist with the project."""
+        behaviors = [b for b in self._get_behavior_options_for_current_selection()
+                     if not str(b).startswith('_')]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Bout Overlay Style")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        # Line / marker thickness -------------------------------------------------
+        thick_row = ttk.Frame(dlg)
+        thick_row.pack(fill='x', padx=12, pady=(12, 4))
+        ttk.Label(thick_row, text="Onset / span-edge line thickness (pt):").pack(side='left')
+        thick_var = tk.StringVar(value=str(self.params.get('bout_overlay_line_thickness', 1.2)))
+        ttk.Spinbox(thick_row, from_=0.2, to=12.0, increment=0.2, width=6,
+                    textvariable=thick_var).pack(side='left', padx=(6, 0))
+        ttk.Label(dlg, text="Larger values make brief bouts (e.g. approach) bolder and easier to see.",
+                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=12)
+
+        # Per-behavior colors -----------------------------------------------------
+        auto_palette = plt.cm.tab10(np.linspace(0, 1, 10))
+        custom = dict(self.params.get('bout_overlay_colors', {}) or {})
+        # Working copy of the effective color shown per behavior (custom else auto).
+        color_state = {}
+        for idx, beh in enumerate(behaviors):
+            if beh in custom:
+                color_state[beh] = custom[beh]
+            else:
+                color_state[beh] = mcolors.to_hex(auto_palette[idx % len(auto_palette)])
+        swatches = {}
+
+        if behaviors:
+            ttk.Label(dlg, text="Behavior colors (click a swatch to change):",
+                      font=('Segoe UI', 9)).pack(anchor='w', padx=12, pady=(10, 4))
+
+            list_wrap = ttk.Frame(dlg)
+            list_wrap.pack(fill='both', expand=True, padx=12)
+            canvas = tk.Canvas(list_wrap, highlightthickness=0,
+                               height=min(300, 30 * len(behaviors) + 4))
+            scroll = ttk.Scrollbar(list_wrap, orient='vertical', command=canvas.yview)
+            inner = ttk.Frame(canvas)
+            inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+            canvas.create_window((0, 0), window=inner, anchor='nw')
+            canvas.configure(yscrollcommand=scroll.set)
+            canvas.pack(side='left', fill='both', expand=True)
+            scroll.pack(side='right', fill='y')
+
+            def _pick(beh):
+                rgb, hex_col = colorchooser.askcolor(
+                    color=color_state[beh], title=f"Color for {beh}", parent=dlg)
+                if hex_col:
+                    color_state[beh] = hex_col
+                    swatches[beh].config(bg=hex_col, activebackground=hex_col)
+
+            for beh in behaviors:
+                row = ttk.Frame(inner)
+                row.pack(fill='x', pady=2)
+                sw = tk.Button(row, width=3, bg=color_state[beh], relief='ridge',
+                               activebackground=color_state[beh],
+                               command=lambda b=beh: _pick(b))
+                sw.pack(side='left', padx=(0, 8))
+                swatches[beh] = sw
+                ttk.Label(row, text=beh).pack(side='left')
+        else:
+            ttk.Label(dlg, text="(No behaviors found for the current selection — "
+                               "thickness will still apply.)",
+                      foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=12, pady=(10, 0))
+
+        def _apply():
+            try:
+                lw = float(thick_var.get())
+            except ValueError:
+                messagebox.showwarning("Invalid Thickness",
+                                       "Enter a number for the line thickness.", parent=dlg)
+                return
+            self.params['bout_overlay_line_thickness'] = max(0.2, lw)
+            # Store the explicit color for every listed behavior so the palette is
+            # stable and fully controllable (use "Reset colors" for auto again).
+            if behaviors:
+                self.params['bout_overlay_colors'] = {b: color_state[b] for b in behaviors}
+            dlg.destroy()
+            if self.plot_type_var.get() == "Bouts Overlay":
+                self.generate_plot()
+
+        def _reset_colors():
+            self.params['bout_overlay_colors'] = {}
+            for idx, beh in enumerate(behaviors):
+                color_state[beh] = mcolors.to_hex(auto_palette[idx % len(auto_palette)])
+                swatches[beh].config(bg=color_state[beh], activebackground=color_state[beh])
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=10)
+        ttk.Button(btn_row, text="Apply", command=_apply).pack(side='left', padx=4)
+        ttk.Button(btn_row, text="Reset colors", command=_reset_colors).pack(side='left', padx=4)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='left', padx=4)
+
     def plot_bouts_overlay(self, fig, data, subject):
         """Plot z-scored signal with bout markers"""
         if 'beh_synced' not in data:
@@ -21733,73 +22559,127 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'Selected channel(s) not available in processed data', ha='center', va='center', fontsize=14)
             return
 
-        # Create subplots stacked for each selected channel
+        # Create subplots stacked for each selected channel (shared x so the
+        # bout highlights line up across channels).
         n_plots = len(phot_cols)
+        n_frames = beh.shape[0]
         axes = []
         for i, col_idx in enumerate(phot_cols):
-            ax = fig.add_subplot(n_plots, 1, i + 1)
+            ax = fig.add_subplot(n_plots, 1, i + 1, sharex=axes[0] if axes else None)
             signal = self._apply_visualizer_smoothing(beh[:, col_idx])
-            ax.plot(beh[:, 0], signal, linewidth=0.5, label=f'Ch{sel_chs[i]}')
-            ax.set_title(f'Ch{sel_chs[i]} z-scored signal with bout markers')
-            ax.set_xlabel('Frame')
+            ax.plot(beh[:, 0], signal, linewidth=0.6, color='#2b2b2b', zorder=3)
+            ax.set_title(f'Ch{sel_chs[i]} z-scored signal with bout highlights')
             ax.set_ylabel('Z-score')
-            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-            ax.legend()
-            axes.append(ax)
-        
-        # Add bout markers — prefer scaled onset_frames from processed_data,
-        # fall back to reading the boutframes file directly (unscaled).
-        boutframes_file = self.boutframes_path_var.get()
-        stored_bouts = data.get('bouts', {})
-        has_stored = bool(stored_bouts)
-
-        if has_stored or (boutframes_file and os.path.exists(boutframes_file) and subject):
-            try:
-                selected_behavior = self.behavior_var.get().strip()
-
-                # Determine which behaviors to plot
-                if has_stored:
-                    all_behaviors = [b for b in stored_bouts if b != 'onset_frames']
-                    behaviors_to_plot = ([selected_behavior]
-                                         if selected_behavior and selected_behavior in stored_bouts
-                                         else all_behaviors)
-                else:
-                    df = pd.read_excel(boutframes_file, sheet_name=subject)
-                    behaviors_to_plot = ([selected_behavior]
-                                         if selected_behavior and selected_behavior in df.columns
-                                         else list(df.columns))
-
-                colors = plt.cm.tab10(np.linspace(0, 1, max(len(behaviors_to_plot), 1)))
-
-                for idx, (behavior, color) in enumerate(zip(behaviors_to_plot, colors)):
-                    # Prefer scaled onset_frames from processed_data
-                    if behavior in stored_bouts and 'onset_frames' in stored_bouts[behavior]:
-                        frames = np.asarray(stored_bouts[behavior]['onset_frames'], dtype=int)
-                    elif boutframes_file and os.path.exists(boutframes_file):
-                        df = pd.read_excel(boutframes_file, sheet_name=subject)
-                        if behavior not in df.columns:
-                            continue
-                        frames = pd.to_numeric(df[behavior], errors='coerce').dropna().to_numpy(dtype=int)
-                    else:
-                        continue
-
-                    for frame in frames:
-                        if frame < len(beh):
-                            for ax in axes:
-                                ax.axvline(frame, color=color, alpha=0.3, linewidth=1)
-
-                    axes[0].plot([], [], color=color, label=behavior, linewidth=2)
-
-                axes[0].legend(loc='upper right', fontsize=8)
-
-            except Exception as e:
-                axes[0].text(0.5, 0.95, f'Could not load bout markers: {str(e)}',
-                             transform=axes[0].transAxes, ha='center', va='top',
-                             fontsize=8, color='red')
-        
-        for ax in axes:
+            ax.axhline(0, color='k', linestyle='--', alpha=0.3, zorder=1)
             ax.grid(True, alpha=0.3)
-        
+            axes.append(ax)
+        axes[-1].set_xlabel('Frame')
+
+        # Build behavior -> list of (start, end_or_None) spans.  Prefer the
+        # scaled onset/end frames stored on processed_data; fall back to parsing
+        # the boutframes file (start/end aware) and applying the same transform.
+        boutframes_file = self.boutframes_path_var.get()
+        stored_bouts = data.get('bouts', {}) or {}
+        selected_behavior = self.behavior_var.get().strip()
+
+        behavior_spans = {}  # behavior name -> [(start, end_or_None), ...]
+        try:
+            # Determine the candidate behaviors, ignoring bookkeeping keys.
+            if stored_bouts:
+                candidates = [b for b in stored_bouts if not str(b).startswith('_')]
+            elif boutframes_file and os.path.exists(boutframes_file) and subject:
+                parsed, _ = self._parse_boutframes_dataframe(
+                    pd.read_excel(boutframes_file, sheet_name=subject))
+                candidates = [name for (name, _s, _e) in parsed]
+            else:
+                candidates = []
+
+            # If the user picked an explicit behavior set via the pop-up selector,
+            # honor it (preserving candidate order); otherwise honor a single
+            # dropdown selection when it matches, else show all behaviors.
+            chosen = getattr(self, 'viz_overlay_behaviors', None)
+            if chosen:
+                behaviors_to_plot = [b for b in candidates if b in chosen]
+            elif selected_behavior and selected_behavior in candidates:
+                behaviors_to_plot = [selected_behavior]
+            else:
+                behaviors_to_plot = candidates
+
+            for behavior in behaviors_to_plot:
+                starts, ends = None, None
+                entry = stored_bouts.get(behavior) if isinstance(stored_bouts, dict) else None
+                if isinstance(entry, dict) and 'onset_frames' in entry:
+                    starts = np.asarray(entry.get('onset_frames') or [], dtype=float)
+                    ef = entry.get('end_frames')
+                    ends = np.asarray(ef, dtype=float) if ef is not None else None
+                elif boutframes_file and os.path.exists(boutframes_file) and subject:
+                    parsed, _ = self._parse_boutframes_dataframe(
+                        pd.read_excel(boutframes_file, sheet_name=subject))
+                    match = next(((s, e) for (nm, s, e) in parsed if nm == behavior), None)
+                    if match is None:
+                        continue
+                    raw_s, raw_e = match
+                    starts = self._transform_boutframe_values(raw_s, subject, as_int=False).astype(float)
+                    ends = (self._transform_boutframe_values(raw_e, subject, as_int=False).astype(float)
+                            if raw_e is not None else None)
+
+                if starts is None or starts.size == 0:
+                    continue
+
+                spans = []
+                for j, s in enumerate(starts):
+                    e = None
+                    if ends is not None and j < len(ends) and not np.isnan(ends[j]):
+                        e = float(ends[j])
+                    spans.append((float(s), e))
+                behavior_spans[behavior] = spans
+        except Exception as e:
+            axes[0].text(0.5, 0.95, f'Could not load bouts: {str(e)}',
+                         transform=axes[0].transAxes, ha='center', va='top',
+                         fontsize=8, color='red')
+
+        # Draw the highlights: one color per behavior, shaded start->end span
+        # (plus a bold onset line so very short bouts stay visible), or a bold
+        # vertical line for start-only behaviors, plus a behavior legend.
+        # Colors and line thickness are user-configurable via the "Bout Overlay
+        # Style…" dialog; behaviors without a custom color fall back to tab10.
+        colors = plt.cm.tab10(np.linspace(0, 1, 10))
+        custom_colors = self.params.get('bout_overlay_colors', {}) or {}
+        try:
+            line_lw = float(self.params.get('bout_overlay_line_thickness', 1.2))
+        except (TypeError, ValueError):
+            line_lw = 1.2
+        line_lw = max(0.2, line_lw)
+        legend_handles = []
+        for idx, (behavior, spans) in enumerate(behavior_spans.items()):
+            color = custom_colors.get(behavior) or colors[idx % len(colors)]
+            drew = False
+            for (s, e) in spans:
+                if s >= n_frames or (e is not None and e < 0):
+                    continue
+                if e is None or e <= s:
+                    # Start-only bout: mark the onset with a bold vertical line.
+                    for ax in axes:
+                        ax.axvline(s, color=color, alpha=0.8, linewidth=line_lw, zorder=2)
+                else:
+                    lo, hi = max(0.0, s), min(float(n_frames - 1), e)
+                    for ax in axes:
+                        ax.axvspan(lo, hi, facecolor=color, alpha=0.22, linewidth=0, zorder=2)
+                        # Bold onset boundary keeps short (e.g. approach) bouts visible.
+                        ax.axvline(lo, color=color, alpha=0.8, linewidth=line_lw, zorder=2)
+                drew = True
+            if drew:
+                legend_handles.append(Rectangle((0, 0), 1, 1, color=color, alpha=0.75,
+                                                label=behavior))
+
+        if legend_handles:
+            axes[0].legend(handles=legend_handles, loc='upper right', fontsize=8,
+                           title='Behavior', framealpha=0.9)
+        elif not behavior_spans:
+            axes[0].text(0.5, 0.95, 'No bouts found for this subject',
+                         transform=axes[0].transAxes, ha='center', va='top',
+                         fontsize=9, color='gray')
+
         fig.tight_layout()
     
     def plot_extracted_bouts(self, fig, data):
@@ -26963,10 +27843,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 np.array(cond_list, dtype=object),
                 np.array(order_list, dtype=float), L)
 
-    def _collect_flmm_factor(self, subjects, behaviors, channel):
+    def _collect_flmm_factor(self, subjects, behaviors, channel,
+                             max_bouts=_MAX_BOUTS_UNSET):
         """Collect bouts across several behaviors, tagging each bout with its
-        behavior (the multi-level factor). Returns (Z, subjects, factor, L)."""
-        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        behavior (the multi-level factor). Returns (Z, subjects, factor, L).
+
+        ``max_bouts`` defaults to reading the Tk entry; a worker thread must pass
+        the already-resolved limit instead (Tk vars are not thread-safe)."""
+        if max_bouts is _MAX_BOUTS_UNSET:
+            max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         traces, subj_list, fac_list = [], [], []
         for subject in subjects:
             data = self.processed_data.get(subject, {})
@@ -27000,11 +27885,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return (Z, np.array(subj_list, dtype=object),
                 np.array(fac_list, dtype=object), L)
 
-    def _collect_flmm_across_channels(self, subjects, behavior, channels):
+    def _collect_flmm_across_channels(self, subjects, behavior, channels,
+                                      max_bouts=_MAX_BOUTS_UNSET):
         """Collect ONE behavior's bouts across several channels, tagging each bout
         with its channel (the factor). Used by the same-behavior-across-channels
-        pairwise mode. Returns (Z, subjects, channel_factor, L) or None."""
-        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        pairwise mode. Returns (Z, subjects, channel_factor, L) or None.
+
+        ``max_bouts`` defaults to reading the Tk entry; a worker thread must pass
+        the already-resolved limit instead (Tk vars are not thread-safe)."""
+        if max_bouts is _MAX_BOUTS_UNSET:
+            max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         traces, subj_list, chan_list = [], [], []
         for subject in subjects:
             data = self.processed_data.get(subject, {})
@@ -27291,18 +28181,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             pass
         return bonf, 'Bonferroni (fallback)'
 
-    def _fit_factor_timecourse(self, Z, subjects, factor, ref_level=None):
+    def _fit_factor_timecourse(self, Z, subjects, factor, ref_level=None,
+                               progress=None, log=None):
         """Multi-level factor FUI: fit ONE model  Y ~ factor + (1|subject)  at
         every timepoint and return EVERY coefficient (intercept = mean of the
         reference level; each other = that level vs the reference). Matches
         fastFMM's factor-variable analysis; bands pool the residual/random
         structure across all levels (unlike separate pairwise fits).
 
+        ``progress(frac, detail)`` (optional) is called as the per-timepoint fits
+        advance; ``log`` (optional) replaces self.log_message so a worker thread
+        can route messages through the progress queue instead of touching Tk.
+
         Returns dict: betas (K x L), ses (K x L), coef_labels, ref_level, plus
         eta / tau2 / sig2 / X / subj_codes / n_subjects for the GLS covariance.
         """
         import warnings
         import statsmodels.api as sm
+        logf = log or self.log_message
 
         n, L = Z.shape
         uniq_subj = {s: i for i, s in enumerate(sorted(set(subjects.tolist())))}
@@ -27332,7 +28228,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         SANE_SE = 1e3
         fallback_logged = False
 
+        prog_every = max(1, L // 40)
         for t in range(L):
+            if progress is not None and t % prog_every == 0:
+                progress(t / L, f"fitting mixed model — timepoint {t + 1}/{L}")
             y = Z[:, t]
             mask = np.isfinite(y)
             if mask.sum() < p + 1:
@@ -27379,7 +28278,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     eta[mask, t] = yt - Xt @ fp
                     if use_mixed and not fallback_logged:
                         fallback_logged = True
-                        self.log_message("FLMM factor: OLS fallback at some timepoints.")
+                        logf("FLMM factor: OLS fallback at some timepoints.")
                 except Exception:
                     pass
 
@@ -27894,6 +28793,8 @@ cat("OK\n")
         lines = self._flmm_factor_stats_lines(
             coef_labels, ref_level, behavior_label, channel, Z, n_subjects,
             time_axis, betas_s, ses_s, c_stars, pointwise_only, backend_label)
+        if isinstance(self.flmm_timecourse_data, dict):
+            self.flmm_timecourse_data['stats_lines'] = lines
         self._display_bout_stats(lines)
 
     def plot_timecourse_flmm(self):
@@ -28256,6 +29157,7 @@ cat("OK\n")
         else:
             lines += ["", "Pure-Python FUI: β(t) matches R lme4/fastFMM closely; bands",
                       "within ~5–11% of fastFMM. Select the R engine for exact bands."]
+        lines += self._flmm_method_citations()
         return lines
 
     # ---- Pairwise: every behavior vs every other (FDR-corrected panel) --------
@@ -28300,26 +29202,34 @@ cat("OK\n")
                 'sig_mask': sig_mask, 'beta': bc_s, 'se': se_s,
                 'peak': peak, 'peak_k': peak_k}
 
-    def _flmm_pairwise_pmatrix(self, fitf, levels, ref_level, n_sim=10000):
+    def _flmm_pairwise_pmatrix(self, fitf, levels, ref_level, n_sim=10000,
+                               progress=None):
         """Every level-vs-level contrast from ONE joint factor fit.
 
         For each unordered pair (A, B) build the contrast function β(t)=meanA−meanB
         and run the global sup-t functional Wald test (_flmm_contrast_supt). Raw
         p-values are Benjamini-Hochberg FDR corrected across all pairs. Returns a
-        dict of matrices/records, or None."""
+        dict of matrices/records, or None. ``progress(frac, detail)`` (optional) is
+        called as the joint covariance and per-pair tests advance."""
         betas = fitf['betas']              # (K, L)
         ses = fitf['ses']                  # (K, L)
         p_coef = betas.shape[0]
         other = [lev for lev in levels if lev != ref_level]
         pos = {lev: 1 + other.index(lev) for lev in other}  # coef col of each level
         use_gls = fitf['n_subjects'] >= 3
+        if progress is not None:
+            progress(0.0, "computing joint covariance…")
         A = self._flmm_factor_contribs(fitf)[0] if use_gls else None
 
         n = len(levels)
+        n_pairs_total = n * (n - 1) // 2
         pmat = np.full((n, n), np.nan)
         records, pair_idx, raw_p = {}, [], []
         for i in range(n):
             for j in range(i):
+                if progress is not None:
+                    progress(len(pair_idx) / max(1, n_pairs_total),
+                             f"testing pairs — {len(pair_idx) + 1}/{n_pairs_total}")
                 x, y = levels[i], levels[j]
                 c = np.zeros(p_coef)
                 if x != ref_level:
@@ -28338,6 +29248,144 @@ cat("OK\n")
             pmat[i, j] = pmat[j, i] = fdr_p[k]
         return {'p_fdr': pmat, 'records': records, 'ref_level': ref_level,
                 'n_pairs': len(pair_idx), 'gls': use_gls}
+
+    @staticmethod
+    def _flmm_subject_means(Z, subjects, factor, levels, L):
+        """Per-subject mean trace for each factor level.
+
+        Returns ``{level: {subject: ndarray(L)}}`` — each subject's bouts of that
+        level averaged into one trace.  Used by the per-subject peak-effect plot,
+        which reads each animal's z at the FLMM-defined peak time so behaviors with
+        a real (transient/biphasic) effect separate from the shuffle control even
+        when their full-window average is ~0.
+        """
+        subj = np.asarray([str(s) for s in subjects])
+        fac = np.asarray([str(f) for f in factor])
+        Z = np.asarray(Z, float)
+        out = {}
+        for lev in levels:
+            lev_mask = fac == lev
+            d = {}
+            for s in np.unique(subj[lev_mask]):
+                rows = Z[lev_mask & (subj == s)]
+                if rows.size:
+                    with np.errstate(invalid='ignore'):
+                        d[s] = np.nanmean(rows, axis=0)
+            out[lev] = d
+        return out
+
+    @staticmethod
+    def _flmm_default_control_level(levels):
+        """Auto-detect the control/null level (a 'shuffle'/'random' behavior) so it
+        becomes the reference the peak effects are read against.  None if absent."""
+        for lev in levels:
+            ll = str(lev).lower()
+            if 'shuffle' in ll or 'random' in ll:
+                return lev
+        return None
+
+    @staticmethod
+    def _flmm_mask_windows(mask, time):
+        """Contiguous True runs of *mask* as a list of (start_s, end_s) using the
+        *time* axis (seconds).  Used to label each behavior's significant window."""
+        mask = np.asarray(mask, bool)
+        wins, i, n = [], 0, len(mask)
+        while i < n:
+            if mask[i]:
+                j = i
+                while j + 1 < n and mask[j + 1]:
+                    j += 1
+                wins.append((float(time[i]), float(time[j])))
+                i = j + 1
+            else:
+                i += 1
+        return wins
+
+    def _flmm_peak_effect_table(self, panel, ref_level=None):
+        """Per-subject **signed peak z within the FLMM-significant window** for each
+        behavior, read at that behavior's peak time (defined from the group-mean
+        trace, not each subject's own extremum, to avoid upward bias).
+
+        The peak time and significant window come from the behavior-vs-control
+        contrast the FLMM already computed; each subject's value is that subject's
+        own mean trace at that timepoint (so the sign gives the effect direction).
+        The control level itself is summarised over the union of all significant
+        windows to show the null distribution.
+
+        Returns ``{ref_level, order, per_level, subjects}`` or None.
+        """
+        levels = panel.get('levels') or []
+        subj_means = panel.get('subj_means')
+        if not subj_means:
+            return None
+        result = panel['result']
+        records = result['records']
+        time = np.asarray(panel['time'], float)
+        onset = int(np.argmin(np.abs(time)))
+        if ref_level is None or ref_level not in levels:
+            ref_level = (self._flmm_default_control_level(levels)
+                         or result.get('ref_level') or levels[0])
+
+        idx = {lev: i for i, lev in enumerate(levels)}
+
+        def _record(a, b):
+            ia, ib = idx[a], idx[b]
+            return records.get((max(ia, ib), min(ia, ib)))
+
+        def _group_mean(lev):
+            d = subj_means.get(lev, {})
+            if not d:
+                return None
+            with np.errstate(invalid='ignore'):
+                return np.nanmean(np.vstack(list(d.values())), axis=0)
+
+        union = np.zeros(len(time), bool)
+        per_level = {}
+        for lev in levels:
+            if lev == ref_level:
+                continue
+            rec = _record(lev, ref_level)
+            sig = (np.asarray(rec['sig_mask'], bool) if rec is not None
+                   else np.zeros(len(time), bool))
+            union |= sig
+            gm = _group_mean(lev)
+            means = subj_means.get(lev, {})
+            if gm is None or not means:
+                continue
+            win = np.where(sig)[0]
+            if win.size == 0:                       # not significant → post-onset peak
+                win = np.arange(onset, len(time))
+            k = int(win[int(np.nanargmax(np.abs(gm[win])))])
+            vals = {s: float(tr[k]) for s, tr in means.items()
+                    if np.isfinite(tr[k])}
+            per_level[lev] = {
+                'peak_k': k, 'peak_t': float(time[k]),
+                'sig_windows': self._flmm_mask_windows(sig, time),
+                'n_sig': int(sig.sum()), 'values': vals,
+                'p_fdr': float(rec['p_fdr']) if rec is not None else np.nan,
+                'is_control': False}
+
+        # Control row: peak of its own (flat) group trace over the union window.
+        gm = _group_mean(ref_level)
+        means = subj_means.get(ref_level, {})
+        if gm is not None and means:
+            win = np.where(union)[0]
+            if win.size == 0:
+                win = np.arange(onset, len(time))
+            k = int(win[int(np.nanargmax(np.abs(gm[win])))])
+            vals = {s: float(tr[k]) for s, tr in means.items()
+                    if np.isfinite(tr[k])}
+            per_level[ref_level] = {
+                'peak_k': k, 'peak_t': float(time[k]), 'sig_windows': [],
+                'n_sig': 0, 'values': vals, 'p_fdr': np.nan, 'is_control': True}
+
+        order = [l for l in levels if l != ref_level and l in per_level]
+        if ref_level in per_level:
+            order.append(ref_level)
+        if not order:
+            return None
+        return {'ref_level': ref_level, 'order': order, 'per_level': per_level,
+                'subjects': panel.get('subjects', [])}
 
     def _flmm_pairwise_dialog(self, behaviors, channels, default_behaviors,
                               default_channel):
@@ -28460,55 +29508,111 @@ cat("OK\n")
 
     def _run_flmm_pairwise(self, subjects_sel, default_channel, all_behaviors):
         """Entry point for pairwise behavior comparison. Opens the behavior/channel/
-        mode popup, then dispatches to the within-channel or across-channel runner.
+        mode popup, then runs the (potentially long) computation in a background
+        thread behind a detailed progress window so the GUI stays responsive.
         Python FUI engine (no R needed)."""
         channels = self._all_channel_names()
         choice = self._flmm_pairwise_dialog(
             all_behaviors, channels, all_behaviors, default_channel)
         if not choice:
             return
-        if choice['mode'] == 'within':
-            self._run_pairwise_within(subjects_sel, choice['behaviors'],
-                                      choice['channels'])
-        else:
-            self._run_pairwise_across_channels(subjects_sel, choice['behaviors'],
-                                               choice['channels'])
+        mode = choice['mode']
+        behaviors = choice['behaviors']
+        sel_channels = choice['channels']
+        # Resolve every Tk-dependent value on the main thread before threading —
+        # the worker must not touch Tk variables.
+        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        holder = {}
 
-    def _run_pairwise_within(self, subjects_sel, behaviors, channels):
-        """Within-channel behavior × behavior matrix, one per selected channel.
-        Rendered one at a time with a channel selector."""
-        self.root.config(cursor="watch")
-        self.root.update()
+        def worker(q):
+            if mode == 'within':
+                store, warn = self._compute_pairwise_within(
+                    subjects_sel, behaviors, sel_channels, max_bouts, q)
+            else:
+                store, warn = self._compute_pairwise_across_channels(
+                    subjects_sel, behaviors, sel_channels, max_bouts, q)
+            holder['store'], holder['warn'] = store, warn
+
+        def on_done():
+            store, warn = holder.get('store'), holder.get('warn')
+            if store is None:
+                if warn:
+                    messagebox.showwarning("No Data", warn)
+                return
+            self.flmm_timecourse_data = store
+            self._show_pairwise_panels(store)
+
+        subtitle = ("within channel — one matrix per channel" if mode == 'within'
+                    else "same behavior across channels")
+        self._run_with_progress("Pairwise comparison", worker, on_done_fn=on_done,
+                                cancelable=True, subtitle=subtitle)
+
+    @staticmethod
+    def _phase_progress(q, status, base, span):
+        """Build a progress callback for one phase that maps a local 0..1 fraction
+        into the global [base, base+span] range, checks the cancel flag, and posts
+        status/detail/progress to the worker queue. Returns _p(frac, detail=None)."""
+        q.put(('status', status))
+
+        def _p(frac, detail=None):
+            if q.cancel_event.is_set():
+                raise _ProgressCancelled()
+            frac = 0.0 if frac < 0 else 1.0 if frac > 1 else float(frac)
+            q.put(('progress', base + span * frac))
+            if detail is not None:
+                q.put(('detail', detail))
+        return _p
+
+    def _compute_pairwise_within(self, subjects_sel, behaviors, channels,
+                                 max_bouts, q):
+        """Worker: within-channel behavior × behavior matrix, one per channel.
+        Returns (store, warn); runs off the main thread, reporting via ``q``."""
+        logq = lambda m: q.put(('log', m))
         panels, order = {}, []
-        try:
-            for channel in channels:
-                collected = self._collect_flmm_factor(subjects_sel, behaviors, channel)
-                if collected is None:
-                    continue
-                Z, subjects, factor, L = collected
-                levels = sorted(set(str(f) for f in factor))
-                if len(levels) < 2:
-                    continue
-                ref_level = levels[0]
-                fitf = self._fit_factor_timecourse(Z, subjects, factor,
-                                                   ref_level=ref_level)
-                result = self._flmm_pairwise_pmatrix(fitf, levels, ref_level)
-                if result is None:
-                    continue
-                fps = self.params['fps']
-                prebout = min(self.params['preboutframes'], L - 1)
-                panels[channel] = {
-                    'levels': levels, 'result': result,
-                    'n_bouts': int(Z.shape[0]),
-                    'n_subjects': len(set(subjects.tolist())),
-                    'time': (np.arange(L) - prebout) / fps}
-                order.append(channel)
-        finally:
-            self.root.config(cursor="")
+        C = max(1, len(channels))
+        for ci, channel in enumerate(channels):
+            if q.cancel_event.is_set():
+                raise _ProgressCancelled()
+            base, span = ci / C, 1.0 / C
+            q.put(('status', f"Channel {channel}  ({ci + 1}/{C})"))
+            q.put(('detail', "collecting bouts…"))
+            q.put(('progress', base))
+            collected = self._collect_flmm_factor(
+                subjects_sel, behaviors, channel, max_bouts=max_bouts)
+            if collected is None:
+                continue
+            Z, subjects, factor, L = collected
+            levels = sorted(set(str(f) for f in factor))
+            if len(levels) < 2:
+                continue
+            ref_level = levels[0]
+            fit_p = self._phase_progress(
+                q, f"Channel {channel}  ({ci + 1}/{C})", base + 0.05 * span,
+                0.70 * span)
+            fitf = self._fit_factor_timecourse(
+                Z, subjects, factor, ref_level=ref_level, progress=fit_p, log=logq)
+            pair_p = self._phase_progress(
+                q, f"Channel {channel}  ({ci + 1}/{C})", base + 0.75 * span,
+                0.25 * span)
+            result = self._flmm_pairwise_pmatrix(fitf, levels, ref_level,
+                                                 progress=pair_p)
+            if result is None:
+                continue
+            fps = self.params['fps']
+            prebout = min(self.params['preboutframes'], L - 1)
+            panels[channel] = {
+                'levels': levels, 'result': result,
+                'n_bouts': int(Z.shape[0]),
+                'n_subjects': len(set(subjects.tolist())),
+                'time': (np.arange(L) - prebout) / fps,
+                # Per-subject mean traces (small) so the per-subject peak-effect
+                # plot/export can read each animal's z at the FLMM peak time.
+                'subj_means': self._flmm_subject_means(Z, subjects, factor, levels, L),
+                'subjects': sorted(set(str(s) for s in subjects.tolist()))}
+            order.append(channel)
+        q.put(('progress', 1.0))
         if not order:
-            messagebox.showwarning(
-                "No Data", "No channel had ≥2 behaviors with usable bouts.")
-            return
+            return None, "No channel had ≥2 behaviors with usable bouts."
 
         store = {
             'kind': 'pairwise_within', 'order': order, 'panels': panels,
@@ -28521,65 +29625,77 @@ cat("OK\n")
                 panels[ch]['n_bouts'], panels[ch]['n_subjects'],
                 panels[ch]['time']),
         }
-        self.flmm_timecourse_data = store
-        self._show_pairwise_panels(store)
+        return store, None
 
-    def _run_pairwise_across_channels(self, subjects_sel, behaviors, channels):
-        """Same-behavior-across-channels: for each behavior fit Y~channel+(1|subj)
-        and test every channel pair with the sup-t functional Wald test. FDR is
-        applied jointly across the whole (behavior × channel-pair) family. With
-        two channels the result is one test per behavior (a forest-style panel);
-        with more channels it is a channel × channel matrix per behavior."""
-        self.root.config(cursor="watch")
-        self.root.update()
-        per_beh = {}          # behavior -> {levels, betas, ses, A, records, ...}
-        raw_records = []      # flat list for joint FDR: (beh, i, j, rec)
-        L_ref = None
-        try:
-            for beh in behaviors:
-                collected = self._collect_flmm_across_channels(
-                    subjects_sel, beh, channels)
-                if collected is None:
-                    continue
-                Z, subjects, factor, L = collected
-                levels = sorted(set(str(f) for f in factor))
-                if len(levels) < 2:
-                    continue
-                ref = levels[0]
-                fitf = self._fit_factor_timecourse(Z, subjects, factor, ref_level=ref)
-                betas, ses = fitf['betas'], fitf['ses']
-                A = (self._flmm_factor_contribs(fitf)[0]
-                     if fitf['n_subjects'] >= 3 else None)
-                other = [lv for lv in levels if lv != ref]
-                pos = {lv: 1 + other.index(lv) for lv in other}
-                recs = {}
-                for i in range(len(levels)):
-                    for j in range(i):
-                        x, y = levels[i], levels[j]
-                        c = np.zeros(betas.shape[0])
-                        if x != ref:
-                            c[pos[x]] += 1.0
-                        if y != ref:
-                            c[pos[y]] -= 1.0
-                        rec = self._flmm_contrast_supt(betas, ses, A, c)
-                        rec['x'], rec['y'] = x, y
-                        recs[(i, j)] = rec
-                        raw_records.append((beh, i, j))
-                fps = self.params['fps']
-                prebout = min(self.params['preboutframes'], L - 1)
-                per_beh[beh] = {
-                    'levels': levels, 'records': recs, 'ref_level': ref,
-                    'n_bouts': int(Z.shape[0]),
-                    'n_subjects': len(set(subjects.tolist())),
-                    'gls': A is not None,
-                    'time': (np.arange(L) - prebout) / fps}
-        finally:
-            self.root.config(cursor="")
+    def _compute_pairwise_across_channels(self, subjects_sel, behaviors, channels,
+                                          max_bouts, q):
+        """Worker: same-behavior-across-channels. For each behavior fit
+        Y~channel+(1|subj) and test every channel pair with the sup-t functional
+        Wald test; FDR is applied jointly across the whole (behavior × channel-pair)
+        family. Returns (store, warn); runs off the main thread, reporting via ``q``.
+        Two channels → one test per behavior (forest panel); more → a channel ×
+        channel matrix per behavior."""
+        logq = lambda m: q.put(('log', m))
+        per_beh = {}          # behavior -> {levels, records, ...}
+        raw_records = []      # flat list for joint FDR: (beh, i, j)
+        B = max(1, len(behaviors))
+        for bi, beh in enumerate(behaviors):
+            if q.cancel_event.is_set():
+                raise _ProgressCancelled()
+            base, span = bi / B, 1.0 / B
+            q.put(('status', f"Behavior {beh}  ({bi + 1}/{B})"))
+            q.put(('detail', "collecting bouts…"))
+            q.put(('progress', base))
+            collected = self._collect_flmm_across_channels(
+                subjects_sel, beh, channels, max_bouts=max_bouts)
+            if collected is None:
+                continue
+            Z, subjects, factor, L = collected
+            levels = sorted(set(str(f) for f in factor))
+            if len(levels) < 2:
+                continue
+            ref = levels[0]
+            fit_p = self._phase_progress(
+                q, f"Behavior {beh}  ({bi + 1}/{B})", base + 0.05 * span,
+                0.85 * span)
+            fitf = self._fit_factor_timecourse(
+                Z, subjects, factor, ref_level=ref, progress=fit_p, log=logq)
+            self._phase_progress(
+                q, f"Behavior {beh}  ({bi + 1}/{B})", base + 0.90 * span,
+                0.10 * span)(0.0, "testing channel pairs…")
+            betas, ses = fitf['betas'], fitf['ses']
+            A = (self._flmm_factor_contribs(fitf)[0]
+                 if fitf['n_subjects'] >= 3 else None)
+            other = [lv for lv in levels if lv != ref]
+            pos = {lv: 1 + other.index(lv) for lv in other}
+            recs = {}
+            for i in range(len(levels)):
+                for j in range(i):
+                    x, y = levels[i], levels[j]
+                    c = np.zeros(betas.shape[0])
+                    if x != ref:
+                        c[pos[x]] += 1.0
+                    if y != ref:
+                        c[pos[y]] -= 1.0
+                    rec = self._flmm_contrast_supt(betas, ses, A, c)
+                    rec['x'], rec['y'] = x, y
+                    recs[(i, j)] = rec
+                    raw_records.append((beh, i, j))
+            fps = self.params['fps']
+            prebout = min(self.params['preboutframes'], L - 1)
+            per_beh[beh] = {
+                'levels': levels, 'records': recs, 'ref_level': ref,
+                'n_bouts': int(Z.shape[0]),
+                'n_subjects': len(set(subjects.tolist())),
+                'gls': A is not None,
+                'time': (np.arange(L) - prebout) / fps}
+        # Status only — never lower the bar (the last behavior already advanced it
+        # near 1.0); the final ('progress', 1.0) is emitted after the store builds.
+        q.put(('status', "Correcting & preparing panels…"))
+        q.put(('detail', ""))
         if not per_beh:
-            messagebox.showwarning(
-                "No Data",
-                "No behavior had usable bouts in ≥2 of the selected channels.")
-            return
+            return None, ("No behavior had usable bouts in ≥2 of the selected "
+                          "channels.")
 
         # Joint BH-FDR across every (behavior × channel-pair) test.
         raw_p = np.array([per_beh[b]['records'][(i, j)]['p_raw']
@@ -28627,8 +29743,8 @@ cat("OK\n")
                     per_beh[b]['n_subjects'], per_beh[b]['time'], is_channel=True,
                     fdr_family=n_tests),
             }
-        self.flmm_timecourse_data = store
-        self._show_pairwise_panels(store)
+        q.put(('progress', 1.0))
+        return store, None
 
     def _show_pairwise_panels(self, store):
         """Render pairwise results into the bout canvas with a selector to switch
@@ -28640,14 +29756,21 @@ cat("OK\n")
         sel_var = tk.StringVar(value=keys[0])
 
         top = ttk.Frame(self.bout_histogram_frame)
-        if len(keys) > 1 and store.get('selector_label'):
+        has_peak = store.get('kind') == 'pairwise_within' and any(
+            p.get('subj_means') for p in store.get('panels', {}).values())
+        if (len(keys) > 1 and store.get('selector_label')) or has_peak:
             top.pack(fill='x', padx=6, pady=(6, 0))
+        if len(keys) > 1 and store.get('selector_label'):
             ttk.Label(top, text=store['selector_label']).pack(side='left')
             combo = ttk.Combobox(top, values=keys, textvariable=sel_var,
                                  state='readonly', width=24)
             combo.pack(side='left', padx=6)
         else:
             combo = None
+        if has_peak:
+            ttk.Button(top, text="Per-subject peak effect…",
+                       command=lambda: self._flmm_show_peak_effect(
+                           store, sel_var.get())).pack(side='right', padx=6)
         holder = ttk.Frame(self.bout_histogram_frame)
         holder.pack(fill='both', expand=True)
 
@@ -28675,6 +29798,226 @@ cat("OK\n")
         if not np.isfinite(p):
             return "—"
         return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+
+    # ── Per-subject peak-effect plot/export (FLMM-directional summary) ──
+
+    def _build_flmm_peak_effect_figure(self, table, channel):
+        """Horizontal violin+strip of each subject's signed peak z (read at the
+        FLMM peak time within the significant window), one row per behavior with
+        the control last — a directional, FLMM-consistent replacement for the
+        window-average that keeps significant behaviors distinct from the shuffle
+        control.  FDR stars from the behavior-vs-control contrast annotate each row."""
+        self._apply_plot_style()
+        order = table['order']
+        per = table['per_level']
+        ref = table['ref_level']
+        n = len(order)
+        fig = Figure(figsize=(6.2, max(2.6, 0.62 * n + 1.1)), dpi=100)
+        ax = fig.add_subplot(111)
+
+        # First behavior at the top → descending y.
+        ypos = {lev: n - i for i, lev in enumerate(order)}
+        beh_color, ctrl_color = '#111111', '#9e9e9e'
+        median_color = '#e6007e'
+        rng = np.random.default_rng(0)
+
+        xmax = 0.0
+        for lev in order:
+            info = per[lev]
+            y = ypos[lev]
+            vals = np.array(list(info['values'].values()), float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            xmax = max(xmax, np.nanmax(np.abs(vals)))
+            is_ctrl = info['is_control']
+            face = ctrl_color if is_ctrl else beh_color
+            if vals.size >= 2 and np.ptp(vals) > 1e-9:
+                vp = ax.violinplot([vals], positions=[y], vert=False,
+                                   widths=0.72, showextrema=False)
+                for b in vp['bodies']:
+                    b.set_facecolor(face)
+                    b.set_edgecolor('none')
+                    b.set_alpha(0.55 if is_ctrl else 0.42)
+            # individual animals
+            jit = (rng.random(vals.size) - 0.5) * 0.22
+            ax.scatter(vals, np.full(vals.size, y) + jit, s=16,
+                       color=face, edgecolor='white', linewidth=0.5, zorder=3)
+            # median marker
+            med = float(np.median(vals))
+            ax.plot([med, med], [y - 0.34, y + 0.34], color=median_color,
+                    lw=2.4, zorder=4, solid_capstyle='round')
+
+        ax.axvline(0, color='#888888', lw=1.0, ls='--', zorder=1)
+        # Stars from the behavior-vs-control FDR p.
+        star_x = (xmax * 1.06) if xmax > 0 else 0.1
+        for lev in order:
+            info = per[lev]
+            if info['is_control']:
+                continue
+            star = self._flmm_pairwise_stars(info['p_fdr'])
+            ax.text(star_x, ypos[lev], star, va='center', ha='left',
+                    fontsize=11, fontweight='bold', color='#222222')
+
+        ax.set_yticks([ypos[l] for l in order])
+        ax.set_yticklabels([f"{l}*" if False else l for l in order])
+        ax.set_ylim(0.4, n + 0.6)
+        ax.set_xlabel("Signed peak z-score  (at FLMM peak time, in sig. window)")
+        ax.set_title(f"{channel}: per-subject peak effect vs {ref}", fontweight='bold')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.tight_layout()
+        return fig
+
+    def _export_flmm_peak_effect_csv(self, table, channel):
+        """Write the per-subject peak-effect values (subjects × behaviors) plus a
+        metadata block (peak time, FDR p, significant window) to CSV for GraphPad
+        etc.  Returns the path written, or None if cancelled."""
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            title="Export per-subject peak effect",
+            defaultextension=".csv",
+            initialfile=f"FLMM_peak_effect_{channel}.csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return None
+        order = table['order']
+        per = table['per_level']
+        subjects = sorted({s for lev in order for s in per[lev]['values']})
+        data = {lev: [per[lev]['values'].get(s, np.nan) for s in subjects]
+                for lev in order}
+        df = pd.DataFrame(data, index=subjects)
+        df.index.name = 'subject'
+        with open(path, 'w', newline='', encoding='utf-8') as fh:
+            fh.write(f"# {channel}: per-subject signed peak z at FLMM peak time "
+                     f"(within significant window); control = {table['ref_level']}\n")
+            df.to_csv(fh)
+            fh.write("\n# metadata\n")
+            meta = pd.DataFrame({
+                'peak_time_s': [round(per[l]['peak_t'], 3) for l in order],
+                'p_fdr_vs_control': [('' if per[l]['is_control']
+                                      else round(per[l]['p_fdr'], 5)) for l in order],
+                'sig_window_s': ['; '.join(f"{a:.2f}..{b:.2f}"
+                                           for a, b in per[l]['sig_windows'])
+                                 or ('control' if per[l]['is_control'] else 'ns')
+                                 for l in order],
+            }, index=order)
+            meta.index.name = 'behavior'
+            meta.to_csv(fh)
+        self.log_message(f"Exported per-subject peak effect → {path}")
+        return path
+
+    def _flmm_show_peak_effect(self, store, key):
+        """Pop-out window: per-subject peak-effect violin for one panel, with a
+        control-level selector and a CSV export.  Only meaningful for within-channel
+        panels (which carry the per-subject traces)."""
+        panels = store.get('panels', {})
+        panel = panels.get(key)
+        if not panel or not panel.get('subj_means'):
+            messagebox.showinfo(
+                "Peak effect",
+                "Per-subject peak-effect plots are available for the "
+                "within-channel comparison (which carries each animal's trace).")
+            return
+        table0 = self._flmm_peak_effect_table(panel)
+        if table0 is None:
+            messagebox.showinfo("Peak effect", "Not enough data to summarise.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Per-subject peak effect — {key}")
+        win.transient(self.root)
+
+        ctrl_row = ttk.Frame(win)
+        ctrl_row.pack(fill='x', padx=10, pady=(10, 4))
+        ttk.Label(ctrl_row, text="Control / reference:").pack(side='left', padx=(0, 6))
+        ref_var = tk.StringVar(value=table0['ref_level'])
+        ref_combo = ttk.Combobox(ctrl_row, textvariable=ref_var, state='readonly',
+                                 width=22, values=list(panel['levels']))
+        ref_combo.pack(side='left')
+
+        body = ttk.Frame(win)
+        body.pack(fill='both', expand=True, padx=6, pady=6)
+        state = {'table': table0}
+
+        def _draw(*_):
+            for w in body.winfo_children():
+                w.destroy()
+            table = self._flmm_peak_effect_table(panel, ref_level=ref_var.get())
+            if table is None:
+                ttk.Label(body, text="Not enough data for this reference.").pack()
+                state['table'] = None
+                return
+            state['table'] = table
+            fig = self._build_flmm_peak_effect_figure(table, key)
+            self._embed_plot_canvas(fig, body)
+
+        def _export():
+            if state['table'] is not None:
+                self._export_flmm_peak_effect_csv(state['table'], key)
+
+        ttk.Button(ctrl_row, text="Export CSV…", command=_export).pack(side='right')
+        ref_combo.bind("<<ComboboxSelected>>", _draw)
+        _draw()
+
+    # Real, verified citations that justify each step of the FLMM inference. Shown
+    # in the stats readout and the exported PDF report so results are manuscript-
+    # traceable. (References verified against the primary sources.)
+    _FLMM_REFERENCES = [
+        "Cui E, Leroux A, Smirnova E, Crainiceanu CM (2022). Fast Univariate "
+        "Inference for Longitudinal Functional Models. J. Comput. Graph. Stat. "
+        "31(1):219-230. doi:10.1080/10618600.2021.1950006",
+        "Loewinger G, Cui E, Lovinger D, Pereira F (2025). A statistical framework "
+        "for analysis of trial-level temporal dynamics in fiber photometry "
+        "experiments. eLife 13:RP95802. doi:10.7554/eLife.95802  [fastFMM]",
+        "Aarts E, Verhage M, Veenvliet JV, Dolan CV, van der Sluis S (2014). A "
+        "solution to dependency: using multilevel analysis to accommodate nested "
+        "data. Nat. Neurosci. 17(4):491-496. doi:10.1038/nn.3648",
+        "Benjamini Y, Hochberg Y (1995). Controlling the false discovery rate: a "
+        "practical and powerful approach to multiple testing. J. R. Stat. Soc. B "
+        "57(1):289-300.",
+        "Liang K-Y, Zeger SL (1986). Longitudinal data analysis using generalized "
+        "linear models. Biometrika 73(1):13-22.",
+        "Cameron AC, Miller DL (2015). A practitioner's guide to cluster-robust "
+        "inference. J. Hum. Resour. 50(2):317-372. doi:10.3368/jhr.50.2.317",
+        "Savitzky A, Golay MJE (1964). Smoothing and differentiation of data by "
+        "simplified least squares procedures. Anal. Chem. 36(8):1627-1639.",
+    ]
+
+    def _flmm_method_citations(self, family_note=None):
+        """Method-justification + reference block appended to every FLMM readout.
+
+        ``family_note`` (optional) states what the across-family FDR corrects, so
+        the two multiplicity axes (across-time vs across-family) stay explicit."""
+        lines = ["", "=" * 74, "METHOD & REFERENCES", "-" * 74,
+                 "Per-timepoint linear mixed model with a random intercept per",
+                 "subject (Fast Univariate Inference, FUI), the approach validated for",
+                 "fiber-photometry trial dynamics in the fastFMM framework "
+                 "[Cui 2022; Loewinger 2025].",
+                 "Nested/repeated bouts within subject are handled by the random",
+                 "effect rather than by pseudo-replication [Aarts 2014].",
+                 "",
+                 "Significance over the window is defined by the JOINT (simultaneous)",
+                 "95% band: a period is significant where the band excludes 0. This",
+                 "corrects across time WITHOUT a per-timepoint multiplicity penalty",
+                 "[Cui 2022; Loewinger 2025]. The reported p is the sup-statistic",
+                 "companion — the smallest level at which the joint band first",
+                 "excludes 0 anywhere in the window.",
+                 "",
+                 "Coefficient-function covariance: subject-clustered (CR0) sandwich",
+                 "[Liang & Zeger 1986]; with few subjects CR0 is mildly",
+                 "anticonservative [Cameron & Miller 2015] — use the R/fastFMM engine",
+                 "for the exact analytic band. β(t) smoothing: Savitzky-Golay [1964]."]
+        if family_note:
+            lines += ["",
+                      f"Across-family correction: Benjamini-Hochberg FDR [1995] over "
+                      f"{family_note}.",
+                      "This is a DIFFERENT multiplicity axis from the across-time",
+                      "correction above (which the joint band already handles)."]
+        lines += ["", "References:"]
+        for k, ref in enumerate(self._FLMM_REFERENCES, 1):
+            lines.append(f"  [{k}] {ref}")
+        return lines
 
     def _build_flmm_pairwise_figure(self, levels, channel, result, n_bouts,
                                     n_subjects, is_channel=False, fdr_family=None):
@@ -28792,8 +30135,9 @@ cat("OK\n")
                  f"{head}   |   {n_bouts} bouts, {n_subjects} subject(s), "
                  f"{len(time_axis)} timepoints",
                  f"Model baseline (reference level): {result['ref_level']}",
-                 "Test  : global sup-t (max|β/se|) functional Wald over the window,",
-                 "        subject-clustered joint covariance.  H0: β_A(t)=β_B(t) ∀t.",
+                 "Test  : joint (simultaneous) 95% band over the window — a pair",
+                 "        differs where the band of β_A(t)−β_B(t) excludes 0; p is the",
+                 "        sup-statistic companion (max|β/se|).  H0: β_A(t)=β_B(t) ∀t.",
                  f"Correct: Benjamini-Hochberg FDR across {n_family} pair(s).",
                  "=" * 74,
                  "",
@@ -28826,6 +30170,8 @@ cat("OK\n")
             lines += [
                 "Few subjects (<3): delta-method + Bonferroni-across-time fallback",
                 "(conservative). Add more subjects for the joint-covariance sup-t test."]
+        lines += self._flmm_method_citations(
+            family_note=f"the {n_family} behavior pair(s) compared")
         return lines
 
     def _build_flmm_across_forest_figure(self, beh_order, per_beh, n_tests):
@@ -28920,7 +30266,8 @@ cat("OK\n")
         lines = ["=" * 74,
                  "SAME-BEHAVIOR ACROSS CHANNELS  (per behavior: Y ~ channel + (1|subj))",
                  f"Channels contrasted: {chan_a} vs {chan_b}",
-                 "Test  : global sup-t (max|β/se|) functional Wald over the window.",
+                 "Test  : joint (simultaneous) 95% band — significant where the band",
+                 "        of β(t) excludes 0; p is its sup-statistic (max|β/se|).",
                  f"Correct: Benjamini-Hochberg FDR across {n_tests} behavior test(s).",
                  "=" * 74,
                  "",
@@ -28948,6 +30295,8 @@ cat("OK\n")
                   "Python FUI engine (no R). Bouts from both channels are pooled into",
                   "one per-behavior model with a subject random intercept; the channel",
                   "factor's joint covariance is subject-clustered (CR0)."]
+        lines += self._flmm_method_citations(
+            family_note=f"the {n_tests} behavior test(s)")
         return lines
 
     def _draw_flmm_plot(self, Z, groups, time_axis, reference, beta, ci_lo, ci_hi,
@@ -29037,6 +30386,7 @@ cat("OK\n")
                 "are within ~5–10% of fastFMM (small-sample correction + spline covariance",
                 "smoothing differ). Select the R fastFMM engine for exact bands.",
             ]
+        lines += self._flmm_method_citations()
         return lines
 
     def _report_flmm_stats(self, reference, behavior, channel, Z, n_subjects,
@@ -29046,6 +30396,8 @@ cat("OK\n")
         lines = self._flmm_stats_lines(
             reference, behavior, channel, Z, n_subjects, groups_present,
             time_axis, sig_sim, sig_pt, c_star, pointwise_only, backend_label)
+        if isinstance(getattr(self, 'flmm_timecourse_data', None), dict):
+            self.flmm_timecourse_data['stats_lines'] = lines
         self._display_bout_stats(lines)
 
     def export_timecourse_flmm(self):
@@ -29158,6 +30510,142 @@ cat("OK\n")
             "Copied",
             f"Time-course stats ({d['reference']}, {d['behavior']}/{d['channel']}) "
             f"copied to clipboard.\nPaste into Excel or Prism.")
+
+    # ---------------------- FLMM PDF report export ----------------------------
+
+    def export_flmm_report(self):
+        """Export a self-contained PDF report of the last FLMM analysis: every
+        generated panel plus its full statistics readout and the method citations.
+        Works for the pairwise matrices, the factor model, and the single-model
+        time-course."""
+        d = getattr(self, 'flmm_timecourse_data', None)
+        if not d:
+            messagebox.showinfo(
+                "No Data",
+                "Run an FLMM analysis first (Bout Analysis → Plot ▾ → "
+                "\"Time-Course Statistics (FLMM-style)…\").")
+            return
+        import datetime
+        default = f"FLMM_report_{datetime.datetime.now():%Y%m%d_%H%M}.pdf"
+        path = filedialog.asksaveasfilename(
+            title="Export FLMM Report (PDF)", defaultextension=".pdf",
+            initialfile=default, filetypes=[("PDF document", "*.pdf")])
+        if not path:
+            return
+        self.root.config(cursor="watch")
+        self.root.update()
+        try:
+            n_panels = self._write_flmm_report_pdf(path, d)
+        except Exception as e:
+            import traceback
+            self.log_message(f"FLMM report export failed: {e}\n{traceback.format_exc()}")
+            messagebox.showerror("Export failed",
+                                 f"Could not write the report:\n{e}")
+            return
+        finally:
+            self.root.config(cursor="")
+        self.log_message(f"FLMM report saved ({n_panels} panel(s)): {path}")
+        messagebox.showinfo("Report saved",
+                            f"FLMM report written ({n_panels} panel(s)):\n{path}")
+
+    def _flmm_report_panels(self, d):
+        """Yield (caption, figure_or_None, stats_lines) for each panel of the last
+        FLMM result, so the report covers every generated plot."""
+        kind = d.get('kind')
+        if kind in ('pairwise_within', 'pairwise_across'):
+            for key in d['order']:
+                if kind == 'pairwise_within':
+                    cap = f"Within channel — {key}"
+                elif key == '(all behaviors)':
+                    cap = "Same behavior across channels"
+                else:
+                    cap = f"Across channels — behavior: {key}"
+                yield cap, d['make_fig'](key), d['make_lines'](key)
+        else:
+            # factor / single time-course: reuse the on-screen figure + stashed text
+            cap = f"{d.get('channel', '')}: {d.get('behavior', 'FLMM time-course')}"
+            fig = getattr(self, 'current_bout_figure', None)
+            lines = d.get('stats_lines') or self._flmm_method_citations()
+            yield cap, fig, lines
+
+    def _write_flmm_report_pdf(self, path, d):
+        """Build the multi-page PDF: title/method page, then per panel a figure
+        page followed by its statistics text. Returns the panel count."""
+        import datetime
+        from matplotlib.backends.backend_pdf import PdfPages
+        from matplotlib.figure import Figure
+
+        kind = d.get('kind', 'flmm')
+        pretty = {'pairwise_within': "Pairwise (within channel)",
+                  'pairwise_across': "Pairwise (same behavior across channels)",
+                  'factor': "Factor model", 'single': "Time-course"}.get(kind, "FLMM")
+        panels = list(self._flmm_report_panels(d))
+
+        with PdfPages(path) as pdf:
+            # ---- Title / methods page ----
+            head = [
+                "TRACY — FLMM Time-Course Statistics", "",
+                f"Analysis     : {pretty}",
+                f"Panels       : {len(panels)}",
+                f"Generated    : {datetime.datetime.now():%Y-%m-%d %H:%M}",
+                f"TRACY version: {APP_VERSION}",
+            ]
+            self._pdf_text_page(pdf, head + self._flmm_method_citations(),
+                                title_lines=2)
+            # ---- Per-panel: figure page then its stats text ----
+            for cap, fig, lines in panels:
+                if fig is not None:
+                    try:
+                        fig.suptitle  # touch to ensure it's a Figure
+                        pdf.savefig(fig, bbox_inches='tight')
+                    except Exception as e:
+                        self.log_message(f"FLMM report: could not add figure "
+                                         f"'{cap}' — {e}")
+                self._pdf_text_page(pdf, [cap, "=" * len(cap), ""] + list(lines),
+                                    title_lines=2)
+        return len(panels)
+
+    def _pdf_text_page(self, pdf, lines, title_lines=0, per_page=60, width=104):
+        """Render text ``lines`` onto one or more letter-size PDF pages (monospace,
+        so the aligned stat tables survive). Long lines (e.g. references) wrap with
+        a hanging indent; short table rows are left untouched. ``title_lines`` are
+        bolded on page 1."""
+        import textwrap
+        from matplotlib.figure import Figure
+        wrapped = []
+        for k, ln in enumerate(lines):
+            if k < title_lines or len(ln) <= width:
+                wrapped.append(ln)
+                continue
+            lead = ln[:len(ln) - len(ln.lstrip())]
+            wrapped.extend(textwrap.wrap(
+                ln.strip(), width=width, initial_indent=lead,
+                subsequent_indent=lead + '    ', break_long_words=False,
+                break_on_hyphens=False) or [ln])
+        lines = wrapped
+        i = 0
+        first = True
+        while i < len(lines) or first:
+            chunk = lines[i:i + per_page]
+            fig = Figure(figsize=(8.5, 11), dpi=150)
+            ax = fig.add_axes([0.06, 0.04, 0.9, 0.93])
+            ax.axis('off')
+            y = 1.0
+            start = 0
+            if first and title_lines:
+                for t in chunk[:title_lines]:
+                    ax.text(0.0, y, t, fontsize=12, fontweight='bold', va='top',
+                            family='DejaVu Sans', transform=ax.transAxes)
+                    y -= 0.028
+                start = title_lines
+                y -= 0.006
+            body = "\n".join(chunk[start:])
+            if body:
+                ax.text(0.0, y, body, fontsize=7.6, va='top',
+                        family='monospace', transform=ax.transAxes)
+            pdf.savefig(fig)
+            i += per_page
+            first = False
 
     # ======================== Bout Analysis Methods ========================
     
@@ -33257,38 +34745,102 @@ cat("OK\n")
             self.log_message(f"Error calculating rolling correlation: {str(e)}")
             return None
     
-    def _run_with_progress(self, title, worker_fn, on_done_fn=None):
-        """Run worker_fn(progress_q) in a background thread with a modal progress window.
+    def _run_with_progress(self, title, worker_fn, on_done_fn=None,
+                           cancelable=False, subtitle=None):
+        """Run worker_fn(q) in a background thread with a modal, detailed progress
+        window so the GUI stays responsive during long analyses.
 
-        worker_fn receives a queue.Queue and should put tuples:
-            ('status', message_str)  – updates the status label
-            ('log',    message_str)  – forwards to self.log_message (main thread)
-        When worker_fn returns the window closes and on_done_fn() is called.
+        worker_fn receives a queue.Queue and puts tuples:
+            ('status',   text)   – main stage line
+            ('detail',   text)   – secondary detail line (grey)
+            ('progress', frac)   – 0..1; switches the bar to determinate + shows %
+            ('log',      text)   – forwarded to self.log_message (main thread)
+        If ``cancelable`` the window shows a Cancel button and exposes
+        ``q.cancel_event`` (threading.Event); the worker should poll it and raise
+        _ProgressCancelled to abort. When worker_fn returns the window closes and
+        on_done_fn() runs (skipped on error or cancel).
         """
         import threading
         import queue as _queue
+        import time as _time
 
         prog_win = tk.Toplevel(self.root)
         prog_win.title(title)
         prog_win.resizable(False, False)
         prog_win.protocol("WM_DELETE_WINDOW", lambda: None)  # block manual close
 
-        frame = ttk.Frame(prog_win, padding=16)
+        # A slim accent strip on top keeps it feeling polished, not utilitarian.
+        accent = tk.Frame(prog_win, height=4, bg='#3E82BE')
+        accent.pack(fill='x', side='top')
+        frame = ttk.Frame(prog_win, padding=(20, 16, 20, 16))
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text=title, font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+
+        ttk.Label(frame, text=title, font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        if subtitle:
+            ttk.Label(frame, text=subtitle, foreground='#777',
+                      font=('Segoe UI', 8)).pack(anchor='w', pady=(1, 0))
         status_var = tk.StringVar(value="Initializing…")
-        ttk.Label(frame, textvariable=status_var, wraplength=360,
-                  font=('Segoe UI', 9)).pack(anchor='w', pady=(4, 8))
-        pbar = ttk.Progressbar(frame, mode='indeterminate', length=380)
-        pbar.pack(fill='x')
-        pbar.start(15)
+        ttk.Label(frame, textvariable=status_var, wraplength=440,
+                  font=('Segoe UI', 9)).pack(anchor='w', pady=(8, 1))
+        detail_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=detail_var, wraplength=440,
+                  foreground='#777', font=('Segoe UI', 8)).pack(anchor='w')
+
+        barrow = ttk.Frame(frame)
+        barrow.pack(fill='x', pady=(12, 4))
+        pbar = ttk.Progressbar(barrow, mode='indeterminate', length=380)
+        pbar.pack(side='left', fill='x', expand=True)
+        pct_var = tk.StringVar(value="")
+        ttk.Label(barrow, textvariable=pct_var, width=5, anchor='e',
+                  font=('Segoe UI', 9, 'bold')).pack(side='left', padx=(10, 0))
+        pbar.start(12)
+
+        foot = ttk.Frame(frame)
+        foot.pack(fill='x', pady=(2, 0))
+        elapsed_var = tk.StringVar(value="elapsed 0:00")
+        ttk.Label(foot, textvariable=elapsed_var, foreground='#999',
+                  font=('Segoe UI', 8)).pack(side='left')
+
+        cancel_event = threading.Event()
+        if cancelable:
+            def _do_cancel():
+                cancel_event.set()
+                cancel_btn.configure(state='disabled')
+                status_var.set("Cancelling…")
+                detail_var.set("finishing the current step, then stopping")
+            cancel_btn = ttk.Button(foot, text="Cancel", command=_do_cancel)
+            cancel_btn.pack(side='right')
+
+        det = {'on': False}
+
+        def _set_progress(frac):
+            if not det['on']:
+                pbar.stop()
+                pbar.configure(mode='determinate', maximum=1000)
+                det['on'] = True
+            frac = 0.0 if frac < 0 else 1.0 if frac > 1 else float(frac)
+            pbar['value'] = frac * 1000
+            pct_var.set(f"{int(round(frac * 100))}%")
+
+        start_t = _time.monotonic()
+        done = {'v': False}
+
+        def _tick():
+            if done['v']:
+                return
+            s = int(_time.monotonic() - start_t)
+            elapsed_var.set(f"elapsed {s // 60}:{s % 60:02d}")
+            prog_win.after(500, _tick)
 
         q = _queue.Queue()
-        _result_holder = [None]   # [exception | None]
+        q.cancel_event = cancel_event
+        _result_holder = [None]   # (exc, tb) | ('cancel',) | None
 
         def _thread_target():
             try:
                 worker_fn(q)
+            except _ProgressCancelled:
+                _result_holder[0] = ('cancel',)
             except Exception as _exc:
                 import traceback as _tb
                 _result_holder[0] = (_exc, _tb.format_exc())
@@ -33304,14 +34856,25 @@ cat("OK\n")
                     kind = item[0]
                     if kind == 'status':
                         status_var.set(item[1])
+                    elif kind == 'detail':
+                        detail_var.set(item[1])
+                    elif kind == 'progress':
+                        _set_progress(item[1])
                     elif kind == 'log':
                         self.log_message(item[1])
                     elif kind == '_done':
+                        done['v'] = True
                         pbar.stop()
-                        prog_win.grab_release()
+                        try:
+                            prog_win.grab_release()
+                        except Exception:
+                            pass
                         prog_win.destroy()
-                        if _result_holder[0] is not None:
-                            exc, tb = _result_holder[0]
+                        h = _result_holder[0]
+                        if h is not None and h[0] == 'cancel':
+                            self.log_message(f"{title}: cancelled by user.")
+                        elif h is not None:
+                            exc, tb = h
                             self.log_message(f"ERROR in analysis: {exc}\n{tb}")
                             messagebox.showerror(
                                 "Analysis Error",
@@ -33319,17 +34882,21 @@ cat("OK\n")
                         elif on_done_fn:
                             on_done_fn()
                         return
+            except _queue.Empty:
+                pass
             except Exception:
                 pass
             prog_win.after(50, _poll)
 
         prog_win.grab_set()
         prog_win.update_idletasks()
-        pw, ph = 420, 120
+        pw = max(460, prog_win.winfo_reqwidth())
+        ph = max(180, prog_win.winfo_reqheight())
         rx = self.root.winfo_x() + (self.root.winfo_width()  - pw) // 2
         ry = self.root.winfo_y() + (self.root.winfo_height() - ph) // 2
-        prog_win.geometry(f"{pw}x{ph}+{rx}+{ry}")
+        prog_win.geometry(f"{pw}x{ph}+{max(0, rx)}+{max(0, ry)}")
         t.start()
+        _tick()
         prog_win.after(50, _poll)
 
     def run_connectivity_analysis(self):
@@ -35106,6 +36673,758 @@ cat("OK\n")
             "see where movement–signal coupling is strongest. Uses the same zones as the "
             "other zone-based analyses.",
     }
+
+    # ================================================================== #
+    #  SIGNAL LINKAGE  —  peri-onset behavior/signal coupling analysis     #
+    # ================================================================== #
+    #
+    #  Quantifies how tightly a behavior's bout ONSET is coupled to a rapid
+    #  change in the photometry signal. For each behavior x channel it derives,
+    #  from the stored peri-onset bout matrices (onset at column = prebout):
+    #
+    #    * dF/dt (z/s)      – peak Savitzky-Golay first derivative of the mean
+    #                         peri-onset trace within +/- search_s of onset.
+    #                         Rate of change, not just amplitude.
+    #    * Delta (z)        – post-onset mean minus pre-onset baseline mean.
+    #    * Latency (s)      – time of the dF/dt peak relative to onset (sign =
+    #                         lead/lag: negative means the signal turns first).
+    #    * Reliability r    – mean pairwise correlation of individual bout traces
+    #                         around onset; trial-to-trial consistency (n-free).
+    #    * Locking Z, p     – observed peak |dF/dt| vs a random-onset null built
+    #                         by resampling windows from the full z-score trace
+    #                         (1000 permutations, vectorized). This is the actual
+    #                         "is it time-locked to onset or coincidental" test.
+    #
+    #  Verdict combines significance (permutation p) with consistency (r) so a
+    #  large-but-jittery population transient is not mislabelled as tight.
+
+    SIG_LINK_COLORS = {
+        'Tightly linked': '#2f9e44',
+        'Population-linked (variable)': '#f08c00',
+        'Not linked': '#adb5bd',
+    }
+
+    def create_signal_linkage_tab(self):
+        """Data subtab: how tightly behavior onsets are coupled to rapid signal
+        changes (peri-onset dF/dt + permutation locking test)."""
+        tab = ttk.Frame(self.data_notebook)
+        self.data_notebook.add(tab, text="Signal Linkage")
+
+        outer = ttk.Frame(tab)
+        outer.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # ── Left control column ──────────────────────────────────────────
+        ctrl_panel = ttk.Frame(outer, width=CONTROL_PANEL_W)
+        ctrl_panel.pack(side='left', fill='y', padx=(0, 6))
+        ctrl_panel.pack_propagate(True)
+
+        beta_badge = tk.Label(ctrl_panel, text="BETA",
+                              font=('Segoe UI', 26, 'bold'),
+                              fg='white', bg='#3E82BE', padx=10, pady=2)
+        beta_badge.pack(fill='x', pady=(0, 6))
+
+        ttk.Label(ctrl_panel, text="Onset ⇄ Signal Coupling",
+                  font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        ttk.Label(ctrl_panel,
+                  text="How tightly is each behavior's onset\nlinked to a rapid change in signal?",
+                  foreground='#777', font=('Segoe UI', 8),
+                  justify='left').pack(anchor='w', pady=(0, 6))
+
+        # State vars
+        self.sig_link_channel_var = tk.StringVar(value="G0")
+        self.sig_link_by_var = tk.StringVar(value="Subject")
+        self.sig_link_sg_win_var = tk.StringVar(value="11")
+        self.sig_link_sg_poly_var = tk.StringVar(value="3")
+        self.sig_link_search_var = tk.StringVar(value="1.0")
+        self.sig_link_base_var = tk.StringVar(value="1.0")
+        self.sig_link_resp_var = tk.StringVar(value="1.0")
+        self.sig_link_relia_var = tk.StringVar(value="1.5")
+        self.sig_link_nperm_var = tk.StringVar(value="1000")
+        self._sig_linkage_results = None
+
+        # Channel
+        ch_frame = ttk.LabelFrame(ctrl_panel, text="Channel", padding=4)
+        ch_frame.pack(fill='x', pady=(0, 4))
+        self.sig_link_channel_frame = ttk.Frame(ch_frame)
+        self.sig_link_channel_frame.pack(anchor='w')
+
+        # Subjects
+        subj_frame = ttk.LabelFrame(ctrl_panel, text="Subjects", padding=4)
+        subj_frame.pack(fill='x', pady=(0, 4))
+        _sf = ttk.Frame(subj_frame)
+        _sf.pack(fill='x')
+        self.sig_link_subject_listbox = tk.Listbox(
+            _sf, selectmode='extended', height=5, exportselection=False)
+        self.sig_link_subject_listbox.pack(side='left', fill='x', expand=True)
+        _sb1 = ttk.Scrollbar(_sf, orient='vertical',
+                             command=self.sig_link_subject_listbox.yview)
+        _sb1.pack(side='right', fill='y')
+        self.sig_link_subject_listbox.config(yscrollcommand=_sb1.set)
+        _sbtn = ttk.Frame(subj_frame)
+        _sbtn.pack(fill='x', pady=(3, 0))
+        ttk.Button(_sbtn, text="All", width=6, style='Compact.TButton',
+                   command=lambda: self.sig_link_subject_listbox.selection_set(
+                       0, 'end')).pack(side='left')
+        ttk.Button(_sbtn, text="None", width=6, style='Compact.TButton',
+                   command=lambda: self.sig_link_subject_listbox.selection_clear(
+                       0, 'end')).pack(side='left', padx=(4, 0))
+
+        # Behaviors
+        beh_frame = ttk.LabelFrame(ctrl_panel, text="Behaviors", padding=4)
+        beh_frame.pack(fill='x', pady=(0, 4))
+        _bf = ttk.Frame(beh_frame)
+        _bf.pack(fill='x')
+        self.sig_link_behavior_listbox = tk.Listbox(
+            _bf, selectmode='extended', height=7, exportselection=False)
+        self.sig_link_behavior_listbox.pack(side='left', fill='x', expand=True)
+        _sb2 = ttk.Scrollbar(_bf, orient='vertical',
+                             command=self.sig_link_behavior_listbox.yview)
+        _sb2.pack(side='right', fill='y')
+        self.sig_link_behavior_listbox.config(yscrollcommand=_sb2.set)
+        _bbtn = ttk.Frame(beh_frame)
+        _bbtn.pack(fill='x', pady=(3, 0))
+        ttk.Button(_bbtn, text="All", width=6, style='Compact.TButton',
+                   command=lambda: self.sig_link_behavior_listbox.selection_set(
+                       0, 'end')).pack(side='left')
+        ttk.Button(_bbtn, text="None", width=6, style='Compact.TButton',
+                   command=lambda: self.sig_link_behavior_listbox.selection_clear(
+                       0, 'end')).pack(side='left', padx=(4, 0))
+
+        # Advanced settings (collapsible-ish LabelFrame)
+        adv = ttk.LabelFrame(ctrl_panel, text="Settings", padding=4)
+        adv.pack(fill='x', pady=(0, 4))
+
+        def _mk_row(parent, label, var, width=6, hint=None):
+            row = ttk.Frame(parent)
+            row.pack(fill='x', pady=1)
+            ttk.Label(row, text=label, width=16, anchor='w').pack(side='left')
+            ttk.Entry(row, textvariable=var, width=width).pack(side='left')
+            if hint:
+                ttk.Label(row, text=hint, foreground='#999',
+                          font=('Segoe UI', 7)).pack(side='left', padx=(4, 0))
+
+        _mk_row(adv, "SG window (frames)", self.sig_link_sg_win_var)
+        _mk_row(adv, "SG poly order", self.sig_link_sg_poly_var)
+        _mk_row(adv, "Search ± (s)", self.sig_link_search_var, hint="dF/dt peak")
+        _mk_row(adv, "Baseline (s)", self.sig_link_base_var, hint="pre-onset")
+        _mk_row(adv, "Response (s)", self.sig_link_resp_var, hint="post-onset")
+        _mk_row(adv, "Reliability ± (s)", self.sig_link_relia_var)
+        _mk_row(adv, "Permutations", self.sig_link_nperm_var, hint="null model")
+
+        # Run
+        ttk.Button(ctrl_panel, text="▶  Run Linkage Analysis",
+                   command=self.run_signal_linkage_analysis).pack(
+                       fill='x', pady=(4, 2))
+        self.sig_link_status_var = tk.StringVar(value="")
+        ttk.Label(ctrl_panel, textvariable=self.sig_link_status_var,
+                  foreground='#777', font=('Segoe UI', 8),
+                  wraplength=CONTROL_PANEL_W - 20, justify='left').pack(
+                      anchor='w')
+        ttk.Button(ctrl_panel, text="Copy results table",
+                   style='Compact.TButton',
+                   command=self._copy_signal_linkage_table).pack(
+                       fill='x', pady=(6, 0))
+
+        # ── Right results area (vertically scrollable) ───────────────────
+        right = ttk.Frame(outer)
+        right.pack(side='left', fill='both', expand=True)
+        canvas = tk.Canvas(right, highlightthickness=0)
+        rscroll = ttk.Scrollbar(right, orient='vertical', command=canvas.yview)
+        self.sig_link_scroll_frame = ttk.Frame(canvas)
+        self.sig_link_scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        _win_id = canvas.create_window((0, 0), window=self.sig_link_scroll_frame,
+                                       anchor="nw")
+        canvas.configure(yscrollcommand=rscroll.set)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(_win_id, width=e.width))
+        canvas.pack(side="left", fill="both", expand=True)
+        rscroll.pack(side="right", fill="y")
+        self._register_tab_mousewheel(tab, canvas, self.sig_link_scroll_frame)
+
+        # Placeholder + persistent sub-frames
+        self.sig_link_readout_frame = ttk.Frame(self.sig_link_scroll_frame)
+        self.sig_link_readout_frame.pack(fill='x', padx=6, pady=(6, 0))
+        self.sig_link_table_frame = ttk.Frame(self.sig_link_scroll_frame)
+        self.sig_link_table_frame.pack(fill='x', padx=6, pady=(2, 0))
+        self.sig_link_plot_frame = ttk.Frame(self.sig_link_scroll_frame)
+        self.sig_link_plot_frame.pack(fill='both', expand=True, padx=6, pady=6)
+        self._sig_link_canvas = None
+
+        ttk.Label(self.sig_link_readout_frame,
+                  text="Select subjects and behaviors, then run the analysis.\n"
+                       "Approach and Sniff are strong positive examples in most "
+                       "datasets.",
+                  foreground='#777', justify='left').pack(anchor='w')
+
+        self.refresh_signal_linkage_controls()
+
+    def refresh_signal_linkage_controls(self):
+        """Populate the Signal Linkage subject/behavior/channel lists from the
+        currently processed data (called whenever the bout lists refresh)."""
+        if not hasattr(self, 'sig_link_subject_listbox'):
+            return
+        # Channels
+        frame = getattr(self, 'sig_link_channel_frame', None)
+        if frame is not None:
+            for w in frame.winfo_children():
+                w.destroy()
+            chans = self._all_channel_names()
+            for idx, ch in enumerate(chans):
+                ttk.Radiobutton(frame, text=ch, variable=self.sig_link_channel_var,
+                                value=ch).pack(side='left',
+                                               padx=(0 if idx == 0 else 8, 0))
+            if self.sig_link_channel_var.get() not in chans:
+                self.sig_link_channel_var.set(chans[0])
+        # Subjects
+        prev_s = set(self.sig_link_subject_listbox.get(i)
+                     for i in self.sig_link_subject_listbox.curselection())
+        self.sig_link_subject_listbox.delete(0, 'end')
+        subs = sorted(self.processed_data.keys())
+        for s in subs:
+            self.sig_link_subject_listbox.insert('end', s)
+        for i, s in enumerate(subs):
+            if not prev_s or s in prev_s:
+                self.sig_link_subject_listbox.selection_set(i)
+        # Behaviors
+        prev_b = set(self.sig_link_behavior_listbox.get(i)
+                     for i in self.sig_link_behavior_listbox.curselection())
+        behs = set()
+        for s in self.processed_data.keys():
+            if 'bouts' in self.processed_data[s]:
+                behs.update(self.processed_data[s]['bouts'].keys())
+        behs = sorted(behs)
+        self.sig_link_behavior_listbox.delete(0, 'end')
+        for b in behs:
+            self.sig_link_behavior_listbox.insert('end', b)
+        for i, b in enumerate(behs):
+            if not prev_b or b in prev_b:
+                self.sig_link_behavior_listbox.selection_set(i)
+
+    def _sig_channel_index(self, data, ch_name):
+        """Map a channel designation (e.g. 'G0') to its integer index for this
+        subject, so the full z-score trace can be pulled for the null model."""
+        try:
+            nch = int(data.get('num_photometry_channels') or 0)
+        except Exception:
+            nch = 0
+        for ch in range(max(nch, 8)):
+            try:
+                if self.get_channel_name(data, ch) == ch_name:
+                    return ch
+            except Exception:
+                pass
+        m = re.match(r'^[GRgr](\d+)$', str(ch_name))
+        return int(m.group(1)) if m else 0
+
+    def run_signal_linkage_analysis(self):
+        """Validate inputs on the main thread, then compute in a worker so the
+        GUI never blocks."""
+        subs = [self.sig_link_subject_listbox.get(i)
+                for i in self.sig_link_subject_listbox.curselection()]
+        behs = [self.sig_link_behavior_listbox.get(i)
+                for i in self.sig_link_behavior_listbox.curselection()]
+        channel = self.sig_link_channel_var.get()
+        if not subs:
+            messagebox.showwarning("Signal Linkage", "Select at least one subject.")
+            return
+        if not behs:
+            messagebox.showwarning("Signal Linkage", "Select at least one behavior.")
+            return
+
+        def _f(var, default, lo=None, hi=None, integer=False):
+            try:
+                v = float(var.get())
+            except Exception:
+                v = default
+            if lo is not None:
+                v = max(lo, v)
+            if hi is not None:
+                v = min(hi, v)
+            return int(round(v)) if integer else v
+
+        fps = float(self.params.get('fps', 30) or 30)
+        cfg = {
+            'fps': fps,
+            'sg_win': _f(self.sig_link_sg_win_var, 11, 3, 199, integer=True),
+            'sg_poly': _f(self.sig_link_sg_poly_var, 3, 1, 8, integer=True),
+            'search_s': _f(self.sig_link_search_var, 1.0, 0.1, 5.0),
+            'base_s': _f(self.sig_link_base_var, 1.0, 0.1, 10.0),
+            'resp_s': _f(self.sig_link_resp_var, 1.0, 0.1, 10.0),
+            'relia_s': _f(self.sig_link_relia_var, 1.5, 0.2, 10.0),
+            'n_perm': _f(self.sig_link_nperm_var, 1000, 0, 20000, integer=True),
+            'seed': 7,
+        }
+        self.sig_link_status_var.set("Running…")
+
+        def _worker(q):
+            self._sig_linkage_results = self._compute_signal_linkage(
+                q, subs, channel, behs, cfg)
+
+        self._run_with_progress(
+            "Signal Linkage Analysis", _worker,
+            on_done_fn=self._render_signal_linkage_results,
+            cancelable=False,
+            subtitle="Peri-onset dF/dt + permutation locking test")
+
+    def _fill_nan_1d(self, a):
+        """Linear-interpolate NaNs in a 1D array (for edge-padded mean traces).
+        Returns None if fewer than 2 finite points."""
+        a = np.asarray(a, dtype=float)
+        good = np.isfinite(a)
+        if good.sum() < 2:
+            return None
+        if good.all():
+            return a
+        idx = np.arange(len(a))
+        out = a.copy()
+        out[~good] = np.interp(idx[~good], idx[good], a[good])
+        return out
+
+    def _sig_sg_window(self, win, poly, total):
+        """Coerce SG window to a valid odd length <= total and > poly."""
+        win = int(win)
+        if win % 2 == 0:
+            win += 1
+        if win > total:
+            win = total if total % 2 == 1 else total - 1
+        if win <= poly:
+            win = poly + 1 + (1 - (poly + 1) % 2)
+        return max(3, win)
+
+    def _compute_signal_linkage(self, q, subjects, channel, behaviors, cfg):
+        """Worker-thread core. Pure numpy/scipy; touches no Tk. Returns a results
+        dict consumed by _render_signal_linkage_results on the main thread."""
+        prebout = int(self.params.get('preboutframes', 150))
+        postbout = int(self.params.get('postboutframes', 150))
+        total = prebout + postbout
+
+        # Full z-score traces per subject for the random-onset null.
+        full_by_subj = {}
+        for s in subjects:
+            data = self.processed_data.get(s, {})
+            ci = self._sig_channel_index(data, channel)
+            tr = None
+            try:
+                tr = self.get_channel_signal(data, ci, kind='zscore')
+            except Exception:
+                tr = None
+            if tr is not None:
+                tr = np.asarray(tr, dtype=float)
+            full_by_subj[s] = tr
+
+        results = {}
+        skipped = []
+        n_beh = len(behaviors)
+        for i, beh in enumerate(behaviors):
+            q.put(('status', f"Analyzing '{beh}'  ({i + 1}/{n_beh})"))
+            q.put(('progress', i / max(1, n_beh)))
+            mats = []
+            ftraces = []
+            contributing = []
+            for s in subjects:
+                data = self.processed_data.get(s, {})
+                entry = data.get('bouts', {}).get(beh)
+                if not entry:
+                    continue
+                bts = self._entry_channel_bouts(entry, channel)
+                if not bts:
+                    continue
+                rows = [np.asarray(b, dtype=float) for b in bts
+                        if b is not None and len(b) == total]
+                if not rows:
+                    continue
+                mats.append(np.vstack(rows))
+                contributing.append(s)
+                if full_by_subj.get(s) is not None:
+                    ftraces.append(full_by_subj[s])
+            if not mats:
+                skipped.append(beh)
+                continue
+            mat = np.vstack(mats)
+            q.put(('detail', f"{beh}: {mat.shape[0]} bouts across "
+                             f"{len(contributing)} subject(s)"))
+            m = self._sig_linkage_one(mat, ftraces, prebout, total, cfg)
+            if m is None:
+                skipped.append(beh)
+                continue
+            m['behavior'] = beh
+            m['subjects'] = contributing
+            li, verdict = self._sig_linkage_index_verdict(m)
+            m['linkage_index'] = li
+            m['verdict'] = verdict
+            results[beh] = m
+        q.put(('progress', 1.0))
+
+        order = sorted(results.keys(),
+                       key=lambda b: results[b]['linkage_index'], reverse=True)
+        return {
+            'results': results, 'order': order, 'cfg': cfg,
+            'channel': channel, 'subjects': subjects,
+            'prebout': prebout, 'total': total, 'skipped': skipped,
+        }
+
+    def _sig_linkage_one(self, mat, full_traces, prebout, total, cfg):
+        """Compute all peri-onset metrics for one behavior x channel matrix."""
+        fps = cfg['fps']
+        onset = prebout
+        with np.errstate(invalid='ignore'):
+            mean_tr = np.nanmean(mat, axis=0)
+            counts = np.sum(np.isfinite(mat), axis=0)
+            sem = np.nanstd(mat, axis=0) / np.sqrt(np.maximum(counts, 1))
+        mt = self._fill_nan_1d(mean_tr)
+        if mt is None:
+            return None
+        win = self._sig_sg_window(cfg['sg_win'], cfg['sg_poly'], total)
+        deriv = savgol_filter(mt, win, cfg['sg_poly'], deriv=1, delta=1.0 / fps)
+
+        sw = max(1, int(round(cfg['search_s'] * fps)))
+        lo, hi = max(0, onset - sw), min(total, onset + sw)
+        seg = deriv[lo:hi]
+        k = int(np.argmax(np.abs(seg)))
+        peak_rate = float(seg[k])
+        peak_lat = (lo + k - onset) / fps
+
+        bw = max(1, int(round(cfg['base_s'] * fps)))
+        rw = max(1, int(round(cfg['resp_s'] * fps)))
+        base = float(np.nanmean(mt[max(0, onset - bw):onset]))
+        resp = float(np.nanmean(mt[onset:min(total, onset + rw)]))
+        delta = resp - base
+
+        rlw = max(1, int(round(cfg['relia_s'] * fps)))
+        seg2 = mat[:, max(0, onset - rlw):min(total, onset + rlw)]
+        good = np.all(np.isfinite(seg2), axis=1)
+        reliability = np.nan
+        if good.sum() >= 2:
+            # drop zero-variance rows (would produce NaN correlations)
+            sub = seg2[good]
+            var_ok = np.nanstd(sub, axis=1) > 1e-9
+            sub = sub[var_ok]
+            if sub.shape[0] >= 2:
+                C = np.corrcoef(sub)
+                iu = np.triu_indices_from(C, k=1)
+                reliability = float(np.nanmean(C[iu]))
+
+        obs = abs(peak_rate)
+        z, p = np.nan, np.nan
+        valid = [t for t in full_traces
+                 if t is not None and np.isfinite(t).sum() > total + 2]
+        if valid and cfg['n_perm'] > 0:
+            z, p = self._sig_perm_null(mat.shape[0], valid, prebout, total,
+                                       onset, sw, win, cfg, obs)
+        return dict(mean_tr=mean_tr, sem=sem, deriv=deriv, n=int(mat.shape[0]),
+                    peak_rate=peak_rate, peak_lat=peak_lat, delta=delta,
+                    base=base, resp=resp, reliability=reliability,
+                    z=z, p=p, obs=obs, win=win)
+
+    def _sig_perm_null(self, nboot, traces, prebout, total, onset, sw, win,
+                       cfg, obs):
+        """Random-onset permutation null for peak |dF/dt|. Vectorized in chunks
+        so 1000 perms run in well under a second even for hundreds of bouts."""
+        rng = np.random.default_rng(cfg['seed'])
+        post = total - prebout
+        cat, offs = [], [0]
+        for t in traces:
+            a = np.asarray(t, dtype=float)
+            cat.append(a)
+            offs.append(offs[-1] + len(a))
+        catarr = np.concatenate(cat)
+        valid = []
+        for ti, a in enumerate(cat):
+            base = offs[ti]
+            lo, hi = base + prebout, base + len(a) - post
+            if hi > lo:
+                valid.append(np.arange(lo, hi))
+        if not valid:
+            return np.nan, np.nan
+        valid = np.concatenate(valid)
+        woff = np.arange(-prebout, post)
+        nperm = int(cfg['n_perm'])
+        idx = valid[rng.integers(0, len(valid), size=(nperm, nboot))]
+        null = np.empty(nperm)
+        chunk = max(5, int(2_000_000 / (max(1, nboot) * max(1, total))))
+        for c in range(0, nperm, chunk):
+            ce = min(c + chunk, nperm)
+            centers = idx[c:ce]
+            w = catarr[centers[:, :, None] + woff[None, None, :]]
+            mt = np.nanmean(w, axis=1)
+            mt = np.where(np.isfinite(mt), mt, 0.0)
+            dd = savgol_filter(mt, win, cfg['sg_poly'], deriv=1,
+                               delta=1.0 / cfg['fps'], axis=1)
+            null[c:ce] = np.max(np.abs(dd[:, onset - sw:onset + sw]), axis=1)
+        z = float((obs - null.mean()) / (null.std() + 1e-12))
+        p = float((np.sum(null >= obs) + 1) / (nperm + 1))
+        return z, p
+
+    def _sig_linkage_index_verdict(self, m):
+        """Combine permutation significance with trial-to-trial consistency into
+        a 0-100 Linkage Index and a plain-language verdict.
+
+        LI = 100 * (0.5*L_stat + 0.5*L_consistency), where L_stat is the
+        permutation z capped at 12 (gated to 0 when p >= .05) and L_consistency
+        is the cross-bout reliability r clamped to [0,1]. Verdict separates
+        genuinely tight coupling (significant AND consistent) from population
+        transients that are significant on the mean but jittery across bouts."""
+        z, p, r = m['z'], m['p'], m['reliability']
+        l_stat = 0.0
+        if np.isfinite(z):
+            l_stat = min(1.0, max(0.0, z / 12.0))
+        if np.isfinite(p) and p >= 0.05:
+            l_stat = 0.0
+        l_con = 0.0 if not np.isfinite(r) else min(1.0, max(0.0, r))
+        li = 100.0 * (0.5 * l_stat + 0.5 * l_con)
+        sig = np.isfinite(p) and p < 0.05
+        if sig and np.isfinite(r) and r >= 0.15:
+            verdict = 'Tightly linked'
+        elif sig:
+            verdict = 'Population-linked (variable)'
+        else:
+            verdict = 'Not linked'
+        return li, verdict
+
+    # ---- rendering (main thread) ------------------------------------------
+    def _render_signal_linkage_results(self):
+        res = self._sig_linkage_results
+        self.sig_link_status_var.set("")
+        for frame in (self.sig_link_readout_frame, self.sig_link_table_frame):
+            for w in frame.winfo_children():
+                w.destroy()
+        if self._sig_link_canvas is not None:
+            try:
+                self._sig_link_canvas.get_tk_widget().destroy()
+            except Exception:
+                pass
+            self._sig_link_canvas = None
+        for w in self.sig_link_plot_frame.winfo_children():
+            w.destroy()
+
+        if not res or not res['results']:
+            ttk.Label(self.sig_link_readout_frame,
+                      text="No bouts found for the selected behaviors/subjects.",
+                      foreground='#a00').pack(anchor='w')
+            return
+
+        self._sig_link_build_readout(res)
+        self._sig_link_build_table(res)
+        try:
+            fig = self._build_signal_linkage_figure(res)
+            self._sig_link_canvas = self._embed_plot_canvas(
+                fig, self.sig_link_plot_frame, add_toolbar=True)
+        except Exception as e:
+            import traceback
+            self.log_message(f"Signal Linkage plot error: {e}\n"
+                             f"{traceback.format_exc()}")
+            ttk.Label(self.sig_link_plot_frame,
+                      text=f"Could not render figure: {e}",
+                      foreground='#a00').pack(anchor='w')
+
+    def _sig_link_build_readout(self, res):
+        """Plain-language summary of the most/least linked behaviors."""
+        results, order, cfg = res['results'], res['order'], res['cfg']
+        n_sub = len(res['subjects'])
+        total_bouts = sum(results[b]['n'] for b in order)
+        header = (f"Channel {res['channel']}  ·  {n_sub} subject(s)  ·  "
+                  f"{len(order)} behavior(s)  ·  {total_bouts} bouts  ·  "
+                  f"{cfg['n_perm']} permutations")
+        ttk.Label(self.sig_link_readout_frame, text=header,
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+
+        txt = tk.Text(self.sig_link_readout_frame, height=8, wrap='word',
+                      relief='flat', font=('Segoe UI', 9),
+                      background=self.sig_link_readout_frame.winfo_toplevel(
+                      ).cget('background'))
+        txt.pack(fill='x', pady=(3, 4))
+        for tag, color in self.SIG_LINK_COLORS.items():
+            txt.tag_configure(tag, foreground=color, font=('Segoe UI', 9, 'bold'))
+        txt.tag_configure('metric', foreground='#555')
+
+        def _line(m):
+            lat = m['peak_lat']
+            lead = ("signal leads onset" if lat < -0.03 else
+                    "signal follows onset" if lat > 0.03 else
+                    "coincident with onset")
+            pstr = ("p<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
+                    else f"p={m['p']:.3f}" if np.isfinite(m['p']) else "p=n/a")
+            txt.insert('end', f"  • {m['behavior']}  ", m['verdict'])
+            txt.insert('end',
+                       f"(Δ{m['delta']:+.2f} z, peak {m['peak_rate']:+.2f} z/s "
+                       f"at {lat:+.2f}s — {lead}; r={m['reliability']:.2f}, "
+                       f"{pstr})\n", 'metric')
+
+        tight = [results[b] for b in order
+                 if results[b]['verdict'] == 'Tightly linked']
+        popv = [results[b] for b in order
+                if results[b]['verdict'] == 'Population-linked (variable)']
+        none = [results[b] for b in order
+                if results[b]['verdict'] == 'Not linked']
+
+        if tight:
+            txt.insert('end', "Tightly linked "
+                              "(significant & consistent across bouts):\n",
+                       'Tightly linked')
+            for m in tight:
+                _line(m)
+        if popv:
+            txt.insert('end', "Population-linked but variable "
+                              "(significant mean transient, low bout-to-bout "
+                              "consistency):\n", 'Population-linked (variable)')
+            for m in popv:
+                _line(m)
+        if none:
+            names = ", ".join(m['behavior'] for m in none)
+            txt.insert('end', "Not linked: ", 'Not linked')
+            txt.insert('end', f"{names}\n", 'metric')
+        if res.get('skipped'):
+            txt.insert('end',
+                       f"Skipped (no bouts): {', '.join(res['skipped'])}\n",
+                       'metric')
+        txt.configure(state='disabled')
+
+    def _sig_link_build_table(self, res):
+        results, order = res['results'], res['order']
+        cols = ('Behavior', 'n', 'Linkage', 'Verdict', 'Δ z',
+                'dF/dt z/s', 'Latency s', 'Reliab. r', 'Lock Z', 'p')
+        wrap = ttk.Frame(self.sig_link_table_frame)
+        wrap.pack(fill='x')
+        tree = ttk.Treeview(wrap, columns=cols, show='headings',
+                            height=min(12, max(3, len(order))))
+        widths = {'Behavior': 110, 'n': 45, 'Linkage': 65, 'Verdict': 170,
+                  'Δ z': 60, 'dF/dt z/s': 70, 'Latency s': 70,
+                  'Reliab. r': 70, 'Lock Z': 60, 'p': 70}
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=widths.get(c, 70),
+                        anchor='center' if c not in ('Behavior', 'Verdict')
+                        else 'w', stretch=False)
+        for tag, color in self.SIG_LINK_COLORS.items():
+            tree.tag_configure(tag.replace(' ', '_').replace('(', '').replace(
+                ')', ''), foreground=color)
+        for b in order:
+            m = results[b]
+            pstr = ("<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
+                    else f"{m['p']:.3f}" if np.isfinite(m['p']) else "n/a")
+            zstr = f"{m['z']:.1f}" if np.isfinite(m['z']) else "n/a"
+            rstr = f"{m['reliability']:.2f}" if np.isfinite(
+                m['reliability']) else "n/a"
+            tag = m['verdict'].replace(' ', '_').replace(
+                '(', '').replace(')', '')
+            tree.insert('', 'end', values=(
+                b, m['n'], f"{m['linkage_index']:.0f}", m['verdict'],
+                f"{m['delta']:+.2f}", f"{m['peak_rate']:+.2f}",
+                f"{m['peak_lat']:+.2f}", rstr, zstr, pstr), tags=(tag,))
+        tree.pack(side='left', fill='x', expand=True)
+        self._sig_link_tree = tree
+
+    def _copy_signal_linkage_table(self):
+        res = getattr(self, '_sig_linkage_results', None)
+        if not res or not res.get('results'):
+            messagebox.showinfo("Signal Linkage", "Run an analysis first.")
+            return
+        cols = ['Behavior', 'n', 'LinkageIndex', 'Verdict', 'Delta_z',
+                'dFdt_z_per_s', 'Latency_s', 'Reliability_r', 'LockZ', 'p']
+        lines = ['\t'.join(cols)]
+        for b in res['order']:
+            m = res['results'][b]
+            lines.append('\t'.join(str(x) for x in [
+                b, m['n'], f"{m['linkage_index']:.1f}", m['verdict'],
+                f"{m['delta']:.4f}", f"{m['peak_rate']:.4f}",
+                f"{m['peak_lat']:.4f}", f"{m['reliability']:.4f}",
+                f"{m['z']:.4f}", f"{m['p']:.5f}"]))
+        payload = '\n'.join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(payload)
+        self.sig_link_status_var.set("Results table copied to clipboard.")
+
+    def _build_signal_linkage_figure(self, res):
+        """Clean multi-panel figure: a comparison bar of Linkage Index across
+        behaviors, plus per-behavior peri-onset traces with the dF/dt peak and
+        response window marked."""
+        results, order, cfg = res['results'], res['order'], res['cfg']
+        prebout, total = res['prebout'], res['total']
+        fps = cfg['fps']
+        t = (np.arange(total) - prebout) / fps
+        show = order[:9]
+        ncol = min(3, max(1, len(show)))
+        nrow = int(np.ceil(len(show) / ncol))
+
+        fig = plt.figure(figsize=(4.1 * ncol, 2.3 + 2.5 * nrow),
+                         constrained_layout=True)
+        gs = fig.add_gridspec(nrow + 1, ncol, height_ratios=[1.25] + [1] * nrow)
+
+        # ── Summary bar: Linkage Index across all behaviors ──────────────
+        axb = fig.add_subplot(gs[0, :])
+        bnames = order[::-1]  # so highest ends on top
+        vals = [results[b]['linkage_index'] for b in bnames]
+        colors = [self.SIG_LINK_COLORS[results[b]['verdict']] for b in bnames]
+        ypos = np.arange(len(bnames))
+        axb.barh(ypos, vals, color=colors, edgecolor='white', height=0.7)
+        axb.set_yticks(ypos)
+        axb.set_yticklabels(bnames, fontsize=9)
+        axb.set_xlim(0, 100)
+        axb.set_xlabel("Linkage Index  (0–100)", fontsize=9)
+        axb.set_title("Onset ⇄ signal coupling strength by behavior",
+                      fontsize=11, fontweight='bold', pad=8)
+        for yp, b in zip(ypos, bnames):
+            m = results[b]
+            axb.text(min(98, m['linkage_index'] + 1.5), yp,
+                     f"{m['linkage_index']:.0f}", va='center', ha='left',
+                     fontsize=8, color='#333')
+        axb.grid(axis='x', alpha=0.25)
+        for sp in ('top', 'right'):
+            axb.spines[sp].set_visible(False)
+        # legend
+        from matplotlib.patches import Patch
+        handles = [Patch(facecolor=c, label=k)
+                   for k, c in self.SIG_LINK_COLORS.items()]
+        axb.legend(handles=handles, loc='lower right', fontsize=7,
+                   frameon=False, ncol=1)
+
+        # ── Per-behavior peri-onset panels ───────────────────────────────
+        trace_c = '#2b6cb0'
+        deriv_c = '#c05621'
+        resp_w = cfg['resp_s']
+        for i, beh in enumerate(show):
+            m = results[beh]
+            ax = fig.add_subplot(gs[1 + i // ncol, i % ncol])
+            mean_tr = m['mean_tr']
+            sem = m['sem']
+            ax.axhline(0, color='#ccc', lw=0.8, zorder=0)
+            ax.axvspan(0, resp_w, color=trace_c, alpha=0.06, zorder=0)
+            ax.plot(t, mean_tr, color=trace_c, lw=1.8, zorder=3)
+            ax.fill_between(t, mean_tr - sem, mean_tr + sem, color=trace_c,
+                            alpha=0.2, zorder=2, linewidth=0)
+            ax.axvline(0, color='k', ls='--', lw=1, zorder=1)
+            # dF/dt peak marker
+            ax.axvline(m['peak_lat'], color=deriv_c, ls=':', lw=1.4, zorder=1)
+            # verdict-colored title
+            vc = self.SIG_LINK_COLORS[m['verdict']]
+            ax.set_title(f"{beh}   (n={m['n']})", fontsize=10, color=vc,
+                         fontweight='bold')
+            pstr = ("p<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
+                    else f"p={m['p']:.3f}" if np.isfinite(m['p']) else "p=n/a")
+            ann = (f"Δ {m['delta']:+.2f} z\n"
+                   f"peak {m['peak_rate']:+.2f} z/s\n"
+                   f"lat {m['peak_lat']:+.2f} s\n"
+                   f"r {m['reliability']:.2f}   {pstr}")
+            ax.text(0.03, 0.97, ann, transform=ax.transAxes, va='top',
+                    ha='left', fontsize=7.5, color='#333',
+                    bbox=dict(boxstyle='round,pad=0.3', fc='white',
+                              ec=vc, alpha=0.85, lw=1.0))
+            if i // ncol == nrow - 1:
+                ax.set_xlabel("time from onset (s)", fontsize=8)
+            if i % ncol == 0:
+                ax.set_ylabel("z-score", fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.grid(alpha=0.2)
+            for sp in ('top', 'right'):
+                ax.spines[sp].set_visible(False)
+
+        fig.suptitle(
+            f"Signal Linkage — channel {res['channel']}   "
+            f"(dashed = onset · dotted = dF/dt peak · shaded = response window)",
+            fontsize=10)
+        return fig
 
     def create_kinematics_tab(self):
         """Data subtab: velocity / acceleration / spatial vectors vs signal."""
