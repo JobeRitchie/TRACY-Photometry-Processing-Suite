@@ -6,6 +6,7 @@ Replicates functionality of FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 import tkinter.simpledialog
+import tkinter.font as tkfont
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -35,8 +36,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.8.0"
-APP_VERSION_DATE = "July 10, 2026"
+APP_VERSION = "1.9.0"
+APP_VERSION_DATE = "July 21, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -84,10 +85,27 @@ class ZoneEditor:
         main_frame = ttk.Frame(self.parent)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Left panel - Controls
-        control_frame = ttk.LabelFrame(main_frame, text="Zone Controls", padding=10)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        
+        # Left panel - Controls.
+        # The action buttons (Save & Apply / Cancel) are packed against the
+        # BOTTOM of this column before anything that expands, so they keep their
+        # space no matter how short the screen is; the settings above them are
+        # placed in a scrolling viewport instead of being clipped away.
+        control_outer = ttk.LabelFrame(main_frame, text="Zone Controls", padding=6)
+        control_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+
+        action_frame = ttk.Frame(control_outer)
+        action_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Button(action_frame, text="Save & Apply", style='Compact.TButton',
+                   command=self.save_zones).pack(fill=tk.X, pady=1)
+        ttk.Button(action_frame, text="Cancel", style='Compact.TButton',
+                   command=self.parent.destroy).pack(fill=tk.X, pady=1)
+        ttk.Button(action_frame, text="Analysis Settings...", style='Compact.TButton',
+                   command=self.open_analysis_settings).pack(fill=tk.X, pady=(1, 4))
+        ttk.Separator(control_outer, orient=tk.HORIZONTAL).pack(
+            side=tk.BOTTOM, fill=tk.X, pady=4)
+
+        control_frame = self.main_app.make_scrollable(control_outer, fit_width=True)
+
         # Template selection
         ttk.Label(control_frame, text="Maze Template:").pack(anchor=tk.W, pady=(0, 5))
         current_maze = self.main_app.params['maze_type']
@@ -106,7 +124,7 @@ class ZoneEditor:
         self.maze_width_var = tk.StringVar(value=str(self.maze_width))
         maze_width_entry = ttk.Entry(maze_width_frame, textvariable=self.maze_width_var, width=8)
         maze_width_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Button(maze_width_frame, text="Apply", width=6,
+        ttk.Button(maze_width_frame, text="Apply", width=6, style='Compact.TButton',
                    command=self._apply_maze_width).pack(side=tk.LEFT)
         
         ttk.Separator(control_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
@@ -121,7 +139,7 @@ class ZoneEditor:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.zone_listbox = tk.Listbox(zone_list_frame, yscrollcommand=scrollbar.set,
-                                       height=15, width=25)
+                                       height=8, width=24)
         self.zone_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.zone_listbox.yview)
         self.zone_listbox.bind('<<ListboxSelect>>', self.select_zone_from_list)
@@ -131,11 +149,11 @@ class ZoneEditor:
         # Zone management buttons (for custom arena)
         zone_mgmt_frame = ttk.Frame(control_frame)
         zone_mgmt_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(zone_mgmt_frame, text="+ Add Zone",
-                   command=self.add_zone).pack(side=tk.LEFT, padx=(0, 3))
-        ttk.Button(zone_mgmt_frame, text="- Remove",
-                   command=self.remove_zone).pack(side=tk.LEFT, padx=(0, 3))
-        ttk.Button(zone_mgmt_frame, text="Rename",
+        ttk.Button(zone_mgmt_frame, text="+ Add", style='Compact.TButton',
+                   command=self.add_zone).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(zone_mgmt_frame, text="- Remove", style='Compact.TButton',
+                   command=self.remove_zone).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(zone_mgmt_frame, text="Rename", style='Compact.TButton',
                    command=self.rename_zone).pack(side=tk.LEFT)
         
         # Zone details
@@ -176,32 +194,18 @@ class ZoneEditor:
         self.zone_color_var = tk.StringVar(value='#CCCCCC')
         self.color_preview = tk.Label(color_frame, bg='#CCCCCC', width=4, relief='solid', borderwidth=1)
         self.color_preview.pack(side=tk.LEFT, padx=4)
-        ttk.Button(color_frame, text="Pick Color", command=self.pick_zone_color).pack(side=tk.LEFT)
+        ttk.Button(color_frame, text="Pick Color", style='Compact.TButton',
+                   command=self.pick_zone_color).pack(side=tk.LEFT)
         
-        ttk.Button(details_frame, text="Update Zone", 
-                  command=self.update_zone_from_entries).grid(row=6, column=0, columnspan=2, pady=10)
-        
-        ttk.Separator(control_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-        
-        # Analysis settings button
-        ttk.Button(control_frame, text="Analysis Settings...",
-                   command=self.open_analysis_settings).pack(fill=tk.X, pady=(0, 6))
-        
-        # Action buttons
-        button_frame = ttk.Frame(control_frame)
-        button_frame.pack(fill=tk.X, pady=2)
-        
-        ttk.Button(button_frame, text="Save & Apply", 
-                  command=self.save_zones).pack(fill=tk.X, pady=2)
-        ttk.Button(button_frame, text="Cancel", 
-                  command=self.parent.destroy).pack(fill=tk.X, pady=2)
+        ttk.Button(details_frame, text="Update Zone", style='Compact.TButton',
+                  command=self.update_zone_from_entries).grid(row=6, column=0, columnspan=2, pady=6)
         
         # Right panel - Visualization
         viz_frame = ttk.Frame(main_frame)
         viz_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         # Create matplotlib figure
-        self.fig, self.ax = plt.subplots(figsize=(8, 8))
+        self.fig, self.ax = plt.subplots(figsize=(6.5, 6.5))
         self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -1003,8 +1007,15 @@ class FPAnalysisGUI:
         self.root = root
         self.root.title(f"Tracy - Fiber Photometry Analysis Suite v{APP_VERSION}")
         self._set_window_icon()
-        # Fallback size if the window is later un-maximized, then open maximized.
-        self.root.geometry("1400x900")
+        # UI density must be established before any widget is built, since
+        # `tk scaling` is what every point-size font is measured against.
+        self._init_ui_metrics()
+        # Fallback size if the window is later un-maximized. Clamped to the
+        # screen so the un-maximized window can't extend past the desktop
+        # (which hides whatever sits at the bottom of a tab).
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.root.geometry(f"{min(1400, _sw - 40)}x{min(900, _sh - 90)}")
+        self.root.minsize(min(900, _sw - 40), min(600, _sh - 90))
         try:
             # 'zoomed' maximizes on Windows; fall back to the Linux attribute.
             self.root.state('zoomed')
@@ -1463,7 +1474,7 @@ class FPAnalysisGUI:
         """Open interactive zone editor window"""
         editor_window = tk.Toplevel(self.root)
         editor_window.title("Zone Editor")
-        editor_window.geometry("1000x800")
+        self.fit_toplevel(editor_window, 1000, 800)
         
         # Create editor instance
         editor = ZoneEditor(editor_window, self)
@@ -1493,13 +1504,216 @@ class FPAnalysisGUI:
         settings_menu.add_separator()
         settings_menu.add_command(label="Zone Editor", command=self.open_zone_editor)
         settings_menu.add_separator()
+
+        # Interface density. Auto-picked from the screen height at startup, but
+        # exposed here so users on small or high-DPI displays can override it.
+        scale_menu = tk.Menu(settings_menu, tearoff=0)
+        settings_menu.add_cascade(label="Interface Scale", menu=scale_menu)
+        self._ui_scale_var = tk.DoubleVar(value=self.ui_scale)
+        for label, value in self.UI_SCALE_PRESETS:
+            scale_menu.add_radiobutton(
+                label=f"{label}  ({int(value * 100)}%)",
+                variable=self._ui_scale_var, value=value,
+                command=lambda v=value: self.set_ui_scale(v))
+        settings_menu.add_separator()
         settings_menu.add_command(label="\ud83d\udcbe Save Configuration Preset", command=self.save_config_preset)
         settings_menu.add_command(label="\ud83d\udcc2 Load Configuration Preset", command=self.load_config_preset)
     
+    # ──────────────────────────────────────────────────────────────────────
+    # UI density / scaling
+    #
+    # Fonts throughout the app are given as point sizes (e.g. ('Segoe UI', 9)).
+    # Tk converts points -> pixels through its `tk scaling` factor, so changing
+    # that ONE value rescales every font in the application at once, including
+    # the several hundred hard-coded tuples. That is the single lever used
+    # here; widget padding (which is in pixels and therefore unaffected) is
+    # scaled explicitly in apply_theme(). Widget `width=`/`height=` options are
+    # in character cells, so they follow the font automatically.
+    # ──────────────────────────────────────────────────────────────────────
+
+    # Named-font base point sizes. Tk on Windows reports some of these as
+    # negative (= pixels), which would NOT follow `tk scaling`; normalizing them
+    # to positive points makes menus, listboxes and text widgets scale too.
+    _UI_NAMED_FONTS = {
+        'TkDefaultFont': 9, 'TkTextFont': 9, 'TkMenuFont': 9,
+        'TkHeadingFont': 9, 'TkIconFont': 9, 'TkSmallCaptionFont': 8,
+        'TkTooltipFont': 8, 'TkFixedFont': 9,
+    }
+
+    UI_SCALE_PRESETS = [
+        ("Compact (small screens)", 0.75),
+        ("Cozy", 0.85),
+        ("Default", 0.90),
+        ("Comfortable", 1.00),
+        ("Large", 1.15),
+    ]
+
+    def _ui_prefs_path(self):
+        return os.path.join(os.path.expanduser('~'), '.tracy_ui.json')
+
+    def _auto_ui_scale(self):
+        """Pick a density from the screen height. The layouts were authored on a
+        1080p display, so shorter screens need proportionally smaller chrome for
+        tall panels (e.g. the Zone Editor's control column) to fit."""
+        try:
+            sh = self.root.winfo_screenheight()
+        except Exception:
+            return 0.90
+        if sh < 800:
+            return 0.72
+        if sh < 900:
+            return 0.78
+        if sh < 1000:
+            return 0.85
+        return 0.90
+
+    def _init_ui_metrics(self):
+        """Establish the app-wide UI scale before any widget is created."""
+        try:
+            self._ui_base_scaling = float(self.root.tk.call('tk', 'scaling'))
+        except Exception:
+            self._ui_base_scaling = 1.3333333
+        # A DPI-unaware process always sees 96 DPI; guard against odd values.
+        if not (0.5 <= self._ui_base_scaling <= 4.0):
+            self._ui_base_scaling = 1.3333333
+
+        scale = None
+        try:
+            with open(self._ui_prefs_path(), 'r') as fh:
+                scale = float(json.load(fh).get('ui_scale'))
+        except Exception:
+            scale = None
+        if scale is None or not (0.6 <= scale <= 1.4):
+            scale = self._auto_ui_scale()
+        self.ui_scale = scale
+        self._apply_ui_scale()
+
+    def _apply_ui_scale(self):
+        """Push self.ui_scale into Tk. Safe to call again at runtime."""
+        try:
+            self.root.tk.call('tk', 'scaling', self._ui_base_scaling * self.ui_scale)
+        except Exception:
+            pass
+        for name, base in self._UI_NAMED_FONTS.items():
+            try:
+                f = tkfont.nametofont(name)
+                cur = f.cget('size')
+                if cur < 0:
+                    # Negative == pixels, which ignore `tk scaling`. Convert to
+                    # the equivalent point size so this font scales like the
+                    # rest of the app. (Sizes are already points on Windows Tk;
+                    # this is for builds that report pixels.)
+                    cur = int(round(abs(cur) / self._ui_base_scaling))
+                f.configure(size=cur or base)
+            except Exception:
+                pass
+
+    def ui_px(self, n):
+        """Scale a pixel dimension (padding, canvas height, window size) to the
+        current UI density. Pixels do not follow `tk scaling`, so anything
+        expressed in pixels must go through here to stay proportional."""
+        return max(1, int(round(n * self.ui_scale)))
+
+    def set_ui_scale(self, value):
+        """Change UI density at runtime and persist the choice."""
+        self.ui_scale = float(value)
+        self._apply_ui_scale()
+        self.apply_theme()
+        try:
+            with open(self._ui_prefs_path(), 'w') as fh:
+                json.dump({'ui_scale': self.ui_scale}, fh)
+        except Exception:
+            pass
+        try:
+            messagebox.showinfo(
+                "UI Scale",
+                "Interface scale updated.\n\n"
+                "Some panels only re-measure when rebuilt — restart TRACY for the "
+                "change to apply everywhere.")
+        except Exception:
+            pass
+
+    def fit_toplevel(self, win, width=None, height=None, parent=None):
+        """Size a Toplevel so it always fits on the user's screen.
+
+        Hard-coded dialog sizes (e.g. 1000x800) run off the bottom of a 768p or
+        900p display, which is how action buttons at the foot of a dialog become
+        unreachable. This clamps the request to the usable screen area, leaving
+        room for the taskbar and title bar, and centers the result.
+        """
+        try:
+            win.update_idletasks()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            # Leave room for the taskbar / window decorations.
+            max_w = max(320, sw - 40)
+            max_h = max(240, sh - 90)
+            w = int(width) if width else win.winfo_reqwidth()
+            h = int(height) if height else win.winfo_reqheight()
+            w = min(w, max_w)
+            h = min(h, max_h)
+            base = parent if parent is not None else self.root
+            try:
+                x = base.winfo_rootx() + max(0, (base.winfo_width() - w) // 2)
+                y = base.winfo_rooty() + max(0, (base.winfo_height() - h) // 3)
+            except Exception:
+                x, y = (sw - w) // 2, (sh - h) // 3
+            x = max(0, min(x, sw - w))
+            y = max(0, min(y, sh - h))
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            win.minsize(min(320, w), min(240, h))
+        except Exception:
+            if width and height:
+                try:
+                    win.geometry(f"{int(width)}x{int(height)}")
+                except Exception:
+                    pass
+        return win
+
+    def make_scrollable(self, parent, fit_width=False):
+        """Wrap `parent` in a scrolling viewport and return the inner frame.
+
+        Content taller than the window stays reachable by scrolling instead of
+        being clipped off the bottom of the screen. With `fit_width=True` the
+        viewport adopts the natural width of its content (for a fixed-width side
+        column); otherwise the content is pinned to the viewport width.
+        """
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0,
+                           background=self.colors['bg_light'])
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _sync(_e=None):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            if fit_width:
+                # A Canvas does not inherit its child's size, so ask for the
+                # content's natural width or the column collapses to the Tk
+                # default (~238 px) and clips its controls horizontally.
+                canvas.configure(width=inner.winfo_reqwidth())
+            else:
+                # Pin the inner frame to the viewport width so nothing is pushed
+                # horizontally out of view.
+                canvas.itemconfigure(win_id, width=canvas.winfo_width())
+        inner.bind('<Configure>', _sync)
+        canvas.bind('<Configure>', _sync)
+
+        def _wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', _wheel))
+        canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
+        return inner
+
     def apply_theme(self):
         """Apply custom color scheme to the application"""
         style = ttk.Style()
-        
+        px = self.ui_px
+
         # Configure root window
         self.root.configure(bg=self.colors['bg_light'])
         
@@ -1508,10 +1722,10 @@ class FPAnalysisGUI:
         
         # Configure notebook (tabs)
         style.configure('TNotebook', background=self.colors['bg_light'], borderwidth=0)
-        style.configure('TNotebook.Tab', 
+        style.configure('TNotebook.Tab',
                        background=self.colors['bg_medium'],
                        foreground=self.colors['text_light'],
-                       padding=[20, 10],
+                       padding=[px(11), px(5)],
                        font=('Segoe UI', 10, 'bold'),
                        borderwidth=0)
         style.map('TNotebook.Tab',
@@ -1536,7 +1750,7 @@ class FPAnalysisGUI:
                        relief='raised',
                        focuscolor='none',
                        font=('Segoe UI', 9, 'bold'),
-                       padding=[15, 8])
+                       padding=[px(8), px(4)])
         style.map('TButton',
                  background=[('active', self.colors['accent_dark_blue']),
                            ('pressed', self.colors['bg_medium'])],
@@ -1570,11 +1784,28 @@ class FPAnalysisGUI:
                        foreground='white',
                        borderwidth=0, relief='raised', focuscolor='none',
                        font=('Segoe UI', 9, 'bold'),
-                       padding=[8, 4])
+                       padding=[px(5), px(2)])
         style.map('Compact.TButton',
                  background=[('active', self.colors['accent_dark_blue']),
                            ('pressed', self.colors['bg_medium'])],
                  relief=[('pressed', 'sunken'), ('active', 'raised')])
+
+        # Spinboxes: give the arrows a real hit target and keep the field from
+        # collapsing to a couple of characters at small scales, which is what
+        # made them unusable on low-resolution displays.
+        for _sb in ('TSpinbox', 'TCombobox'):
+            try:
+                style.configure(_sb, arrowsize=px(12), padding=[px(2), px(1)])
+            except tk.TclError:
+                pass
+        style.configure('TLabelframe', borderwidth=1)
+        # Trim the default label/checkbutton/radiobutton padding so dense
+        # control panels stack in noticeably less vertical space.
+        for _w in ('TLabel', 'TCheckbutton', 'TRadiobutton'):
+            try:
+                style.configure(_w, padding=[0, px(1)])
+            except tk.TclError:
+                pass
 
     def _apply_plot_style(self):
         """Apply a single, app-wide matplotlib style so every figure (embedded
@@ -1838,9 +2069,13 @@ class FPAnalysisGUI:
         
     def create_project_tab(self):
         """Tab for project creation and management"""
-        tab = ttk.Frame(self.project_notebook)
-        self.project_notebook.add(tab, text="Setup")
-        
+        tab_outer = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab_outer, text="Setup")
+        # This tab's content is ~820 px tall — more than the viewport on a
+        # 1366x768 laptop — so host it in a scrolling viewport rather than
+        # letting the lower controls fall off the bottom of the screen.
+        tab = self.make_scrollable(tab_outer)
+
         # Project info frame
         info_frame = ttk.LabelFrame(tab, text="Project Information", padding=10)
         info_frame.pack(fill='x', padx=10, pady=10)
@@ -2055,7 +2290,7 @@ class FPAnalysisGUI:
         ttk.Label(offset_frame,
                   text="Generate additional behaviors by shifting boutframe/TTL onsets by a fixed number of frames.\n"
                        "Each offset is treated as a separate behavior for bout analysis and visualization.",
-                  foreground='gray', font=('Segoe UI', 8), wraplength=600, justify='left').pack(anchor='w', pady=(0, 5))
+                  foreground='gray', font=('Segoe UI', 8), wraplength=self.ui_px(600), justify='left').pack(anchor='w', pady=(0, 5))
         
         offset_add_row = ttk.Frame(offset_frame)
         offset_add_row.pack(fill='x', pady=2)
@@ -2231,7 +2466,7 @@ class FPAnalysisGUI:
         param_frame.pack(side='left', fill='both', expand=True, padx=(3, 0))
         
         # Create scrollable parameters area
-        param_canvas = tk.Canvas(param_frame, height=120, highlightthickness=0)
+        param_canvas = tk.Canvas(param_frame, height=self.ui_px(120), highlightthickness=0)
         param_scrollbar = ttk.Scrollbar(param_frame, orient="vertical", command=param_canvas.yview)
         param_inner = ttk.Frame(param_canvas)
         
@@ -2406,7 +2641,7 @@ class FPAnalysisGUI:
                   text="Per-subject frame shift applied after global shift/scaling, before precut correction.  "
                        "Positive = forward (later), Negative = backward (earlier).  "
                        "Click the Shift cell to edit; Tab moves to the next row.",
-                  foreground='gray', wraplength=700).pack(anchor='w', padx=10, pady=(8, 4))
+                  foreground='gray', wraplength=self.ui_px(700)).pack(anchor='w', padx=10, pady=(8, 4))
 
         # Button row
         shifts_btn_row = ttk.Frame(shifts_tab)
@@ -2450,7 +2685,7 @@ class FPAnalysisGUI:
                   text="Double-click a Shift cell to edit one value.  "
                        "For many subjects: copy a single column of values from Excel, "
                        "select the starting row, then click 'Paste Column from Clipboard'.",
-                  foreground='gray', wraplength=700).pack(anchor='w', padx=10, pady=(0, 4))
+                  foreground='gray', wraplength=self.ui_px(700)).pack(anchor='w', padx=10, pady=(0, 4))
 
         self._refresh_per_subject_shifts_list()
 
@@ -2463,7 +2698,7 @@ class FPAnalysisGUI:
                        "non-destructive filter: the boutframes file is never modified — the rules are "
                        "applied to every subject when bouts are (re-)extracted.  Click "
                        "“Apply Settings & Re-extract Bouts” above to update results.",
-                  foreground='gray', wraplength=720, justify='left').pack(anchor='w', padx=10, pady=(8, 4))
+                  foreground='gray', wraplength=self.ui_px(720), justify='left').pack(anchor='w', padx=10, pady=(8, 4))
 
         excl_frame = ttk.LabelFrame(excl_tab, text="Exclusion Rules (frames)", padding=10)
         excl_frame.pack(fill='x', padx=10, pady=(0, 6))
@@ -2502,7 +2737,7 @@ class FPAnalysisGUI:
                   text="Enter 0 to disable a rule.  Duration rules require a start/end boutframes file.  "
                        "The proximity rule drops the later bout when it begins too soon after the previous "
                        "kept bout.",
-                  foreground='gray', font=('Segoe UI', 8), wraplength=720, justify='left').grid(
+                  foreground='gray', font=('Segoe UI', 8), wraplength=self.ui_px(720), justify='left').grid(
                       row=4, column=0, columnspan=4, sticky='w', pady=(6, 0))
 
         # Live-update hints + params as the user types / toggles
@@ -2915,7 +3150,7 @@ class FPAnalysisGUI:
                               text="💡 Tip: Groups are saved as .tracy files in your project folder.",
                               font=('Segoe UI', 9),
                               foreground='blue',
-                              wraplength=500)
+                              wraplength=self.ui_px(500))
         info_label.pack(side='bottom', fill='x', padx=10, pady=5)
         
     def create_exclusions_tab(self):
@@ -3434,7 +3669,7 @@ class FPAnalysisGUI:
                   text="Compute coherence in baseline (pre-onset) and post-onset windows for each bout, "
                        "averaged across all selected subjects / groups from the selector above.",
                   foreground='gray', font=('Segoe UI', 8),
-                  wraplength=680).pack(anchor='w', pady=(0, 8))
+                  wraplength=self.ui_px(680)).pack(anchor='w', pady=(0, 8))
 
         bout_params_frame = ttk.Frame(bout_tab)
         bout_params_frame.pack(fill='x', pady=(0, 6))
@@ -3499,7 +3734,7 @@ class FPAnalysisGUI:
                   text="Compare spectral coherence across experimental groups. "
                        "Whole Session compares mean spectra; By Bout compares pre/post changes per group.",
                   foreground='gray', font=('Segoe UI', 8),
-                  wraplength=680).grid(row=0, column=0, columnspan=4,
+                  wraplength=self.ui_px(680)).grid(row=0, column=0, columnspan=4,
                                        sticky='w', padx=3, pady=(0, 6))
 
         # Sub-mode radio
@@ -3761,8 +3996,14 @@ class FPAnalysisGUI:
         """Display Auto-Tune results in a window with table + preview plot."""
         win = tk.Toplevel(self.root)
         win.title("Auto-Tune Results")
-        win.geometry("1050x680")
+        self.fit_toplevel(win, 1050, 680)
         win.transient(self.root)
+
+        # Reserve the action row at the bottom before the expanding body: on a
+        # 768p screen the window is shorter than its content and anything packed
+        # after an expanding widget gets clipped off-screen.
+        btn_row = ttk.Frame(win)
+        btn_row.pack(side=tk.BOTTOM, fill='x', padx=8, pady=(0, 6))
 
         # Split: left = table, right = plot
         paned = ttk.PanedWindow(win, orient='horizontal')
@@ -3780,7 +4021,9 @@ class FPAnalysisGUI:
                   wraplength=380, justify='left').pack(anchor='w', pady=(0, 6))
 
         cols = ('Rank', 'Method', 'Parameters', 'Score', 'Mean Coh')
-        tree = ttk.Treeview(left, columns=cols, show='headings', height=20,
+        # height=12 rather than 20: the table scrolls anyway, and a taller
+        # request pushes the window past the bottom of a 768p screen.
+        tree = ttk.Treeview(left, columns=cols, show='headings', height=12,
                             selectmode='browse')
         for col, w in zip(cols, [40, 120, 200, 60, 70]):
             tree.heading(col, text=col)
@@ -3813,10 +4056,7 @@ class FPAnalysisGUI:
         tree.pack(side='left', fill='both', expand=True)
         tsb.pack(side='right', fill='y')
 
-        # ── Apply buttons ─────────────────────────────────────────────────
-        btn_row = ttk.Frame(win)
-        btn_row.pack(fill='x', padx=8, pady=(0, 6))
-
+        # ── Apply buttons (row already pinned to the bottom above) ────────
         # Best Morlet
         best_morlet = next((r for r in results if r['method'] == 'Morlet Wavelet'), None)
         # Best Welch
@@ -3844,12 +4084,14 @@ class FPAnalysisGUI:
             cfg = best_morlet['config']
             ttk.Button(btn_row,
                        text=f"Apply Best Morlet  (w={cfg['morlet_w']}, n={cfg['morlet_n_freqs']})",
+                       style='Compact.TButton',
                        command=lambda r=best_morlet: _apply(r)
                        ).pack(side='left', padx=6)
         if best_welch:
             cfg = best_welch['config']
             ttk.Button(btn_row,
                        text=f"Apply Best Welch  (window={cfg['nperseg_sec']}s)",
+                       style='Compact.TButton',
                        command=lambda r=best_welch: _apply(r)
                        ).pack(side='left', padx=6)
 
@@ -3861,9 +4103,10 @@ class FPAnalysisGUI:
             rank = int(sel[0]) - 1
             _apply(results[rank])
 
-        ttk.Button(btn_row, text="Apply Selected Row",
+        ttk.Button(btn_row, text="Apply Selected Row", style='Compact.TButton',
                    command=_apply_selected).pack(side='left', padx=6)
-        ttk.Button(btn_row, text="Close", command=win.destroy).pack(side='right', padx=6)
+        ttk.Button(btn_row, text="Close", style='Compact.TButton',
+                   command=win.destroy).pack(side='right', padx=6)
 
         # ── Right: preview plot (top 5) ───────────────────────────────────
         right = ttk.Frame(paned, padding=4)
@@ -3943,7 +4186,7 @@ class FPAnalysisGUI:
         result = {'value': None}
         dlg = tk.Toplevel(self.root)
         dlg.title(title)
-        dlg.geometry("320x180")
+        self.fit_toplevel(dlg, 320, 180)
         dlg.resizable(False, False)
         dlg.transient(self.root)
         dlg.grab_set()
@@ -5127,7 +5370,7 @@ class FPAnalysisGUI:
         else:
             grp_dlg = tk.Toplevel(self.root)
             grp_dlg.title("Select Groups to Plot")
-            grp_dlg.geometry("340x300")
+            self.fit_toplevel(grp_dlg, 340, 300)
             grp_dlg.transient(self.root)
             grp_dlg.grab_set()
 
@@ -5303,7 +5546,7 @@ class FPAnalysisGUI:
         n_selected = len(selected_group_names)
         progress_win = tk.Toplevel(self.root)
         progress_win.title("Computing group spectrograms…")
-        progress_win.geometry("340x100")
+        self.fit_toplevel(progress_win, 340, 100)
         progress_win.transient(self.root)
         progress_win.grab_set()
         prog_lbl = ttk.Label(progress_win, text="Starting…")
@@ -5353,7 +5596,7 @@ class FPAnalysisGUI:
         if n_valid >= 2:
             sel_dlg = tk.Toplevel(self.root)
             sel_dlg.title("Group Contrast Selection")
-            sel_dlg.geometry("340x220")
+            self.fit_toplevel(sel_dlg, 340, 220)
             sel_dlg.transient(self.root)
             sel_dlg.grab_set()
 
@@ -5512,10 +5755,16 @@ class FPAnalysisGUI:
         """Open a dialog to adjust all coherence analysis and plot parameters."""
         dlg = tk.Toplevel(self.root)
         dlg.title("Coherence Settings")
-        dlg.geometry("560x700")
+        self.fit_toplevel(dlg, 560, 700)
         dlg.resizable(False, True)
         dlg.transient(self.root)
         dlg.grab_set()
+
+        # Pin the action row to the bottom of the dialog before the scrolling
+        # body. Inside the scroll frame it would sit below ~700 px of settings
+        # and be unreachable on a 768p screen without scrolling to the end.
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(side=tk.BOTTOM, fill='x', padx=10, pady=8)
 
         outer = ttk.Frame(dlg)
         outer.pack(fill='both', expand=True)
@@ -5555,7 +5804,7 @@ class FPAnalysisGUI:
                         '\u2014  e.g., Freq min = 0.05 Hz  \u2192  window \u2265 40 s.  '
                         'A window that is too short will underestimate coherence at low frequencies.'),
                   foreground='#b05800', font=('Segoe UI', 8),
-                  wraplength=430).grid(row=3, column=0, columnspan=3, sticky='w', padx=4, pady=(0, 4))
+                  wraplength=self.ui_px(430)).grid(row=3, column=0, columnspan=3, sticky='w', padx=4, pady=(0, 4))
 
         # ── Sliding Coherence ─────────────────────────────────────────
         f2 = ttk.LabelFrame(sf, text='Sliding Coherence', padding=8)
@@ -5629,7 +5878,7 @@ class FPAnalysisGUI:
                   text='Bands used in coherence bar charts and group comparisons. '
                        'Edit directly on the Coherence tab for full CRUD controls.',
                   foreground='gray', font=('Segoe UI', 8),
-                  wraplength=420).grid(row=0, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
+                  wraplength=self.ui_px(420)).grid(row=0, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 4))
 
         # Read-only summary of current bands
         bands_text_var = tk.StringVar()
@@ -5714,8 +5963,6 @@ class FPAnalysisGUI:
                     else:
                         vars_[k].set(str(v))
 
-        btn_row = ttk.Frame(sf)
-        btn_row.pack(fill='x', padx=10, pady=10)
         ttk.Button(btn_row, text='Apply & Close', command=apply).pack(side='left', padx=5)
         ttk.Button(btn_row, text='Reset Defaults', command=reset).pack(side='left', padx=5)
         ttk.Button(btn_row, text='Cancel', command=dlg.destroy).pack(side='left', padx=5)
@@ -6248,12 +6495,18 @@ class FPAnalysisGUI:
         else:
             sel_dlg = tk.Toplevel(self.root)
             sel_dlg.title("Select subjects to plot")
-            sel_dlg.geometry("360x460")
+            self.fit_toplevel(sel_dlg, 360, 460)
             sel_dlg.transient(self.root)
             sel_dlg.grab_set()
 
             ttk.Label(sel_dlg, text="Select one or more subjects:",
                       font=('Segoe UI', 10)).pack(anchor='w', padx=12, pady=(12, 4))
+
+            # Reserve the mode/action block at the bottom before the expanding
+            # list, so Plot/Cancel stay on-screen when the dialog is clamped to
+            # a short display.
+            bottom = ttk.Frame(sel_dlg)
+            bottom.pack(side=tk.BOTTOM, fill='x')
 
             lb_frame = ttk.Frame(sel_dlg)
             lb_frame.pack(fill='both', expand=True, padx=12, pady=4)
@@ -6267,11 +6520,11 @@ class FPAnalysisGUI:
                 _lb.insert('end', n)
             _lb.select_set(0)
 
-            ttk.Separator(sel_dlg, orient='horizontal').pack(fill='x', padx=12, pady=(6, 2))
-            ttk.Label(sel_dlg, text="Display mode:",
+            ttk.Separator(bottom, orient='horizontal').pack(fill='x', padx=12, pady=(6, 2))
+            ttk.Label(bottom, text="Display mode:",
                       font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12)
             mode_var = tk.StringVar(value='individual')
-            mode_frame = ttk.Frame(sel_dlg)
+            mode_frame = ttk.Frame(bottom)
             mode_frame.pack(anchor='w', padx=20, pady=2)
             ttk.Radiobutton(mode_frame, text="Individual panels",
                             variable=mode_var, value='individual').pack(anchor='w')
@@ -6283,7 +6536,7 @@ class FPAnalysisGUI:
                 chosen['mode']  = mode_var.get()
                 sel_dlg.destroy()
 
-            btn_row = ttk.Frame(sel_dlg)
+            btn_row = ttk.Frame(bottom)
             btn_row.pack(fill='x', padx=12, pady=10)
             ttk.Button(btn_row, text="Plot",   command=_ok).pack(side='left', padx=4)
             ttk.Button(btn_row, text="Cancel", command=sel_dlg.destroy).pack(side='left', padx=4)
@@ -6985,12 +7238,18 @@ class FPAnalysisGUI:
         else:
             sel_dlg = tk.Toplevel(self.root)
             sel_dlg.title("Select subjects to plot")
-            sel_dlg.geometry("360x460")
+            self.fit_toplevel(sel_dlg, 360, 460)
             sel_dlg.transient(self.root)
             sel_dlg.grab_set()
 
             ttk.Label(sel_dlg, text="Select one or more subjects/groups:",
                       font=('Segoe UI', 10)).pack(anchor='w', padx=12, pady=(12, 4))
+
+            # Reserve the mode/action block at the bottom before the expanding
+            # list, so Plot/Cancel stay on-screen when the dialog is clamped to
+            # a short display.
+            bottom = ttk.Frame(sel_dlg)
+            bottom.pack(side=tk.BOTTOM, fill='x')
 
             lb_frame = ttk.Frame(sel_dlg)
             lb_frame.pack(fill='both', expand=True, padx=12, pady=4)
@@ -7004,11 +7263,11 @@ class FPAnalysisGUI:
                 lb.insert('end', n)
             lb.select_set(0)
 
-            ttk.Separator(sel_dlg, orient='horizontal').pack(fill='x', padx=12, pady=(6, 2))
-            ttk.Label(sel_dlg, text="Display mode:",
+            ttk.Separator(bottom, orient='horizontal').pack(fill='x', padx=12, pady=(6, 2))
+            ttk.Label(bottom, text="Display mode:",
                       font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12)
             mode_var = tk.StringVar(value='individual')
-            mode_frame = ttk.Frame(sel_dlg)
+            mode_frame = ttk.Frame(bottom)
             mode_frame.pack(anchor='w', padx=20, pady=2)
             ttk.Radiobutton(mode_frame, text="Individual panels",
                             variable=mode_var, value='individual').pack(anchor='w')
@@ -7020,7 +7279,7 @@ class FPAnalysisGUI:
                 chosen['mode']  = mode_var.get()
                 sel_dlg.destroy()
 
-            btn_row = ttk.Frame(sel_dlg)
+            btn_row = ttk.Frame(bottom)
             btn_row.pack(fill='x', padx=12, pady=10)
             ttk.Button(btn_row, text="Plot",   command=_ok).pack(side='left', padx=4)
             ttk.Button(btn_row, text="Cancel", command=sel_dlg.destroy).pack(side='left', padx=4)
@@ -7157,7 +7416,7 @@ class FPAnalysisGUI:
         # Create dialog
         dialog = tk.Toplevel(self.root)
         dialog.title("Export Connectivity Results")
-        dialog.geometry("450x250")
+        self.fit_toplevel(dialog, 450, 250)
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -7528,7 +7787,7 @@ class FPAnalysisGUI:
         bout_graph_container.pack(fill='x', padx=5, pady=(2, 3))
 
         self.bout_histogram_canvas = tk.Canvas(
-            bout_graph_container, height=450, highlightthickness=0)
+            bout_graph_container, height=self.ui_px(450), highlightthickness=0)
         bout_h_scrollbar = ttk.Scrollbar(
             bout_graph_container, orient="horizontal",
             command=self.bout_histogram_canvas.xview)
@@ -8028,13 +8287,18 @@ class FPAnalysisGUI:
         # Create dialog for export options
         dialog = tk.Toplevel(self.root)
         dialog.title("Export Spike Analysis")
-        dialog.geometry("450x300")
+        self.fit_toplevel(dialog, 450, 300)
         dialog.transient(self.root)
         dialog.grab_set()
         
+        # Bottom-pin the action row outside the body: on a short screen the
+        # dialog is clamped and anything packed after the body gets clipped.
+        button_frame = ttk.Frame(dialog, padding=(20, 0, 20, 12))
+        button_frame.pack(side=tk.BOTTOM, fill='x')
+
         main_frame = ttk.Frame(dialog, padding=20)
         main_frame.pack(fill='both', expand=True)
-        
+
         ttk.Label(main_frame, text="Select Export Type:", font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=(0, 10))
         
         export_type = tk.StringVar(value="summary")
@@ -8061,10 +8325,7 @@ class FPAnalysisGUI:
         ttk.Label(main_frame, text="   • Spike rate calculated for each behavioral zone", 
                  foreground='gray', font=('Segoe UI', 9)).pack(anchor='w', padx=20)
         
-        # Button frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(side='bottom', fill='x', pady=(20, 0))
-        
+        # Button frame (already pinned to the bottom of the dialog above)
         result = {'export': False}
         
         def on_export():
@@ -9309,6 +9570,23 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix (accessibility) — Buttons at the bottom of tabs and dialogs were unreachable
+    on low-resolution monitors. On a 1366x768 or 1600x900 laptop the content simply
+    ran off the bottom of the screen with no way to scroll to it — the Zone Editor's
+    "Save & Apply" being the clearest case, where it sat below an expanding zone list
+    and was always the first thing pushed off-screen. Action buttons in the Zone
+    Editor and in the tall dialogs are now pinned to the bottom of their window
+    BEFORE any expanding content, so they always keep their space, and the settings
+    above them scroll. The Setup, Kinematics and System Check tabs, whose content
+    was 90-220 px taller than a 768p viewport, now scroll as well.
+  • Change — Interface is more compact everywhere. TRACY now picks a UI density from
+    your screen height at startup (tighter on short screens), shrinking all fonts,
+    buttons, tabs, spinboxes and padding together — a standard button drops from
+    113x37 to 95x27 px, so noticeably more fits on screen. Override it under
+    Settings → Interface Scale (75%-115%); the choice is remembered between sessions.
+  • Fix — Dialogs no longer open larger than the desktop. Every window with a fixed
+    size is now clamped to the usable screen area and centred, instead of extending
+    past the bottom edge on smaller displays.
   • New — Signal Linkage tab (BETA, Data → Signal Linkage). Measures how tightly
     each behavior's onset is coupled to a rapid change in signal: it takes the
     peri-onset derivative (Savitzky-Golay dF/dt) and tests the peak against a
@@ -9559,9 +9837,13 @@ Version 1.0.0
     
     def create_system_tab(self):
         """Tab for checking system requirements and dependencies"""
-        tab = ttk.Frame(self.info_notebook)
-        self.info_notebook.add(tab, text="System Check")
-        self.system_check_tab = tab  # keep reference for tab-title updates... !!
+        tab_outer = ttk.Frame(self.info_notebook)
+        self.info_notebook.add(tab_outer, text="System Check")
+        # Keep the reference to the NOTEBOOK child (info_notebook.index() needs
+        # it); the content itself goes in a scrolling viewport, since the
+        # dependency list plus the update controls overflow a 768p viewport.
+        self.system_check_tab = tab_outer  # keep reference for tab-title updates... !!
+        tab = self.make_scrollable(tab_outer)
         
         # Title
         title_label = ttk.Label(tab, text="System Requirements Check", 
@@ -10136,9 +10418,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         help_window = tk.Toplevel(self.root)
         help_window.title("TTL File Help")
-        help_window.geometry("600x500")
+        self.fit_toplevel(help_window, 600, 500)
         help_window.transient(self.root)
         
+        # Close button first so it keeps its space when the window is clamped
+        # to a short screen; the help text scrolls above it.
+        ttk.Button(help_window, text="Close",
+                   command=help_window.destroy).pack(side=tk.BOTTOM, pady=5)
+
         # Create text widget with scrollbar
         text_frame = ttk.Frame(help_window)
         text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -10153,9 +10440,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         text_widget.insert('1.0', help_text)
         text_widget.config(state=tk.DISABLED)
-        
-        # Add close button
-        ttk.Button(help_window, text="Close", command=help_window.destroy).pack(pady=5)
     
     # ======================== Project Management ========================
     
@@ -10257,7 +10541,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not quiet:
             progress_window = tk.Toplevel(self.root)
             progress_window.title("Saving Project")
-            progress_window.geometry("400x150")
+            self.fit_toplevel(progress_window, 400, 150)
             progress_window.transient(self.root)
             progress_window.grab_set()
 
@@ -11700,15 +11984,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Create dialog to select subjects to clear
         dialog = tk.Toplevel(self.root)
         dialog.title("Clear Subject Data")
-        dialog.geometry("400x500")
+        self.fit_toplevel(dialog, 400, 500)
         
         ttk.Label(dialog, text="Select subjects to clear:", font=('Segoe UI', 11, 'bold')).pack(pady=10)
-        
+
+        # Reserve the button rows at the bottom before the expanding list, so
+        # "Clear Selected Data" stays reachable when the dialog is clamped to a
+        # short display.
+        bottom = ttk.Frame(dialog)
+        bottom.pack(side=tk.BOTTOM, fill='x')
+
         # Create listbox with all subjects
         list_frame = ttk.Frame(dialog)
         list_frame.pack(fill='both', expand=True, padx=20, pady=10)
-        
-        subjects_listbox = tk.Listbox(list_frame, selectmode='multiple', height=15)
+
+        subjects_listbox = tk.Listbox(list_frame, selectmode='multiple', height=10)
         scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=subjects_listbox.yview)
         subjects_listbox.config(yscrollcommand=scrollbar.set)
         
@@ -11727,9 +12017,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         def clear_selection():
             subjects_listbox.selection_clear(0, tk.END)
         
-        button_frame = ttk.Frame(dialog)
+        button_frame = ttk.Frame(bottom)
         button_frame.pack(fill='x', padx=20, pady=5)
-        
+
         ttk.Button(button_frame, text="Select All", command=select_all).pack(side='left', padx=5)
         ttk.Button(button_frame, text="Clear Selection", command=clear_selection).pack(side='left', padx=5)
         
@@ -11793,7 +12083,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         "Subjects Cleared",
                         f"Removed {len(selected_subjects)} subject(s) from the project.")
 
-        action_frame = ttk.Frame(dialog)
+        action_frame = ttk.Frame(bottom)
         action_frame.pack(fill='x', padx=20, pady=(5, 15))
         ttk.Button(action_frame, text="Clear Selected Data", command=do_clear).pack(side='left', padx=5)
         ttk.Button(action_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
@@ -11858,7 +12148,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Open dialog to edit processing parameters"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Edit Processing Parameters")
-        dialog.geometry("500x600")
+        self.fit_toplevel(dialog, 500, 600)
         
         # Create scrollable canvas
         canvas = tk.Canvas(dialog)
@@ -11953,8 +12243,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             except ValueError as e:
                 messagebox.showerror("Error", f"Please enter valid values.\nNumeric parameters must be numbers.\n\nError: {str(e)}")
         
-        ttk.Button(scrollable_frame, text="Save", command=save_params).grid(row=len(self.params), column=0, columnspan=2, pady=20)
-        
+        # Save sits outside the scrolling canvas and is packed first, so it is
+        # always visible instead of hiding below a screen-height parameter list.
+        save_row = ttk.Frame(dialog)
+        save_row.pack(side=tk.BOTTOM, fill='x')
+        ttk.Button(save_row, text="Save", command=save_params).pack(pady=12)
+
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
     
@@ -12825,7 +13119,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Scrollable body
         body_wrap = tk.Frame(win, bg=bg_light)
         body_wrap.pack(fill='both', expand=True, padx=12, pady=(0, 6))
-        canvas = tk.Canvas(body_wrap, bg=bg_light, highlightthickness=0, width=640)
+        canvas = tk.Canvas(body_wrap, bg=bg_light, highlightthickness=0,
+                           width=self.ui_px(640))
         vsb = ttk.Scrollbar(body_wrap, orient='vertical', command=canvas.yview)
         inner = tk.Frame(canvas, bg=bg_light)
         inner.bind('<Configure>',
@@ -12856,7 +13151,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for it in items:
                 tk.Label(card, text=f"• {it}", bg='white', fg=text_dark,
                          font=('Segoe UI', 9), anchor='w', justify='left',
-                         wraplength=600).pack(fill='x', padx=14, pady=1)
+                         wraplength=self.ui_px(600)).pack(fill='x', padx=14, pady=1)
             tk.Frame(card, bg='white', height=4).pack()
 
         def add_detail_section(title, rows, kind):
@@ -12867,11 +13162,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for head, detail, mono in rows:
                 tk.Label(card, text=f"• {head}", bg='white', fg=text_dark,
                          font=('Segoe UI', 9, 'bold'), anchor='w', justify='left',
-                         wraplength=610).pack(fill='x', padx=14, pady=(3, 0))
+                         wraplength=self.ui_px(610)).pack(fill='x', padx=14, pady=(3, 0))
                 if detail:
                     tk.Label(card, text=f"     {detail}", bg='white', fg=text_muted,
                              font=('Segoe UI', 8), anchor='w', justify='left',
-                             wraplength=600).pack(fill='x', padx=14, pady=(0, 1))
+                             wraplength=self.ui_px(600)).pack(fill='x', padx=14, pady=(0, 1))
                 if mono:
                     mono_txt = mono.rstrip()
                     nlines = min(25, mono_txt.count('\n') + 1)
@@ -17837,7 +18132,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                  f"{len(subjects)} processed subject(s) — a control 'null' behavior "
                  "for the FLMM comparison.  Bouts are kept clear of the session edges "
                  "by the pre/post window.")
-        ttk.Label(dlg, text=intro, wraplength=420, justify='left',
+        ttk.Label(dlg, text=intro, wraplength=self.ui_px(420), justify='left',
                   foreground='gray').pack(anchor='w', padx=14, pady=(12, 6))
 
         form = ttk.Frame(dlg)
@@ -17884,7 +18179,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         note = ("The behavior is written to the boutframes file (a .bak backup is "
                 "made first). Existing columns with this name are replaced.")
-        ttk.Label(dlg, text=note, wraplength=420, justify='left',
+        ttk.Label(dlg, text=note, wraplength=self.ui_px(420), justify='left',
                   foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=14, pady=(8, 4))
 
         btn_row = ttk.Frame(dlg)
@@ -18905,7 +19200,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
                 dialog = tk.Toplevel(self.root)
                 dialog.title("Handle Conflicts")
-                dialog.geometry("450x250")
+                self.fit_toplevel(dialog, 450, 250)
                 dialog.transient(self.root)
                 dialog.grab_set()
                 
@@ -19141,10 +19436,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Create custom dialog for conflict resolution
                 conflict_dialog = tk.Toplevel(self.root)
                 conflict_dialog.title("Import Groups - Resolve Conflicts")
-                conflict_dialog.geometry("600x400")
+                self.fit_toplevel(conflict_dialog, 600, 400)
                 conflict_dialog.transient(self.root)
                 conflict_dialog.grab_set()
                 
+                # Reserve the button row before the expanding options frame; a
+                # long conflict list otherwise pushes it off a short screen.
+                button_frame = ttk.Frame(conflict_dialog)
+                button_frame.pack(side=tk.BOTTOM, fill='x', padx=10, pady=10)
+
                 # Summary label
                 summary_label = ttk.Label(conflict_dialog, text=summary, justify='left')
                 summary_label.pack(padx=10, pady=10, anchor='w')
@@ -19166,10 +19466,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ttk.Radiobutton(conflict_frame, text="Cancel import",
                                variable=resolution_var, value="cancel").pack(anchor='w', pady=5)
                 
-                # Buttons
-                button_frame = ttk.Frame(conflict_dialog)
-                button_frame.pack(fill='x', padx=10, pady=10)
-                
+                # Buttons (row already pinned to the bottom above)
                 result = {'action': None}
                 
                 def on_ok():
@@ -21046,11 +21343,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         win = tk.Toplevel(self.root)
         win.title("Advanced Graph Settings")
-        win.geometry("650x760")
+        self.fit_toplevel(win, 650, 760)
         win.transient(self.root)
         self.graph_settings_window = win
 
-        main = ttk.Frame(win, padding=10)
+        # This window asks for ~760 px of settings, more than a 768p screen can
+        # show: pin the footer first, then scroll the body above it.
+        footer = ttk.Frame(win, padding=(10, 6))
+        footer.pack(side=tk.BOTTOM, fill='x')
+
+        main = ttk.Frame(self.make_scrollable(win), padding=10)
         main.pack(fill='both', expand=True)
 
         trace_frame = ttk.LabelFrame(main, text="Trace Styling", padding=8)
@@ -21220,9 +21522,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                   foreground='gray', font=('Segoe UI', 8)).grid(
             row=3, column=2, columnspan=2, sticky='w', padx=5, pady=(6, 0))
 
-        footer = ttk.Frame(main)
-        footer.pack(fill='x', pady=(8, 0))
-
+        # (footer is already pinned to the bottom of the window above)
         def _apply_and_refresh():
             try:
                 self.get_trace_styling()
@@ -22376,7 +22676,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Scrollable list so long behavior sets stay usable.
         list_wrap = ttk.Frame(dlg)
         list_wrap.pack(fill='both', expand=True, padx=12)
-        canvas = tk.Canvas(list_wrap, highlightthickness=0, height=min(300, 24 * len(behaviors) + 4))
+        canvas = tk.Canvas(list_wrap, highlightthickness=0,
+                           height=self.ui_px(min(300, 24 * len(behaviors) + 4)))
         scroll = ttk.Scrollbar(list_wrap, orient='vertical', command=canvas.yview)
         inner = ttk.Frame(canvas)
         inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
@@ -22482,7 +22783,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             list_wrap = ttk.Frame(dlg)
             list_wrap.pack(fill='both', expand=True, padx=12)
             canvas = tk.Canvas(list_wrap, highlightthickness=0,
-                               height=min(300, 30 * len(behaviors) + 4))
+                               height=self.ui_px(min(300, 30 * len(behaviors) + 4)))
             scroll = ttk.Scrollbar(list_wrap, orient='vertical', command=canvas.yview)
             inner = ttk.Frame(canvas)
             inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
@@ -29409,7 +29710,7 @@ cat("OK\n")
             wrap = ttk.Frame(body)
             wrap.grid(row=1, column=0, sticky='nw', padx=(4, 24))
             bcanvas = tk.Canvas(wrap, highlightthickness=0, borderwidth=0,
-                                width=200, height=340)
+                                width=self.ui_px(200), height=self.ui_px(340))
             bscroll = ttk.Scrollbar(wrap, orient='vertical', command=bcanvas.yview)
             beh_frame = ttk.Frame(bcanvas)
             beh_frame.bind(
@@ -32329,12 +32630,17 @@ cat("OK\n")
         # Show export dialog
         export_win = tk.Toplevel(self.root)
         export_win.title("Export Bout Order Data")
-        export_win.geometry("780x520")
+        self.fit_toplevel(export_win, 780, 520)
 
         ttk.Label(export_win,
                   text="Copy the text below directly into Excel/Prism/etc. (tab-separated),\n"
                        "or save to a .csv file.",
                   font=('Segoe UI', 9)).pack(pady=(8, 4), padx=10, anchor='w')
+
+        # Reserve the action row before the expanding text box, so Copy/Save
+        # stay on-screen when the window is clamped to a short display.
+        btn_frame = ttk.Frame(export_win)
+        btn_frame.pack(side=tk.BOTTOM, fill='x', padx=10, pady=(0, 10))
 
         text_frame = ttk.Frame(export_win)
         text_frame.pack(fill='both', expand=True, padx=10, pady=(0, 6))
@@ -32345,9 +32651,6 @@ cat("OK\n")
         sb.config(command=text_box.yview)
         text_box.insert('1.0', text_content)
         text_box.config(state='disabled')
-
-        btn_frame = ttk.Frame(export_win)
-        btn_frame.pack(fill='x', padx=10, pady=(0, 10))
 
         def copy_to_clipboard():
             export_win.clipboard_clear()
@@ -33952,13 +34255,18 @@ cat("OK\n")
         # Create new window
         req_window = tk.Toplevel(self.root)
         req_window.title("requirements.txt")
-        req_window.geometry("500x400")
+        self.fit_toplevel(req_window, 500, 400)
         
+        # Copy row first so it keeps its space when the window is clamped to a
+        # short screen; the text pane scrolls above it.
+        copy_row = ttk.Frame(req_window)
+        copy_row.pack(side='bottom', fill='x')
+
         # Text widget
         text = tk.Text(req_window, wrap='word', font=('Consolas', 10))
         scrollbar = ttk.Scrollbar(req_window, command=text.yview)
         text.config(yscrollcommand=scrollbar.set)
-        
+
         text.pack(side='left', fill='both', expand=True, padx=5, pady=5)
         scrollbar.pack(side='right', fill='y')
         
@@ -33974,7 +34282,7 @@ cat("OK\n")
             req_window.clipboard_clear()
             req_window.clipboard_append(content)
         
-        ttk.Button(req_window, text="Copy to Clipboard", 
+        ttk.Button(copy_row, text="Copy to Clipboard",
                   command=copy_to_clipboard).pack(pady=5)
 
     # ======================== Update Methods ========================
@@ -34780,10 +35088,10 @@ cat("OK\n")
             ttk.Label(frame, text=subtitle, foreground='#777',
                       font=('Segoe UI', 8)).pack(anchor='w', pady=(1, 0))
         status_var = tk.StringVar(value="Initializing…")
-        ttk.Label(frame, textvariable=status_var, wraplength=440,
+        ttk.Label(frame, textvariable=status_var, wraplength=self.ui_px(440),
                   font=('Segoe UI', 9)).pack(anchor='w', pady=(8, 1))
         detail_var = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=detail_var, wraplength=440,
+        ttk.Label(frame, textvariable=detail_var, wraplength=self.ui_px(440),
                   foreground='#777', font=('Segoe UI', 8)).pack(anchor='w')
 
         barrow = ttk.Frame(frame)
@@ -35679,12 +35987,18 @@ cat("OK\n")
 
         win = tk.Toplevel(self.root)
         win.title("Decision Probability Settings")
-        win.geometry("430x560")
+        self.fit_toplevel(win, 430, 560)
         win.resizable(False, False)
         win.transient(self.root)
         self._dec_prob_settings_win = win
 
-        main = ttk.Frame(win, padding=12)
+        # Close is pinned to the window (not the body) so it survives the
+        # height clamp on a 768p screen; the settings scroll above it.
+        close_row = ttk.Frame(win)
+        close_row.pack(side=tk.BOTTOM, fill='x')
+        ttk.Button(close_row, text="Close", command=win.destroy).pack(pady=6)
+
+        main = ttk.Frame(self.make_scrollable(win), padding=12)
         main.pack(fill='both', expand=True)
 
         def _row(parent, label, var, row_idx):
@@ -35750,8 +36064,6 @@ cat("OK\n")
                             "Requires Subject-mean averaging method.",
                   foreground='gray', font=('TkDefaultFont', 8)).grid(
             row=1, column=0, columnspan=2, sticky='w', padx=6)
-
-        ttk.Button(main, text="Close", command=win.destroy).pack(pady=(4, 0))
 
     # ── Core computation ──────────────────────────────────────────────────────
 
@@ -37437,15 +37749,19 @@ cat("OK\n")
         # Size the control column to its content (with a sensible minimum) so
         # nothing is clipped — a hard-fixed pixel width overflowed at higher
         # Windows DPI scaling, cutting off button labels.
-        ctrl_panel = ttk.Frame(outer, width=CONTROL_PANEL_W)
-        ctrl_panel.pack(side='left', fill='y', padx=(0, 5))
-        ctrl_panel.pack_propagate(True)
+        ctrl_outer = ttk.Frame(outer, width=CONTROL_PANEL_W)
+        ctrl_outer.pack(side='left', fill='y', padx=(0, 5))
+        ctrl_outer.pack_propagate(True)
+        # The control stack is taller than a 768p viewport, which put the
+        # analysis buttons at its foot out of reach; scroll it instead.
+        ctrl_panel = self.make_scrollable(ctrl_outer, fit_width=True)
 
-        # Prominent BETA badge — this tab is new/experimental.
+        # BETA badge — this tab is new/experimental. Kept modest: at 26 pt it
+        # cost ~50 px of a control column that already overflows short screens.
         beta_badge = tk.Label(ctrl_panel, text="BETA",
-                              font=('Segoe UI', 26, 'bold'),
-                              fg='white', bg='#e67e22', padx=10, pady=2)
-        beta_badge.pack(fill='x', pady=(0, 6))
+                              font=('Segoe UI', 13, 'bold'),
+                              fg='white', bg='#e67e22', padx=8, pady=1)
+        beta_badge.pack(fill='x', pady=(0, 4))
 
         self.kin_plot_frame = ttk.Frame(outer)
         self.kin_plot_frame.pack(side='left', fill='both', expand=True)
@@ -37653,7 +37969,7 @@ cat("OK\n")
                 pass
         win = tk.Toplevel(self.root)
         win.title("Kinematics Graph Settings")
-        win.geometry("420x520")
+        self.fit_toplevel(win, 420, 520)
         win.transient(self.root)
         self._kin_settings_win = win
         g = self.kin_gfx
@@ -37673,7 +37989,12 @@ cat("OK\n")
         v_zmin      = tk.StringVar(value=str(g['zmin']))
         v_zmax      = tk.StringVar(value=str(g['zmax']))
 
-        main = ttk.Frame(win, padding=12)
+        # Apply/Cancel pinned to the window and the settings scrolled above it,
+        # so the buttons survive the height clamp on a 768p screen.
+        bf = ttk.Frame(win, padding=(12, 6))
+        bf.pack(side=tk.BOTTOM, fill='x')
+
+        main = ttk.Frame(self.make_scrollable(win), padding=12)
         main.pack(fill='both', expand=True)
 
         cmaps = ['coolwarm', 'RdBu_r', 'bwr', 'seismic', 'viridis', 'plasma',
@@ -37756,8 +38077,6 @@ cat("OK\n")
             if self.kin_figure is not None:
                 self.run_kinematics()
 
-        bf = ttk.Frame(main)
-        bf.pack(fill='x', pady=(4, 0))
         ttk.Button(bf, text="Apply", command=_apply).pack(side='right', padx=4)
         ttk.Button(bf, text="Cancel", command=win.destroy).pack(side='right')
 
@@ -37767,12 +38086,12 @@ cat("OK\n")
         text = self.KIN_EXPLAIN.get(analysis, "No description available for this analysis.")
         win = tk.Toplevel(self.root)
         win.title(f"About: {analysis}")
-        win.geometry("560x340")
+        self.fit_toplevel(win, 560, 340)
         win.transient(self.root)
         frame = ttk.Frame(win, padding=12)
         frame.pack(fill='both', expand=True)
         ttk.Label(frame, text=analysis, font=('TkDefaultFont', 12, 'bold'),
-                  wraplength=520, justify='left').pack(anchor='w', pady=(0, 8))
+                  wraplength=self.ui_px(520), justify='left').pack(anchor='w', pady=(0, 8))
         body = tk.Text(frame, wrap='word', font=('TkDefaultFont', 10),
                        relief='flat', height=12)
         body.insert('1.0', text)
@@ -39158,7 +39477,11 @@ cat("OK\n")
     def _kin_show_table_window(self, df):
         win = tk.Toplevel(self.root)
         win.title("Kinematics Summary")
-        win.geometry("720x360")
+        self.fit_toplevel(win, 720, 360)
+        # Export row first: packed after the expanding table it would be the
+        # part that falls off the bottom on a short screen.
+        ttk.Button(win, text="Export CSV…",
+                   command=lambda: self._kin_export_df(df)).pack(side='bottom', pady=4)
         cols = list(df.columns)
         tree = ttk.Treeview(win, columns=cols, show='headings')
         for c in cols:
@@ -39167,8 +39490,6 @@ cat("OK\n")
         for _, r in df.iterrows():
             tree.insert('', 'end', values=[r[c] for c in cols])
         tree.pack(fill='both', expand=True, side='top')
-        ttk.Button(win, text="Export CSV…",
-                   command=lambda: self._kin_export_df(df)).pack(pady=4)
 
     def _kin_export_df(self, df):
         path = filedialog.asksaveasfilename(
