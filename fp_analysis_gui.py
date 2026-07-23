@@ -9,6 +9,7 @@ import tkinter.simpledialog
 import tkinter.font as tkfont
 import pandas as pd
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
@@ -36,8 +37,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.9.0"
-APP_VERSION_DATE = "July 21, 2026"
+APP_VERSION = "1.10.0"
+APP_VERSION_DATE = "July 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -50,6 +51,10 @@ APP_VERSION_DATE = "July 21, 2026"
 #                       them are not clipped.
 #   SECTION_PAD / WIDGET_PAD : standard outer / inter-widget padding.
 MAX_PLOT_WIDTH_IN = 13.0
+# Base multiplier applied to every embedded figure so plots render deliberately
+# SMALL by default (never filling the window); the user's plot_scale setting
+# multiplies on top of this. See _embed_plot_canvas and set_plot_scale.
+PLOT_BASE_SCALE = 0.8
 CONTROL_PANEL_W = 320
 SECTION_PAD = 5
 WIDGET_PAD = 3
@@ -1205,6 +1210,9 @@ class FPAnalysisGUI:
                 {'name': 'High',       'fmin': 8.0,  'fmax': 12.0},
             ],
         }
+        # Restore any coherence settings the user persisted in a prior session
+        # (e.g. custom frequency bands) so they don't revert to defaults.
+        self._load_persisted_conn_params()
         # Storage for group coherence comparison results
         self.group_coherence_results = {}
 
@@ -1515,6 +1523,17 @@ class FPAnalysisGUI:
                 label=f"{label}  ({int(value * 100)}%)",
                 variable=self._ui_scale_var, value=value,
                 command=lambda v=value: self.set_ui_scale(v))
+
+        # Plot size. Figures render deliberately small by default; this lets the
+        # user scale them up/down. Persisted between sessions.
+        plot_menu = tk.Menu(settings_menu, tearoff=0)
+        settings_menu.add_cascade(label="Plot Size", menu=plot_menu)
+        self._plot_scale_var = tk.DoubleVar(value=getattr(self, 'plot_scale', 1.0))
+        for label, value in self.PLOT_SCALE_PRESETS:
+            plot_menu.add_radiobutton(
+                label=f"{label}  ({int(value * 100)}%)",
+                variable=self._plot_scale_var, value=value,
+                command=lambda v=value: self.set_plot_scale(v))
         settings_menu.add_separator()
         settings_menu.add_command(label="\ud83d\udcbe Save Configuration Preset", command=self.save_config_preset)
         settings_menu.add_command(label="\ud83d\udcc2 Load Configuration Preset", command=self.load_config_preset)
@@ -1548,8 +1567,67 @@ class FPAnalysisGUI:
         ("Large", 1.15),
     ]
 
+    # Global plot-size presets (multiplies PLOT_BASE_SCALE). 100% = the compact
+    # default; users who want bigger graphs pick a larger value.
+    PLOT_SCALE_PRESETS = [
+        ("Tiny", 0.5),
+        ("Small", 0.75),
+        ("Default", 1.0),
+        ("Large", 1.25),
+        ("Larger", 1.5),
+        ("Huge", 2.0),
+    ]
+
     def _ui_prefs_path(self):
         return os.path.join(os.path.expanduser('~'), '.tracy_ui.json')
+
+    def _load_ui_prefs(self):
+        """Return the persisted UI-prefs dict (empty on any error). The file is a
+        shared JSON store for cross-session settings (UI scale, coherence
+        frequency bands, …)."""
+        try:
+            with open(self._ui_prefs_path(), 'r') as fh:
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_ui_prefs(self, updates):
+        """Merge ``updates`` into the persisted UI-prefs file (read-modify-write)
+        so writing one key never clobbers the others."""
+        try:
+            prefs = self._load_ui_prefs()
+            prefs.update(updates)
+            with open(self._ui_prefs_path(), 'w') as fh:
+                json.dump(prefs, fh)
+        except Exception:
+            pass
+
+    def _persist_freq_bands(self):
+        """Save the current coherence frequency bands so edits survive a restart
+        (fixes bands reverting to defaults every session)."""
+        try:
+            self._save_ui_prefs({'freq_bands': self.conn_params.get('freq_bands', [])})
+        except Exception:
+            pass
+
+    def _load_persisted_conn_params(self):
+        """Overlay persisted coherence settings onto conn_params at startup.
+        Currently restores the user-defined frequency bands; validated so a
+        corrupt file falls back to the built-in defaults already in place."""
+        prefs = self._load_ui_prefs()
+        bands = prefs.get('freq_bands')
+        if isinstance(bands, list):
+            clean = []
+            for b in bands:
+                try:
+                    clean.append({'name': str(b['name']),
+                                  'fmin': float(b['fmin']),
+                                  'fmax': float(b['fmax'])})
+                except (TypeError, KeyError, ValueError):
+                    continue
+            if clean:
+                self.conn_params['freq_bands'] = clean
 
     def _auto_ui_scale(self):
         """Pick a density from the screen height. The layouts were authored on a
@@ -1577,15 +1655,21 @@ class FPAnalysisGUI:
         if not (0.5 <= self._ui_base_scaling <= 4.0):
             self._ui_base_scaling = 1.3333333
 
-        scale = None
+        prefs = self._load_ui_prefs()
         try:
-            with open(self._ui_prefs_path(), 'r') as fh:
-                scale = float(json.load(fh).get('ui_scale'))
-        except Exception:
+            scale = float(prefs.get('ui_scale'))
+        except (TypeError, ValueError):
             scale = None
         if scale is None or not (0.6 <= scale <= 1.4):
             scale = self._auto_ui_scale()
         self.ui_scale = scale
+        # User plot-size preference (multiplies PLOT_BASE_SCALE in the embed
+        # helper). Clamped to a sane range; default 1.0.
+        try:
+            ps = float(prefs.get('plot_scale', 1.0))
+        except (TypeError, ValueError):
+            ps = 1.0
+        self.plot_scale = min(3.0, max(0.3, ps))
         self._apply_ui_scale()
 
     def _apply_ui_scale(self):
@@ -1619,17 +1703,30 @@ class FPAnalysisGUI:
         self.ui_scale = float(value)
         self._apply_ui_scale()
         self.apply_theme()
-        try:
-            with open(self._ui_prefs_path(), 'w') as fh:
-                json.dump({'ui_scale': self.ui_scale}, fh)
-        except Exception:
-            pass
+        # Merge so we don't wipe other persisted prefs (e.g. freq_bands).
+        self._save_ui_prefs({'ui_scale': self.ui_scale})
         try:
             messagebox.showinfo(
                 "UI Scale",
                 "Interface scale updated.\n\n"
                 "Some panels only re-measure when rebuilt — restart TRACY for the "
                 "change to apply everywhere.")
+        except Exception:
+            pass
+
+    def set_plot_scale(self, value):
+        """Change the global plot size at runtime and persist it. Figures are
+        re-rendered at this scale the next time they are drawn."""
+        try:
+            self.plot_scale = min(3.0, max(0.3, float(value)))
+        except (TypeError, ValueError):
+            return
+        self._save_ui_prefs({'plot_scale': self.plot_scale})
+        try:
+            messagebox.showinfo(
+                "Plot Size",
+                f"Plot size set to {int(round(self.plot_scale * 100))}%.\n\n"
+                "Re-plot (or reopen a graph) to apply the new size.")
         except Exception:
             pass
 
@@ -3807,6 +3904,8 @@ class FPAnalysisGUI:
                    command=self.visualize_group_coherence_bands).pack(side='left', padx=3)
         ttk.Button(self._grp_ws_btns, text="\U0001f4be Export",
                    command=self.export_group_coherence_comparison).pack(side='left', padx=3)
+        ttk.Button(self._grp_ws_btns, text="\U0001f517 Zone Coherence",
+                   command=self.run_zone_coherence).pack(side='left', padx=3)
 
         self._grp_bout_btns = ttk.Frame(grp_tab)
         self._grp_bout_btns.grid(row=5, column=0, columnspan=4, sticky='w', pady=(4, 0))
@@ -4180,6 +4279,9 @@ class FPAnalysisGUI:
             self.freq_bands_listbox.insert(
                 'end',
                 f"  {b['name']:<16}  {b['fmin']:.3f} – {b['fmax']:.3f} Hz")
+        # Persist after every add/edit/remove/move/reset so the bands survive a
+        # restart instead of reverting to defaults each session.
+        self._persist_freq_bands()
 
     def _freq_band_dialog(self, title, name='', fmin='', fmax=''):
         """Open a dialog to enter/edit one frequency band. Returns (name, fmin, fmax) or None."""
@@ -4428,6 +4530,143 @@ class FPAnalysisGUI:
 
         self._run_with_progress(
             "Running Group Coherence Comparison…", _worker, _on_done)
+
+    def run_zone_coherence(self):
+        """Coherence restricted to the frames the animal spends in each
+        behavioral zone category, compared across the selected groups.
+
+        For every subject the two selected channels and the tracked position are
+        read from the aligned beh_synced matrix; frames are labelled by zone
+        category and static coherence is computed on the in-zone samples of each
+        category.  Bars show the mean spectral coherence per zone, grouped.
+        (In-zone frames are concatenated before the spectral estimate, so treat
+        very short zone occupancies with caution.)"""
+        sel = self.grp_comp_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("No Groups",
+                "Select one or more groups from the comparison list.")
+            return
+        raw_names = [self.grp_comp_listbox.get(i) for i in sel]
+        selected_groups = [n.rsplit('  (n=', 1)[0].strip() for n in raw_names]
+
+        ch1 = self.conn_channel1_var.get()
+        ch2 = self.conn_channel2_var.get()
+        if ch1 == ch2:
+            messagebox.showwarning("Invalid Channels", "Please select two different channels.")
+            return
+
+        fs = float(self.params.get('fps', 30))
+        fmin = self.conn_params['static_fmin']
+        fmax = self.conn_params['static_fmax']
+        nperseg_sec = self.conn_params['static_nperseg_sec']
+        method = self.conn_params.get('coherence_method', 'Welch')
+        morlet_n = int(self.conn_params.get('morlet_n_freqs', 50))
+        morlet_w = float(self.conn_params.get('morlet_w', 6.0))
+        use_excl = self.use_exclusions_conn.get()
+        min_samples = max(int(2 * fs), int(nperseg_sec * fs))  # need a couple of segments
+
+        def _category(zone):
+            info = self.zones.get(zone)
+            if isinstance(info, dict):
+                return info.get('category', zone) or zone
+            return zone
+
+        # group -> category -> list of per-subject mean coherence
+        results = {}
+        categories_seen = []
+        try:
+            self.root.config(cursor='watch'); self.root.update()
+        except Exception:
+            pass
+        try:
+            for gname in selected_groups:
+                for subj in self.groups.get(gname, []):
+                    if subj not in self.processed_data:
+                        continue
+                    if use_excl and (self.is_subject_channel_excluded(subj, ch1) or
+                                     self.is_subject_channel_excluded(subj, ch2)):
+                        continue
+                    data = self.processed_data[subj]
+                    beh = data.get('beh_synced')
+                    if beh is None or not data.get('has_position', False) or beh.shape[1] < 4:
+                        continue
+                    col1 = self._bout_channel_column(data, ch1)
+                    col2 = self._bout_channel_column(data, ch2)
+                    if col1 is None or col2 is None or max(col1, col2) >= beh.shape[1]:
+                        continue
+                    s1 = np.asarray(beh[:, col1], dtype=float)
+                    s2 = np.asarray(beh[:, col2], dtype=float)
+                    xs = np.asarray(beh[:, 2], dtype=float)
+                    ys = np.asarray(beh[:, 3], dtype=float)
+                    # Per-frame zone category.
+                    cats = np.empty(len(xs), dtype=object)
+                    for i in range(len(xs)):
+                        if np.isnan(xs[i]) or np.isnan(ys[i]):
+                            cats[i] = None
+                        else:
+                            cats[i] = _category(self.classify_zone(xs[i], ys[i]))
+                    for cat in set(c for c in cats if c and c != 'unknown'):
+                        mask = np.array([c == cat for c in cats]) & ~np.isnan(s1) & ~np.isnan(s2)
+                        if int(np.sum(mask)) < min_samples:
+                            continue
+                        m1, m2 = s1[mask], s2[mask]
+                        if method == 'Morlet Wavelet':
+                            res = self.calculate_static_coherence_morlet(
+                                m1, m2, fs=fs, fmin=fmin, fmax=fmax, n_freqs=morlet_n, w=morlet_w)
+                        else:
+                            res = self.calculate_static_coherence(
+                                m1, m2, fs=fs, fmin=fmin, fmax=fmax, nperseg=nperseg_sec)
+                        if res is None:
+                            continue
+                        mc = float(np.nanmean(np.asarray(res['coh'])))
+                        results.setdefault(gname, {}).setdefault(cat, []).append(mc)
+                        if cat not in categories_seen:
+                            categories_seen.append(cat)
+        finally:
+            try:
+                self.root.config(cursor='')
+            except Exception:
+                pass
+
+        if not results:
+            messagebox.showwarning(
+                "No Data",
+                "Could not compute zone coherence.\n\n"
+                "Requires processed subjects with position data and enough time "
+                "spent in each zone.")
+            return
+
+        categories = sorted(categories_seen)
+        groups = [g for g in selected_groups if g in results]
+        fig = Figure(figsize=(max(5.5, 1.4 * len(categories) + 3.0), 4.6), dpi=100)
+        ax = fig.add_subplot(111)
+        x = np.arange(len(categories))
+        gw = 0.8 / max(1, len(groups))
+        gcolors = matplotlib.colormaps['tab10'](np.linspace(0, 1, max(10, len(groups))))
+        for gi, g in enumerate(groups):
+            means = [np.mean(results[g][c]) if results[g].get(c) else 0 for c in categories]
+            sems = [(np.std(results[g][c]) / np.sqrt(len(results[g][c])))
+                    if len(results[g].get(c, [])) > 1 else 0 for c in categories]
+            offset = (gi - len(groups) / 2 + 0.5) * gw
+            ax.bar(x + offset, means, gw, yerr=sems, capsize=3, label=g,
+                   color=gcolors[gi], edgecolor='black', linewidth=0.6, alpha=0.85)
+            for ci, c in enumerate(categories):
+                vals = results[g].get(c, [])
+                if vals:
+                    jitter = np.random.normal(0, 0.02, len(vals))
+                    ax.scatter(np.full(len(vals), x[ci] + offset) + jitter, vals,
+                               s=16, color='black', alpha=0.5, zorder=3)
+        ax.set_xticks(x)
+        ax.set_xticklabels(categories, rotation=20, ha='right')
+        ax.set_ylabel(f'Mean coherence ({fmin:g}–{fmax:g} Hz)')
+        ax.set_title(f'Zone coherence: {ch1} ↔ {ch2}', fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3, axis='y')
+        fig.tight_layout()
+        self._embed_plot_window(fig, f"Zone Coherence — {ch1}-{ch2}", "1000x650")
+        self.log_message(
+            f"Zone coherence computed for {ch1}-{ch2} across {len(groups)} group(s), "
+            f"{len(categories)} zone(s).")
 
     # ── Palette helper ─────────────────────────────────────────────────────
     _GRP_PALETTE = [
@@ -7747,6 +7986,8 @@ class FPAnalysisGUI:
                               command=self.generate_bout_bar_graphs)
         plot_menu.add_command(label="Compare Across Bouts",
                               command=self.compare_across_bouts)
+        plot_menu.add_command(label="Compare Channels (within groups)",
+                              command=self.compare_bout_channels)
         plot_menu.add_command(label="Compare First vs Last",
                               command=self.compare_first_vs_last_bouts)
         plot_menu.add_command(label="Binned Progression",
@@ -8046,6 +8287,9 @@ class FPAnalysisGUI:
         ttk.Button(btn_frame, text="Export Results", style='Compact.TButton',
                    command=self.export_spike_results).grid(
             row=1, column=1, sticky='ew', padx=2, pady=2)
+        ttk.Button(btn_frame, text="Spikes by Bout Phase", style='Compact.TButton',
+                   command=self.analyze_spikes_by_bout_phase).grid(
+            row=2, column=0, columnspan=2, sticky='ew', padx=2, pady=2)
 
         # ── Results Table ────────────────────────────────────────────────────
         results_frame = ttk.LabelFrame(main_frame, text="Spike Analysis Results", padding=5)
@@ -8141,6 +8385,38 @@ class FPAnalysisGUI:
         if hasattr(self, 'spike_channel_check_frame'):
             self.refresh_spike_channels()
     
+    def _spike_selected_subjects(self):
+        """Subjects implied by the current spike-tab listbox selection (groups
+        expanded to members).  Returns ``None`` when nothing is selected so
+        callers fall back to every analyzed subject.
+
+        Visualization and export use this to honor the *current* selection
+        instead of blindly showing every subject left in ``spike_results`` from
+        an earlier run (which surfaced as "random"/unselected groups appearing
+        in the plots and exports)."""
+        try:
+            sel = self.spike_listbox.curselection()
+        except Exception:
+            return None
+        if not sel:
+            return None
+        if self.spike_mode_var.get() == "Subject":
+            return {self.spike_listbox.get(i) for i in sel}
+        subs = set()
+        for i in sel:
+            subs.update(self.groups.get(self.spike_listbox.get(i), []))
+        return subs
+
+    def _spike_results_for_selection(self):
+        """``spike_results`` filtered to the current selection.  Falls back to
+        the full set when nothing is selected or the selection matches nothing
+        analyzed (so a stale selection never blanks the plot)."""
+        sel = self._spike_selected_subjects()
+        if not sel:
+            return dict(self.spike_results)
+        filtered = {s: r for s, r in self.spike_results.items() if s in sel}
+        return filtered if filtered else dict(self.spike_results)
+
     def run_spike_analysis(self):
         """Run spike analysis on selected subjects/groups"""
         selected_indices = self.spike_listbox.curselection()
@@ -8394,13 +8670,15 @@ class FPAnalysisGUI:
                       'Total Duration (min)']
             ws.append(headers)
             
-            # Write data - respecting exclusions and channel selection
-            for subject, results in self.spike_results.items():
+            # Write data - respecting exclusions, channel selection AND the
+            # current subject/group selection (so unselected leftovers from an
+            # earlier run aren't silently exported).
+            for subject, results in self._spike_results_for_selection().items():
                 # Apply exclusions if enabled
                 excluded_channels = self.exclusions.get(subject, []) if self.use_exclusions_spike.get() else []
-                
+
                 group_name = subject_to_group.get(subject, "N/A")
-                
+
                 # Get session duration
                 if subject in self.processed_data:
                     data = self.processed_data[subject]
@@ -8475,12 +8753,15 @@ class FPAnalysisGUI:
                     subject_to_group[member] = group_name
             
             fps = self.params['fps']
-            
+
+            # Restrict to the current subject/group selection.
+            sel_results = self._spike_results_for_selection()
+
             # First pass: determine maximum number of bins across all subjects
             max_bins = 0
             subject_bin_data = {}
-           
-            for subject in self.spike_results.keys():
+
+            for subject in sel_results.keys():
                 # Apply exclusions if enabled
                 if self.use_exclusions_spike.get():
                     excluded_channels = self.exclusions.get(subject, [])
@@ -8515,8 +8796,8 @@ class FPAnalysisGUI:
             
             # Build rows with bins as columns
             rows = []
-            
-            for subject in self.spike_results.keys():
+
+            for subject in sel_results.keys():
                 # Apply exclusions again
                 if self.use_exclusions_spike.get():
                     excluded_channels = self.exclusions.get(subject, [])
@@ -8623,12 +8904,15 @@ class FPAnalysisGUI:
                     subject_to_group[member] = group_name
             
             fps = self.params['fps']
-            
+
+            # Restrict to the current subject/group selection.
+            sel_results = self._spike_results_for_selection()
+
             # First pass: collect all unique zones across all subjects
             all_zones = set()
             subject_zone_data = {}
-            
-            for subject in self.spike_results.keys():
+
+            for subject in sel_results.keys():
                 # Apply exclusions if enabled
                 if self.use_exclusions_spike.get():
                     excluded_channels = self.exclusions.get(subject, [])
@@ -8636,12 +8920,12 @@ class FPAnalysisGUI:
                     if excluded_channels and show_g0 and show_g1:
                         if 'G0' in excluded_channels and 'G1' in excluded_channels:
                             continue
-                
+
                 if subject not in self.spike_data or subject not in self.processed_data:
                     continue
-                
+
                 data = self.processed_data[subject]
-                
+
                 # Check if behavioral data exists
                 if 'beh_synced' not in data:
                     self.log_message(f"Warning: No behavioral data for {subject}, skipping zone-binned export")
@@ -8700,8 +8984,8 @@ class FPAnalysisGUI:
             
             # Build rows with zones as columns
             rows = []
-            
-            for subject in self.spike_results.keys():
+
+            for subject in sel_results.keys():
                 # Apply exclusions again
                 if self.use_exclusions_spike.get():
                     excluded_channels = self.exclusions.get(subject, [])
@@ -8825,15 +9109,19 @@ class FPAnalysisGUI:
         # Determine if we're in group mode
         group_mode = self.spike_mode_var.get() == "Group"
 
+        # Restrict to the currently-selected subjects/groups so the plot always
+        # reflects the selection instead of every subject left in spike_results.
+        spike_results = self._spike_results_for_selection()
+
         # Check if single subject selected in Subject mode
-        if not group_mode and len(self.spike_results) == 1:
-            subject = list(self.spike_results.keys())[0]
+        if not group_mode and len(spike_results) == 1:
+            subject = list(spike_results.keys())[0]
             self._plot_single_subject_spikes(fig, subject)
             return
 
         # Collect which channels actually have data across all results
         available_channels = set()
-        for results in self.spike_results.values():
+        for results in spike_results.values():
             available_channels.update(results.keys())
 
         # Use the intersection of active + available; fallback to all available
@@ -8863,18 +9151,18 @@ class FPAnalysisGUI:
             if group_mode:
                 data_rate = {}
                 data_amp  = {}
-                for subject, results in self.spike_results.items():
+                for subject, results in spike_results.items():
                     if ch_name not in results:
                         continue
                     group = subject_to_group.get(subject, "Ungrouped")
                     data_rate.setdefault(group, []).append(results[ch_name]['spike_rate_per_min'])
                     data_amp.setdefault(group,  []).append(results[ch_name]['mean_amplitude'])
             else:
-                subjects  = list(self.spike_results.keys())
-                data_rate = {s: [self.spike_results[s][ch_name]['spike_rate_per_min']]
-                             for s in subjects if ch_name in self.spike_results[s]}
-                data_amp  = {s: [self.spike_results[s][ch_name]['mean_amplitude']]
-                             for s in subjects if ch_name in self.spike_results[s]}
+                subjects  = list(spike_results.keys())
+                data_rate = {s: [spike_results[s][ch_name]['spike_rate_per_min']]
+                             for s in subjects if ch_name in spike_results[s]}
+                data_amp  = {s: [spike_results[s][ch_name]['mean_amplitude']]
+                             for s in subjects if ch_name in spike_results[s]}
 
             if not data_rate:
                 continue
@@ -9028,17 +9316,178 @@ class FPAnalysisGUI:
 
         fig.tight_layout()
     
+    def analyze_spikes_by_bout_phase(self):
+        """Compare transient rate in the pre / during / post windows around a
+        behavior's bouts, per group.  Answers "does firing change before vs.
+        during vs. after the behavior?".  Uses the detected transient times and
+        the extracted bout onset/end frames."""
+        if not self.spike_data:
+            messagebox.showinfo("No Data", "Please run spike analysis first.")
+            return
+
+        sel_subjects = list(self._spike_results_for_selection().keys())
+        if not sel_subjects:
+            messagebox.showinfo("No Selection", "Select subjects/groups and run spike analysis.")
+            return
+
+        # Behaviors available across the selection.
+        behaviors = set()
+        for s in sel_subjects:
+            behaviors.update(self.processed_data.get(s, {}).get('bouts', {}).keys())
+        behaviors = sorted(behaviors)
+        if not behaviors:
+            messagebox.showinfo("No Bouts", "No extracted bouts found for the selection.\n"
+                                            "Process data with a boutframes file first.")
+            return
+
+        # Small modal: behavior + window length.
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Spikes by Bout Phase")
+        dlg.transient(self.root); dlg.grab_set()
+        self.fit_toplevel(dlg, 340, 200)
+        frm = ttk.Frame(dlg, padding=14); frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text="Behavior:").grid(row=0, column=0, sticky='w', pady=3)
+        beh_var = tk.StringVar(value=behaviors[0])
+        ttk.Combobox(frm, textvariable=beh_var, values=behaviors, state='readonly',
+                     width=20).grid(row=0, column=1, pady=3)
+        ttk.Label(frm, text="Pre/Post window (s):").grid(row=1, column=0, sticky='w', pady=3)
+        win_var = tk.StringVar(value="5")
+        ttk.Entry(frm, textvariable=win_var, width=8).grid(row=1, column=1, sticky='w', pady=3)
+        res = {'ok': False}
+        def _go():
+            res['ok'] = True; dlg.destroy()
+        ttk.Button(frm, text="Analyze", command=_go).grid(row=2, column=0, pady=10)
+        ttk.Button(frm, text="Cancel", command=dlg.destroy).grid(row=2, column=1, sticky='w', pady=10)
+        self.root.wait_window(dlg)
+        if not res['ok']:
+            return
+        behavior = beh_var.get()
+        try:
+            win_sec = float(win_var.get())
+            if win_sec <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Pre/Post window must be a positive number of seconds.")
+            return
+
+        fps = self.params['fps']
+        active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
+        apply_excl = self.use_exclusions_spike.get()
+        group_mode = self.spike_mode_var.get() == "Group"
+        subject_to_group = {}
+        for g, members in self.groups.items():
+            for mm in members:
+                subject_to_group[mm] = g
+
+        phases = ['Pre', 'During', 'Post']
+        # group -> phase -> list of per-subject mean rates (per min)
+        data = {}
+        for subject in sel_subjects:
+            sdata = self.spike_data.get(subject, {})
+            entry = self.processed_data.get(subject, {}).get('bouts', {}).get(behavior, {})
+            onsets = entry.get('onset_frames') or []
+            ends = entry.get('end_frames')
+            if not onsets:
+                continue
+            group = subject_to_group.get(subject, "Ungrouped") if group_mode else subject
+            for ch in sdata:
+                if active_channels and ch not in active_channels:
+                    continue
+                if apply_excl and self.is_subject_channel_excluded(subject, ch):
+                    continue
+                spike_t = np.asarray(sdata[ch].get('spike_times', []), dtype=float)  # seconds
+                if spike_t.size == 0:
+                    # still counts as 0 rate; keep going
+                    spike_t = np.array([])
+                per_phase = {p: [] for p in phases}  # per-bout rate/min
+                for i, onset_f in enumerate(onsets):
+                    onset_s = float(onset_f) / fps
+                    end_s = None
+                    if ends is not None and i < len(ends) and ends[i] is not None:
+                        try:
+                            ev = float(ends[i])
+                            if not np.isnan(ev):
+                                end_s = ev / fps
+                        except (TypeError, ValueError):
+                            end_s = None
+                    if end_s is None or end_s <= onset_s:
+                        end_s = onset_s + win_sec  # fallback "during" when no end frame
+                    windows = {
+                        'Pre':    (onset_s - win_sec, onset_s),
+                        'During': (onset_s, end_s),
+                        'Post':   (end_s, end_s + win_sec),
+                    }
+                    for p, (a, b) in windows.items():
+                        dur_min = max(1e-9, (b - a) / 60.0)
+                        cnt = int(np.sum((spike_t >= a) & (spike_t < b)))
+                        per_phase[p].append(cnt / dur_min)
+                if any(per_phase[p] for p in phases):
+                    data.setdefault(group, {p: [] for p in phases})
+                    for p in phases:
+                        if per_phase[p]:
+                            data[group][p].append(float(np.mean(per_phase[p])))
+
+        if not data:
+            messagebox.showwarning("No Data",
+                                   f"No transients/bouts to compare for '{behavior}'.")
+            return
+
+        groups = list(data.keys())
+        fig = Figure(figsize=(max(5.0, 1.6 * len(groups) + 3.0), 4.5), dpi=100)
+        ax = fig.add_subplot(111)
+        phase_colors = {'Pre': '#4a90e2', 'During': '#e67e22', 'Post': '#2ecc71'}
+        x = np.arange(len(groups))
+        width = 0.26
+        for pi, p in enumerate(phases):
+            means = [np.mean(data[g][p]) if data[g][p] else 0 for g in groups]
+            sems = [(np.std(data[g][p]) / np.sqrt(len(data[g][p]))) if len(data[g][p]) > 1 else 0
+                    for g in groups]
+            offset = (pi - 1) * width
+            ax.bar(x + offset, means, width, yerr=sems, capsize=3, label=p,
+                   color=phase_colors[p], edgecolor='black', linewidth=0.6, alpha=0.85)
+            for gi, g in enumerate(groups):
+                vals = data[g][p]
+                if vals:
+                    jitter = np.random.normal(0, 0.03, len(vals))
+                    ax.scatter(np.full(len(vals), x[gi] + offset) + jitter, vals,
+                               s=18, color='black', alpha=0.5, zorder=3)
+        # Friedman across phases per group (paired by subject) when computable.
+        notes = []
+        for g in groups:
+            arrs = [data[g][p] for p in phases]
+            n = min(len(a) for a in arrs)
+            if n >= 3:
+                try:
+                    stat, pval = stats.friedmanchisquare(*[a[:n] for a in arrs])
+                    notes.append(f"{g}: Friedman p={pval:.3g} (n={n})")
+                except Exception:
+                    pass
+        ax.set_xticks(x)
+        ax.set_xticklabels(groups, rotation=20, ha='right')
+        ax.set_ylabel('Transient rate (per min)')
+        ax.set_title(f"Transient rate by bout phase — {behavior}\n(pre/post window = {win_sec:g}s)",
+                     fontsize=11, fontweight='bold')
+        ax.legend(title='Phase', fontsize=9)
+        ax.grid(True, alpha=0.3, axis='y')
+        if notes:
+            ax.text(0.01, 0.99, "\n".join(notes), transform=ax.transAxes, va='top', ha='left',
+                    fontsize=8, color='#444',
+                    bbox=dict(boxstyle='round', fc='white', ec='#ccc', alpha=0.8))
+        fig.tight_layout()
+        self._embed_plot_window(fig, f"Spikes by Bout Phase — {behavior}", "1000x650")
+
     def visualize_spikes_by_zone(self):
         """Analyze and visualize spike frequency by behavioral zone"""
         if not self.spike_results:
             messagebox.showinfo("No Data", "Please run spike analysis first")
             return
         
-        # Get subjects from spike results
-        subjects = list(self.spike_results.keys())
-        
+        # Get subjects from spike results, restricted to the current selection so
+        # zone plots don't include unselected groups left over from a prior run.
+        subjects = list(self._spike_results_for_selection().keys())
+
         # Check if any subjects have position data
-        subjects_with_position = [s for s in subjects if s in self.processed_data and 
+        subjects_with_position = [s for s in subjects if s in self.processed_data and
                                  self.processed_data[s].get('has_position', False)]
         
         if not subjects_with_position:
@@ -9078,73 +9527,33 @@ class FPAnalysisGUI:
             fig.text(0.5, 0.5, 'No zones defined', ha='center', va='center')
             return
         
-        # Aggregate arm zones (average rates for matching arm pairs)
+        # Aggregate sub-zones into their overarching behavioral category so
+        # matching sub-zones roll up under one label instead of being plotted
+        # individually.  This uses each zone's template 'category' (e.g. the four
+        # OFT corners share category 'corner'; the two EPM open arms share
+        # 'open'), which correctly handles OFT/OFT-style mazes where the old
+        # up/down/left/right name-pattern matching left every corner separate.
+        # Falls back to the zone's own name when it has no category (e.g. custom
+        # user zones), so those are still shown individually.
+        def _zone_category(zone):
+            zinfo = self.zones.get(zone)
+            if isinstance(zinfo, dict):
+                cat = zinfo.get('category')
+                if cat:
+                    return cat
+            return zone
+
         def aggregate_zones(zone_data):
-            """Aggregate matching arm pairs (up/down, left/right) by averaging rates"""
-            aggregated = {}
-            used_zones = set()
-            
+            """Average each category's sub-zone rates (non-zero values only, so a
+            never-visited sub-zone doesn't drag the mean down)."""
+            from collections import OrderedDict
+            buckets = OrderedDict()
             for zone in all_zone_names:
-                if zone in used_zones:
-                    continue
-                
-                # Check for matching pairs - handle both prefix and suffix patterns
-                partner_zone = None
-                display_name = zone
-                
-                # Check for suffix patterns (*_up, *_down, *_left, *_right)
-                if zone.endswith('_up'):
-                    base_name = zone[:-3]  # Remove '_up' suffix
-                    partner_zone = base_name + '_down'
-                    display_name = base_name
-                elif zone.endswith('_down'):
-                    base_name = zone[:-5]  # Remove '_down' suffix
-                    partner_zone = base_name + '_up'
-                    display_name = base_name
-                elif zone.endswith('_left'):
-                    base_name = zone[:-5]  # Remove '_left' suffix
-                    partner_zone = base_name + '_right'
-                    display_name = base_name
-                elif zone.endswith('_right'):
-                    base_name = zone[:-6]  # Remove '_right' suffix
-                    partner_zone = base_name + '_left'
-                    display_name = base_name
-                # Check for prefix patterns (top_*, bottom_*, left_*, right_*)
-                elif zone.startswith('top_'):
-                    partner_zone = 'bottom_' + zone[4:]
-                    display_name = zone[4:]
-                elif zone.startswith('bottom_'):
-                    partner_zone = 'top_' + zone[7:]
-                    display_name = zone[7:]
-                elif zone.startswith('left_'):
-                    partner_zone = 'right_' + zone[5:]
-                    display_name = zone[5:]
-                elif zone.startswith('right_'):
-                    partner_zone = 'left_' + zone[6:]
-                    display_name = zone[6:]
-                
-                # Average the two arms if partner exists
-                if partner_zone and partner_zone in all_zone_names:
-                    zone1_val = zone_data.get(zone, 0)
-                    zone2_val = zone_data.get(partner_zone, 0)
-                    
-                    # Average non-zero values
-                    if zone1_val > 0 and zone2_val > 0:
-                        aggregated[display_name] = (zone1_val + zone2_val) / 2
-                    elif zone1_val > 0:
-                        aggregated[display_name] = zone1_val
-                    elif zone2_val > 0:
-                        aggregated[display_name] = zone2_val
-                    else:
-                        aggregated[display_name] = 0
-                    
-                    used_zones.add(zone)
-                    used_zones.add(partner_zone)
-                else:
-                    # No partner, use as-is
-                    aggregated[display_name] = zone_data.get(zone, 0)
-                    used_zones.add(zone)
-            
+                buckets.setdefault(_zone_category(zone), []).append(zone_data.get(zone, 0))
+            aggregated = OrderedDict()
+            for cat, vals in buckets.items():
+                nonzero = [v for v in vals if v > 0]
+                aggregated[cat] = float(np.mean(nonzero)) if nonzero else 0
             return aggregated
         
         # Get aggregated zone names
@@ -9569,6 +9978,64 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Fix — Bout plots ignored your channel selection. Every group / multi-subject and
+    bout-order plot was hardwired to the first two green channels, so ticking a red
+    (570 nm) channel such as R4/R5 still produced G0/G1 plots. All of those views now
+    resolve the actual channel checkboxes, plot the channels you picked, label the
+    axes/titles/heatmaps with the real designation, and apply per-channel exclusions
+    to the right channel.
+  • Fix — "Compare Across Bouts" stopped short. A length pre-filter dropped later and
+    edge-clipped bouts before they were ever measured, so a group's line ended after
+    the first couple of bouts even though the metrics table listed the rest. Bouts are
+    now validated the same way in both paths.
+  • New — Compare Channels (Bout Analysis → Plot ▾ → "Compare Channels (within
+    groups)"). Overlays each channel's mean ± SEM peri-onset trace, one panel per
+    group, so channels can be compared in the GUI rather than only in the export.
+  • New — Plot Size setting (Settings → Plot Size). Embedded figures now render
+    deliberately compact instead of filling the window, and the size is adjustable
+    from Tiny (50%) to Huge (200%). Scaling moves fonts and layout together, so plots
+    stay legible at any size. Remembered between sessions.
+  • Fix — Wide plots could not be fully seen. Pop-out plot windows now have BOTH
+    scrollbars and render the figure at its natural width (Shift+wheel scrolls
+    horizontally), so many-panel figures such as whole-session coherence can be
+    scrolled through instead of being squeezed to fit; the window itself is clamped to
+    your screen.
+  • New — Zone Coherence (Coherence → group comparison → "Zone Coherence"). Computes
+    coherence between two channels separately for the frames spent in each behavioral
+    zone category and compares them across groups, with per-subject points and SEM.
+  • Fix — Coherence frequency bands reverted to the defaults every restart. Custom
+    bands are now saved as you add/edit/remove/reorder them and restored at startup.
+    The settings file is merged rather than overwritten, so saving one preference no
+    longer wipes the others.
+  • New — Spikes by Bout Phase (Spike Analysis → "Spikes by Bout Phase"). Compares
+    transient rate before / during / after a behavior's bouts, per group, using the
+    detected transients and the extracted onset/end frames, with a Friedman test
+    across the three phases where n allows.
+  • Fix — Spike plots and exports showed subjects you had not selected. Every spike
+    visualization and export (summary, time-binned, zone-binned, by-zone) now honors
+    the current subject/group selection instead of including whatever was left in
+    memory from an earlier run.
+  • Change — Spike-by-zone plots aggregate sub-zones by their zone category instead of
+    guessing from up/down/left/right name patterns, so the four OFT corners (or any
+    template's matching sub-zones) roll up under one bar instead of being listed
+    separately. Custom zones without a category are still shown individually.
+  • Change — Signal-integrity auto-exclude now asks first. Instead of silently
+    excluding, it opens a review window listing every evaluated subject/channel with
+    its score; below-threshold channels are pre-ticked, and you can untick one to keep
+    it (useful for preserving n in a small group) or tick an above-threshold channel
+    to drop it anyway. Only what you leave ticked is applied.
+  • Change — Decision Probability is no longer EPM-only. New "Decision Zones" From/To
+    selectors let you define the transition for any arena (EPM, OFT, custom); the
+    outcome checkboxes, plot legends, and stats labels rename themselves to match the
+    chosen zones (defaults remain closed → open / open → closed for EPM).
+  • Fix — The Decision Probability and Signal Linkage control columns are now
+    scrollable, so their advanced options and Run buttons stay reachable on short
+    (768p) screens.
+  • Fix (internal) — Replaced the deprecated matplotlib colormap lookups that emit
+    warnings (and are slated for removal) on current matplotlib versions.
+
+Version 1.9.0  •  July 21, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix (accessibility) — Buttons at the bottom of tabs and dialogs were unreachable
     on low-resolution monitors. On a 1366x768 or 1600x900 laptop the content simply
@@ -19755,43 +20222,127 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 "None of the selected groups/subjects have processed data.")
             return
 
-        added = []   # list of (subject, channel) tuples newly excluded
-
+        # Collect every evaluated subject/channel with its score, rather than
+        # silently excluding.  The user then reviews the scores in a confirmation
+        # window and decides per channel whether to honor or ignore the
+        # auto-exclude — useful when group n is small and a poorer channel is
+        # worth keeping.
+        candidates = []  # (subject, channel, score, already_excluded)
         for subject in target_subjects:
             data = self.processed_data[subject]
             channel_metrics_list = self._extract_signal_integrity_metrics(data)
             if not channel_metrics_list:
                 continue
-
             for metrics in channel_metrics_list:
                 channel = metrics.get('channel', 'G0')
-                score = metrics.get('overall_score', 0)
+                score = float(metrics.get('overall_score', 0) or 0)
+                already = channel in self.exclusions.get(subject, [])
+                candidates.append((subject, channel, score, already))
 
-                if score < threshold:
-                    # Add to self.exclusions
-                    if subject not in self.exclusions:
-                        self.exclusions[subject] = []
-                    if channel not in self.exclusions[subject]:
-                        self.exclusions[subject].append(channel)
-                        added.append((subject, channel))
+        if not candidates:
+            messagebox.showwarning(
+                "No Data",
+                "Could not compute integrity scores for the selected groups/subjects.")
+            return
 
-        # Refresh the Exclusions tab UI so the new ticks are visible
-        self.refresh_exclusions_list()
+        self._show_auto_exclude_confirmation(candidates, threshold, len(target_subjects))
 
-        scope_note = f"{len(target_subjects)} selected subject(s)"
-        if added:
-            summary_lines = [f"  • {subj}  –  {ch}" for subj, ch in sorted(added)]
-            messagebox.showinfo(
-                "Exclusions Updated",
-                f"{len(added)} channel(s) across {scope_note} added to the "
-                f"Exclusions tab (score < {threshold:.1f}):\n\n" + "\n".join(summary_lines)
-            )
-        else:
-            messagebox.showinfo(
-                "No New Exclusions",
-                f"All channels in {scope_note} meet the minimum integrity score of "
-                f"{threshold:.1f}.\nNo new exclusions were added."
-            )
+    def _show_auto_exclude_confirmation(self, candidates, threshold, n_subjects):
+        """Confirmation window for signal-integrity auto-exclude.
+
+        Shows every evaluated subject/channel with its integrity score; channels
+        below ``threshold`` are pre-ticked for exclusion but the user can untick
+        any to keep it (e.g. to preserve n in a small group), or tick an
+        above-threshold channel to exclude it anyway.  Only the boxes left ticked
+        (and not already excluded) are added to the Exclusions tab on Apply."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirm Signal-Integrity Auto-Exclude")
+        dlg.transient(self.root)
+        self.fit_toplevel(dlg, 560, 620)
+        dlg.grab_set()
+
+        # Bottom-pinned action row (survives short-screen clamping).
+        btn_row = ttk.Frame(dlg, padding=(14, 6, 14, 12))
+        btn_row.pack(side='bottom', fill='x')
+
+        header = ttk.Frame(dlg, padding=(14, 12, 14, 4))
+        header.pack(side='top', fill='x')
+        n_below = sum(1 for _, _, s, a in candidates if s < threshold and not a)
+        ttk.Label(header, font=('Segoe UI', 11, 'bold'),
+                  text="Review channels flagged for auto-exclude").pack(anchor='w')
+        ttk.Label(header, foreground='#666', font=('Segoe UI', 9), justify='left',
+                  text=(f"Threshold: score < {threshold:.1f}   |   "
+                        f"{n_below} channel(s) flagged across {n_subjects} subject(s).\n"
+                        "Ticked = will be excluded. Untick to keep a channel; "
+                        "tick an OK channel to exclude it anyway.")).pack(anchor='w', pady=(2, 0))
+
+        # Scrollable body of one checkbox row per channel.
+        body_outer = ttk.Frame(dlg)
+        body_outer.pack(side='top', fill='both', expand=True, padx=6, pady=4)
+        body = self.make_scrollable(body_outer)
+
+        cols = ttk.Frame(body)
+        cols.pack(fill='x', pady=(2, 4))
+        ttk.Label(cols, text="Exclude", font=('Segoe UI', 9, 'bold'), width=8).grid(row=0, column=0)
+        ttk.Label(cols, text="Subject", font=('Segoe UI', 9, 'bold'), width=18).grid(row=0, column=1, sticky='w')
+        ttk.Label(cols, text="Channel", font=('Segoe UI', 9, 'bold'), width=8).grid(row=0, column=2, sticky='w')
+        ttk.Label(cols, text="Score", font=('Segoe UI', 9, 'bold'), width=8).grid(row=0, column=3, sticky='w')
+        ttk.Label(cols, text="Status", font=('Segoe UI', 9, 'bold'), width=16).grid(row=0, column=4, sticky='w')
+
+        row_vars = []  # (subject, channel, score, tk.BooleanVar, already)
+        ordered = sorted(candidates, key=lambda c: (c[3], c[2]))  # not-already first, low score first
+        for r, (subject, channel, score, already) in enumerate(ordered, 1):
+            var = tk.BooleanVar(value=(score < threshold) and not already)
+            cb = ttk.Checkbutton(cols, variable=var)
+            cb.grid(row=r, column=0)
+            if already:
+                cb.state(['disabled'])
+                var.set(True)
+            flagged = score < threshold
+            fg = '#c0392b' if flagged else '#2e7d32'
+            ttk.Label(cols, text=subject, width=18).grid(row=r, column=1, sticky='w')
+            ttk.Label(cols, text=channel, width=8).grid(row=r, column=2, sticky='w')
+            ttk.Label(cols, text=f"{score:.1f}", width=8, foreground=fg).grid(row=r, column=3, sticky='w')
+            status = "already excluded" if already else ("below threshold" if flagged else "OK")
+            ttk.Label(cols, text=status, width=16, foreground='#888' if already else fg).grid(
+                row=r, column=4, sticky='w')
+            row_vars.append((subject, channel, score, var, already))
+
+        def _set_all(flagged_only, value):
+            for subject, channel, score, var, already in row_vars:
+                if already or (flagged_only and score >= threshold):
+                    continue
+                var.set(value)
+
+        quick = ttk.Frame(header)
+        quick.pack(anchor='w', pady=(6, 0))
+        ttk.Button(quick, text="Select flagged", style='Compact.TButton',
+                   command=lambda: _set_all(True, True)).pack(side='left', padx=(0, 4))
+        ttk.Button(quick, text="Deselect all", style='Compact.TButton',
+                   command=lambda: _set_all(False, False)).pack(side='left')
+
+        def on_apply():
+            added = []
+            for subject, channel, score, var, already in row_vars:
+                if already or not var.get():
+                    continue
+                self.exclusions.setdefault(subject, [])
+                if channel not in self.exclusions[subject]:
+                    self.exclusions[subject].append(channel)
+                    added.append((subject, channel))
+            dlg.destroy()
+            self.refresh_exclusions_list()
+            if added:
+                lines = [f"  • {s} – {c}" for s, c in sorted(added)]
+                messagebox.showinfo("Exclusions Updated",
+                                    f"{len(added)} channel(s) added to the Exclusions tab:\n\n"
+                                    + "\n".join(lines))
+            else:
+                messagebox.showinfo("No New Exclusions",
+                                    "No channels were added to the Exclusions tab.")
+
+        ttk.Button(btn_row, text="Apply Selected Exclusions", command=on_apply).pack(side='left')
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='left', padx=6)
 
     def refresh_exclusions_list(self):
         """Refresh the exclusions list with current subjects and their channels"""
@@ -20018,6 +20569,53 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             key = f"transition_to_{zone_name}"
             result[label] = (key, zone_name)
         return result if result else {"(No zones defined)": ("no_entries", "none")}
+
+    def _dec_prob_base_categories(self):
+        """Distinct base zone categories for the Decision Probability From/To
+        selectors.  Proximal/distal sub-categories collapse to their base (so
+        'open' covers open_proximal + open_distal), giving a clean generic
+        selector that works for EPM, OFT, or any custom arena."""
+        bases = []
+        for zone, info in self.zones.items():
+            cat = (info.get('category', zone) if isinstance(info, dict) else zone) or zone
+            for suf in ('_proximal', '_distal'):
+                if cat.endswith(suf):
+                    cat = cat[:-len(suf)]
+            if cat not in bases:
+                bases.append(cat)
+        return bases
+
+    def _dec_prob_zones_for_base(self, base):
+        """Zone names whose (base) category matches ``base``."""
+        out = []
+        for zone, info in self.zones.items():
+            cat = (info.get('category', zone) if isinstance(info, dict) else zone) or zone
+            for suf in ('_proximal', '_distal'):
+                if cat.endswith(suf):
+                    cat = cat[:-len(suf)]
+            if cat == base:
+                out.append(zone)
+        return out
+
+    def _update_dec_prob_outcome_labels(self):
+        """Refresh the Decision Probability outcome checkbox text and the display
+        labels used in plots/exports to match the chosen From/To zones."""
+        frm = self.dec_prob_from_var.get() or "from"
+        to = self.dec_prob_to_var.get() or "to"
+        self._dec_prob_outcome_labels = {
+            'explore': f"{frm}→{to}",
+            'retreat': f"{to}→{frm}",
+        }
+        try:
+            self._dec_prob_explore_cb.configure(text=f"Forward  ({frm} → {to})")
+            self._dec_prob_retreat_cb.configure(text=f"Reverse  ({to} → {frm})")
+        except Exception:
+            pass
+
+    def _dec_prob_label(self, key):
+        """User-facing label for an outcome slot ('explore'/'retreat')."""
+        return getattr(self, '_dec_prob_outcome_labels', {}).get(
+            key, 'Explore' if key == 'explore' else 'Retreat')
 
     def _get_default_entry_frames_dict(self):
         """Return empty entry frame lists for all configured entry types."""
@@ -20539,7 +21137,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 avail = 1200
         return max(320, avail - 24)
 
-    def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True):
+    def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True,
+                           fit_width=True):
         """Embed a matplotlib figure (+ optional toolbar) in `parent`, rendered
         at a sensible, readable scale and centered horizontally so it does not
         stretch to fill the whole window.
@@ -20568,12 +21167,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         #      inches at the current dpi keeps the rendered plot inside the panel.
         dpi = fig.get_dpi()
         w_in, h_in = fig.get_size_inches()
-        avail_px = self._available_plot_width_px(parent)
-        max_w_in = min(MAX_PLOT_WIDTH_IN, avail_px / float(dpi))
-        if w_in > max_w_in:
-            new_dpi = max(40, dpi * (max_w_in / float(w_in)))
-            fig.set_dpi(new_dpi)
-            dpi = new_dpi
+        # Global plot-size scaling: shrink/grow every figure uniformly (dpi
+        # scales rendered pixels AND fonts together, preserving layout/aspect).
+        # PLOT_BASE_SCALE keeps defaults compact; self.plot_scale is the user
+        # setting. Applied before the width cap so a large scale can't overflow.
+        render_scale = PLOT_BASE_SCALE * float(getattr(self, 'plot_scale', 1.0) or 1.0)
+        if abs(render_scale - 1.0) > 1e-3:
+            dpi = max(20, dpi * render_scale)
+            fig.set_dpi(dpi)
+        # fit_width=False (used by the scrollable pop-out) keeps the figure at
+        # its natural width so wide, many-panel plots (e.g. whole-session
+        # coherence) render full-size and are reached by horizontal scrolling
+        # instead of being shrunk to fit — the "can't zoom out / scroll to see
+        # them all" case.
+        if fit_width:
+            avail_px = self._available_plot_width_px(parent)
+            max_w_in = min(MAX_PLOT_WIDTH_IN, avail_px / float(dpi))
+            if w_in > max_w_in:
+                new_dpi = max(40, dpi * (max_w_in / float(w_in)))
+                fig.set_dpi(new_dpi)
+                dpi = new_dpi
 
         # Honour the global gridline toggle before drawing (and remember this
         # figure so the toggle can live-update it later).
@@ -20624,12 +21237,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         outer = ttk.Frame(win)
         outer.pack(side='top', fill='both', expand=True)
+        # Both scrollbars: wide many-panel figures (e.g. whole-session coherence)
+        # need horizontal scrolling too, not just vertical.
         vscroll = ttk.Scrollbar(outer, orient='vertical')
+        hscroll = ttk.Scrollbar(outer, orient='horizontal')
         sc_canvas = tk.Canvas(outer, highlightthickness=0,
-                              yscrollcommand=vscroll.set)
+                              yscrollcommand=vscroll.set,
+                              xscrollcommand=hscroll.set)
         vscroll.config(command=sc_canvas.yview)
-        sc_canvas.pack(side='left', fill='both', expand=True)
-        vscroll.pack(side='right', fill='y')
+        hscroll.config(command=sc_canvas.xview)
+        # Grid so the two scrollbars frame the canvas without overlapping.
+        sc_canvas.grid(row=0, column=0, sticky='nsew')
+        vscroll.grid(row=0, column=1, sticky='ns')
+        hscroll.grid(row=1, column=0, sticky='ew')
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
 
         inner = ttk.Frame(sc_canvas)
         sc_canvas.create_window((0, 0), window=inner, anchor='nw')
@@ -20638,21 +21260,34 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             sc_canvas.configure(scrollregion=sc_canvas.bbox('all'))
         inner.bind('<Configure>', _sync_scrollregion)
 
-        # Reuse the in-tab embed for the cap/center logic, but keep the toolbar
-        # out of the scroll region.
-        canvas = self._embed_plot_canvas(fig, inner, add_toolbar=False)
+        # Render at natural width (fit_width=False) so wide plots overflow into
+        # the horizontal scroll region instead of being shrunk to fit; keep the
+        # toolbar out of the scroll region.
+        canvas = self._embed_plot_canvas(fig, inner, add_toolbar=False, fit_width=False)
         toolbar = NavigationToolbar2Tk(canvas, toolbar_holder)
         toolbar.update()
         self._add_grid_toolbar_button(toolbar)
 
-        # Mouse-wheel scrolls the pop-out while the pointer is over it.
+        # Mouse-wheel scrolls the pop-out while the pointer is over it; Shift+wheel
+        # scrolls horizontally (standard convention for wide content).
         def _wheel(event):
             try:
                 sc_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
             except tk.TclError:
                 pass
-        sc_canvas.bind('<Enter>', lambda e: sc_canvas.bind_all('<MouseWheel>', _wheel))
-        sc_canvas.bind('<Leave>', lambda e: sc_canvas.unbind_all('<MouseWheel>'))
+        def _wheel_h(event):
+            try:
+                sc_canvas.xview_scroll(int(-1 * (event.delta / 120)), 'units')
+            except tk.TclError:
+                pass
+        def _bind_wheels(_e=None):
+            sc_canvas.bind_all('<MouseWheel>', _wheel)
+            sc_canvas.bind_all('<Shift-MouseWheel>', _wheel_h)
+        def _unbind_wheels(_e=None):
+            sc_canvas.unbind_all('<MouseWheel>')
+            sc_canvas.unbind_all('<Shift-MouseWheel>')
+        sc_canvas.bind('<Enter>', _bind_wheels)
+        sc_canvas.bind('<Leave>', _unbind_wheels)
 
         # Size the window to the capped figure (plus toolbar / scrollbar) unless
         # the caller asked for a specific geometry.
@@ -20661,8 +21296,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         else:
             dpi = fig.get_dpi()
             w_in, h_in = fig.get_size_inches()
-            w_px = int(w_in * dpi) + 40
-            h_px = min(900, int(h_in * dpi) + 90)
+            # Clamp the WINDOW to the screen; the figure keeps its natural size
+            # inside and overflow is reached via the scrollbars. Without this a
+            # very wide/tall figure would open a window larger than the display.
+            try:
+                scr_w = int(win.winfo_screenwidth() * 0.95)
+                scr_h = int(win.winfo_screenheight() * 0.90)
+            except Exception:
+                scr_w, scr_h = 1400, 900
+            w_px = min(scr_w, int(w_in * dpi) + 60)
+            h_px = min(scr_h, int(h_in * dpi) + 90)
             win.geometry(f"{max(400, w_px)}x{max(300, h_px)}")
         return win, canvas
 
@@ -21634,7 +22277,37 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             sel.append(1)
         return sel
 
-    
+    def _viz_bout_channel_slots(self, subjects, max_slots=2):
+        """Resolve the visualization channel checkboxes into up to ``max_slots``
+        ``(bout_key, label)`` pairs for the group/multi bout plots.
+
+        The group/multi bout visualizers historically hardcoded the first two
+        channels as ``G0``/``G1``, so a red/570 selection (e.g. ``R4``/``R5``)
+        was ignored and the green channels were plotted instead.  Resolving the
+        actual checkbox selection here makes those plots honor the same channel
+        choice as the single-subject views.
+
+        ``bout_key`` is the ``Ch{n}`` key used to look up stored bouts (always
+        present in a bout entry, alongside the real designation and the legacy
+        G0/G1 aliases); ``label`` is the human channel designation (e.g. ``R4``),
+        also used as the per-channel exclusion key.  Missing slots are returned
+        as ``(None, None)`` so callers can skip them.
+        """
+        ref = {}
+        for s in subjects:
+            if s in self.processed_data:
+                ref = self.processed_data[s]
+                break
+        sel = self.get_selected_viz_channels(ref)
+        if not sel:
+            sel = [0, 1]
+        slots = []
+        for idx in sel[:max_slots]:
+            slots.append((f'Ch{idx}', self.get_channel_name(ref, idx)))
+        while len(slots) < max_slots:
+            slots.append((None, None))
+        return slots
+
     def _viz_channel_wavelengths(self, data, sel_chs, has_470, has_570):
         """Map each selected channel to its OWN wavelength for plotting.
 
@@ -26590,7 +27263,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fps = self.params['fps']
         prebout = self.params['preboutframes']
         average_within_subject = self.viz_average_within_subject.get()
-        
+
+        # Resolve the two plot slots from the channel checkboxes so the selected
+        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
+        # 'G0'/'G1' below are internal slot identifiers only; key_a/key_b are the
+        # real stored-bout keys and label_a/label_b the channel designations.
+        _slot_subjects = []
+        for _g in group_names:
+            _slot_subjects.extend(self.groups.get(_g, []))
+        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(_slot_subjects, max_slots=2)
+
         # Collect bouts per group AND track subjects for heatmap
         group_bouts = {}  # {group_name: {'G0': [bouts], 'G1': [bouts]}}
         subject_order = []  # List of (group_name, subject) tuples for heatmap ordering
@@ -26605,8 +27287,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             subjects_for_g0 = subjects
             subjects_for_g1 = subjects
             if self.use_exclusions_viz.get():
-                subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-                subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
+                subjects_for_g0 = self.get_included_subjects_for_channel(subjects, label_a)
+                subjects_for_g1 = (self.get_included_subjects_for_channel(subjects, label_b)
+                                   if key_b is not None else subjects)
             
             # We'll process all subjects and track which channels are valid
             for subject in subjects:
@@ -26634,12 +27317,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 subject_has_g0 = subject in subjects_for_g0
                 subject_has_g1 = subject in subjects_for_g1
                 
-                # Process G0 bouts for this subject (only if not excluded)
-                if subject_has_g0 and bout_data.get('G0'):
+                # Process slot-A bouts for this subject (only if not excluded)
+                if subject_has_g0 and key_a is not None and bout_data.get(key_a):
                     # Realign to current window so groups built from subjects with
                     # different pre/post still share a common onset.
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    subject_g0_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+                    subject_g0_bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
 
                     if len(subject_g0_bouts) > 0:
                         max_len = max(len(b) for b in subject_g0_bouts)
@@ -26658,10 +27341,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if (group_name, subject) not in subject_order:
                             subject_order.append((group_name, subject))
                 
-                # Process G1 bouts for this subject (only if not excluded)
-                if subject_has_g1 and bout_data.get('G1'):
+                # Process slot-B bouts for this subject (only if not excluded)
+                if subject_has_g1 and key_b is not None and bout_data.get(key_b):
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    subject_g1_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+                    subject_g1_bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
 
                     if len(subject_g1_bouts) > 0:
                         max_len = max(len(b) for b in subject_g1_bouts)
@@ -26747,8 +27430,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax1_trace.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
             ax1_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1_trace.set_xlabel('Time from bout onset (s)')
-            ax1_trace.set_ylabel('G0 Z-score')
-            ax1_trace.set_title(f'G0: {behavior} by Group')
+            ax1_trace.set_ylabel(f'{label_a} Z-score')
+            ax1_trace.set_title(f'{label_a}: {behavior} by Group')
             ax1_trace.legend(loc='best', fontsize=8)
             ax1_trace.grid(True, alpha=0.3)
             
@@ -26774,8 +27457,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax1_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
                     ax1_heat.set_xlabel('Time from bout onset (s)')
                     ax1_heat.set_ylabel('Subject (by group)')
-                    ax1_heat.set_title('G0 Heatmap' if average_within_subject
-                                       else 'G0 Heatmap (All Bouts)')
+                    ax1_heat.set_title(f'{label_a} Heatmap' if average_within_subject
+                                       else f'{label_a} Heatmap (All Bouts)')
                     ax1_heat.set_yticks(ytick_positions)
                     ax1_heat.set_yticklabels(ytick_labels, fontsize=7)
 
@@ -26817,8 +27500,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax2_trace.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
             ax2_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2_trace.set_xlabel('Time from bout onset (s)')
-            ax2_trace.set_ylabel('G1 Z-score')
-            ax2_trace.set_title(f'G1: {behavior} by Group')
+            ax2_trace.set_ylabel(f'{label_b} Z-score')
+            ax2_trace.set_title(f'{label_b}: {behavior} by Group')
             ax2_trace.legend(loc='best', fontsize=8)
             ax2_trace.grid(True, alpha=0.3)
             
@@ -26844,8 +27527,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax2_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
                     ax2_heat.set_xlabel('Time from bout onset (s)')
                     ax2_heat.set_ylabel('Subject (by group)')
-                    ax2_heat.set_title('G1 Heatmap' if average_within_subject
-                                       else 'G1 Heatmap (All Bouts)')
+                    ax2_heat.set_title(f'{label_b} Heatmap' if average_within_subject
+                                       else f'{label_b} Heatmap (All Bouts)')
                     ax2_heat.set_yticks(ytick_positions)
                     ax2_heat.set_yticklabels(ytick_labels, fontsize=7)
 
@@ -26870,14 +27553,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         
         average_within_subject = self.viz_average_within_subject.get()
-        
+
+        # Resolve the two plot slots from the channel checkboxes so the selected
+        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
+        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(subjects, max_slots=2)
+
         # Apply exclusions if enabled - need to check both channels
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
-        
+            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, label_a)
+            subjects_for_g1 = (self.get_included_subjects_for_channel(subjects, label_b)
+                               if key_b is not None else subjects)
+
         # Collect bouts from all subjects
         all_g0_bouts = []
         all_g1_bouts = []
@@ -26897,11 +27585,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # Use .get(): a subject recorded on a single channel may not
                     # have a 'G0'/'G1' key at all, and a bracket access would
                     # raise KeyError and abort the whole multi-subject plot.
-                    if subject_has_g0 and bout_data.get('G0'):
+                    if subject_has_g0 and key_a is not None and bout_data.get(key_a):
                         # Realign to current window so subjects extracted with a
                         # different pre/post still average against a common onset.
                         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        subject_g0_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+                        subject_g0_bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
 
                         max_len = max(len(b) for b in subject_g0_bouts)
                         bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
@@ -26911,9 +27599,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         all_g0_bouts.append(subject_avg)
                     
                     # Average G1 bouts for this subject (only if not excluded)
-                    if subject_has_g1 and bout_data.get('G1'):
+                    if subject_has_g1 and key_b is not None and bout_data.get(key_b):
                         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        subject_g1_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+                        subject_g1_bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
 
                         max_len = max(len(b) for b in subject_g1_bouts)
                         bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
@@ -26924,8 +27612,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 else:
                     # Use all bouts (original behavior), realigned to current window
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    bouts_g0 = self._entry_channel_bouts(bout_data, 'G0', max_bouts) if subject_has_g0 else []
-                    bouts_g1 = self._entry_channel_bouts(bout_data, 'G1', max_bouts) if subject_has_g1 else []
+                    bouts_g0 = (self._entry_channel_bouts(bout_data, key_a, max_bouts)
+                                if subject_has_g0 and key_a is not None else [])
+                    bouts_g1 = (self._entry_channel_bouts(bout_data, key_b, max_bouts)
+                                if subject_has_g1 and key_b is not None else [])
 
                     if bouts_g0:
                         all_g0_bouts.extend(bouts_g0)
@@ -26991,10 +27681,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax1.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel('G0 Z-score')
+            ax1.set_ylabel(f'{label_a} Z-score')
             n_label = f"n={len(all_g0_bouts)} subjects" if average_within_subject else f"n={len(all_g0_bouts)} bouts"
             title_suffix = " (averaged within subject)" if average_within_subject else ""
-            ax1.set_title(f'G0: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
+            ax1.set_title(f'{label_a}: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
             if average_within_subject:
                 ax1.legend(loc='best', fontsize=8)
             ax1.grid(True, alpha=0.3)
@@ -27016,7 +27706,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax3.axvline(0, color='yellow', linestyle='--', linewidth=2)
             ax3.set_xlabel('Time from bout onset (s)')
             ax3.set_ylabel(heatmap_ylabel)
-            ax3.set_title(f'G0 Heatmap{heatmap_title_suffix}')
+            ax3.set_title(f'{label_a} Heatmap{heatmap_title_suffix}')
             plt.colorbar(im, ax=ax3, label='Z-score')
         
         # Plot G1 traces and heatmap
@@ -27049,10 +27739,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax2.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel('G1 Z-score')
+            ax2.set_ylabel(f'{label_b} Z-score')
             n_label = f"n={len(all_g1_bouts)} subjects" if average_within_subject else f"n={len(all_g1_bouts)} bouts"
             title_suffix = " (averaged within subject)" if average_within_subject else ""
-            ax2.set_title(f'G1: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
+            ax2.set_title(f'{label_b}: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
             if average_within_subject:
                 ax2.legend(loc='best', fontsize=8)
             ax2.grid(True, alpha=0.3)
@@ -27074,7 +27764,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax4.axvline(0, color='yellow', linestyle='--', linewidth=2)
             ax4.set_xlabel('Time from bout onset (s)')
             ax4.set_ylabel(heatmap_ylabel)
-            ax4.set_title(f'G1 Heatmap{heatmap_title_suffix}')
+            ax4.set_title(f'{label_b} Heatmap{heatmap_title_suffix}')
             plt.colorbar(im, ax=ax4, label='Z-score')
         
         fig.tight_layout()
@@ -27093,21 +27783,25 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         
         bout_data = data['bouts'][behavior]
-        
+
+        # Resolve the two plot slots from the channel checkboxes so the selected
+        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
+        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots([subject], max_slots=2)
+
         # Apply exclusions if enabled
-        show_g0 = True
-        show_g1 = True
+        show_g0 = key_a is not None
+        show_g1 = key_b is not None
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel([subject], 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel([subject], 'G1')
-            show_g0 = subject in subjects_for_g0
-            show_g1 = subject in subjects_for_g1
-        
+            if show_g0:
+                show_g0 = subject in self.get_included_subjects_for_channel([subject], label_a)
+            if show_g1:
+                show_g1 = subject in self.get_included_subjects_for_channel([subject], label_b)
+
         # Realign to current window so the onset marker matches the traces even
         # if pre/post changed since extraction.
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-        bouts_g0 = self._entry_channel_bouts(bout_data, 'G0', max_bouts) if show_g0 else []
-        bouts_g1 = self._entry_channel_bouts(bout_data, 'G1', max_bouts) if show_g1 else []
+        bouts_g0 = self._entry_channel_bouts(bout_data, key_a, max_bouts) if show_g0 else []
+        bouts_g1 = self._entry_channel_bouts(bout_data, key_b, max_bouts) if show_g1 else []
 
         # Filter by selected bout number if not "All"
         selected_bout = self.bout_number_var.get()
@@ -27176,7 +27870,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax1.plot(time_axis, padded, color=color, alpha=0.8, linewidth=2.0, 
                             label=f'Bout #{bout_num}')
                 
-                title = f'G0: {subject} - {behavior}\n(Comparing Bout Order: n={len(bouts_g0)} bouts)'
+                title = f'{label_a}: {subject} - {behavior}\n(Comparing Bout Order: n={len(bouts_g0)} bouts)'
                 if len(bouts_g0) <= 15:
                     ax1.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
             else:
@@ -27184,15 +27878,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 bout = bouts_g0[0]
                 padded = np.full(max_len, np.nan)
                 padded[:len(bout)] = bout
-                ax1.plot(time_axis, padded, color='blue', alpha=0.8, linewidth=2.0, 
+                ax1.plot(time_axis, padded, color='blue', alpha=0.8, linewidth=2.0,
                         label=f'Bout #{selected_bout}')
-                title = f'G0: {subject} - {behavior}\n(Bout #{selected_bout} only)'
+                title = f'{label_a}: {subject} - {behavior}\n(Bout #{selected_bout} only)'
                 ax1.legend(loc='best', fontsize=8)
-            
+
             ax1.axvline(0, color='r', linestyle='--', linewidth=2)
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel('G0 Z-score')
+            ax1.set_ylabel(f'{label_a} Z-score')
             ax1.set_title(title)
             ax1.grid(True, alpha=0.3)
         
@@ -27213,7 +27907,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax2.plot(time_axis, padded, color=color, alpha=0.8, linewidth=2.0, 
                             label=f'Bout #{bout_num}')
                 
-                title = f'G1: {subject} - {behavior}\n(Comparing Bout Order: n={len(bouts_g1)} bouts)'
+                title = f'{label_b}: {subject} - {behavior}\n(Comparing Bout Order: n={len(bouts_g1)} bouts)'
                 if len(bouts_g1) <= 15:
                     ax2.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
             else:
@@ -27221,15 +27915,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 bout = bouts_g1[0]
                 padded = np.full(max_len, np.nan)
                 padded[:len(bout)] = bout
-                ax2.plot(time_axis, padded, color='green', alpha=0.8, linewidth=2.0, 
+                ax2.plot(time_axis, padded, color='green', alpha=0.8, linewidth=2.0,
                         label=f'Bout #{selected_bout}')
-                title = f'G1: {subject} - {behavior}\n(Bout #{selected_bout} only)'
+                title = f'{label_b}: {subject} - {behavior}\n(Bout #{selected_bout} only)'
                 ax2.legend(loc='best', fontsize=8)
-            
+
             ax2.axvline(0, color='r', linestyle='--', linewidth=2)
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel('G1 Z-score')
+            ax2.set_ylabel(f'{label_b} Z-score')
             ax2.set_title(title)
             ax2.grid(True, alpha=0.3)
         
@@ -27243,35 +27937,40 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
         
+        # Resolve the two plot slots from the channel checkboxes so the selected
+        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
+        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(subjects, max_slots=2)
+
         # Apply exclusions if enabled
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
-        
+            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, label_a)
+            subjects_for_g1 = (self.get_included_subjects_for_channel(subjects, label_b)
+                               if key_b is not None else subjects)
+
         # Collect bouts from all subjects organized by bout number
         g0_bouts_by_number = {}  # {bout_num: [traces]}
         g1_bouts_by_number = {}
-        
+
         for subject in subjects:
             data = self.processed_data[subject]
             if 'bouts' in data and behavior in data['bouts']:
                 bout_data = data['bouts'][behavior]
-                
+
                 # Check if subject is excluded for each channel.  Realign to the
                 # current window so bouts pooled by number across subjects share a
                 # common onset even when extracted with different pre/post.
                 max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                if subject in subjects_for_g0 and bout_data.get('G0'):
-                    bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+                if key_a is not None and subject in subjects_for_g0 and bout_data.get(key_a):
+                    bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
                     for bout_num, bout in enumerate(bouts, 1):
                         if bout_num not in g0_bouts_by_number:
                             g0_bouts_by_number[bout_num] = []
                         g0_bouts_by_number[bout_num].append(bout)
 
-                if subject in subjects_for_g1 and bout_data.get('G1'):
-                    bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+                if key_b is not None and subject in subjects_for_g1 and bout_data.get(key_b):
+                    bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
                     for bout_num, bout in enumerate(bouts, 1):
                         if bout_num not in g1_bouts_by_number:
                             g1_bouts_by_number[bout_num] = []
@@ -27352,12 +28051,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax1.axvline(0, color='r', linestyle='--', linewidth=2)
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel('G0 Z-score')
+            ax1.set_ylabel(f'{label_a} Z-score')
             total_bouts = sum(len(bouts) for bouts in g0_bouts_by_number.values())
             if selected_bout == "All":
-                ax1.set_title(f'G0: {behavior}\nComparing by Bout Order ({len(subjects)} subjects, {total_bouts} total bouts)')
+                ax1.set_title(f'{label_a}: {behavior}\nComparing by Bout Order ({len(subjects)} subjects, {total_bouts} total bouts)')
             else:
-                ax1.set_title(f'G0: {behavior}\nBout #{selected_bout} only ({len(subjects)} subjects, {total_bouts} total bouts)')
+                ax1.set_title(f'{label_a}: {behavior}\nBout #{selected_bout} only ({len(subjects)} subjects, {total_bouts} total bouts)')
             if max_bout_num <= 15 or selected_bout != "All":
                 ax1.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
             ax1.grid(True, alpha=0.3)
@@ -27394,12 +28093,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax2.axvline(0, color='r', linestyle='--', linewidth=2)
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel('G1 Z-score')
+            ax2.set_ylabel(f'{label_b} Z-score')
             total_bouts = sum(len(bouts) for bouts in g1_bouts_by_number.values())
             if selected_bout == "All":
-                ax2.set_title(f'G1: {behavior}\nComparing by Bout Order ({len(subjects)} subjects, {total_bouts} total bouts)')
+                ax2.set_title(f'{label_b}: {behavior}\nComparing by Bout Order ({len(subjects)} subjects, {total_bouts} total bouts)')
             else:
-                ax2.set_title(f'G1: {behavior}\nBout #{selected_bout} only ({len(subjects)} subjects, {total_bouts} total bouts)')
+                ax2.set_title(f'{label_b}: {behavior}\nBout #{selected_bout} only ({len(subjects)} subjects, {total_bouts} total bouts)')
             if max_bout_num <= 15 or selected_bout != "All":
                 ax2.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
             ax2.grid(True, alpha=0.3)
@@ -27427,12 +28126,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
         
+        # Resolve the two plot slots from the channel checkboxes so the selected
+        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
+        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(all_subjects, max_slots=2)
+
         # Apply exclusions if enabled
         subjects_for_g0 = all_subjects
         subjects_for_g1 = all_subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(all_subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(all_subjects, 'G1')
+            subjects_for_g0 = self.get_included_subjects_for_channel(all_subjects, label_a)
+            subjects_for_g1 = (self.get_included_subjects_for_channel(all_subjects, label_b)
+                               if key_b is not None else all_subjects)
         
         # Collect bouts organized by group and bout number: {group: {bout_num: [traces]}}
         g0_data_by_group = {group: {} for group in selected_groups}
@@ -27453,15 +28157,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # the current window so bouts pooled by number across groups
                     # share a common onset regardless of extraction pre/post.
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if subject in subjects_for_g0 and bout_data.get('G0'):
-                        bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+                    if key_a is not None and subject in subjects_for_g0 and bout_data.get(key_a):
+                        bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
                         for bout_num, bout in enumerate(bouts, 1):
                             if bout_num not in g0_data_by_group[group_name]:
                                 g0_data_by_group[group_name][bout_num] = []
                             g0_data_by_group[group_name][bout_num].append(bout)
 
-                    if subject in subjects_for_g1 and bout_data.get('G1'):
-                        bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+                    if key_b is not None and subject in subjects_for_g1 and bout_data.get(key_b):
+                        bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
                         for bout_num, bout in enumerate(bouts, 1):
                             if bout_num not in g1_data_by_group[group_name]:
                                 g1_data_by_group[group_name][bout_num] = []
@@ -27562,13 +28266,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax1.axvline(0, color='r', linestyle='--', linewidth=2)
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel('G0 Z-score')
-            total_bouts = sum(len(bouts) for bout_dict in g0_data_by_group.values() 
+            ax1.set_ylabel(f'{label_a} Z-score')
+            total_bouts = sum(len(bouts) for bout_dict in g0_data_by_group.values()
                             for bouts in bout_dict.values())
             if selected_bout == "All":
-                ax1.set_title(f'G0: {behavior}\nComparing by Bout Order within Groups ({total_bouts} total bouts)')
+                ax1.set_title(f'{label_a}: {behavior}\nComparing by Bout Order within Groups ({total_bouts} total bouts)')
             else:
-                ax1.set_title(f'G0: {behavior}\nBout #{selected_bout} only within Groups ({total_bouts} total bouts)')
+                ax1.set_title(f'{label_a}: {behavior}\nBout #{selected_bout} only within Groups ({total_bouts} total bouts)')
             ax1.legend(loc='best', fontsize=7, ncol=1)
             ax1.grid(True, alpha=0.3)
         
@@ -27610,18 +28314,134 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax2.axvline(0, color='r', linestyle='--', linewidth=2)
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel('G1 Z-score')
-            total_bouts = sum(len(bouts) for bout_dict in g1_data_by_group.values() 
+            ax2.set_ylabel(f'{label_b} Z-score')
+            total_bouts = sum(len(bouts) for bout_dict in g1_data_by_group.values()
                             for bouts in bout_dict.values())
             if selected_bout == "All":
-                ax2.set_title(f'G1: {behavior}\nComparing by Bout Order within Groups ({total_bouts} total bouts)')
+                ax2.set_title(f'{label_b}: {behavior}\nComparing by Bout Order within Groups ({total_bouts} total bouts)')
             else:
-                ax2.set_title(f'G1: {behavior}\nBout #{selected_bout} only within Groups ({total_bouts} total bouts)')
+                ax2.set_title(f'{label_b}: {behavior}\nBout #{selected_bout} only within Groups ({total_bouts} total bouts)')
             ax2.legend(loc='best', fontsize=7, ncol=1)
             ax2.grid(True, alpha=0.3)
         
         fig.tight_layout()
     
+    def compare_bout_channels(self):
+        """Bout Analysis: overlay each channel's mean peri-onset trace so channels
+        (e.g. G0 vs R4) can be compared within each group in the GUI.
+
+        One subplot per group (or a single 'All' panel in Subject mode); one
+        coloured line per channel with mean ± SEM across subjects.  This mirrors
+        the per-channel comparison that the bout export already offers, which the
+        in-GUI views previously lacked."""
+        in_group_mode = self.bout_analysis_by_var.get() == "Group"
+        if in_group_mode:
+            sel = self.bout_analysis_group_listbox.curselection()
+            if not sel:
+                messagebox.showerror("Error", "Please select at least one group")
+                return
+            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in sel]
+            group_members = {g: list(self.groups.get(g, [])) for g in selected_groups}
+        else:
+            sel = self.bout_analysis_subject_listbox.curselection()
+            if not sel:
+                messagebox.showerror("Error", "Please select at least one subject")
+                return
+            selected_subjects = [self.bout_analysis_subject_listbox.get(i) for i in sel]
+            selected_groups = ['All']
+            group_members = {'All': selected_subjects}
+
+        behavior = self.bout_analysis_behavior_var.get()
+        if not behavior:
+            messagebox.showerror("Error", "Please select a behavior")
+            return
+
+        channels = self._all_channel_names()
+        if not channels:
+            messagebox.showerror("Error", "No channels detected.")
+            return
+
+        fps = self.params['fps']
+        prebout = self.params['preboutframes']
+        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        apply_excl = self.use_exclusions_bout.get()
+
+        # group -> channel -> list of per-subject mean traces
+        data_by_group = {g: {ch: [] for ch in channels} for g in selected_groups}
+        for group_name, members in group_members.items():
+            for subject in members:
+                if subject not in self.processed_data:
+                    continue
+                entry = self.processed_data[subject].get('bouts', {}).get(behavior, {})
+                if not entry:
+                    continue
+                for ch in channels:
+                    if apply_excl and self.is_subject_channel_excluded(subject, ch):
+                        continue
+                    bouts = self._entry_channel_bouts(entry, ch, max_bouts)
+                    bouts = [b for b in bouts if len(b) > 0]
+                    if not bouts:
+                        continue
+                    max_len = max(len(b) for b in bouts)
+                    mat = np.full((len(bouts), max_len), np.nan)
+                    for i, b in enumerate(bouts):
+                        mat[i, :len(b)] = b
+                    data_by_group[group_name][ch].append(np.nanmean(mat, axis=0))
+
+        if not any(any(v for v in chdata.values()) for chdata in data_by_group.values()):
+            messagebox.showwarning("No Data", f"No bout data available for {behavior}")
+            return
+
+        ch_colors = matplotlib.colormaps['tab10'](np.linspace(0, 1, max(10, len(channels))))
+        n_groups = len(selected_groups)
+
+        for widget in self.bout_histogram_frame.winfo_children():
+            widget.destroy()
+
+        def _draw():
+            self.root.update_idletasks()
+            fig = Figure(figsize=(self._bout_fig_width(4, per_item=0.6, base=4.5, minimum=6.0),
+                                  max(3.0 * n_groups, 3.5)), dpi=100)
+            for g_idx, group_name in enumerate(selected_groups, 1):
+                ax = fig.add_subplot(n_groups, 1, g_idx)
+                any_line = False
+                for c_idx, ch in enumerate(channels):
+                    traces = data_by_group[group_name][ch]
+                    if not traces:
+                        continue
+                    max_len = max(len(t) for t in traces)
+                    mat = np.full((len(traces), max_len), np.nan)
+                    for i, t in enumerate(traces):
+                        mat[i, :len(t)] = t
+                    mean = np.nanmean(mat, axis=0)
+                    n = np.sum(~np.isnan(mat), axis=0)
+                    sem = np.nanstd(mat, axis=0) / np.sqrt(np.maximum(n, 1))
+                    time_axis = (np.arange(max_len) - prebout) / fps
+                    color = ch_colors[c_idx % len(ch_colors)]
+                    ax.plot(time_axis, mean, color=color, linewidth=2,
+                            label=f'{ch} (n={len(traces)})')
+                    ax.fill_between(time_axis, mean - sem, mean + sem, color=color, alpha=0.2)
+                    any_line = True
+                ax.axvline(0, color='r', linestyle='--', linewidth=1.5)
+                ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+                ax.set_ylabel('Z-score', fontsize=10)
+                ax.set_title(f'{group_name}: {behavior} — channel comparison', fontsize=10,
+                             fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                if any_line:
+                    ax.legend(fontsize=8, ncol=2)
+                if g_idx == n_groups:
+                    ax.set_xlabel('Time from bout onset (s)', fontsize=10)
+            fig.tight_layout()
+            canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
+            self.current_bout_canvas = canvas
+            self.current_bout_figure = fig
+            self.bout_histogram_frame.update_idletasks()
+            self.bout_histogram_canvas.configure(
+                scrollregion=self.bout_histogram_canvas.bbox("all"))
+
+        self.bout_histogram_canvas.after(10, _draw)
+
     def compare_across_bouts(self):
         """Compare metrics across bouts from the Bout Analysis tab - shows bar graphs by bout number"""
         # Get selected subjects or groups
@@ -27709,10 +28529,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             group = subject_to_group.get(subject, None)
             
             for bout_num, bout in enumerate(bouts_data, 1):
-                if len(bout) > max(abs(window_start_frame), abs(window_end_frame)):
-                    if bout_num not in bouts_by_number:
-                        bouts_by_number[bout_num] = []
-                    bouts_by_number[bout_num].append((bout, subject, group))
+                # Collect every non-empty bout and let _bout_analysis_segment()
+                # (below) decide validity by actually extracting the window.  A
+                # crude length pre-filter here (comparing the raw stored trace
+                # length against the window offsets) silently dropped later /
+                # edge-clipped bouts, so a group's line stopped after the first
+                # couple of bouts even though the metrics table (which has no
+                # such pre-filter) listed them.  Keep the two paths consistent.
+                if len(bout) == 0:
+                    continue
+                if bout_num not in bouts_by_number:
+                    bouts_by_number[bout_num] = []
+                bouts_by_number[bout_num].append((bout, subject, group))
         
         if not bouts_by_number:
             messagebox.showwarning("No Data", f"No bout data available for {behavior}")
@@ -35793,10 +36621,12 @@ cat("OK\n")
         outer.pack(fill='both', expand=True, padx=5, pady=5)
 
         # Size the control column to its content (DPI-safe) so button labels
-        # aren't clipped by a hard-fixed pixel width.
-        ctrl_panel = ttk.Frame(outer, width=CONTROL_PANEL_W)
-        ctrl_panel.pack(side='left', fill='y', padx=(0, 5))
-        ctrl_panel.pack_propagate(True)
+        # aren't clipped by a hard-fixed pixel width, and wrap it in a scrolling
+        # viewport so a tall control stack stays reachable on short screens.
+        ctrl_outer = ttk.Frame(outer, width=CONTROL_PANEL_W)
+        ctrl_outer.pack(side='left', fill='y', padx=(0, 5))
+        ctrl_outer.pack_propagate(True)
+        ctrl_panel = self.make_scrollable(ctrl_outer, fit_width=True)
 
         self.dec_prob_plot_frame = ttk.Frame(outer)
         self.dec_prob_plot_frame.pack(side='left', fill='both', expand=True)
@@ -35877,14 +36707,38 @@ cat("OK\n")
                         value="Bar").pack(side='left', padx=(10, 0))
 
         # ── Outcomes to show ─────────────────────────────────────────────────
+        zone_frame = ttk.LabelFrame(ctrl_panel, text="Decision Zones", padding=5)
+        zone_frame.pack(fill='x', pady=(0, 5))
+        bases = self._dec_prob_base_categories()
+        def _default_base(prefer, fallback_idx):
+            for b in bases:
+                if b == prefer:
+                    return b
+            return bases[fallback_idx] if len(bases) > fallback_idx else (bases[0] if bases else "")
+        self.dec_prob_from_var = tk.StringVar(value=_default_base('closed', 0))
+        self.dec_prob_to_var   = tk.StringVar(value=_default_base('open', 1))
+        _fr = ttk.Frame(zone_frame); _fr.pack(fill='x', pady=1)
+        ttk.Label(_fr, text="From:", width=6).pack(side='left')
+        self.dec_prob_from_combo = ttk.Combobox(_fr, textvariable=self.dec_prob_from_var,
+                                                 values=bases, width=14, state='readonly')
+        self.dec_prob_from_combo.pack(side='left')
+        _tr = ttk.Frame(zone_frame); _tr.pack(fill='x', pady=1)
+        ttk.Label(_tr, text="To:", width=6).pack(side='left')
+        self.dec_prob_to_combo = ttk.Combobox(_tr, textvariable=self.dec_prob_to_var,
+                                               values=bases, width=14, state='readonly')
+        self.dec_prob_to_combo.pack(side='left')
+
         outcomes_frame = ttk.LabelFrame(ctrl_panel, text="Show Outcomes", padding=5)
         outcomes_frame.pack(fill='x', pady=(0, 5))
-        ttk.Checkbutton(outcomes_frame,
-                        text="Explore  (closed arm \u2192 open arm)",
-                        variable=self.dec_prob_show_explore).pack(anchor='w')
-        ttk.Checkbutton(outcomes_frame,
-                        text="Retreat  (open arm \u2192 closed arm)",
-                        variable=self.dec_prob_show_retreat).pack(anchor='w')
+        self._dec_prob_explore_cb = ttk.Checkbutton(
+            outcomes_frame, variable=self.dec_prob_show_explore)
+        self._dec_prob_explore_cb.pack(anchor='w')
+        self._dec_prob_retreat_cb = ttk.Checkbutton(
+            outcomes_frame, variable=self.dec_prob_show_retreat)
+        self._dec_prob_retreat_cb.pack(anchor='w')
+        self.dec_prob_from_var.trace_add('write', lambda *a: self._update_dec_prob_outcome_labels())
+        self.dec_prob_to_var.trace_add('write', lambda *a: self._update_dec_prob_outcome_labels())
+        self._update_dec_prob_outcome_labels()
 
         # ── Apply exclusions ──────────────────────────────────────────────────
         excl_frame = ttk.Frame(ctrl_panel)
@@ -36201,27 +37055,25 @@ cat("OK\n")
             apply_excl = self.use_exclusions_dec_prob.get()
             pool_edges = self.dec_prob_pool_edges_var.get()
 
-            maze_type = self.params.get('maze_type', 'EPM')
-            if maze_type not in ('EPM', 'EPM_Complex'):
+            # Decision zones are user-selectable (From / To), so the analysis is
+            # no longer EPM-only: "Forward" = From→To, "Reverse" = To→From. For
+            # EPM the defaults are closed→open (explore) and open→closed (retreat).
+            from_base = self.dec_prob_from_var.get()
+            to_base   = self.dec_prob_to_var.get()
+            if not from_base or not to_base or from_base == to_base:
                 messagebox.showwarning(
-                    "EPM Only",
-                    "Decision Probability analysis requires an EPM or EPM_Complex maze.")
+                    "Zone Error",
+                    "Choose two DIFFERENT zones in 'Decision Zones' (From / To).")
                 return
-
-            zone_names   = list(self.zones.keys())
-            open_zones   = [z for z in zone_names
-                            if self.zones[z].get('category') in
-                            ('open', 'open_proximal', 'open_distal')]
-            closed_zones = [z for z in zone_names
-                            if self.zones[z].get('category') in
-                            ('closed', 'closed_proximal', 'closed_distal')]
-
+            closed_zones = self._dec_prob_zones_for_base(from_base)  # 'From' region
+            open_zones   = self._dec_prob_zones_for_base(to_base)    # 'To' region
             if not open_zones or not closed_zones:
                 messagebox.showwarning(
                     "Zone Error",
-                    "Could not identify both open and closed arm zones.\n"
+                    f"Could not find zones for '{from_base}' and/or '{to_base}'.\n"
                     "Check the zone configuration.")
                 return
+            self._update_dec_prob_outcome_labels()
 
             # Gather selected subjects / groups
             by_group = self.dec_prob_by_var.get() == "Group"
@@ -36541,8 +37393,8 @@ cat("OK\n")
             if ('explore' in gd and gd['explore'].get('per_subject') and
                     'retreat' in gd and gd['retreat'].get('per_subject')):
                 data_bf = {
-                    'Explore': gd['explore']['per_subject'],
-                    'Retreat': gd['retreat']['per_subject'],
+                    self._dec_prob_label('explore'): gd['explore']['per_subject'],
+                    self._dec_prob_label('retreat'): gd['retreat']['per_subject'],
                 }
                 res = _anova2(data_bf, 'Outcome')
                 if res is not None:
@@ -36619,8 +37471,8 @@ cat("OK\n")
         # ── Colour palettes ────────────────────────────────────────────────────
         group_names = list(results.keys())
         n_groups    = max(len(group_names), 1)
-        explore_colors = plt.cm.get_cmap('tab10')(np.linspace(0.3, 0.7, n_groups))
-        retreat_colors = plt.cm.get_cmap('Oranges')(np.linspace(0.4, 0.85, n_groups))
+        explore_colors = matplotlib.colormaps['tab10'](np.linspace(0.3, 0.7, n_groups))
+        retreat_colors = matplotlib.colormaps['Oranges'](np.linspace(0.4, 0.85, n_groups))
 
         fig, ax = plt.subplots(figsize=(7, 5))
         self.dec_prob_figure = fig
@@ -36634,12 +37486,12 @@ cat("OK\n")
             for g_idx, (group_name, gdata) in enumerate(results.items()):
                 if 'explore' in gdata:
                     d = gdata['explore']
-                    series.append((f"{group_name} Explore",
+                    series.append((f"{group_name} {self._dec_prob_label('explore')}",
                                    d['centers'], d['mean'], d['sem'],
                                    explore_colors[g_idx]))
                 if 'retreat' in gdata:
                     d = gdata['retreat']
-                    series.append((f"{group_name} Retreat",
+                    series.append((f"{group_name} {self._dec_prob_label('retreat')}",
                                    d['centers'], d['mean'], d['sem'],
                                    retreat_colors[g_idx]))
             n_series = max(len(series), 1)
@@ -36682,9 +37534,9 @@ cat("OK\n")
                                         color=exp_col, alpha=0.20)
                         ln, = ax.plot(centers[valid], mean_p[valid], '-o',
                                       color=exp_col, linewidth=2, markersize=4,
-                                      label=f"{group_name} Explore")
+                                      label=f"{group_name} {self._dec_prob_label('explore')}")
                         handles.append(ln)
-                        labels.append(f"{group_name} Explore")
+                        labels.append(f"{group_name} {self._dec_prob_label('explore')}")
 
                 if 'retreat' in gdata:
                     d = gdata['retreat']
@@ -36704,9 +37556,9 @@ cat("OK\n")
                         ln, = ax.plot(centers[valid], mean_p[valid],
                                       color=ret_col, linewidth=2, markersize=4,
                                       marker='o', linestyle='--',
-                                      label=f"{group_name} Retreat")
+                                      label=f"{group_name} {self._dec_prob_label('retreat')}")
                         handles.append(ln)
-                        labels.append(f"{group_name} Retreat")
+                        labels.append(f"{group_name} {self._dec_prob_label('retreat')}")
 
         # ── Axes formatting ────────────────────────────────────────────────────
         ax.set_xlabel("dF/F (z-score)", fontsize=12)
@@ -37026,9 +37878,13 @@ cat("OK\n")
         outer.pack(fill='both', expand=True, padx=5, pady=5)
 
         # ── Left control column ──────────────────────────────────────────
-        ctrl_panel = ttk.Frame(outer, width=CONTROL_PANEL_W)
-        ctrl_panel.pack(side='left', fill='y', padx=(0, 6))
-        ctrl_panel.pack_propagate(True)
+        # Wrap the column in a scrolling viewport: the control stack is taller
+        # than a short (e.g. 768p) screen, which pushed the advanced options and
+        # the Run button off the bottom with no way to reach them.
+        ctrl_outer = ttk.Frame(outer, width=CONTROL_PANEL_W)
+        ctrl_outer.pack(side='left', fill='y', padx=(0, 6))
+        ctrl_outer.pack_propagate(True)
+        ctrl_panel = self.make_scrollable(ctrl_outer, fit_width=True)
 
         beta_badge = tk.Label(ctrl_panel, text="BETA",
                               font=('Segoe UI', 26, 'bold'),
@@ -38118,7 +38974,7 @@ cat("OK\n")
         g = self.kin_gfx
         finite = values[np.isfinite(values)]
         cmap_name = g['cmap_div'] if diverging else g['cmap_seq']
-        cmap = mpl.cm.get_cmap(cmap_name).copy()
+        cmap = mpl.colormaps[cmap_name].copy()
         cmap.set_bad(alpha=0.0)  # NaN (unvisited) -> transparent
         if g['auto_limits'] or g['vmin'] == '' or g['vmax'] == '':
             if finite.size:
