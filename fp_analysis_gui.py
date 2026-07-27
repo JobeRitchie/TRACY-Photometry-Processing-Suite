@@ -37,8 +37,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.10.0"
-APP_VERSION_DATE = "July 23, 2026"
+APP_VERSION = "1.10.1"
+APP_VERSION_DATE = "July 27, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -9978,6 +9978,29 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Fix — Bout Analysis decay metrics (Tau and Half-Decay t½) were not fitting the
+    decay. Four faults compounded: the baseline was read from the leading tenth of the
+    window, which in longer windows swallowed the rising edge and flipped clean upward
+    transients upside-down (the "peak" landing on frame 0); fits that did not describe
+    the data at all still reported a number, so pure noise returned taus of 19 s, 33 s
+    or 0 s; the fit's starting guess scaled with the window, so the same bout's tau
+    drifted from 0.4 s to 4.9 s purely by widening the analysis window, and 14–19% of
+    bouts reported a tau longer than the entire window; and gaps (NaNs) were deleted
+    rather than interpolated, compressing the time axis so every seconds value was
+    wrong. On a 29-subject dataset, tau is now stable across 5/10/30 s windows
+    (0.32/0.37/0.36 s where it previously ran 0.37→1.23 s), and a decay of known rate
+    is recovered exactly.
+  • Change — Tau and t½ now report N/A instead of a number when the window cannot
+    support the measurement: the deflection is within noise, the signal never
+    appreciably decays, less than one full time constant is visible, or the fit does
+    not match the data. Expect more N/A cells than before — those rows were previously
+    filled with unconstrained extrapolations. The peak is located on a lightly smoothed
+    copy, so a single noisy sample can no longer define it, and the fit stops where the
+    transient ends rather than running to the end of the window, so a later spontaneous
+    event no longer stretches the reported decay.
+
+Version 1.10.0  •  July 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — Bout plots ignored your channel selection. Every group / multi-subject and
     bout-order plot was hardwired to the first two green channels, so ticking a red
@@ -20868,6 +20891,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         variable=self.metric_auc).grid(row=1, column=2, sticky='w', padx=5, pady=2)
         ttk.Checkbutton(mf, text="Half-Decay Time (t½)",
                         variable=self.metric_t_half).grid(row=2, column=0, sticky='w', padx=5, pady=2)
+        ttk.Label(mf, text="Tau/t½ report N/A when the window holds no measurable decay "
+                           "(set the window to bracket the transient)",
+                  foreground='gray', font=('Segoe UI', 7)).grid(
+            row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(2, 0))
         auc_row = ttk.Frame(mf)
         auc_row.grid(row=2, column=2, sticky='w', padx=20, pady=2)
         ttk.Radiobutton(auc_row, text="All",   variable=self.metric_auc_mode, value="both").pack(side='left', padx=2)
@@ -32239,31 +32266,96 @@ cat("OK\n")
             except Exception as e:
                 self.log_message(f"Auto-graph generation failed: {e}")
     
+    # ── Decay metrics (tau, t½) ─────────────────────────────────────────────
+    # Both metrics describe the descent of a transient from its peak, so they
+    # share the same preparation: fill gaps without disturbing the time axis,
+    # locate the peak on a lightly smoothed copy, and estimate the level the
+    # transient rose from and decays back toward.
+
+    @staticmethod
+    def _decay_fill_nans(data):
+        """Trim NaN edges and linearly interpolate interior NaNs.
+
+        Deleting NaNs outright compresses the time axis, which silently
+        corrupts every frames-to-seconds conversion downstream whenever a
+        window contains gaps."""
+        data = np.asarray(data, dtype=float).ravel()
+        good = ~np.isnan(data)
+        if not good.any():
+            return np.array([], dtype=float)
+        first = int(np.argmax(good))
+        last = len(data) - int(np.argmax(good[::-1]))
+        data = data[first:last]
+        good = ~np.isnan(data)
+        if not good.all():
+            idx = np.arange(len(data), dtype=float)
+            data = np.interp(idx, idx[good], data[good])
+        return data
+
+    def _decay_smooth(self, data):
+        """Short (~200 ms) moving average used only for peak finding and level
+        estimates, so a single noisy sample can never define the peak."""
+        w = int(round((self.params.get('fps', 1) or 1) / 5.0))
+        w = max(3, min(w, max(3, len(data) // 10)))
+        if w % 2 == 0:
+            w += 1
+        if w >= len(data):
+            return data.copy()
+        pad = w // 2
+        padded = np.concatenate([np.full(pad, data[0]), data, np.full(pad, data[-1])])
+        return np.convolve(padded, np.ones(w) / w, mode='valid')
+
+    @staticmethod
+    def _decay_noise_sigma(data):
+        """Robust sample-to-sample noise level. Successive differences of white
+        noise have sd = sigma*sqrt(2), so the MAD of the differences recovers
+        sigma without being inflated by the transient itself."""
+        d = np.diff(np.asarray(data, dtype=float))
+        if d.size == 0:
+            return 0.0
+        return float(1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2.0))
+
     def _orient_transient(self, data):
         """Orient a window so its dominant transient is a positive deflection
         and locate the peak. Decay metrics measure the descent from this peak.
 
         A signal that dips below baseline (negative-going transient) is flipped
         so the same decay-from-peak logic applies to both. Returns
-        (sig, baseline, peak_idx) with sig oriented positive, or None if the
-        window is too short. ``baseline`` is estimated from the leading samples
-        of the window (before the peak) as a robust median."""
-        data = np.asarray(data, dtype=float)
-        data = data[~np.isnan(data)]
+        ``(sig, smooth, baseline, peak_idx)`` with ``sig`` oriented positive and
+        ``smooth`` its lightly smoothed counterpart, or None if the window is
+        too short."""
+        data = self._decay_fill_nans(data)
         if len(data) < 5:
             return None
+        fps = self.params.get('fps', 1) or 1
+        sm = self._decay_smooth(data)
 
-        # Baseline = median of the leading portion of the window (pre-peak level)
-        lead = max(3, len(data) // 10)
-        baseline = float(np.median(data[:lead]))
+        # Orientation is decided against the level at the START of the window.
+        # That lead is measured as a fixed ~0.5 s rather than as len//10: a
+        # proportional lead grows with the window and swallowed the rising edge,
+        # which inverted clean positive transients and put the "peak" at frame 0.
+        lead_n = int(np.clip(round(fps * 0.5), 3, max(3, len(sm) // 4)))
+        center = float(np.median(sm[:lead_n]))
+        pos_idx = int(np.argmax(sm))
+        neg_idx = int(np.argmin(sm))
+        if (center - sm[neg_idx]) > (sm[pos_idx] - center):
+            sig, sm, center, peak_idx = -data, -sm, -center, neg_idx  # flip
+        else:
+            sig, peak_idx = data, pos_idx
 
-        pos_idx = int(np.argmax(data))
-        neg_idx = int(np.argmin(data))
-        # Choose whichever excursion from baseline is larger as "the" transient
-        if abs(data[pos_idx] - baseline) >= abs(data[neg_idx] - baseline):
-            return data, baseline, pos_idx
-        # Negative-going: flip so the peak is a positive deflection
-        return -data, -baseline, neg_idx
+        # Baseline = the level the transient rose from / decays back toward.
+        # Estimate it before the peak and again from the tail, then keep the
+        # lower: transient contamination can only pull either estimate UP, so
+        # the smaller one is the estimate that escaped it.
+        levels = []
+        if peak_idx >= 3:
+            pre_n = min(peak_idx, max(3, int(round(fps))))  # earliest ~1 s
+            levels.append(float(np.median(sm[:pre_n])))
+        if peak_idx < len(sm) - 3:
+            tail_n = max(3, len(sm) // 10)
+            levels.append(float(np.median(sm[-tail_n:])))
+        baseline = min(levels) if levels else center
+        return sig, sm, baseline, peak_idx
 
     def calculate_tau(self, data):
         """Decay time constant (tau, in seconds) from a mono-exponential fit of
@@ -32273,41 +32365,113 @@ cat("OK\n")
 
         Unlike a fit over the whole window, this isolates the decay and ignores
         the baseline and rising edge, so it reflects the true decay rate of the
-        event. Returns None if the decay cannot be estimated (no clear peak,
-        too few post-peak samples, or the fit fails to converge)."""
+        event. Returns None when the window cannot support the estimate -- the
+        deflection is within noise, the signal never appreciably decays, the fit
+        does not describe the data, or the decay is slower than the window is
+        long -- rather than reporting an unconstrained extrapolation."""
         oriented = self._orient_transient(data)
         if oriented is None:
             return None
-        sig, baseline, peak_idx = oriented
+        sig, sm, baseline, peak_idx = oriented
 
         fps = self.params.get('fps', 1) or 1
 
-        # Fit only the descending phase, from the peak to the end of the window
+        # Fit only the descending phase, starting at the peak
         decay = sig[peak_idx:]
+        decay_sm = sm[peak_idx:]
         if len(decay) < 5:
             return None
 
-        amp = float(decay[0] - baseline)
-        if amp <= 1e-6:
-            return None  # no meaningful deflection to decay from
+        amp = float(decay_sm[0] - baseline)
+        if amp <= max(3.0 * self._decay_noise_sigma(sig), 1e-6):
+            return None  # deflection indistinguishable from noise
 
-        try:
-            x = np.arange(len(decay))
-
-            def exp_decay(x, a, tau, c):
-                return a * np.exp(-x / tau) + c
-
-            tau0 = max(2.0, len(decay) / 3.0)
-            popt, _ = curve_fit(
-                exp_decay, x, decay,
-                p0=[amp, tau0, baseline],
-                bounds=([0, 1e-3, -np.inf], [np.inf, len(decay) * 5, np.inf]),
-                maxfev=5000,
-            )
-            tau_seconds = popt[1] / fps  # frames -> seconds
-            return tau_seconds
-        except Exception:
+        # End the decay where the transient ends -- once the signal has returned
+        # to baseline, or once a NEW deflection starts -- instead of running to
+        # the end of the window.  Fitting the whole remainder made tau a property
+        # of the window length (and of whatever events happened to follow) rather
+        # than of the transient being measured.
+        stop = len(decay_sm)
+        settled = np.nonzero(decay_sm <= baseline + 0.05 * amp)[0]
+        if settled.size:
+            # keep a short tail past the crossing so the fit can pin the asymptote
+            stop = min(stop, int(settled[0]) + max(3, len(decay_sm) // 10))
+        running_min = np.minimum.accumulate(decay_sm)
+        rising = (decay_sm > running_min + 0.30 * amp).astype(int)
+        hold = max(2, int(round(fps * 0.1)))  # must be sustained ~100 ms
+        if rising.size >= hold:
+            sustained = np.nonzero(
+                np.convolve(rising, np.ones(hold, dtype=int), mode='valid') == hold)[0]
+            if sustained.size:
+                stop = min(stop, int(sustained[0]))
+        if stop < 5:
             return None
+        decay = decay[:stop]
+        decay_sm = decay_sm[:stop]
+        n = len(decay)
+
+        # The window must contain at least one full time constant of decay
+        # (1 - 1/e of the amplitude).  Below that, amplitude and time constant
+        # trade off freely and the fit extrapolates well past the recorded data:
+        # a true 5 s decay observed for 4 s was being reported as 0.8 s.
+        tail_n = max(3, n // 10)
+        end_level = float(np.median(decay_sm[-tail_n:]))
+        if (decay_sm[0] - end_level) < (1.0 - 1.0 / np.e) * amp:
+            return None
+
+        x = np.arange(n, dtype=float)
+        c0 = min(baseline, end_level)
+
+        # Data-driven starting guess: for a mono-exponential, log(y - c) falls
+        # linearly with slope -1/tau.  The previous fixed guess (len/3) scaled
+        # with the window, so the optimiser settled in a different local minimum
+        # for every window length and tau tracked the window, not the signal.
+        y = decay - c0
+        mask = y > 0.2 * amp
+        tau0 = None
+        if int(mask.sum()) >= 5:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                slope = np.polyfit(x[mask], np.log(y[mask]), 1)[0]
+            if np.isfinite(slope) and slope < 0:
+                tau0 = -1.0 / slope
+        if tau0 is None or not np.isfinite(tau0):
+            tau0 = n / 3.0
+        tau0 = float(np.clip(tau0, 1.0, float(n)))
+
+        def exp_decay(t, a, tau, c):
+            return a * np.exp(-t / tau) + c
+
+        ss_tot = float(np.sum((decay - decay.mean()) ** 2))
+        if ss_tot <= 0:
+            return None
+
+        # Multi-start around the estimate so a single unlucky basin cannot
+        # decide the answer; keep the fit that actually describes the data.
+        best = None
+        for seed in (tau0, tau0 / 4.0, tau0 * 4.0):
+            seed = float(np.clip(seed, 1.0, n * 2.0))
+            try:
+                popt, _ = curve_fit(
+                    exp_decay, x, decay,
+                    p0=[amp, seed, c0],
+                    bounds=([0, 1e-3, -np.inf], [np.inf, n * 2.0, np.inf]),
+                    maxfev=5000,
+                )
+            except Exception:
+                continue
+            resid = decay - exp_decay(x, *popt)
+            r2 = 1.0 - float(np.sum(resid ** 2)) / ss_tot
+            if best is None or r2 > best[0]:
+                best = (r2, float(popt[1]))
+
+        if best is None:
+            return None
+        r2, tau_frames = best
+        if r2 < 0.5:
+            return None  # not exponential-shaped; a number here would be noise
+        if tau_frames > n:
+            return None  # slower than the window is long -> not measurable here
+        return tau_frames / fps  # frames -> seconds
 
     def calculate_t_half(self, data):
         """Model-free half-decay time (in seconds): time from the peak of the
@@ -32315,26 +32479,28 @@ cat("OK\n")
 
         Because it requires no curve fitting, it never fails to converge and is
         robust to noise -- often a more trustworthy decay measure than tau. The
-        crossing is linearly interpolated between frames for sub-frame
-        precision. Returns None if the signal never decays to the half level
+        crossing is taken on the smoothed trace and must be sustained, so a
+        single noisy sample cannot end the decay early; it is then linearly
+        interpolated between frames for sub-frame precision. Returns None if the
+        deflection is within noise or the signal never reaches the half level
         within the window."""
         oriented = self._orient_transient(data)
         if oriented is None:
             return None
-        sig, baseline, peak_idx = oriented
+        sig, sm, baseline, peak_idx = oriented
 
         fps = self.params.get('fps', 1) or 1
 
-        peak_val = float(sig[peak_idx])
-        amp = peak_val - baseline
-        if amp <= 1e-6:
+        amp = float(sm[peak_idx] - baseline)
+        if amp <= max(3.0 * self._decay_noise_sigma(sig), 1e-6):
             return None
 
         half_level = baseline + amp / 2.0
-        # Walk forward from the peak to the first crossing of the half level
-        for i in range(peak_idx + 1, len(sig)):
-            if sig[i] <= half_level:
-                prev, curr = sig[i - 1], sig[i]
+        hold = max(1, min(3, len(sm) - peak_idx - 1))
+        # Walk forward from the peak to the first sustained crossing
+        for i in range(peak_idx + 1, len(sm)):
+            if sm[i] <= half_level and bool(np.all(sm[i:i + hold] <= half_level)):
+                prev, curr = sm[i - 1], sm[i]
                 frac = 0.0 if prev == curr else (prev - half_level) / (prev - curr)
                 t_frames = (i - 1 + frac) - peak_idx
                 return t_frames / fps
