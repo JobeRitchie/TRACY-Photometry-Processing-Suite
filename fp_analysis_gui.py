@@ -155,6 +155,72 @@ def derive_animal_map(subject_ids, pattern=DEFAULT_SESSION_PATTERN, overrides=No
     return raw, True
 
 
+# ── Pooled z-scoring ────────────────────────────────────────────────────────
+# Z-scoring each session independently puts an animal's days on different
+# amplitude scales -- a 2 z-score transient means one thing on a quiet day and
+# another on a noisy one.  Pooling z-scores an animal against the mean and SD of
+# all its sessions together.
+#
+# The key property: z-scoring is affine, so the pooled z-score is a rescale of
+# the z-scores already stored, not a reprocess.  With per-session moments
+# (mu_s, sd_s) and pooled moments (mu_p, sd_p),
+#
+#     z_pooled = (sd_s/sd_p) * z_session + (mu_s - mu_p)/sd_p
+#
+# which is numerically identical to recomputing from the corrected trace, is
+# exactly invertible, and works on an already-loaded project.  It must be done
+# this way: smoothing rewrites corrected_* in place before a project is saved,
+# so recomputing from it would derive the moments from smoothed data.
+
+
+def pool_moments(stats_list):
+    """Pool per-session moments into the moments of their concatenation.
+
+    Takes dicts of ``{'n', 'mean', 'sd'}`` and returns one of the same shape.
+    The n-weighting is not a choice: it is what the moments of the concatenated
+    recording are, so a short session correctly counts for less.
+
+        mu_p    = sum(n_i * mu_i) / sum(n_i)
+        sd_p^2  = sum(n_i * (sd_i^2 + mu_i^2)) / sum(n_i) - mu_p^2
+
+    Returns None if there is nothing usable to pool.
+    """
+    usable = [s for s in (stats_list or [])
+              if s and s.get('n') and float(s.get('sd') or 0.0) > 0]
+    if not usable:
+        return None
+    total_n = sum(int(s['n']) for s in usable)
+    mu_p = sum(int(s['n']) * float(s['mean']) for s in usable) / total_n
+    second = sum(int(s['n']) * (float(s['sd']) ** 2 + float(s['mean']) ** 2)
+                 for s in usable) / total_n
+    var_p = max(second - mu_p ** 2, 0.0)   # clamp: only float error goes negative
+    return {'n': total_n, 'mean': mu_p, 'sd': float(np.sqrt(var_p))}
+
+
+def affine_for(session_stats, pooled_stats):
+    """``(a, b)`` mapping a session's z-scores onto the pooled scale.
+
+    ``z_pooled = a * z_session + b``.  Returns None when either set of moments
+    is degenerate, so the caller leaves that channel alone rather than
+    dividing by zero.
+    """
+    if not session_stats or not pooled_stats:
+        return None
+    sd_s = float(session_stats.get('sd') or 0.0)
+    sd_p = float(pooled_stats.get('sd') or 0.0)
+    if sd_s <= 0 or sd_p <= 0:
+        return None
+    a = sd_s / sd_p
+    b = (float(session_stats['mean']) - float(pooled_stats['mean'])) / sd_p
+    return a, b
+
+
+def invert_affine(ab):
+    """The exact inverse of ``(a, b)``, for reverting a pooled rescale."""
+    a, b = ab
+    return 1.0 / a, -b / a
+
+
 class _ProgressCancelled(Exception):
     """Raised inside a background worker when the user hits Cancel on the
     detailed progress window, so the run aborts cleanly (not as an error)."""
@@ -2401,8 +2467,30 @@ class FPAnalysisGUI:
         self.session_pattern_custom_entry.bind(
             '<KeyRelease>', lambda _e: self._on_session_pattern_changed(from_entry=True))
 
-        ttk.Button(frame, text="Refresh preview", style='Compact.TButton',
-                   command=self._refresh_identity_preview).pack(anchor='w', pady=(4, 2))
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(anchor='w', pady=(4, 2))
+        ttk.Button(btn_row, text="Refresh preview", style='Compact.TButton',
+                   command=self._refresh_identity_preview).pack(side='left', padx=(0, 12))
+
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=6)
+        ttk.Label(frame, text="Pooled Z-Scoring", font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+        ttk.Label(frame,
+                  text="Z-score each animal against all of its sessions together instead of each\n"
+                       "session on its own, so a 2 z-score transient means the same thing on both\n"
+                       "days. This rescales the z-scores already computed — it is exact and exactly\n"
+                       "reversible, so no reprocessing is needed. Animals with one session are left\n"
+                       "alone, as are subjects processed before the moments were recorded.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(600), justify='left').pack(anchor='w', pady=(0, 4))
+
+        pool_row = ttk.Frame(frame)
+        pool_row.pack(anchor='w', pady=2)
+        ttk.Button(pool_row, text="Apply pooled z-scoring", style='Compact.TButton',
+                   command=lambda: self._toggle_pooled_zscore(True)).pack(side='left', padx=(0, 6))
+        ttk.Button(pool_row, text="Revert to per-session", style='Compact.TButton',
+                   command=lambda: self._toggle_pooled_zscore(False)).pack(side='left', padx=(0, 12))
+        self.pooled_status_label = ttk.Label(pool_row, text="", font=('Segoe UI', 8))
+        self.pooled_status_label.pack(side='left')
 
         preview_box = ttk.Frame(frame)
         preview_box.pack(fill='both', expand=True, pady=(2, 0))
@@ -2421,6 +2509,46 @@ class FPAnalysisGUI:
         # is no single refresh hook to hang this off. Rebuilding whenever the tab
         # becomes visible keeps the preview honest without touching those paths.
         parent.bind('<Map>', lambda _e: self._refresh_identity_preview())
+
+    def _toggle_pooled_zscore(self, enable):
+        """Apply or revert pooled z-scoring across the loaded subjects."""
+        if not self.processed_data:
+            messagebox.showinfo("No Data", "Process or load a project first.")
+            return
+
+        changed, messages = self.set_pooled_zscore(enable)
+        for line in messages:
+            self.log_message(f"  {line}")
+
+        if not changed:
+            skipped = [m for m in messages if 'skipped' in m]
+            detail = ("\n\n" + "\n".join(skipped[:8])) if skipped else ""
+            messagebox.showinfo(
+                "Nothing to change",
+                ("No subjects were eligible for pooling." if enable else
+                 "No subjects currently have pooled z-scoring applied.") + detail)
+            self._refresh_identity_preview()
+            return
+
+        # The cached arrays on disk are now stale for exactly these subjects.
+        if self.current_project:
+            self.save_project(subjects=changed, quiet=True)
+
+        self._refresh_identity_preview()
+        messagebox.showinfo(
+            "Pooled Z-Scoring",
+            f"{'Applied' if enable else 'Reverted'} for {len(changed)} subject(s).\n\n"
+            "Z-scores, behaviour-synced traces and cached bouts were rescaled; "
+            "plots and exports will use the new scale.")
+
+    def _pooled_status_text(self):
+        """One-line summary of which subjects are currently pooled."""
+        if not self.processed_data:
+            return ''
+        pooled = [s for s, d in self.processed_data.items() if d.get('zscore_pooled')]
+        if not pooled:
+            return "Currently: per-session z-scores."
+        return f"Currently: pooled for {len(pooled)} of {len(self.processed_data)} subject(s)."
 
     def _sync_identity_widgets(self):
         """Enable the free-text pattern box only when 'Custom regex…' is chosen."""
@@ -2484,6 +2612,9 @@ class FPAnalysisGUI:
         self.identity_preview.delete('1.0', 'end')
         self.identity_preview.insert('1.0', '\n'.join(lines))
         self.identity_preview.configure(state='disabled')
+
+        if hasattr(self, 'pooled_status_label'):
+            self.pooled_status_label.config(text=self._pooled_status_text())
 
     def create_processing_tab(self):
         """Tab for data processing"""
@@ -11403,7 +11534,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # z-scoring across an animal's sessions rescales the stored
                     # z-scores, and these moments cannot be recovered from
                     # corrected_* after smoothing has rewritten it in place.
-                    'zscore_stats': data.get('zscore_stats') or {}
+                    'zscore_stats': data.get('zscore_stats') or {},
+                    # Whether the saved z-scores are on the animal's pooled scale,
+                    # and the exact transform that put them there, so reverting
+                    # inverts what was applied instead of recomputing it.
+                    'zscore_pooled': bool(data.get('zscore_pooled', False)),
+                    'zscore_pooling_applied': data.get('zscore_pooling_applied') or {}
                 }
                 metadata_file = os.path.join(project_path, 'processed', f'{subject}_metadata.json')
                 with open(metadata_file, 'w') as f:
@@ -11999,6 +12135,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                                  'mean': float(v['mean']),
                                                  'sd': float(v['sd'])}
                                         for k, v in stored_zs.items()
+                                    }
+                                # Pooled-z state, so the toggle reflects the saved
+                                # arrays and a revert inverts the real transform.
+                                if metadata.get('zscore_pooled'):
+                                    subject_data['zscore_pooled'] = True
+                                stored_pool = metadata.get('zscore_pooling_applied')
+                                if stored_pool:
+                                    subject_data['zscore_pooling_applied'] = {
+                                        str(k): (float(v[0]), float(v[1]))
+                                        for k, v in stored_pool.items()
                                     }
 
                         # Load 470nm data if available
@@ -13225,6 +13371,169 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             sorted(set(subj_list)), self._session_pattern(),
             self.params.get('animal_overrides') or {})
         return [mapping.get(s, (s, ''))[0] for s in subj_list]
+
+    # ======================== Pooled Z-Scoring ========================
+
+    def _channel_wavelength(self, data, ch):
+        """'570' if channel *ch* is designated red, else '470'."""
+        return '570' if str(self.get_channel_name(data, ch)).upper().startswith('R') else '470'
+
+    def compute_pooled_affines(self, subject_ids=None):
+        """Per-subject, per-channel ``(a, b)`` putting each session on its
+        animal's pooled scale.
+
+        Returns ``(affines, skipped)`` where affines is
+        ``{subject: {stat_key: (a, b)}}`` and skipped is ``{subject: reason}``.
+        Animals contributing only one session are skipped: pooling one session
+        with itself is the identity, so applying it would only add float noise.
+        """
+        ids = list(subject_ids) if subject_ids is not None else list(self.processed_data.keys())
+        ids = [s for s in ids if s in self.processed_data]
+        mapping = self.get_animal_map(ids)
+
+        by_animal = {}
+        for sid in ids:
+            by_animal.setdefault(mapping.get(sid, (sid, ''))[0], []).append(sid)
+
+        affines, skipped = {}, {}
+        for animal, members in by_animal.items():
+            if len(members) < 2:
+                skipped[members[0]] = f"only session of animal '{animal}'"
+                continue
+            missing = [s for s in members
+                       if not (self.processed_data[s].get('zscore_stats'))]
+            if missing:
+                for s in members:
+                    skipped[s] = ("no stored z-scoring moments (processed before they "
+                                  "were recorded — reprocess to enable pooling)")
+                continue
+
+            keys = set()
+            for s in members:
+                keys.update(self.processed_data[s]['zscore_stats'].keys())
+
+            for key in sorted(keys):
+                per_session = [self.processed_data[s]['zscore_stats'].get(key) for s in members]
+                if any(st is None for st in per_session):
+                    continue        # channel absent from one session — cannot pool it
+                pooled = pool_moments(per_session)
+                if pooled is None:
+                    continue
+                for s, st in zip(members, per_session):
+                    ab = affine_for(st, pooled)
+                    if ab is not None:
+                        affines.setdefault(s, {})[key] = ab
+        return affines, skipped
+
+    def _rescale_bout_store(self, store, ab_by_channel, scale_only):
+        """Rescale every cached bout trace in a (possibly nested) bout dict.
+
+        Bout stores are keyed by channel name at their innermost level, with
+        metadata under underscore-prefixed keys. When bouts were baseline
+        corrected the per-bout mean has already been subtracted, so the offset
+        cancels and only the scale applies.
+        """
+        if not isinstance(store, dict):
+            return
+        for key, value in store.items():
+            if isinstance(key, str) and key.startswith('_'):
+                continue            # _prebout / _postbout and friends
+            if isinstance(value, dict):
+                self._rescale_bout_store(value, ab_by_channel, scale_only)
+            elif isinstance(value, list) and key in ab_by_channel:
+                a, b = ab_by_channel[key]
+                off = 0.0 if scale_only else b
+                store[key] = [np.asarray(tr, dtype=float) * a + off for tr in value]
+
+    def apply_affine_to_result(self, result, affines, invert=False):
+        """Rescale one subject's cached z-scores onto (or off) the pooled scale.
+
+        Touches zscore_470/zscore_570, the combined zscore, the photometry
+        columns of beh_synced, and every cached bout trace -- everything
+        downstream is derived from these and commutes with an affine map.
+        """
+        if not affines:
+            return False
+        ab_by_key = {k: (invert_affine(v) if invert else tuple(v))
+                     for k, v in affines.items()}
+
+        for wl in ('470', '570'):
+            arr = result.get(f'zscore_{wl}')
+            if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+                continue
+            for ch in range(arr.shape[1] - 2):
+                ab = ab_by_key.get(f'{wl}_{ch}')
+                if ab:
+                    arr[:, 2 + ch] = arr[:, 2 + ch] * ab[0] + ab[1]
+
+        # Per-channel transform for everything built from the combined matrix,
+        # where each channel carries its own wavelength.
+        n_ch = self.get_num_channels(result)
+        ab_by_channel_idx = {}
+        for ch in range(n_ch):
+            ab = ab_by_key.get(f'{self._channel_wavelength(result, ch)}_{ch}')
+            if ab:
+                ab_by_channel_idx[ch] = ab
+
+        combined = self._combine_by_wavelength(result, 'zscore')
+        if combined is not None:
+            result['zscore'] = combined     # rebuilt from the rescaled wavelength matrices
+
+        beh = result.get('beh_synced')
+        if isinstance(beh, np.ndarray) and beh.ndim == 2:
+            for ch, ab in ab_by_channel_idx.items():
+                col = 6 + ch
+                if col < beh.shape[1]:
+                    beh[:, col] = beh[:, col] * ab[0] + ab[1]
+
+        ab_by_name = {self.get_channel_name(result, ch): ab
+                      for ch, ab in ab_by_channel_idx.items()}
+        ab_by_name.update({f'Ch{ch}': ab for ch, ab in ab_by_channel_idx.items()})
+        scale_only = bool(self.params.get('baseline_correct_bouts', True))
+        for store_key in ('bouts', 'entry_bouts'):
+            self._rescale_bout_store(result.get(store_key), ab_by_name, scale_only)
+
+        result['zscore_pooled'] = not invert
+        if invert:
+            result.pop('zscore_pooling_applied', None)
+        else:
+            result['zscore_pooling_applied'] = {k: list(v) for k, v in ab_by_key.items()}
+        return True
+
+    def set_pooled_zscore(self, enable, subject_ids=None):
+        """Turn pooled z-scoring on or off. Returns ``(changed, messages)``.
+
+        Reverting applies the exact inverse of what was applied, rather than
+        recomputing, so a toggle round-trips to the original arrays.
+        """
+        ids = list(subject_ids) if subject_ids is not None else list(self.processed_data.keys())
+        ids = [s for s in ids if s in self.processed_data]
+        changed, messages = [], []
+
+        if enable:
+            affines, skipped = self.compute_pooled_affines(ids)
+            for sid, reason in sorted(skipped.items()):
+                messages.append(f"{sid}: skipped — {reason}")
+            for sid in ids:
+                data = self.processed_data[sid]
+                if data.get('zscore_pooled'):
+                    continue
+                if sid in affines and self.apply_affine_to_result(data, affines[sid]):
+                    changed.append(sid)
+        else:
+            for sid in ids:
+                data = self.processed_data[sid]
+                applied = data.get('zscore_pooling_applied')
+                if not applied:
+                    continue
+                if self.apply_affine_to_result(data, applied, invert=True):
+                    changed.append(sid)
+
+        if changed:
+            verb = 'Applied' if enable else 'Reverted'
+            messages.append(f"{verb} pooled z-scoring for {len(changed)} subject(s): "
+                            f"{', '.join(sorted(changed))}")
+        return changed, messages
 
     @staticmethod
     def _record_zscore_stats(result, wavelength, channel, channel_data):
