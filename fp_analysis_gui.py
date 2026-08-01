@@ -2328,6 +2328,23 @@ class FPAnalysisGUI:
         output = self.make_scrollable(output_host, width=self.ui_px(320))
         return selection, settings, output, actions
 
+    def button_grid(self, parent, items, cols=3, style=None):
+        """Lay *items* out as a wrapping grid of buttons rather than one row.
+
+        A row of five or six actions is wider than the zone it now has to fit
+        in, and a button past the right edge is simply unreachable -- there is
+        no horizontal scrollbar to find it with. Wrapping costs a little height
+        in a column that already scrolls.
+        """
+        for col in range(cols):
+            parent.grid_columnconfigure(col, weight=1)
+        for i, (text, command) in enumerate(items):
+            kwargs = {'style': style} if style else {}
+            ttk.Button(parent, text=text, command=command, **kwargs).grid(
+                row=i // cols, column=i % cols, sticky='ew',
+                padx=(0 if i % cols == 0 else self.ui_px(3), 0),
+                pady=(0 if i < cols else self.ui_px(3), 0))
+
     def register_option_clusters(self, tab_key, plot_type_var, clusters, table,
                                  always=()):
         """Show only the option clusters the current plot type uses.
@@ -4894,121 +4911,115 @@ class FPAnalysisGUI:
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Coherence")
 
-        # ── scrollable canvas ──────────────────────────────────────────────
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
+        # The three analysis modes live in a notebook in the Output zone, each
+        # with its own options, actions and results. The left column holds only
+        # what all three share -- who is analysed, which channels, which method,
+        # and the frequency bands -- so those stop being repeated per mode.
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups",
+            settings_title="Coherence Settings")
 
-        # ══════════════════════════════════════════════════════════════════
-        #  TOP CONTROL BAR
-        # ══════════════════════════════════════════════════════════════════
-        ctrl = ttk.LabelFrame(scrollable_frame, text="Coherence Analysis", padding=8)
-        ctrl.pack(fill='x', padx=5, pady=5)
+        # ── Selection ──────────────────────────────────────────────────────
+        self.conn_mode_var = tk.StringVar(value="Subject")
+        mode_row = ttk.Frame(selection)
+        mode_row.pack(fill='x')
+        ttk.Label(mode_row, text="Analyze by:").pack(side='left')
+        ttk.Radiobutton(mode_row, text="Subject", variable=self.conn_mode_var,
+                        value="Subject",
+                        command=self.update_conn_listbox).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Radiobutton(mode_row, text="Group", variable=self.conn_mode_var,
+                        value="Group",
+                        command=self.update_conn_listbox).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Label(selection, text="Used by the Whole-Session and By-Bout analyses.",
+                  foreground='gray', font=('Segoe UI', 8), justify='left',
+                  wraplength=self.ui_px(240)).pack(anchor='w')
 
-        # Row 0 — channels, method, buttons
-        r0 = ttk.Frame(ctrl)
-        r0.pack(fill='x', pady=(0, 4))
+        lb_outer = ttk.Frame(selection)
+        lb_outer.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+        lb_sb = ttk.Scrollbar(lb_outer, orient='vertical')
+        lb_sb.pack(side='right', fill='y')
+        self.conn_listbox = tk.Listbox(lb_outer, selectmode='multiple', height=6,
+                                       yscrollcommand=lb_sb.set, exportselection=False)
+        self.conn_listbox.pack(side='left', fill='both', expand=True)
+        lb_sb.config(command=self.conn_listbox.yview)
 
-        ttk.Label(r0, text="Ch 1:").pack(side='left', padx=(0, 2))
+        # ── Settings ───────────────────────────────────────────────────────
+        ch1_row = ttk.Frame(settings)
+        ch1_row.pack(fill='x')
+        ttk.Label(ch1_row, text="Channel 1:").pack(side='left')
         self.conn_channel1_var = tk.StringVar(value="G0")
-        self.conn_channel1_combo = ttk.Combobox(r0, textvariable=self.conn_channel1_var,
-                     values=["G0", "G1", "R1"], state='readonly', width=8)
-        self.conn_channel1_combo.pack(side='left', padx=(0, 10))
+        self.conn_channel1_combo = ttk.Combobox(
+            ch1_row, textvariable=self.conn_channel1_var,
+            values=["G0", "G1", "R1"], state='readonly', width=8)
+        self.conn_channel1_combo.pack(side='right')
 
-        ttk.Label(r0, text="Ch 2:").pack(side='left', padx=(0, 2))
+        ch2_row = ttk.Frame(settings)
+        ch2_row.pack(fill='x', pady=(self.ui_px(3), 0))
+        ttk.Label(ch2_row, text="Channel 2:").pack(side='left')
         self.conn_channel2_var = tk.StringVar(value="G1")
-        self.conn_channel2_combo = ttk.Combobox(r0, textvariable=self.conn_channel2_var,
-                     values=["G0", "G1", "R1"], state='readonly', width=8)
-        self.conn_channel2_combo.pack(side='left', padx=(0, 10))
+        self.conn_channel2_combo = ttk.Combobox(
+            ch2_row, textvariable=self.conn_channel2_var,
+            values=["G0", "G1", "R1"], state='readonly', width=8)
+        self.conn_channel2_combo.pack(side='right')
 
-        ttk.Label(r0, text="Method:").pack(side='left', padx=(0, 2))
+        ttk.Label(settings, text="Method:").pack(anchor='w', pady=(self.ui_px(6), 0))
         self.conn_coh_method_var = tk.StringVar(value=self.conn_params['coherence_method'])
-        ttk.Combobox(r0, textvariable=self.conn_coh_method_var,
-                     values=["Morlet Wavelet", "Welch"], state='readonly', width=16
-                     ).pack(side='left', padx=(0, 10))
+        ttk.Combobox(settings, textvariable=self.conn_coh_method_var,
+                     values=["Morlet Wavelet", "Welch"], state='readonly').pack(fill='x')
         self.conn_coh_method_var.trace_add(
             'write', lambda *a: self.conn_params.update(
                 {'coherence_method': self.conn_coh_method_var.get()}))
 
-        ttk.Separator(r0, orient='vertical').pack(side='left', fill='y', padx=8)
-        ttk.Button(r0, text="\u2699 Settings",
-                   command=self.open_connectivity_settings).pack(side='left', padx=3)
-        ttk.Button(r0, text="\U0001f52c Auto-Tune",
-                   command=self.auto_tune_coherence_settings).pack(side='left', padx=3)
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_conn).pack(
+            anchor='w', pady=(self.ui_px(6), 0))
 
-        ttk.Separator(r0, orient='vertical').pack(side='left', fill='y', padx=8)
-        ttk.Checkbutton(r0, text="Apply Exclusions",
-                        variable=self.use_exclusions_conn).pack(side='left', padx=3)
+        ttk.Button(settings, text="⚙  Coherence Settings…",
+                   command=self.open_connectivity_settings).pack(
+            fill='x', pady=(self.ui_px(6), 0))
+        ttk.Button(settings, text="🔬  Auto-Tune",
+                   command=self.auto_tune_coherence_settings).pack(
+            fill='x', pady=(self.ui_px(4), 0))
 
-        # Row 1 — subject/group selector (shared across Whole-Session + By-Bout tabs)
-        r1 = ttk.Frame(ctrl)
-        r1.pack(fill='x', pady=(2, 0))
+        ttk.Separator(settings, orient='horizontal').pack(
+            fill='x', pady=self.ui_px(8))
 
-        self.conn_mode_var = tk.StringVar(value="Subject")
-        ttk.Label(r1, text="Analyze by:").pack(side='left', padx=(0, 4))
-        ttk.Radiobutton(r1, text="Subject", variable=self.conn_mode_var,
-                        value="Subject",
-                        command=self.update_conn_listbox).pack(side='left', padx=4)
-        ttk.Radiobutton(r1, text="Group", variable=self.conn_mode_var,
-                        value="Group",
-                        command=self.update_conn_listbox).pack(side='left', padx=4)
-        ttk.Label(r1, text="(used by Whole-Session and By-Bout analyses)",
-                  foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=8)
-
-        lb_outer = ttk.Frame(ctrl)
-        lb_outer.pack(fill='x', pady=(4, 0))
-        lb_sb = ttk.Scrollbar(lb_outer, orient='vertical')
-        lb_sb.pack(side='right', fill='y')
-        self.conn_listbox = tk.Listbox(lb_outer, selectmode='multiple', height=5,
-                                       yscrollcommand=lb_sb.set)
-        self.conn_listbox.pack(side='left', fill='both', expand=True)
-        lb_sb.config(command=self.conn_listbox.yview)
-
-        # ══════════════════════════════════════════════════════════════════
-        #  FREQUENCY BANDS
-        # ══════════════════════════════════════════════════════════════════
-        bands_outer = ttk.LabelFrame(scrollable_frame, text="Frequency Bands", padding=8)
-        bands_outer.pack(fill='x', padx=5, pady=5)
-
-        bands_top = ttk.Frame(bands_outer)
+        ttk.Label(settings, text="Frequency bands:").pack(anchor='w')
+        bands_top = ttk.Frame(settings)
         bands_top.pack(fill='x')
         lb2_sb = ttk.Scrollbar(bands_top, orient='vertical')
         lb2_sb.pack(side='right', fill='y')
         self.freq_bands_listbox = tk.Listbox(bands_top, height=4,
                                              yscrollcommand=lb2_sb.set,
-                                             font=('Courier New', 9))
-        self.freq_bands_listbox.pack(side='left', fill='x', expand=True)
+                                             font=('Courier New', 9),
+                                             exportselection=False)
+        self.freq_bands_listbox.pack(side='left', fill='both', expand=True)
         lb2_sb.config(command=self.freq_bands_listbox.yview)
 
-        bands_btns = ttk.Frame(bands_outer)
-        bands_btns.pack(fill='x', pady=(4, 0))
-        ttk.Button(bands_btns, text="+ Add",
-                   command=self._freq_band_add).pack(side='left', padx=2)
-        ttk.Button(bands_btns, text="\u270e Edit",
-                   command=self._freq_band_edit).pack(side='left', padx=2)
-        ttk.Button(bands_btns, text="\u2715 Remove",
-                   command=self._freq_band_remove).pack(side='left', padx=2)
-        ttk.Button(bands_btns, text="\u2191",
-                   command=lambda: self._freq_band_move(-1)).pack(side='left', padx=2)
-        ttk.Button(bands_btns, text="\u2193",
-                   command=lambda: self._freq_band_move(1)).pack(side='left', padx=2)
-        ttk.Button(bands_btns, text="Reset Defaults",
-                   command=self._freq_band_reset_defaults).pack(side='left', padx=6)
+        # Two columns: at three, "Remove" was clipped by the column edge.
+        bands_btns = ttk.Frame(settings)
+        bands_btns.pack(fill='x', pady=(self.ui_px(3), 0))
+        self.button_grid(bands_btns, (
+            ("+ Add", self._freq_band_add),
+            ("✎ Edit", self._freq_band_edit),
+            ("✕ Remove", self._freq_band_remove),
+            ("Reset", self._freq_band_reset_defaults),
+            ("↑", lambda: self._freq_band_move(-1)),
+            ("↓", lambda: self._freq_band_move(1))),
+            cols=2, style='Compact.TButton')
         self._refresh_freq_band_listbox()
+
+        # The Actions zone stays empty on this tab: every action belongs to one
+        # of the three analysis modes, so each lives in its own notebook page
+        # next to the results it produces.
 
         # ══════════════════════════════════════════════════════════════════
         #  ANALYSIS MODE NOTEBOOK  (Whole Session | By Bout | By Group)
         # ══════════════════════════════════════════════════════════════════
-        mode_nb = ttk.Notebook(scrollable_frame)
-        mode_nb.pack(fill='both', expand=True, padx=5, pady=5)
+        mode_nb = ttk.Notebook(output)
+        mode_nb.pack(fill='both', expand=True)
 
         # ── TAB 1: Whole Session ──────────────────────────────────────────
         ws_tab = ttk.Frame(mode_nb, padding=10)
@@ -5036,18 +5047,13 @@ class FPAnalysisGUI:
 
         ws_btns = ttk.Frame(ws_tab)
         ws_btns.pack(fill='x', pady=(0, 6))
-        ttk.Button(ws_btns, text="\u25b6 Run Analysis",
-                   command=self.run_connectivity_analysis).pack(side='left', padx=3)
-        ttk.Button(ws_btns, text="\U0001f4ca Visualize Coherence",
-                   command=self.visualize_connectivity).pack(side='left', padx=3)
-        ttk.Button(ws_btns, text="\U0001f4c8 Power Spectra",
-                   command=self.visualize_power_spectra).pack(side='left', padx=3)
-        ttk.Button(ws_btns, text="\U0001f30a Wavelet Spectrogram",
-                   command=self.visualize_wavelet_spectrogram).pack(side='left', padx=3)
-        ttk.Button(ws_btns, text="\U0001f4c8 Band Bars",
-                   command=self.visualize_connectivity_band_bars).pack(side='left', padx=3)
-        ttk.Button(ws_btns, text="\U0001f4be Export",
-                   command=self.export_connectivity_results).pack(side='left', padx=3)
+        self.button_grid(ws_btns, (
+            ("▶ Run Analysis", self.run_connectivity_analysis),
+            ("📊 Visualize Coherence", self.visualize_connectivity),
+            ("📈 Power Spectra", self.visualize_power_spectra),
+            ("🌊 Wavelet Spectrogram", self.visualize_wavelet_spectrogram),
+            ("📈 Band Bars", self.visualize_connectivity_band_bars),
+            ("💾 Export", self.export_connectivity_results)))
 
         ws_tree_frame = ttk.Frame(ws_tab)
         ws_tree_frame.pack(fill='both', expand=True)
@@ -5111,16 +5117,12 @@ class FPAnalysisGUI:
 
         bout_btns = ttk.Frame(bout_tab)
         bout_btns.pack(fill='x', pady=(0, 6))
-        ttk.Button(bout_btns, text="\u25b6 Run Bout Epoch Coherence",
-                   command=self.run_bout_epoch_coherence).pack(side='left', padx=3)
-        ttk.Button(bout_btns, text="\U0001f4ca Plot Epoch Coherence",
-                   command=self.visualize_bout_epoch_coherence).pack(side='left', padx=3)
-        ttk.Button(bout_btns, text="\U0001f4c8 Plot Band Bars",
-                   command=self.visualize_connectivity_band_bars).pack(side='left', padx=3)
-        ttk.Button(bout_btns, text="\U0001f30a Epoch Spectrogram",
-                   command=self.visualize_bout_epoch_spectrogram).pack(side='left', padx=3)
-        ttk.Button(bout_btns, text="\U0001f4be Export Epoch Data",
-                   command=self.export_bout_epoch_coherence).pack(side='left', padx=3)
+        self.button_grid(bout_btns, (
+            ("▶ Run Bout Epoch Coherence", self.run_bout_epoch_coherence),
+            ("📊 Plot Epoch Coherence", self.visualize_bout_epoch_coherence),
+            ("📈 Plot Band Bars", self.visualize_connectivity_band_bars),
+            ("🌊 Epoch Spectrogram", self.visualize_bout_epoch_spectrogram),
+            ("💾 Export Epoch Data", self.export_bout_epoch_coherence)))
 
         self.bout_epoch_status_var = tk.StringVar(value="No epoch analysis run yet.")
         ttk.Label(bout_tab, textvariable=self.bout_epoch_status_var,
@@ -5202,32 +5204,23 @@ class FPAnalysisGUI:
 
         # Buttons row (row 5) — swapped by _toggle_grp_tab_mode
         self._grp_ws_btns = ttk.Frame(grp_tab)
-        self._grp_ws_btns.grid(row=5, column=0, columnspan=4, sticky='w', pady=(4, 0))
-        ttk.Button(self._grp_ws_btns, text="\u25b6 Run Group Comparison",
-                   command=self.run_group_coherence_comparison).pack(side='left', padx=3)
-        ttk.Button(self._grp_ws_btns, text="\U0001f4ca Plot Spectra",
-                   command=self.visualize_group_coherence_spectra).pack(side='left', padx=3)
-        ttk.Button(self._grp_ws_btns, text="\U0001f4c8 Plot Band Bars",
-                   command=self.visualize_group_coherence_bands).pack(side='left', padx=3)
-        ttk.Button(self._grp_ws_btns, text="\U0001f4be Export",
-                   command=self.export_group_coherence_comparison).pack(side='left', padx=3)
-        ttk.Button(self._grp_ws_btns, text="\U0001f517 Zone Coherence",
-                   command=self.run_zone_coherence).pack(side='left', padx=3)
+        self._grp_ws_btns.grid(row=5, column=0, columnspan=4, sticky='ew', pady=(4, 0))
+        self.button_grid(self._grp_ws_btns, (
+            ("▶ Run Group Comparison", self.run_group_coherence_comparison),
+            ("📊 Plot Spectra", self.visualize_group_coherence_spectra),
+            ("📈 Plot Band Bars", self.visualize_group_coherence_bands),
+            ("💾 Export", self.export_group_coherence_comparison),
+            ("🔗 Zone Coherence", self.run_zone_coherence)))
 
         self._grp_bout_btns = ttk.Frame(grp_tab)
-        self._grp_bout_btns.grid(row=5, column=0, columnspan=4, sticky='w', pady=(4, 0))
-        ttk.Button(self._grp_bout_btns, text="\u25b6 Run Bout-Epoch Group Comparison",
-                   command=self.run_bout_epoch_group_comparison).pack(side='left', padx=3)
-        ttk.Button(self._grp_bout_btns, text="\U0001f4ca Plot Spectra (Pre vs Post)",
-                   command=self.visualize_beg_spectra).pack(side='left', padx=3)
-        ttk.Button(self._grp_bout_btns, text="\U0001f4c8 Plot Band Bars (Pre vs Post)",
-                   command=self.visualize_beg_band_bars).pack(side='left', padx=3)
-        ttk.Button(self._grp_bout_btns, text="\U0001f4c8 Plot Delta Coherence",
-                   command=self.visualize_beg_delta).pack(side='left', padx=3)
-        ttk.Button(self._grp_bout_btns, text="\U0001f321 Peri-Event Spectrogram",
-                   command=self.visualize_beg_peri_event_spectrogram).pack(side='left', padx=3)
-        ttk.Button(self._grp_bout_btns, text="\U0001f4be Export",
-                   command=self.export_beg_comparison).pack(side='left', padx=3)
+        self._grp_bout_btns.grid(row=5, column=0, columnspan=4, sticky='ew', pady=(4, 0))
+        self.button_grid(self._grp_bout_btns, (
+            ("▶ Run Bout-Epoch Group Comparison", self.run_bout_epoch_group_comparison),
+            ("📊 Plot Spectra (Pre vs Post)", self.visualize_beg_spectra),
+            ("📈 Plot Band Bars (Pre vs Post)", self.visualize_beg_band_bars),
+            ("📈 Plot Delta Coherence", self.visualize_beg_delta),
+            ("🌡 Peri-Event Spectrogram", self.visualize_beg_peri_event_spectrogram),
+            ("💾 Export", self.export_beg_comparison)))
 
         # Status label (row 6) — shared
         self.grp_comp_status_var = tk.StringVar(value="No group comparison run yet.")
