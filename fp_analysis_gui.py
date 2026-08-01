@@ -300,6 +300,69 @@ def factor_levels(subject_ids, subject_factors, factor, level_order=None):
     return ordered + rest + tail
 
 
+def levels_from_ids(subject_ids, pattern):
+    """Read a factor level out of each subject ID with *pattern*.
+
+    The level is the named group ``level`` if the pattern defines one, else the
+    first capturing group, else the whole match -- so both ``_(?P<level>.+)$``
+    and a bare ``pre|post`` do the obvious thing.
+
+    Subjects the pattern does not match are simply absent from the result
+    rather than assigned an empty level.  A partial auto-assignment is normal
+    (a pattern written for one cohort need not match another), and blanking
+    the rest would silently destroy hand assignments.
+
+    Raises ``re.error`` on a malformed pattern so the caller can report it
+    instead of guessing.
+    """
+    rx = re.compile(pattern)
+    out = {}
+    for sid in subject_ids:
+        match = rx.search(str(sid))
+        if not match:
+            continue
+        if 'level' in rx.groupindex:
+            level = match.group('level')
+        elif match.groups():
+            level = match.group(1)
+        else:
+            level = match.group(0)
+        if level:
+            out[str(sid)] = str(level)
+    return out
+
+
+# A factor is recorded in three parallel places -- the name list, the per-subject
+# assignments, and the level order. Renaming or deleting one has to touch all
+# three or the factor half-survives: a stale level order silently reorders a
+# plot's series, and a stale assignment resurrects a deleted factor via
+# get_factor_definitions(). Keeping both edits here keeps them in step.
+
+def rename_factor_in(params, old, new):
+    """Rename factor *old* to *new* across every structure that records it."""
+    params['factor_definitions'] = [
+        new if f == old else f for f in (params.get('factor_definitions') or [])]
+    for levels in (params.get('subject_factors') or {}).values():
+        if old in levels:
+            levels[new] = levels.pop(old)
+    order = params.get('factor_level_order') or {}
+    if old in order:
+        order[new] = order.pop(old)
+    return params
+
+
+def delete_factor_from(params, name):
+    """Remove factor *name* and every trace of it. Returns assignments removed."""
+    params['factor_definitions'] = [
+        f for f in (params.get('factor_definitions') or []) if f != name]
+    removed = 0
+    for levels in (params.get('subject_factors') or {}).values():
+        if levels.pop(name, None) is not None:
+            removed += 1
+    (params.get('factor_level_order') or {}).pop(name, None)
+    return removed
+
+
 class _ProgressCancelled(Exception):
     """Raised inside a background worker when the user hits Cancel on the
     detailed progress window, so the run aborts cleanly (not as an error)."""
@@ -2254,6 +2317,7 @@ class FPAnalysisGUI:
         self.create_processing_tab()
         self.create_boutframes_tab()
         self.create_groups_tab()
+        self.create_factors_tab()
         self.create_exclusions_tab()
         # Data-group subtabs
         self.create_behavioral_data_tab()
@@ -3710,6 +3774,462 @@ class FPAnalysisGUI:
                               wraplength=self.ui_px(500))
         info_label.pack(side='bottom', fill='x', padx=10, pady=5)
         
+    # ======================== Factors ========================
+    # Derived factors are computed from data that already exists (self.groups,
+    # the subject-ID pattern) rather than stored, so they cannot drift out of
+    # sync with it. They can still be overridden per subject: a stored level
+    # always wins in get_subject_factors().
+    _FACTOR_DERIVED = ('Group', 'Session', 'Animal')
+
+    def create_factors_tab(self):
+        """Tab for defining factors and assigning their levels to subjects.
+
+        A factor is any way of dividing subjects -- Group, Session, Drug, Sex,
+        Day. Every graphing tab facets on the same factors, so an experiment's
+        structure is declared once here rather than per plot.
+        """
+        tab = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(tab, text="Factors")
+
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
+
+        ttk.Label(scrollable_frame,
+                  text="A factor is any way of dividing subjects — Group, Session, Drug, Sex, Day.\n"
+                       "Graphing tabs can combine a factor's levels, split into one series per level, or\n"
+                       "filter to a single level, and splitting two factors at once gives the cross-product\n"
+                       "(\"Fentanyl × Post\"). Group, Session and Animal are derived automatically; assigning\n"
+                       "a level here overrides the derived one for that subject.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(760), justify='left').pack(anchor='w', padx=8, pady=(8, 2))
+
+        main_container = ttk.Frame(scrollable_frame)
+        main_container.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # ── Left: the factors themselves, and each one's level order ──────────
+        left_panel = ttk.Frame(main_container)
+        left_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 4))
+
+        factor_frame = ttk.LabelFrame(left_panel, text="Factors", padding=5)
+        factor_frame.pack(fill='both', expand=True)
+
+        factor_list_frame = ttk.Frame(factor_frame)
+        factor_list_frame.pack(fill='both', expand=True)
+        self.factor_listbox = tk.Listbox(factor_list_frame, selectmode='single',
+                                         height=8, exportselection=False)
+        self.factor_listbox.pack(side='left', fill='both', expand=True)
+        self.factor_listbox.bind('<<ListboxSelect>>', lambda _e: self._on_factor_selected())
+        self.factor_listbox.bind('<Double-Button-1>', lambda _e: self.rename_factor())
+        fl_scroll = ttk.Scrollbar(factor_list_frame, orient='vertical',
+                                  command=self.factor_listbox.yview)
+        fl_scroll.pack(side='right', fill='y')
+        self.factor_listbox.config(yscrollcommand=fl_scroll.set)
+
+        factor_btns = ttk.Frame(factor_frame)
+        factor_btns.pack(fill='x', pady=(6, 0))
+        ttk.Button(factor_btns, text="New…", style='Compact.TButton',
+                   command=self.create_factor).pack(side='left', padx=(0, 4))
+        ttk.Button(factor_btns, text="Rename…", style='Compact.TButton',
+                   command=self.rename_factor).pack(side='left', padx=(0, 4))
+        ttk.Button(factor_btns, text="Delete", style='Compact.TButton',
+                   command=self.delete_factor).pack(side='left')
+
+        # Level display order drives series order and colour assignment on every
+        # plot, so it is user-controlled rather than alphabetical by accident.
+        level_frame = ttk.LabelFrame(left_panel, text="Levels (plot order)", padding=5)
+        level_frame.pack(fill='both', expand=True, pady=(6, 0))
+
+        level_list_frame = ttk.Frame(level_frame)
+        level_list_frame.pack(fill='both', expand=True)
+        self.factor_level_listbox = tk.Listbox(level_list_frame, selectmode='single',
+                                               height=7, exportselection=False)
+        self.factor_level_listbox.pack(side='left', fill='both', expand=True)
+        lv_scroll = ttk.Scrollbar(level_list_frame, orient='vertical',
+                                  command=self.factor_level_listbox.yview)
+        lv_scroll.pack(side='right', fill='y')
+        self.factor_level_listbox.config(yscrollcommand=lv_scroll.set)
+
+        level_btns = ttk.Frame(level_frame)
+        level_btns.pack(fill='x', pady=(6, 0))
+        ttk.Button(level_btns, text="▲ Up", style='Compact.TButton',
+                   command=lambda: self.move_factor_level(-1)).pack(side='left', padx=(0, 4))
+        ttk.Button(level_btns, text="▼ Down", style='Compact.TButton',
+                   command=lambda: self.move_factor_level(1)).pack(side='left', padx=(0, 4))
+        ttk.Button(level_btns, text="Rename…", style='Compact.TButton',
+                   command=self.rename_factor_level).pack(side='left')
+
+        # ── Right: the subject × factor grid and the assignment actions ───────
+        right_panel = ttk.LabelFrame(main_container, text="Subject Assignments", padding=5)
+        right_panel.grid(row=0, column=1, sticky='nsew')
+
+        self.factor_status_label = ttk.Label(right_panel, text="", foreground='gray',
+                                             font=('Segoe UI', 8))
+        self.factor_status_label.pack(anchor='w', pady=(0, 4))
+
+        tree_frame = ttk.Frame(right_panel)
+        tree_frame.pack(fill='both', expand=True)
+        self.factor_tree = ttk.Treeview(tree_frame, columns=(), show='tree headings',
+                                        selectmode='extended', height=14)
+        tree_vsb = ttk.Scrollbar(tree_frame, orient='vertical',
+                                 command=self.factor_tree.yview)
+        tree_hsb = ttk.Scrollbar(tree_frame, orient='horizontal',
+                                 command=self.factor_tree.xview)
+        self.factor_tree.configure(yscrollcommand=tree_vsb.set, xscrollcommand=tree_hsb.set)
+        self.factor_tree.grid(row=0, column=0, sticky='nsew')
+        tree_vsb.grid(row=0, column=1, sticky='ns')
+        tree_hsb.grid(row=1, column=0, sticky='ew')
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        # Bulk assignment. Per-subject editing alone is unusable at 23 subjects,
+        # so the primary action is "assign this level to everything selected".
+        assign_frame = ttk.Frame(right_panel)
+        assign_frame.pack(fill='x', pady=(6, 0))
+        ttk.Label(assign_frame, text="Set").pack(side='left', padx=(0, 4))
+        self.factor_assign_name_label = ttk.Label(assign_frame, text="(no factor)",
+                                                  font=('Segoe UI', 9, 'bold'))
+        self.factor_assign_name_label.pack(side='left', padx=(0, 4))
+        ttk.Label(assign_frame, text="=").pack(side='left', padx=(0, 4))
+        self.factor_assign_level_var = tk.StringVar()
+        self.factor_assign_combo = ttk.Combobox(
+            assign_frame, textvariable=self.factor_assign_level_var, width=18)
+        self.factor_assign_combo.pack(side='left', padx=(0, 6))
+        ttk.Button(assign_frame, text="Assign to selected", style='Compact.TButton',
+                   command=self.assign_factor_level).pack(side='left', padx=(0, 4))
+        ttk.Button(assign_frame, text="Clear from selected", style='Compact.TButton',
+                   command=self.clear_factor_level).pack(side='left', padx=(0, 4))
+        ttk.Button(assign_frame, text="Select all", style='Compact.TButton',
+                   command=lambda: self.factor_tree.selection_set(
+                       self.factor_tree.get_children())).pack(side='left')
+
+        ttk.Label(right_panel,
+                  text="New levels are created by typing one in the box — it does not have to exist yet.",
+                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 0))
+
+        auto_frame = ttk.Frame(right_panel)
+        auto_frame.pack(fill='x', pady=(6, 0))
+        ttk.Label(auto_frame, text="Auto-assign from subject ID:").pack(side='left', padx=(0, 4))
+        self.factor_autoassign_var = tk.StringVar(value=r'_(?P<level>[^_]+)$')
+        ttk.Entry(auto_frame, textvariable=self.factor_autoassign_var,
+                  width=26).pack(side='left', padx=(0, 6))
+        ttk.Button(auto_frame, text="Apply pattern…", style='Compact.TButton',
+                   command=self.auto_assign_factor).pack(side='left', padx=(0, 4))
+        ttk.Button(auto_frame, text="🔄 Refresh", style='Compact.TButton',
+                   command=self.refresh_factors_display).pack(side='left')
+
+        ttk.Label(right_panel,
+                  text="The level is the (?P<level>…) group if the pattern has one, else the first "
+                       "capture group, else the whole match. Subjects the pattern misses keep what "
+                       "they have. Assignments are saved with the project.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(560), justify='left').pack(anchor='w', pady=(3, 0))
+
+        main_container.grid_rowconfigure(0, weight=1)
+        main_container.grid_columnconfigure(0, weight=0)
+        main_container.grid_columnconfigure(1, weight=1)
+
+        self.refresh_factors_display()
+        # The subject set and self.groups both change from elsewhere (processing,
+        # project load, the Groups tab) with no single hook to hang this off.
+        # Rebuilding when the tab becomes visible keeps the grid honest without
+        # threading a callback through all of those paths.
+        tab.bind('<Map>', lambda _e: self.refresh_factors_display())
+
+    def _selected_factor(self):
+        """Name of the factor highlighted in the factor list, or None."""
+        names = getattr(self, '_factor_names', [])
+        sel = self.factor_listbox.curselection() if hasattr(self, 'factor_listbox') else ()
+        if not sel or sel[0] >= len(names):
+            return None
+        return names[sel[0]]
+
+    def refresh_factors_display(self):
+        """Rebuild the factor list, the level list and the assignment grid."""
+        if not hasattr(self, 'factor_tree'):
+            return
+        subjects = sorted(self.processed_data.keys())
+        factors = self.get_factor_definitions(subjects)
+        assignments = self.get_subject_factors(subjects)
+
+        previous = self._selected_factor()
+        self._factor_names = factors
+        self.factor_listbox.delete(0, 'end')
+        for name in factors:
+            marker = '  (derived)' if name in self._FACTOR_DERIVED else ''
+            self.factor_listbox.insert('end', f"{name}{marker}")
+        if factors:
+            index = factors.index(previous) if previous in factors else 0
+            self.factor_listbox.selection_clear(0, 'end')
+            self.factor_listbox.selection_set(index)
+
+        selected_rows = set(self.factor_tree.selection())
+        self.factor_tree.delete(*self.factor_tree.get_children())
+        self.factor_tree['columns'] = factors
+        self.factor_tree.heading('#0', text='Subject')
+        self.factor_tree.column('#0', width=self.ui_px(150),
+                                minwidth=self.ui_px(90), stretch=False)
+        for name in factors:
+            self.factor_tree.heading(name, text=name)
+            self.factor_tree.column(name, width=self.ui_px(110),
+                                    minwidth=self.ui_px(60), stretch=False, anchor='w')
+        for sid in subjects:
+            levels = assignments.get(sid) or {}
+            self.factor_tree.insert('', 'end', iid=sid, text=sid,
+                                    values=[levels.get(f, '') for f in factors])
+        restore = [s for s in selected_rows if s in subjects]
+        if restore:
+            self.factor_tree.selection_set(restore)
+
+        if not subjects:
+            self.factor_status_label.config(
+                text="No processed subjects yet — process or load a project.")
+        else:
+            self.factor_status_label.config(
+                text=f"{len(subjects)} subject(s) · {len(factors)} factor(s). "
+                     "Blank cells are unassigned and plot as “(unassigned)”.")
+        self._on_factor_selected()
+
+    def _on_factor_selected(self):
+        """Refresh the level list and assignment box for the chosen factor."""
+        factor = self._selected_factor()
+        self.factor_assign_name_label.config(text=factor or "(no factor)")
+
+        self.factor_level_listbox.delete(0, 'end')
+        if not factor:
+            self.factor_assign_combo['values'] = []
+            return
+        subjects = sorted(self.processed_data.keys())
+        levels = [lv for lv in factor_levels(
+            subjects, self.get_subject_factors(subjects), factor,
+            (self.params.get('factor_level_order') or {}).get(factor))
+            if lv != FACTOR_UNASSIGNED]
+        for level in levels:
+            self.factor_level_listbox.insert('end', level)
+        self.factor_assign_combo['values'] = levels
+
+    def create_factor(self):
+        """Add a user-defined factor. Its levels are created on first use."""
+        name = tk.simpledialog.askstring(
+            "New Factor", "Factor name (e.g. Drug, Sex, Day):", parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in self.get_factor_definitions():
+            messagebox.showwarning("Duplicate", f"Factor '{name}' already exists.")
+            return
+        self.params.setdefault('factor_definitions', []).append(name)
+        self.refresh_factors_display()
+        if name in getattr(self, '_factor_names', []):
+            self.factor_listbox.selection_clear(0, 'end')
+            self.factor_listbox.selection_set(self._factor_names.index(name))
+            self._on_factor_selected()
+        self.log_message(f"Created factor '{name}'")
+
+    def rename_factor(self):
+        """Rename a user-defined factor everywhere it is recorded."""
+        factor = self._selected_factor()
+        if not factor:
+            return
+        if factor in self._FACTOR_DERIVED:
+            messagebox.showinfo(
+                "Derived Factor",
+                f"'{factor}' is derived automatically and cannot be renamed.\n\n"
+                "Group comes from the Groups tab; Session and Animal come from the "
+                "ID style on Processing → Animals & Sessions.")
+            return
+        new = tk.simpledialog.askstring(
+            "Rename Factor", f"New name for '{factor}':",
+            initialvalue=factor, parent=self.root)
+        if not new or not new.strip() or new.strip() == factor:
+            return
+        new = new.strip()
+        if new in self.get_factor_definitions():
+            messagebox.showwarning("Duplicate", f"Factor '{new}' already exists.")
+            return
+
+        rename_factor_in(self.params, factor, new)
+        self.refresh_factors_display()
+        self.log_message(f"Renamed factor '{factor}' to '{new}'")
+
+    def delete_factor(self):
+        """Remove a user-defined factor and every assignment of it."""
+        factor = self._selected_factor()
+        if not factor:
+            return
+        if factor in self._FACTOR_DERIVED:
+            messagebox.showinfo(
+                "Derived Factor",
+                f"'{factor}' is derived automatically and cannot be deleted.\n\n"
+                "It disappears on its own when nothing produces it — Group when no "
+                "groups exist, Session when the IDs encode no sessions.")
+            return
+        assigned = sum(1 for levels in (self.params.get('subject_factors') or {}).values()
+                       if factor in levels)
+        if not messagebox.askyesno(
+                "Delete Factor",
+                f"Delete factor '{factor}'?\n\n"
+                f"{assigned} subject assignment(s) will be removed."):
+            return
+        delete_factor_from(self.params, factor)
+        self.refresh_factors_display()
+        self.log_message(f"Deleted factor '{factor}'")
+
+    def assign_factor_level(self):
+        """Assign the typed level to every subject selected in the grid."""
+        factor = self._selected_factor()
+        subjects = list(self.factor_tree.selection())
+        level = self.factor_assign_level_var.get().strip()
+        if not factor:
+            messagebox.showwarning("No Factor", "Select a factor on the left first.")
+            return
+        if not subjects:
+            messagebox.showwarning("No Subjects", "Select one or more subjects in the grid.")
+            return
+        if not level:
+            messagebox.showwarning("No Level", "Type or choose a level to assign.")
+            return
+
+        stored = self.params.setdefault('subject_factors', {})
+        for sid in subjects:
+            stored.setdefault(sid, {})[factor] = level
+        # A newly created level goes to the end of the plot order rather than
+        # being sorted in, so adding one never reshuffles existing series.
+        order = self.params.setdefault('factor_level_order', {}).setdefault(factor, [])
+        if level not in order:
+            order.append(level)
+        self.refresh_factors_display()
+        self.log_message(f"Assigned {factor}='{level}' to {len(subjects)} subject(s)")
+
+    def clear_factor_level(self):
+        """Drop the stored level for the selected subjects.
+
+        For a derived factor this removes the override, so the subject falls
+        back to its derived level rather than becoming unassigned.
+        """
+        factor = self._selected_factor()
+        subjects = list(self.factor_tree.selection())
+        if not factor or not subjects:
+            messagebox.showwarning(
+                "Nothing to Clear", "Select a factor and one or more subjects.")
+            return
+        stored = self.params.get('subject_factors') or {}
+        cleared = 0
+        for sid in subjects:
+            if stored.get(sid, {}).pop(factor, None) is not None:
+                cleared += 1
+        self.refresh_factors_display()
+        self.log_message(f"Cleared {factor} from {cleared} subject(s)")
+
+    def auto_assign_factor(self):
+        """Populate the selected factor from the subject IDs by regex.
+
+        Shows what the pattern produces before committing: the assignment
+        decides how plots are split, so a pattern that quietly matches nothing
+        (or the wrong token) should be visible rather than discovered later on
+        a plot.
+        """
+        factor = self._selected_factor()
+        if not factor:
+            messagebox.showwarning("No Factor", "Select a factor on the left first.")
+            return
+        pattern = self.factor_autoassign_var.get().strip()
+        if not pattern:
+            return
+        subjects = sorted(self.processed_data.keys())
+        if not subjects:
+            messagebox.showinfo("No Data", "Process or load a project first.")
+            return
+
+        try:
+            derived = levels_from_ids(subjects, pattern)
+        except re.error as exc:
+            messagebox.showerror("Invalid Pattern", f"Not a valid regular expression:\n{exc}")
+            return
+        if not derived:
+            messagebox.showinfo(
+                "No Matches",
+                f"The pattern matched none of the {len(subjects)} subject ID(s), "
+                "so nothing was assigned.")
+            return
+
+        sample = '\n'.join(f"  {sid} → {lv}" for sid, lv in list(derived.items())[:12])
+        more = f"\n  … and {len(derived) - 12} more" if len(derived) > 12 else ""
+        missed = len(subjects) - len(derived)
+        missed_note = (f"\n\n{missed} subject(s) did not match and will keep their "
+                       "current assignment.") if missed else ""
+        if not messagebox.askyesno(
+                "Auto-assign Levels",
+                f"Assign {factor} for {len(derived)} of {len(subjects)} subject(s)?\n\n"
+                f"{sample}{more}{missed_note}"):
+            return
+
+        stored = self.params.setdefault('subject_factors', {})
+        for sid, level in derived.items():
+            stored.setdefault(sid, {})[factor] = level
+        order = self.params.setdefault('factor_level_order', {}).setdefault(factor, [])
+        for level in derived.values():
+            if level not in order:
+                order.append(level)
+        self.refresh_factors_display()
+        self.log_message(f"Auto-assigned {factor} for {len(derived)} subject(s) from /{pattern}/")
+
+    def move_factor_level(self, delta):
+        """Move the highlighted level up or down in plot order."""
+        factor = self._selected_factor()
+        sel = self.factor_level_listbox.curselection()
+        if not factor or not sel:
+            return
+        levels = list(self.factor_level_listbox.get(0, 'end'))
+        i = sel[0]
+        j = i + delta
+        if not 0 <= j < len(levels):
+            return
+        levels[i], levels[j] = levels[j], levels[i]
+        self.params.setdefault('factor_level_order', {})[factor] = levels
+        self._on_factor_selected()
+        self.factor_level_listbox.selection_set(j)
+
+    def rename_factor_level(self):
+        """Rename a level of a user-defined factor across all subjects."""
+        factor = self._selected_factor()
+        sel = self.factor_level_listbox.curselection()
+        if not factor or not sel:
+            return
+        if factor in self._FACTOR_DERIVED:
+            messagebox.showinfo(
+                "Derived Factor",
+                f"Levels of '{factor}' come from elsewhere, so renaming one here would "
+                "be undone the next time it is derived.\n\n"
+                "Rename the group on the Groups tab, or change the ID style on "
+                "Processing → Animals & Sessions.")
+            return
+        old = self.factor_level_listbox.get(sel[0])
+        new = tk.simpledialog.askstring(
+            "Rename Level", f"New name for level '{old}' of {factor}:",
+            initialvalue=old, parent=self.root)
+        if not new or not new.strip() or new.strip() == old:
+            return
+        new = new.strip()
+        for levels in (self.params.get('subject_factors') or {}).values():
+            if levels.get(factor) == old:
+                levels[factor] = new
+        order = self.params.setdefault('factor_level_order', {}).get(factor)
+        if order:
+            self.params['factor_level_order'][factor] = [
+                new if lv == old else lv for lv in order]
+        self.refresh_factors_display()
+        self.log_message(f"Renamed {factor} level '{old}' to '{new}'")
+
     def create_exclusions_tab(self):
         """Tab for managing subject exclusions on a per-channel basis"""
         tab = ttk.Frame(self.project_notebook)

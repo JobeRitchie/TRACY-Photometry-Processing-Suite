@@ -10,6 +10,7 @@ vocabulary, which is why Group x Session costs nothing extra.
 
 import importlib.util
 import os
+import re
 import sys
 
 import pytest
@@ -200,3 +201,76 @@ def test_an_empty_factor_still_gets_a_control():
     """A factor created but not yet assigned must appear, or it cannot be used."""
     app = _Facets(SUBJECTS, params={'factor_definitions': ['Drug']})
     assert 'Drug' in app.get_factor_definitions()
+
+
+# ---------------------------------------------------------------------------
+# Auto-assigning levels from the subject ID
+# ---------------------------------------------------------------------------
+
+def test_named_level_group_is_preferred():
+    got = _M.levels_from_ids(SUBJECTS, r'_(?P<level>[^_]+)$')
+    assert got == {'2F_pre': 'pre', '2F_post': 'post',
+                   '3M_pre': 'pre', '3M_post': 'post'}
+
+
+def test_first_capture_group_is_used_when_unnamed():
+    assert _M.levels_from_ids(['2F_pre'], r'_(.+)$') == {'2F_pre': 'pre'}
+
+
+def test_whole_match_is_used_when_nothing_is_captured():
+    got = _M.levels_from_ids(SUBJECTS, r'pre|post')
+    assert got['2F_pre'] == 'pre' and got['2F_post'] == 'post'
+
+
+def test_unmatched_subjects_are_omitted_not_blanked():
+    """A pattern for one cohort need not match another; blanking the rest would
+    destroy hand assignments that the user made deliberately."""
+    got = _M.levels_from_ids(SUBJECTS + ['Control7'], r'_(?P<level>[^_]+)$')
+    assert 'Control7' not in got
+    assert len(got) == 4
+
+
+def test_an_empty_capture_is_not_an_assignment():
+    assert _M.levels_from_ids(['2F_'], r'_(?P<level>.*)$') == {}
+
+
+def test_a_malformed_pattern_raises_rather_than_guessing():
+    with pytest.raises(re.error):
+        _M.levels_from_ids(SUBJECTS, '(unclosed')
+
+
+# ---------------------------------------------------------------------------
+# Renaming and deleting a factor must touch all three structures at once
+# ---------------------------------------------------------------------------
+
+def _params():
+    return {'factor_definitions': ['Drug'],
+            'subject_factors': {'2F_pre': {'Drug': 'Fent', 'Sex': 'F'},
+                                '3M_pre': {'Drug': 'Saline'}},
+            'factor_level_order': {'Drug': ['Fent', 'Saline']}}
+
+
+def test_rename_moves_definition_assignments_and_order_together():
+    p = _M.rename_factor_in(_params(), 'Drug', 'Treatment')
+    assert p['factor_definitions'] == ['Treatment']
+    assert p['subject_factors']['2F_pre'] == {'Treatment': 'Fent', 'Sex': 'F'}
+    assert p['factor_level_order'] == {'Treatment': ['Fent', 'Saline']}
+
+
+def test_delete_leaves_nothing_that_could_resurrect_the_factor():
+    p = _params()
+    removed = _M.delete_factor_from(p, 'Drug')
+    assert removed == 2
+    assert p['factor_definitions'] == []
+    assert p['factor_level_order'] == {}
+    assert p['subject_factors'] == {'2F_pre': {'Sex': 'F'}, '3M_pre': {}}
+    # get_factor_definitions() reads assignments too, so a stale one would
+    # bring the factor back after it was deleted.
+    app = _Facets(SUBJECTS, params=p)
+    assert 'Drug' not in app.get_factor_definitions()
+
+
+def test_delete_of_an_unknown_factor_is_a_no_op():
+    p = _params()
+    assert _M.delete_factor_from(p, 'Nope') == 0
+    assert p['factor_definitions'] == ['Drug']
