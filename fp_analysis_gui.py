@@ -221,6 +221,85 @@ def invert_affine(ab):
     return 1.0 / a, -b / a
 
 
+# ── Factors and faceting ────────────────────────────────────────────────────
+# A factor is any way of dividing subjects: Group, Session, Drug, Sex, Day.
+# Each factor's control carries one of three things, and that is the whole
+# vocabulary:
+#
+#   COMBINE      pool every level together (the factor is ignored)
+#   SPLIT        one series per level
+#   a level name filter to just that level
+#
+# Series labels are the cross-product of whatever is SPLIT, so "split Group and
+# split Session" costs nothing extra and yields "Fentanyl x Post".  Ported from
+# ABEL's facet_session_labels(); kept Tk-free so it can be tested directly.
+FACTOR_COMBINE = '— combine —'
+FACTOR_SPLIT = '— split —'
+FACTOR_UNASSIGNED = '(unassigned)'
+
+
+def facet_subjects(subject_ids, subject_factors, selections, factor_order=None):
+    """Resolve factor selections into series labels.
+
+    ``subject_factors`` is ``{subject_id: {factor: level}}``; ``selections`` is
+    ``{factor: COMBINE | SPLIT | level}``.
+
+    Returns ``(labels, split_factors)`` where labels is
+    ``{subject_id: series_label}`` covering only the subjects that survive
+    filtering, and split_factors lists the factors being split, in display
+    order.  With nothing split every surviving subject lands in one series
+    called "All", which is the un-faceted plot.
+
+    A subject with no level recorded for a factor is not dropped -- it gets
+    FACTOR_UNASSIGNED, so gaps in the assignment show up on the plot instead of
+    quietly shrinking the n.
+    """
+    order = list(factor_order) if factor_order else sorted(selections)
+    split_factors = [f for f in order
+                     if selections.get(f) == FACTOR_SPLIT]
+
+    labels = {}
+    for sid in subject_ids:
+        sid = str(sid)
+        levels = subject_factors.get(sid) or {}
+
+        keep = True
+        for factor, choice in selections.items():
+            if choice in (FACTOR_COMBINE, FACTOR_SPLIT) or choice is None:
+                continue
+            if str(levels.get(factor) or FACTOR_UNASSIGNED) != str(choice):
+                keep = False
+                break
+        if not keep:
+            continue
+
+        if split_factors:
+            parts = [str(levels.get(f) or FACTOR_UNASSIGNED) for f in split_factors]
+            labels[sid] = ' × '.join(parts)
+        else:
+            labels[sid] = 'All'
+    return labels, split_factors
+
+
+def factor_levels(subject_ids, subject_factors, factor, level_order=None):
+    """Levels of *factor* present among *subject_ids*, in display order.
+
+    Display order is honoured first (it drives series order and colour
+    assignment on every plot, so it must not be alphabetical by accident), then
+    any remaining levels alphabetically, with FACTOR_UNASSIGNED last.
+    """
+    present = set()
+    for sid in subject_ids:
+        levels = subject_factors.get(str(sid)) or {}
+        present.add(str(levels.get(factor) or FACTOR_UNASSIGNED))
+
+    ordered = [lv for lv in (level_order or []) if lv in present]
+    rest = sorted(lv for lv in present
+                  if lv not in ordered and lv != FACTOR_UNASSIGNED)
+    tail = [FACTOR_UNASSIGNED] if FACTOR_UNASSIGNED in present else []
+    return ordered + rest + tail
+
+
 class _ProgressCancelled(Exception):
     """Raised inside a background worker when the user hits Cancel on the
     detailed progress window, so the run aborts cleanly (not as an error)."""
@@ -1221,6 +1300,13 @@ class FPAnalysisGUI:
             # actually groups subjects together.
             'session_pattern': DEFAULT_SESSION_PATTERN,
             'animal_overrides': {},  # {subject_id: animal_id} — hand-linked exceptions
+            # User-defined factors for faceting: names, per-subject levels, and
+            # the display order of each factor's levels (which drives series
+            # order and colour assignment, so it must not be alphabetical by
+            # accident).  Group/Session/Animal are derived, not stored here.
+            'factor_definitions': [],
+            'subject_factors': {},
+            'factor_level_order': {},
             'boutframes_video_fps': 30,  # Frame rate of source video used to create boutframes
             'auto_scale_boutframes': False,  # Auto-scale boutframe numbers to photometry FPS
             'precut_correct_boutframes': True,  # Subtract precut/n_led_states offset from boutframes to align with post-precut FP data
@@ -13371,6 +13457,58 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             sorted(set(subj_list)), self._session_pattern(),
             self.params.get('animal_overrides') or {})
         return [mapping.get(s, (s, ''))[0] for s in subj_list]
+
+    # ======================== Factors ========================
+
+    def get_subject_factors(self, subject_ids=None):
+        """``{subject_id: {factor: level}}`` for the current project.
+
+        Built-in factors are derived rather than stored, so they cannot drift:
+        Group mirrors self.groups (nothing that reads self.groups changes),
+        Animal and Session come from the ID pattern. User-defined factors from
+        self.subject_factors are layered on top and win on conflict, so a
+        hand-assigned level is never overwritten by a derived one.
+        """
+        ids = [str(s) for s in (subject_ids if subject_ids is not None
+                                else self.processed_data.keys())]
+        mapping = self.get_animal_map(ids)
+        stored = self.params.get('subject_factors') or {}
+
+        group_of = {}
+        for gname, members in (self.groups or {}).items():
+            for sid in members:
+                group_of.setdefault(str(sid), gname)
+
+        out = {}
+        for sid in ids:
+            animal, session = mapping.get(sid, (sid, ''))
+            derived = {'Animal': animal}
+            if session:
+                derived['Session'] = session
+            if sid in group_of:
+                derived['Group'] = group_of[sid]
+            derived.update({k: v for k, v in (stored.get(sid) or {}).items() if v})
+            out[sid] = derived
+        return out
+
+    def get_factor_definitions(self, subject_ids=None):
+        """Factor names available for faceting, built-ins first."""
+        factors = self.get_subject_factors(subject_ids)
+        present = set()
+        for levels in factors.values():
+            present.update(levels)
+        builtin = [f for f in ('Group', 'Session', 'Animal') if f in present]
+        custom = sorted(present - set(builtin))
+        # User-created factors with no assignments yet still deserve a control.
+        for name in (self.params.get('factor_definitions') or []):
+            if name not in builtin and name not in custom:
+                custom.append(name)
+        return builtin + custom
+
+    def facet(self, subject_ids, selections):
+        """Series labels for *subject_ids* under *selections*. See facet_subjects."""
+        return facet_subjects(subject_ids, self.get_subject_factors(subject_ids),
+                              selections, self.get_factor_definitions(subject_ids))
 
     # ======================== Pooled Z-Scoring ========================
 
