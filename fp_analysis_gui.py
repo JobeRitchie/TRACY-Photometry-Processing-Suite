@@ -40473,30 +40473,6 @@ cat("OK\n")
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Signal Linkage")
 
-        outer = ttk.Frame(tab)
-        outer.pack(fill='both', expand=True, padx=5, pady=5)
-
-        # ── Left control column ──────────────────────────────────────────
-        # Wrap the column in a scrolling viewport: the control stack is taller
-        # than a short (e.g. 768p) screen, which pushed the advanced options and
-        # the Run button off the bottom with no way to reach them.
-        ctrl_outer = ttk.Frame(outer, width=CONTROL_PANEL_W)
-        ctrl_outer.pack(side='left', fill='y', padx=(0, 6))
-        ctrl_outer.pack_propagate(True)
-        ctrl_panel = self.make_scrollable(ctrl_outer, fit_width=True)
-
-        beta_badge = tk.Label(ctrl_panel, text="BETA",
-                              font=('Segoe UI', 26, 'bold'),
-                              fg='white', bg='#3E82BE', padx=10, pady=2)
-        beta_badge.pack(fill='x', pady=(0, 6))
-
-        ttk.Label(ctrl_panel, text="Onset ⇄ Signal Coupling",
-                  font=('Segoe UI', 11, 'bold')).pack(anchor='w')
-        ttk.Label(ctrl_panel,
-                  text="How tightly is each behavior's onset\nlinked to a rapid change in signal?",
-                  foreground='#777', font=('Segoe UI', 8),
-                  justify='left').pack(anchor='w', pady=(0, 6))
-
         # State vars
         self.sig_link_channel_var = tk.StringVar(value="G0")
         self.sig_link_by_var = tk.StringVar(value="Subject")
@@ -40509,114 +40485,113 @@ cat("OK\n")
         self.sig_link_nperm_var = tk.StringVar(value="1000")
         self._sig_linkage_results = None
 
-        # Channel
-        ch_frame = ttk.LabelFrame(ctrl_panel, text="Channel", padding=4)
-        ch_frame.pack(fill='x', pady=(0, 4))
-        self.sig_link_channel_frame = ttk.Frame(ch_frame)
-        self.sig_link_channel_frame.pack(anchor='w')
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Behaviors",
+            settings_title="Analysis Settings")
 
-        # Subjects
-        subj_frame = ttk.LabelFrame(ctrl_panel, text="Subjects", padding=4)
-        subj_frame.pack(fill='x', pady=(0, 4))
-        _sf = ttk.Frame(subj_frame)
-        _sf.pack(fill='x')
+        # ── Selection ────────────────────────────────────────────────────
+        # Kept at 13 pt: at 26 the badge alone cost ~50 px of a control column
+        # that has to hold two listboxes and seven settings.
+        tk.Label(selection, text="BETA", font=('Segoe UI', 13, 'bold'),
+                 fg='white', bg='#3E82BE', padx=10, pady=1).pack(
+            fill='x', pady=(0, self.ui_px(4)))
+        ttk.Label(selection, text="Onset ⇄ Signal Coupling",
+                  font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        ttk.Label(selection,
+                  text="How tightly is each behavior's onset linked to a rapid "
+                       "change in signal?",
+                  foreground='#777', font=('Segoe UI', 8), justify='left',
+                  wraplength=self.ui_px(260)).pack(anchor='w',
+                                                   pady=(0, self.ui_px(6)))
+
+        ch_row = ttk.Frame(selection)
+        ch_row.pack(fill='x')
+        ttk.Label(ch_row, text="Channel:").pack(side='left')
+        self.sig_link_channel_frame = ttk.Frame(ch_row)
+        self.sig_link_channel_frame.pack(side='left', padx=(self.ui_px(6), 0))
+
+        ttk.Label(selection, text="Subject(s):").pack(
+            anchor='w', pady=(self.ui_px(6), 0))
+        _sf = ttk.Frame(selection)
+        _sf.pack(fill='both', expand=True)
         self.sig_link_subject_listbox = tk.Listbox(
             _sf, selectmode='extended', height=5, exportselection=False)
-        self.sig_link_subject_listbox.pack(side='left', fill='x', expand=True)
+        self.sig_link_subject_listbox.pack(side='left', fill='both', expand=True)
         _sb1 = ttk.Scrollbar(_sf, orient='vertical',
                              command=self.sig_link_subject_listbox.yview)
         _sb1.pack(side='right', fill='y')
         self.sig_link_subject_listbox.config(yscrollcommand=_sb1.set)
-        _sbtn = ttk.Frame(subj_frame)
-        _sbtn.pack(fill='x', pady=(3, 0))
+        _sbtn = ttk.Frame(selection)
+        _sbtn.pack(fill='x', pady=(self.ui_px(3), 0))
         ttk.Button(_sbtn, text="All", width=6, style='Compact.TButton',
                    command=lambda: self.sig_link_subject_listbox.selection_set(
                        0, 'end')).pack(side='left')
         ttk.Button(_sbtn, text="None", width=6, style='Compact.TButton',
                    command=lambda: self.sig_link_subject_listbox.selection_clear(
-                       0, 'end')).pack(side='left', padx=(4, 0))
+                       0, 'end')).pack(side='left', padx=(self.ui_px(4), 0))
 
-        # Behaviors
-        beh_frame = ttk.LabelFrame(ctrl_panel, text="Behaviors", padding=4)
-        beh_frame.pack(fill='x', pady=(0, 4))
-        _bf = ttk.Frame(beh_frame)
-        _bf.pack(fill='x')
+        ttk.Label(selection, text="Behavior(s):").pack(
+            anchor='w', pady=(self.ui_px(6), 0))
+        _bf = ttk.Frame(selection)
+        _bf.pack(fill='both', expand=True)
         self.sig_link_behavior_listbox = tk.Listbox(
-            _bf, selectmode='extended', height=7, exportselection=False)
-        self.sig_link_behavior_listbox.pack(side='left', fill='x', expand=True)
+            _bf, selectmode='extended', height=5, exportselection=False)
+        self.sig_link_behavior_listbox.pack(side='left', fill='both', expand=True)
         _sb2 = ttk.Scrollbar(_bf, orient='vertical',
                              command=self.sig_link_behavior_listbox.yview)
         _sb2.pack(side='right', fill='y')
         self.sig_link_behavior_listbox.config(yscrollcommand=_sb2.set)
-        _bbtn = ttk.Frame(beh_frame)
-        _bbtn.pack(fill='x', pady=(3, 0))
+        _bbtn = ttk.Frame(selection)
+        _bbtn.pack(fill='x', pady=(self.ui_px(3), 0))
         ttk.Button(_bbtn, text="All", width=6, style='Compact.TButton',
                    command=lambda: self.sig_link_behavior_listbox.selection_set(
                        0, 'end')).pack(side='left')
         ttk.Button(_bbtn, text="None", width=6, style='Compact.TButton',
                    command=lambda: self.sig_link_behavior_listbox.selection_clear(
-                       0, 'end')).pack(side='left', padx=(4, 0))
+                       0, 'end')).pack(side='left', padx=(self.ui_px(4), 0))
 
-        # Advanced settings (collapsible-ish LabelFrame)
-        adv = ttk.LabelFrame(ctrl_panel, text="Settings", padding=4)
-        adv.pack(fill='x', pady=(0, 4))
-
+        # ── Settings ─────────────────────────────────────────────────────
         def _mk_row(parent, label, var, width=6, hint=None):
             row = ttk.Frame(parent)
             row.pack(fill='x', pady=1)
-            ttk.Label(row, text=label, width=16, anchor='w').pack(side='left')
-            ttk.Entry(row, textvariable=var, width=width).pack(side='left')
+            ttk.Label(row, text=label, anchor='w').pack(side='left')
+            ttk.Entry(row, textvariable=var, width=width).pack(side='right')
             if hint:
                 ttk.Label(row, text=hint, foreground='#999',
-                          font=('Segoe UI', 7)).pack(side='left', padx=(4, 0))
+                          font=('Segoe UI', 7)).pack(side='right',
+                                                     padx=(0, self.ui_px(4)))
 
-        _mk_row(adv, "SG window (frames)", self.sig_link_sg_win_var)
-        _mk_row(adv, "SG poly order", self.sig_link_sg_poly_var)
-        _mk_row(adv, "Search ± (s)", self.sig_link_search_var, hint="dF/dt peak")
-        _mk_row(adv, "Baseline (s)", self.sig_link_base_var, hint="pre-onset")
-        _mk_row(adv, "Response (s)", self.sig_link_resp_var, hint="post-onset")
-        _mk_row(adv, "Reliability ± (s)", self.sig_link_relia_var)
-        _mk_row(adv, "Permutations", self.sig_link_nperm_var, hint="null model")
+        _mk_row(settings, "SG window (frames)", self.sig_link_sg_win_var)
+        _mk_row(settings, "SG poly order", self.sig_link_sg_poly_var)
+        _mk_row(settings, "Search ± (s)", self.sig_link_search_var, hint="dF/dt peak")
+        _mk_row(settings, "Baseline (s)", self.sig_link_base_var, hint="pre-onset")
+        _mk_row(settings, "Response (s)", self.sig_link_resp_var, hint="post-onset")
+        _mk_row(settings, "Reliability ± (s)", self.sig_link_relia_var)
+        _mk_row(settings, "Permutations", self.sig_link_nperm_var, hint="null model")
 
-        # Run
-        ttk.Button(ctrl_panel, text="▶  Run Linkage Analysis",
-                   command=self.run_signal_linkage_analysis).pack(
-                       fill='x', pady=(4, 2))
+        # ── Actions ──────────────────────────────────────────────────────
+        ttk.Button(actions, text="▶  Run Linkage Analysis",
+                   command=self.run_signal_linkage_analysis).pack(fill='x')
         self.sig_link_status_var = tk.StringVar(value="")
-        ttk.Label(ctrl_panel, textvariable=self.sig_link_status_var,
+        ttk.Label(actions, textvariable=self.sig_link_status_var,
                   foreground='#777', font=('Segoe UI', 8),
-                  wraplength=CONTROL_PANEL_W - 20, justify='left').pack(
-                      anchor='w')
-        ttk.Button(ctrl_panel, text="Copy results table",
-                   style='Compact.TButton',
+                  wraplength=self.ui_px(260), justify='left').pack(
+            anchor='w', pady=(self.ui_px(2), 0))
+        ttk.Button(actions, text="Copy results table",
                    command=self._copy_signal_linkage_table).pack(
-                       fill='x', pady=(6, 0))
+            fill='x', pady=(self.ui_px(4), 0))
 
-        # ── Right results area (vertically scrollable) ───────────────────
-        right = ttk.Frame(outer)
-        right.pack(side='left', fill='both', expand=True)
-        canvas = tk.Canvas(right, highlightthickness=0)
-        rscroll = ttk.Scrollbar(right, orient='vertical', command=canvas.yview)
-        self.sig_link_scroll_frame = ttk.Frame(canvas)
-        self.sig_link_scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        _win_id = canvas.create_window((0, 0), window=self.sig_link_scroll_frame,
-                                       anchor="nw")
-        canvas.configure(yscrollcommand=rscroll.set)
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure(_win_id, width=e.width))
-        canvas.pack(side="left", fill="both", expand=True)
-        rscroll.pack(side="right", fill="y")
-        self._register_tab_mousewheel(tab, canvas, self.sig_link_scroll_frame)
-
-        # Placeholder + persistent sub-frames
-        self.sig_link_readout_frame = ttk.Frame(self.sig_link_scroll_frame)
-        self.sig_link_readout_frame.pack(fill='x', padx=6, pady=(6, 0))
-        self.sig_link_table_frame = ttk.Frame(self.sig_link_scroll_frame)
-        self.sig_link_table_frame.pack(fill='x', padx=6, pady=(2, 0))
-        self.sig_link_plot_frame = ttk.Frame(self.sig_link_scroll_frame)
-        self.sig_link_plot_frame.pack(fill='both', expand=True, padx=6, pady=6)
+        # ── Output: readout, table, plot ─────────────────────────────────
+        # Other methods repopulate these three frames by name, and the zone is
+        # already a scrolling viewport, so the tab keeps its own scroll for free.
+        self.sig_link_scroll_frame = output
+        self.sig_link_readout_frame = ttk.Frame(output)
+        self.sig_link_readout_frame.pack(fill='x')
+        self.sig_link_table_frame = ttk.Frame(output)
+        self.sig_link_table_frame.pack(fill='x', pady=(self.ui_px(2), 0))
+        self.sig_link_plot_frame = ttk.Frame(output)
+        self.sig_link_plot_frame.pack(fill='both', expand=True,
+                                      pady=(self.ui_px(6), 0))
         self._sig_link_canvas = None
 
         ttk.Label(self.sig_link_readout_frame,
