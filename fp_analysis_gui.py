@@ -9114,27 +9114,6 @@ class FPAnalysisGUI:
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Bout Analysis")
 
-        # ── Outer scrollable canvas (vertical only) ──────────────────────
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        _outer_win_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        # Lock scrollable_frame width = canvas width → prevents horizontal overflow
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure(_outer_win_id, width=e.width))
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
-
         # ── Initialise all BooleanVars / StringVars ───────────────────────
         self.bout_analysis_by_var        = tk.StringVar(value="Subject")
         self.bout_analysis_behavior_var  = tk.StringVar()
@@ -9165,102 +9144,105 @@ class FPAnalysisGUI:
         if not hasattr(self, 'bout_length_bins'):
             self.bout_length_bins = [(0.0, 1.0), (1.0, 3.0), (3.0, None)]
 
-        # ── COMPACT ANALYSIS CONTROLS ────────────────────────────────────
-        ctrl = ttk.LabelFrame(scrollable_frame, text="Analysis Controls", padding=4)
-        ctrl.pack(fill='x', padx=5, pady=(5, 2))
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups",
+            settings_title="Analysis Settings")
 
-        # Row 0 — mode + exclusions
-        row0 = ttk.Frame(ctrl)
-        row0.pack(fill='x', pady=(0, 3))
-        ttk.Label(row0, text="Analyze by:").pack(side='left', padx=(0, 4))
-        ttk.Radiobutton(row0, text="Subject", variable=self.bout_analysis_by_var,
+        # ── Selection ────────────────────────────────────────────────────
+        mode_frame = ttk.Frame(selection)
+        mode_frame.pack(fill='x')
+        ttk.Label(mode_frame, text="Analyze by:").pack(side='left')
+        ttk.Radiobutton(mode_frame, text="Subject", variable=self.bout_analysis_by_var,
                         value="Subject",
-                        command=self.toggle_bout_analysis_mode).pack(side='left')
-        ttk.Radiobutton(row0, text="Group", variable=self.bout_analysis_by_var,
+                        command=self.toggle_bout_analysis_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Radiobutton(mode_frame, text="Group", variable=self.bout_analysis_by_var,
                         value="Group",
-                        command=self.toggle_bout_analysis_mode).pack(side='left', padx=(2, 12))
-        ttk.Checkbutton(row0, text="Apply exclusions",
-                        variable=self.use_exclusions_bout).pack(side='left')
+                        command=self.toggle_bout_analysis_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
 
-        # Row 1 — subject/group list  |  behavior + channel  |  [Settings]
-        row1 = ttk.Frame(ctrl)
-        row1.pack(fill='x')
+        # The subject and group selectors share one slot, so exactly one is
+        # packed at a time and the hidden one leaves no gap behind.
+        self._bout_sel_frame = ttk.Frame(selection)
+        self._bout_sel_frame.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
 
-        # Subject container (shown by default)
-        self._bout_subj_container = ttk.Frame(row1)
-        self._bout_subj_container.pack(side='left', padx=(0, 10))
+        self._bout_subj_container = ttk.Frame(self._bout_sel_frame)
         ttk.Label(self._bout_subj_container, text="Subject(s):").pack(anchor='w')
         _subj_list_frame = ttk.Frame(self._bout_subj_container)
-        _subj_list_frame.pack(fill='y')
+        _subj_list_frame.pack(fill='both', expand=True)
         self.bout_analysis_subject_listbox = tk.Listbox(
-            _subj_list_frame, selectmode='extended', height=4, width=16, exportselection=False)
-        self.bout_analysis_subject_listbox.pack(side='left', fill='y')
+            _subj_list_frame, selectmode='extended', height=5, exportselection=False)
+        self.bout_analysis_subject_listbox.pack(side='left', fill='both', expand=True)
         _sb_s = ttk.Scrollbar(_subj_list_frame, orient='vertical',
                                command=self.bout_analysis_subject_listbox.yview)
         _sb_s.pack(side='right', fill='y')
         self.bout_analysis_subject_listbox.config(yscrollcommand=_sb_s.set)
+        self._bout_subj_container.pack(fill='both', expand=True)
 
-        # Group container (hidden by default)
-        self._bout_grp_container = ttk.Frame(row1)
-        # NOT packed — toggle_bout_analysis_mode will show/hide these two containers
+        self._bout_grp_container = ttk.Frame(self._bout_sel_frame)
         ttk.Label(self._bout_grp_container, text="Group(s):").pack(anchor='w')
         self.bout_analysis_group_frame = ttk.Frame(self._bout_grp_container)
-        self.bout_analysis_group_frame.pack(fill='y')
+        self.bout_analysis_group_frame.pack(fill='both', expand=True)
         self.bout_analysis_group_listbox = tk.Listbox(
-            self.bout_analysis_group_frame, selectmode='extended', height=4, width=16, exportselection=False)
-        self.bout_analysis_group_listbox.pack(side='left', fill='y')
+            self.bout_analysis_group_frame, selectmode='extended', height=4,
+            exportselection=False)
+        self.bout_analysis_group_listbox.pack(side='left', fill='both', expand=True)
         _sb_g = ttk.Scrollbar(self.bout_analysis_group_frame, orient='vertical',
                                command=self.bout_analysis_group_listbox.yview)
         _sb_g.pack(side='right', fill='y')
         self.bout_analysis_group_listbox.config(yscrollcommand=_sb_g.set)
         self._make_facet_controls(self._bout_grp_container, 'bout_analysis').pack(
-            fill='x', pady=(4, 0))
-        # Keep legacy reference used by toggle
-        self.bout_analysis_group_label = ttk.Label(self._bout_grp_container, text="")
+            fill='x', pady=(self.ui_px(6), 0))
 
-        # Behavior + Channel (to the right of the listbox)
-        self._bout_sel_frame = ttk.Frame(row1)
-        sel_frame = self._bout_sel_frame
-        sel_frame.pack(side='left', padx=(0, 10))
-        ttk.Label(sel_frame, text="Behavior:").grid(row=0, column=0, sticky='w', pady=2)
+        # ── Settings ─────────────────────────────────────────────────────
+        ttk.Label(settings, text="Behavior:").pack(anchor='w')
         self.bout_analysis_behavior_combo = ttk.Combobox(
-            sel_frame, textvariable=self.bout_analysis_behavior_var, width=18, state='readonly')
-        self.bout_analysis_behavior_combo.grid(row=0, column=1, sticky='w', padx=(4, 0), pady=2)
-        self.bout_analysis_behavior_combo.bind('<<ComboboxSelected>>', self._on_bout_behavior_changed)
-        ttk.Label(sel_frame, text="Channel:").grid(row=1, column=0, sticky='w', pady=2)
-        self.bout_analysis_channel_frame = ttk.Frame(sel_frame)
-        self.bout_analysis_channel_frame.grid(row=1, column=1, sticky='w', padx=(4, 0))
+            settings, textvariable=self.bout_analysis_behavior_var, state='readonly')
+        self.bout_analysis_behavior_combo.pack(fill='x', pady=(self.ui_px(2), 0))
+        self.bout_analysis_behavior_combo.bind('<<ComboboxSelected>>',
+                                               self._on_bout_behavior_changed)
+
+        ttk.Label(settings, text="Channel:").pack(anchor='w', pady=(self.ui_px(6), 0))
+        self.bout_analysis_channel_frame = ttk.Frame(settings)
+        self.bout_analysis_channel_frame.pack(fill='x')
         # Radiobuttons are built dynamically from the detected channels so any
         # number of channels (G0/G1/R4/R5/…) can be analyzed.
         self.refresh_bout_analysis_channels()
 
-        # Settings button (far right)
-        ttk.Button(row1, text="\u2699  Settings",
-                   command=self._open_bout_settings).pack(side='right', padx=(5, 0))
+        ttk.Separator(settings, orient='horizontal').pack(
+            fill='x', pady=self.ui_px(6))
 
-        # ── ACTIONS ROW ──────────────────────────────────────────────────
-        actions = ttk.Frame(scrollable_frame)
-        actions.pack(fill='x', padx=5, pady=(2, 3))
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_bout).pack(anchor='w')
+        ttk.Checkbutton(settings, text="Average bouts within subject",
+                        variable=self.bout_average_within_subject).pack(anchor='w')
 
-        opt_row = ttk.Frame(actions)
-        opt_row.pack(fill='x', pady=(0, 2))
-        ttk.Checkbutton(opt_row, text="Average bouts within subject",
-                        variable=self.bout_average_within_subject).pack(side='left', padx=(0, 10))
-        ttk.Label(opt_row, text="Max Bouts/Subject:").pack(side='left')
-        ttk.Entry(opt_row, textvariable=self.bout_max_bouts_var, width=7).pack(side='left', padx=(3, 3))
-        ttk.Label(opt_row, text='("all" or number)', foreground='gray',
-                  font=('Segoe UI', 8)).pack(side='left', padx=(0, 14))
-        ttk.Label(opt_row, text="Bouts per bin (X):").pack(side='left')
-        ttk.Entry(opt_row, textvariable=self.bout_first_last_x_var, width=5).pack(side='left', padx=(3, 0))
+        max_row = ttk.Frame(settings)
+        max_row.pack(fill='x', pady=(self.ui_px(4), 0))
+        ttk.Label(max_row, text="Max bouts/subject:").pack(side='left')
+        ttk.Entry(max_row, textvariable=self.bout_max_bouts_var, width=7).pack(
+            side='right')
+        ttk.Label(settings, text='("all" or a number)', foreground='gray',
+                  font=('Segoe UI', 8)).pack(anchor='w')
 
-        btn_row = ttk.Frame(actions)
-        btn_row.pack(fill='x')
+        binx_row = ttk.Frame(settings)
+        binx_row.pack(fill='x', pady=(self.ui_px(4), 0))
+        ttk.Label(binx_row, text="Bouts per bin (X):").pack(side='left')
+        ttk.Entry(binx_row, textvariable=self.bout_first_last_x_var, width=7).pack(
+            side='right')
 
-        ttk.Button(btn_row, text="Calculate Metrics",
-                   command=self.calculate_bout_metrics).pack(side='left', padx=(0, 3))
+        ttk.Button(settings, text="⚙  Metrics & Window Settings…",
+                   command=self._open_bout_settings).pack(
+            fill='x', pady=(self.ui_px(8), 0))
+
+        # ── Actions ──────────────────────────────────────────────────────
+        ttk.Button(actions, text="Calculate Metrics",
+                   command=self.calculate_bout_metrics).pack(fill='x')
 
         # Plot ▾ — all graph types live behind one dropdown
-        plot_mb = ttk.Menubutton(btn_row, text="Plot ▾")
+        # No arrow in the label: a full-width Menubutton already draws its own,
+        # and two of them read as a rendering bug.
+        plot_mb = ttk.Menubutton(actions, text="Plot")
         plot_menu = tk.Menu(plot_mb, tearoff=0)
         plot_menu.add_command(label="Bar Graphs (per metric)",
                               command=self.generate_bout_bar_graphs)
@@ -9281,13 +9263,14 @@ class FPAnalysisGUI:
         plot_menu.add_command(label="Time-Course Statistics (FLMM-style)…",
                               command=self.plot_timecourse_flmm)
         plot_mb['menu'] = plot_menu
-        plot_mb.pack(side='left', padx=3)
+        plot_mb.pack(fill='x', pady=(self.ui_px(4), 0))
 
-        ttk.Button(btn_row, text="Run Statistics",
-                   command=self.run_bout_statistics).pack(side='left', padx=3)
+        ttk.Button(actions, text="Run Statistics",
+                   command=self.run_bout_statistics).pack(
+            fill='x', pady=(self.ui_px(4), 0))
 
         # Export ▾ — both export paths behind one dropdown
-        export_mb = ttk.Menubutton(btn_row, text="Export ▾")
+        export_mb = ttk.Menubutton(actions, text="Export")
         export_menu = tk.Menu(export_mb, tearoff=0)
         export_menu.add_command(label="Metrics Table (Excel)…",
                                 command=self.export_bout_metrics)
@@ -9301,11 +9284,11 @@ class FPAnalysisGUI:
         export_menu.add_command(label="Time-Course / Pairwise — full report (PDF)…",
                                 command=self.export_flmm_report)
         export_mb['menu'] = export_menu
-        export_mb.pack(side='left', padx=3)
+        export_mb.pack(fill='x', pady=(self.ui_px(4), 0))
 
-        # ── GRAPH AREA ───────────────────────────────────────────────────
-        bout_graph_container = ttk.Frame(scrollable_frame)
-        bout_graph_container.pack(fill='x', padx=5, pady=(2, 3))
+        # ── Output: graph, metrics table, statistics ─────────────────────
+        bout_graph_container = ttk.Frame(output)
+        bout_graph_container.pack(fill='both', expand=True)
 
         self.bout_histogram_canvas = tk.Canvas(
             bout_graph_container, height=self.ui_px(450), highlightthickness=0)
@@ -9339,13 +9322,12 @@ class FPAnalysisGUI:
         bout_graph_container.grid_rowconfigure(0, weight=1)
         bout_graph_container.grid_columnconfigure(0, weight=1)
 
-        # ── CALCULATED METRICS TABLE ─────────────────────────────────────
         results_frame = ttk.LabelFrame(
-            scrollable_frame, text="Calculated Metrics (Detailed)", padding=3)
-        results_frame.pack(fill='x', padx=5, pady=(2, 2))
+            output, text="Calculated Metrics (Detailed)", padding=3)
+        results_frame.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
 
         tree_container = ttk.Frame(results_frame)
-        tree_container.pack(fill='both')
+        tree_container.pack(fill='both', expand=True)
 
         self.bout_metrics_tree = ttk.Treeview(tree_container, show='tree headings', height=5)
         vsb = ttk.Scrollbar(tree_container, orient="vertical",
@@ -9369,12 +9351,11 @@ class FPAnalysisGUI:
         self.metrics_context_menu.add_command(
             label="Copy Column (All Rows)", command=self.copy_metrics_column_from_context)
 
-        # ── STATISTICAL RESULTS ──────────────────────────────────────────
-        stats_frame = ttk.LabelFrame(scrollable_frame, text="Statistical Results", padding=3)
-        stats_frame.pack(fill='x', padx=5, pady=(2, 5))
+        stats_frame = ttk.LabelFrame(output, text="Statistical Results", padding=3)
+        stats_frame.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
 
         stats_text_container = ttk.Frame(stats_frame)
-        stats_text_container.pack(fill='both')
+        stats_text_container.pack(fill='both', expand=True)
 
         self.bout_stats_text = tk.Text(
             stats_text_container, height=8, wrap='word',
@@ -9384,7 +9365,7 @@ class FPAnalysisGUI:
         self.bout_stats_text.configure(yscrollcommand=stats_vsb.set)
         self.bout_stats_text.pack(side='left', fill='both', expand=True)
         stats_vsb.pack(side='right', fill='y')
-    
+
     def create_spike_analysis_tab(self):
         """Create spike analysis tab for detecting and analyzing calcium transients"""
         tab = ttk.Frame(self.data_notebook)
@@ -22739,15 +22720,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def toggle_bout_analysis_mode(self):
         """Toggle between subject and group selection mode in bout analysis tab"""
+        # The two selectors share one slot in the Selection zone, so exactly one
+        # is packed at a time and the other leaves no gap behind.
         if self.bout_analysis_by_var.get() == "Group":
             self._bout_subj_container.pack_forget()
-            self._bout_grp_container.pack(
-                side='left', padx=(0, 10), before=self._bout_sel_frame)
+            self._bout_grp_container.pack(fill='both', expand=True)
             self.update_bout_analysis_groups()
+            self.refresh_facet_controls()
         else:
             self._bout_grp_container.pack_forget()
-            self._bout_subj_container.pack(
-                side='left', padx=(0, 10), before=self._bout_sel_frame)
+            self._bout_subj_container.pack(fill='both', expand=True)
     
     def update_bout_analysis_groups(self):
         """Update group list in bout analysis tab"""
