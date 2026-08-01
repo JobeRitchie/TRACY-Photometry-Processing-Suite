@@ -363,6 +363,131 @@ def delete_factor_from(params, name):
     return removed
 
 
+def facet_is_inert(selections):
+    """True when *selections* reproduce the plain group fan-out.
+
+    "Split Group, combine everything else" is what the app already did before
+    factors existed, so it is the default the controls start in. Recognising it
+    lets the untouched case take the original code path verbatim rather than an
+    equivalent-looking reimplementation -- which matters because the two are
+    not quite equivalent: groups may overlap, and a subject in two groups is
+    drawn in both there but lands in exactly one facet series.
+    """
+    for factor, choice in (selections or {}).items():
+        expected = FACTOR_SPLIT if factor == 'Group' else FACTOR_COMBINE
+        if choice != expected:
+            return False
+    return True
+
+
+def facet_series_order(split_factors, levels_by_factor):
+    """Every series label the split factors can produce, in display order.
+
+    The cross-product is taken in each factor's declared level order, so series
+    order (and therefore colour assignment) is stable as subjects come and go
+    rather than following whichever labels happen to be present.
+    """
+    if not split_factors:
+        return ['All']
+    labels = ['']
+    for factor in split_factors:
+        levels = levels_by_factor.get(factor) or []
+        labels = [(prefix + ' × ' + lvl) if prefix else lvl
+                  for prefix in labels for lvl in levels]
+    return labels
+
+
+class FacetControls(ttk.Frame):
+    """A column of one dropdown per factor: combine, split, or a single level.
+
+    Ported from ABEL's _FacetControls. Each graphing tab owns an instance, so
+    tabs facet independently, and each starts in the inert "split Group,
+    combine everything else" state -- an untouched column plots exactly what
+    the tab plotted before factors existed.
+    """
+
+    def __init__(self, parent, app, on_change=None, header="Facet by:"):
+        super().__init__(parent)
+        self.app = app
+        self._on_change = on_change
+        self._combos = {}
+        self._vars = {}
+        self._signature = None
+
+        ttk.Label(self, text=header, font=('Segoe UI', 8, 'bold')).pack(anchor='w')
+        self._hint = ttk.Label(
+            self, text="Define factors on the Factors tab to split plots.",
+            foreground='gray', font=('Segoe UI', 8),
+            wraplength=app.ui_px(180), justify='left')
+        self._hint.pack(anchor='w')
+        self._rows = ttk.Frame(self)
+        self._rows.pack(fill='x')
+
+    def rebuild(self, force=False):
+        """Rebuild one dropdown per factor, restoring the previous selections.
+
+        Cheap to call on every redraw: when the factors and their levels are
+        unchanged it returns before touching a widget. Without that guard,
+        rebuilding mid-interaction would drop the user's selection and close an
+        open dropdown, so the signature check is what makes this safe to wire
+        to refresh paths rather than to one explicit event.
+        """
+        subjects = sorted(self.app.processed_data.keys())
+        factors = self.app.get_factor_definitions(subjects)
+        assignments = self.app.get_subject_factors(subjects)
+        order_map = self.app.params.get('factor_level_order') or {}
+        levels = {f: factor_levels(subjects, assignments, f, order_map.get(f))
+                  for f in factors}
+
+        signature = tuple((f, tuple(levels[f])) for f in factors)
+        if not force and signature == self._signature:
+            return
+        self._signature = signature
+
+        previous = self.selections()
+        for child in self._rows.winfo_children():
+            child.destroy()
+        self._combos, self._vars = {}, {}
+        if factors:
+            self._hint.pack_forget()
+        else:
+            self._hint.pack(anchor='w')
+
+        for factor in factors:
+            row = ttk.Frame(self._rows)
+            row.pack(fill='x', pady=1)
+            ttk.Label(row, text=f"{factor}:", font=('Segoe UI', 8),
+                      width=9, anchor='w').pack(side='left')
+            var = tk.StringVar()
+            combo = ttk.Combobox(
+                row, textvariable=var, state='readonly', width=14,
+                values=[FACTOR_COMBINE, FACTOR_SPLIT] + list(levels[factor]))
+            # Restore what was chosen before, but only if it still exists --
+            # a level can disappear when assignments change underneath.
+            want = previous.get(factor)
+            if want not in (combo['values'] or ()):
+                want = FACTOR_SPLIT if factor == 'Group' else FACTOR_COMBINE
+            var.set(want)
+            combo.pack(side='left', fill='x', expand=True)
+            combo.bind('<<ComboboxSelected>>', lambda _e: self._changed())
+            self._combos[factor] = combo
+            self._vars[factor] = var
+
+    def _changed(self):
+        if callable(self._on_change):
+            self._on_change()
+
+    def selections(self):
+        """``{factor: COMBINE | SPLIT | level}`` as currently chosen."""
+        return {f: v.get() for f, v in self._vars.items()}
+
+    def set_selections(self, selections):
+        for factor, value in (selections or {}).items():
+            var = self._vars.get(factor)
+            if var is not None and value in (self._combos[factor]['values'] or ()):
+                var.set(value)
+
+
 class _ProgressCancelled(Exception):
     """Raised inside a background worker when the user hits Cancel on the
     detailed progress window, so the run aborts cleanly (not as an error)."""
@@ -2373,6 +2498,10 @@ class FPAnalysisGUI:
         handler = self._tab_mousewheel_handlers.get(current_tab)
         if handler is not None:
             self.root.bind_all("<MouseWheel>", handler)
+        # Factors can be created or reassigned while a graphing tab is off
+        # screen. rebuild() returns immediately when nothing changed, so this
+        # is cheap enough to hang off every tab switch.
+        self.refresh_facet_controls()
     
     def create_welcome_tab(self):
         """Welcome/Landing page tab"""
@@ -3572,14 +3701,19 @@ class FPAnalysisGUI:
         self.behav_group_label = ttk.Label(control_frame, text="Group(s):")
         
         behav_group_frame = ttk.Frame(control_frame)
-        
-        self.behav_group_listbox = tk.Listbox(behav_group_frame, selectmode='extended', height=10, width=20, exportselection=False)
+
+        behav_list_holder = ttk.Frame(behav_group_frame)
+        behav_list_holder.pack(side='left', fill='both', expand=True)
+        self.behav_group_listbox = tk.Listbox(behav_list_holder, selectmode='extended', height=10, width=20, exportselection=False)
         self.behav_group_listbox.pack(side='left', fill='both', expand=True)
-        
-        behav_group_scrollbar = ttk.Scrollbar(behav_group_frame, orient='vertical', command=self.behav_group_listbox.yview)
+
+        behav_group_scrollbar = ttk.Scrollbar(behav_list_holder, orient='vertical', command=self.behav_group_listbox.yview)
         behav_group_scrollbar.pack(side='right', fill='y')
         self.behav_group_listbox.config(yscrollcommand=behav_group_scrollbar.set)
-        
+
+        self._make_facet_controls(behav_group_frame, 'behavioral').pack(
+            side='left', fill='y', padx=(8, 0))
+
         # Store for later use
         self.behav_group_frame = behav_group_frame
         
@@ -3998,6 +4132,8 @@ class FPAnalysisGUI:
                 text=f"{len(subjects)} subject(s) · {len(factors)} factor(s). "
                      "Blank cells are unassigned and plot as “(unassigned)”.")
         self._on_factor_selected()
+        # A factor created here is useless until the graphing tabs offer it.
+        self.refresh_facet_controls()
 
     def _on_factor_selected(self):
         """Refresh the level list and assignment box for the chosen factor."""
@@ -4347,14 +4483,23 @@ class FPAnalysisGUI:
         self.viz_group_label = ttk.Label(control_frame, text="Group(s):")
         
         group_frame = ttk.Frame(control_frame)
-        
-        self.viz_group_listbox = tk.Listbox(group_frame, selectmode='extended', height=10, width=20)
+
+        group_list_holder = ttk.Frame(group_frame)
+        group_list_holder.pack(side='left', fill='both', expand=True)
+        self.viz_group_listbox = tk.Listbox(group_list_holder, selectmode='extended', height=10, width=20)
         self.viz_group_listbox.pack(side='left', fill='both', expand=True)
-        
-        group_scrollbar = ttk.Scrollbar(group_frame, orient='vertical', command=self.viz_group_listbox.yview)
+
+        group_scrollbar = ttk.Scrollbar(group_list_holder, orient='vertical', command=self.viz_group_listbox.yview)
         group_scrollbar.pack(side='right', fill='y')
         self.viz_group_listbox.config(yscrollcommand=group_scrollbar.set)
-        
+
+        # The facet column sits beside the group list, not instead of it: the
+        # groups choose which subjects are in play, the facet decides how they
+        # divide into series. Untouched, it splits on Group and combines
+        # everything else, which is the plot this tab always drew.
+        self._make_facet_controls(group_frame, 'visualization').pack(
+            side='left', fill='y', padx=(8, 0))
+
         # Store these for later use
         self.viz_group_frame = group_frame
         
@@ -5438,7 +5583,7 @@ class FPAnalysisGUI:
         bands = self._get_active_freq_bands()
 
         self.group_coherence_results = {}
-        total_subjects = sum(len(self.groups.get(g, [])) for g in selected_groups)
+        total_subjects = sum(len(self._series_members(g)) for g in selected_groups)
         _pd = self.processed_data
         _groups = self.groups
         _params = dict(self.conn_params)
@@ -5560,7 +5705,7 @@ class FPAnalysisGUI:
             pass
         try:
             for gname in selected_groups:
-                for subj in self.groups.get(gname, []):
+                for subj in self._series_members(gname):
                     if subj not in self.processed_data:
                         continue
                     if use_excl and (self.is_subject_channel_excluded(subj, ch1) or
@@ -5991,7 +6136,7 @@ class FPAnalysisGUI:
         bands        = self._get_active_freq_bands()
 
         total_subjects = sum(
-            len(self.groups.get(g, [])) for g in selected_groups)
+            len(self._series_members(g)) for g in selected_groups)
 
         # Storage: { group_name: { subject: {pre_freqs, pre_coh_mean, post_coh_mean,
         #                                     pre_coh_sem, post_coh_sem, n_bouts, ...} } }
@@ -7272,7 +7417,7 @@ class FPAnalysisGUI:
             selected_items = [self.conn_listbox.get(i) for i in selected]
             subjects = []
             for gname in selected_items:
-                for s in self.groups.get(gname, []):
+                for s in self._series_members(gname):
                     if s not in _subject_to_group:
                         _subject_to_group[s] = gname
                         subjects.append(s)
@@ -8915,6 +9060,8 @@ class FPAnalysisGUI:
                                command=self.bout_analysis_group_listbox.yview)
         _sb_g.pack(side='right', fill='y')
         self.bout_analysis_group_listbox.config(yscrollcommand=_sb_g.set)
+        self._make_facet_controls(self._bout_grp_container, 'bout_analysis').pack(
+            fill='x', pady=(4, 0))
         # Keep legacy reference used by toggle
         self.bout_analysis_group_label = ttk.Label(self._bout_grp_container, text="")
 
@@ -9384,7 +9531,7 @@ class FPAnalysisGUI:
             return {self.spike_listbox.get(i) for i in sel}
         subs = set()
         for i in sel:
-            subs.update(self.groups.get(self.spike_listbox.get(i), []))
+            subs.update(self._series_members(self.spike_listbox.get(i)))
         return subs
 
     def _spike_results_for_selection(self):
@@ -9421,7 +9568,7 @@ class FPAnalysisGUI:
         else:  # Group mode
             selected_groups = [self.spike_listbox.get(i) for i in selected_indices]
             for group_name in selected_groups:
-                group_members = self.groups.get(group_name, [])
+                group_members = self._series_members(group_name)
                 for member in group_members:
                     subject_to_group[member] = group_name
                 subjects_to_analyze.extend(group_members)
@@ -14030,6 +14177,91 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return facet_subjects(subject_ids, self.get_subject_factors(subject_ids),
                               selections, self.get_factor_definitions(subject_ids))
 
+    def facet_series(self, subject_pool, selections):
+        """``[(series_label, [subject_id, ...])]`` for *subject_pool*, in plot order.
+
+        Empty series are dropped, so a level nobody is at does not occupy a
+        colour or a legend entry.
+        """
+        labels, split_factors = self.facet(subject_pool, selections)
+        assignments = self.get_subject_factors(subject_pool)
+        order_map = self.params.get('factor_level_order') or {}
+        wanted = facet_series_order(
+            split_factors,
+            {f: factor_levels(subject_pool, assignments, f, order_map.get(f))
+             for f in split_factors})
+
+        members = {}
+        for sid, label in labels.items():      # insertion order == pool order
+            members.setdefault(label, []).append(sid)
+        return [(label, members[label]) for label in wanted if members.get(label)]
+
+    def _series_members(self, name):
+        """Subjects behind a plotted series.
+
+        This is the single seam that makes every existing group plot
+        facet-aware: the plot functions ask for a series' members by name, and
+        get either a facet's members or -- when no facet is active, which is
+        the default -- the group of that name, exactly as before.
+        """
+        facet = getattr(self, '_active_facet', None)
+        if facet and name in facet:
+            return list(facet[name])
+        return self.groups.get(name, [])
+
+    def facet_series_for(self, tab_key, group_names):
+        """Series names a graphing tab should plot, given its selected groups.
+
+        Returns *group_names* untouched when the tab's facet column is inert,
+        so an untouched tab runs the original code path rather than an
+        equivalent-looking substitute. Otherwise the selected groups define the
+        pool of subjects and the facet decides how that pool is divided.
+        """
+        control = getattr(self, 'facet_controls', {}).get(tab_key)
+        selections = control.selections() if control is not None else {}
+        if not selections or facet_is_inert(selections):
+            self._active_facet = None
+            return list(group_names)
+
+        pool, seen = [], set()
+        for group_name in group_names:
+            # The pool is always real group membership: the facet divides the
+            # selection, it does not define it.
+            for sid in self.groups.get(group_name, []):
+                if sid not in seen:
+                    seen.add(sid)
+                    pool.append(sid)
+        series = self.facet_series(pool, selections)
+        self._active_facet = {label: subjects for label, subjects in series}
+        return [label for label, _ in series]
+
+    def selected_series(self, tab_key, listbox):
+        """Series a graphing tab should draw: its selected groups, then its facet.
+
+        Every plot path on a tab goes through here rather than reading the
+        listbox itself, so the panels of one figure cannot disagree about what
+        the series are.
+        """
+        names = [listbox.get(i) for i in listbox.curselection()]
+        return self.facet_series_for(tab_key, names)
+
+    def _make_facet_controls(self, parent, tab_key, on_change=None, **kwargs):
+        """Create this tab's facet column and register it under *tab_key*."""
+        if not hasattr(self, 'facet_controls'):
+            self.facet_controls = {}
+        control = FacetControls(parent, self, on_change=on_change, **kwargs)
+        self.facet_controls[tab_key] = control
+        control.rebuild()
+        return control
+
+    def refresh_facet_controls(self):
+        """Re-derive every tab's facet column after factors or groups change."""
+        for control in getattr(self, 'facet_controls', {}).values():
+            try:
+                control.rebuild()
+            except Exception as exc:
+                self.log_message(f"Facet control refresh skipped: {exc}")
+
     # ======================== Pooled Z-Scoring ========================
 
     def _channel_wavelength(self, data, ch):
@@ -17460,10 +17692,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     messagebox.showwarning("Warning", "Please select at least one group.")
                     return
                 
-                selected_groups = [self.behav_group_listbox.get(i) for i in selected_indices]
+                selected_groups = self.selected_series('behavioral', self.behav_group_listbox)
                 selected_subjects = []
                 for group_name in selected_groups:
-                    group_members = self.groups.get(group_name, [])
+                    group_members = self._series_members(group_name)
                     for member in group_members:
                         subject_to_group[member] = group_name
                     selected_subjects.extend(group_members)
@@ -18035,10 +18267,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # Map subjects to their groups
                     subject_to_group = {}
                     selected_indices = self.behav_group_listbox.curselection()
-                    selected_groups = [self.behav_group_listbox.get(i) for i in selected_indices]
+                    selected_groups = self.selected_series('behavioral', self.behav_group_listbox)
                     
                     for group_name in selected_groups:
-                        for subject in self.groups.get(group_name, []):
+                        for subject in self._series_members(group_name):
                             subject_to_group[subject] = group_name
                 else:
                     subject_to_group = None
@@ -18258,10 +18490,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Determine which subjects/groups to include
                 if is_group_mode:
                     selected_indices = self.behav_group_listbox.curselection()
-                    selected_groups = [self.behav_group_listbox.get(i) for i in selected_indices]
+                    selected_groups = self.selected_series('behavioral', self.behav_group_listbox)
                     subjects_by_group = {}
                     for group_name in selected_groups:
-                        subjects_by_group[group_name] = self.groups.get(group_name, [])
+                        subjects_by_group[group_name] = self._series_members(group_name)
                 else:
                     selected_indices = self.behav_subject_listbox.curselection()
                     selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
@@ -18432,10 +18664,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Determine which subjects/groups to include
                 if is_group_mode:
                     selected_indices = self.behav_group_listbox.curselection()
-                    selected_groups = [self.behav_group_listbox.get(i) for i in selected_indices]
+                    selected_groups = self.selected_series('behavioral', self.behav_group_listbox)
                     subjects_by_group = {}
                     for group_name in selected_groups:
-                        subjects_by_group[group_name] = self.groups.get(group_name, [])
+                        subjects_by_group[group_name] = self._series_members(group_name)
                 else:
                     selected_indices = self.behav_subject_listbox.curselection()
                     selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
@@ -20804,7 +21036,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Update available subjects
         self.update_available_subjects()
-        
+
+        # Group is a factor, so editing groups changes the facet columns' levels.
+        self.refresh_facet_controls()
+
         # Clear group members if no group selected
         if not self.group_listbox.curselection():
             self.group_members_listbox.delete(0, 'end')
@@ -22040,6 +22275,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         saved_subjects = None
         if self.plot_by_var.get() == "Group":
             saved_group_indices = list(self.viz_group_listbox.curselection())
+            # Selection save/restore, not a plotted series: these must be the
+            # listbox's own entries or _restore_group_selections cannot match them.
             saved_groups = [self.viz_group_listbox.get(i) for i in saved_group_indices]
         else:
             saved_subject_indices = list(self.viz_subject_listbox.curselection())
@@ -22119,9 +22356,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         if self.plot_by_var.get() == "Group":
             selected_indices = self.viz_group_listbox.curselection()
-            selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
             for group_name in selected_groups:
-                subjects.extend(self.groups.get(group_name, []))
+                subjects.extend(self._series_members(group_name))
         else:
             selected_indices = self.viz_subject_listbox.curselection()
             subjects = [self.viz_subject_listbox.get(i) for i in selected_indices]
@@ -22154,10 +22391,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.bout_number_var.set("All")
                     return
                 
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                selected_groups = self.selected_series('visualization', self.viz_group_listbox)
                 subjects = []
                 for group_name in selected_groups:
-                    subjects.extend(self.groups.get(group_name, []))
+                    subjects.extend(self._series_members(group_name))
                 subjects = list(set(subjects))
             else:
                 selected_indices = self.viz_subject_listbox.curselection()
@@ -22876,9 +23113,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         try:
             if self.plot_by_var.get() == "Group":
                 selected_indices = self.viz_group_listbox.curselection()
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                selected_groups = self.selected_series('visualization', self.viz_group_listbox)
                 for group_name in selected_groups:
-                    selected_subjects.extend(self.groups.get(group_name, []))
+                    selected_subjects.extend(self._series_members(group_name))
                 seen = set()
                 selected_subjects = [s for s in selected_subjects
                                      if not (s in seen or seen.add(s))]
@@ -22918,10 +23155,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showerror("Error", "Please select at least one group")
                 return
             
-            selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
             selected_subjects = []
             for group_name in selected_groups:
-                selected_subjects.extend(self.groups.get(group_name, []))
+                selected_subjects.extend(self._series_members(group_name))
             
             # Remove duplicates while preserving order
             seen = set()
@@ -23070,7 +23307,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # If comparing groups, plot heatmaps per group instead of flattening subjects
                     if self.plot_by_var.get() == "Group":
                         selected_indices = self.viz_group_listbox.curselection()
-                        selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                        selected_groups = self.selected_series('visualization', self.viz_group_listbox)
                         self.plot_position_heatmap_by_group(fig, selected_groups)
                     else:
                         self.plot_position_heatmap_multi(fig, valid_subjects)
@@ -23088,7 +23325,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # Check if we're in group mode
                     if self.plot_by_var.get() == "Group":
                         selected_indices = self.viz_group_listbox.curselection()
-                        selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                        selected_groups = self.selected_series('visualization', self.viz_group_listbox)
                         self.plot_bout_comparison_by_group(fig, selected_groups)
                     else:
                         self.plot_bout_comparison_multi(fig, valid_subjects)
@@ -23099,7 +23336,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if self.plot_by_var.get() == "Group":
                         # Get which groups were selected and create group-based plot
                         selected_indices = self.viz_group_listbox.curselection()
-                        selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+                        selected_groups = self.selected_series('visualization', self.viz_group_listbox)
                         self.plot_extracted_bouts_by_group(fig, selected_groups)
                     else:
                         self.plot_extracted_bouts_multi(fig, valid_subjects)
@@ -25361,10 +25598,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showwarning("No Selection", "Please select group(s) to export data.")
                 return
             
-            selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
             subjects = []
             for group_name in selected_groups:
-                group_members = self.groups.get(group_name, [])
+                group_members = self._series_members(group_name)
                 subjects.extend(group_members)
                 # Map subjects to their groups
                 for subj in group_members:
@@ -26502,7 +26739,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Collect group data
         group_data = {}
         for group_name in group_names:
-            subjects = self.groups.get(group_name, [])
+            subjects = self._series_members(group_name)
             
             # Apply exclusions if enabled
             if self.use_exclusions_viz.get():
@@ -27091,8 +27328,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         if self.plot_by_var.get() == "Group":
             selected_indices = self.viz_group_listbox.curselection()
-            if len(selected_indices) > 1:
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+            # Count series, not listbox rows: one group split by Session is
+            # two series and belongs on the comparison path.
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
+            if len(selected_groups) > 1:
                 self._plot_distance_euclidean_group_comparison(fig, selected_groups)
                 return
 
@@ -27186,19 +27425,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Suppress G1 when no subject across the compared groups has a 2nd channel.
         if not self._any_subject_has_g1(
-                [s for g in group_names for s in self.groups.get(g, [])]):
+                [s for g in group_names for s in self._series_members(g)]):
             show_g1 = False
 
         subjects_for_g0_by_group = {}
         subjects_for_g1_by_group = {}
         if self.use_exclusions_viz.get():
             for group_name in group_names:
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G0')
                 subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G1')
         else:
             for group_name in group_names:
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 subjects_for_g0_by_group[group_name] = subjects
                 subjects_for_g1_by_group[group_name] = subjects
 
@@ -27220,7 +27459,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for ax_idx, (ch_label, mean_key, ls, marker) in enumerate(channel_rows):
             ax = axes[ax_idx]
             for g_idx, group_name in enumerate(group_names):
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 incl = subjects_for_g0_by_group[group_name] if ch_label == 'G0' else subjects_for_g1_by_group[group_name]
                 group_eucl = {}
                 for subject in incl:
@@ -27258,8 +27497,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Check if we're in group comparison mode with multiple groups
         if self.plot_by_var.get() == "Group":
             selected_indices = self.viz_group_listbox.curselection()
-            if len(selected_indices) > 1:
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
+            # Count series, not listbox rows: one group split by Session is
+            # two series and belongs on the comparison path.
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
+            if len(selected_groups) > 1:
                 self._plot_zone_entry_bouts_group_comparison(fig, selected_groups)
                 return
 
@@ -27479,7 +27720,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         group_subject_counts = {}
 
         for group_name in group_names:
-            subjects = self.groups.get(group_name, [])
+            subjects = self._series_members(group_name)
             subjects_for_g0 = subjects
             subjects_for_g1 = subjects
             if self.use_exclusions_viz.get():
@@ -27623,9 +27864,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Check if we're in group comparison mode
         if self.plot_by_var.get() == "Group":
             selected_indices = self.viz_group_listbox.curselection()
-            if len(selected_indices) > 1:
+            # Count series, not listbox rows: one group split by Session is
+            # two series and belongs on the comparison path.
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
+            if len(selected_groups) > 1:
                 # Multiple groups selected - do group comparison
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
                 self._plot_zone_averages_group_comparison(fig, selected_groups)
                 return
         
@@ -27766,7 +28009,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Suppress G1 when no subject across the compared groups has a 2nd channel.
         if not self._any_subject_has_g1(
-                [s for g in group_names for s in self.groups.get(g, [])]):
+                [s for g in group_names for s in self._series_members(g)]):
             show_g1 = False
 
         # Apply exclusions if enabled
@@ -27774,12 +28017,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g1_by_group = {}
         if self.use_exclusions_viz.get():
             for group_name in group_names:
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G0')
                 subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G1')
         else:
             for group_name in group_names:
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 subjects_for_g0_by_group[group_name] = subjects
                 subjects_for_g1_by_group[group_name] = subjects
         
@@ -27789,7 +28032,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         categories = None
         
         for group_name in group_names:
-            subjects = self.groups.get(group_name, [])
+            subjects = self._series_members(group_name)
             if not subjects:
                 continue
             
@@ -27963,9 +28206,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Check if we're in group comparison mode
         if self.plot_by_var.get() == "Group":
             selected_indices = self.viz_group_listbox.curselection()
-            if len(selected_indices) > 1:
+            # Count series, not listbox rows: one group split by Session is
+            # two series and belongs on the comparison path.
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
+            if len(selected_groups) > 1:
                 # Multiple groups selected - do group comparison
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
                 self._plot_distance_group_comparison(fig, selected_groups)
                 return
         
@@ -28145,7 +28390,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Suppress G1 when no subject across the compared groups has a 2nd channel.
         if not self._any_subject_has_g1(
-                [s for g in group_names for s in self.groups.get(g, [])]):
+                [s for g in group_names for s in self._series_members(g)]):
             show_g1 = False
 
         maze_type = self.params.get('maze_type', 'EPM')
@@ -28165,12 +28410,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g1_by_group = {}
         if self.use_exclusions_viz.get():
             for group_name in group_names:
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G0')
                 subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G1')
         else:
             for group_name in group_names:
-                subjects = self.groups.get(group_name, [])
+                subjects = self._series_members(group_name)
                 subjects_for_g0_by_group[group_name] = subjects
                 subjects_for_g1_by_group[group_name] = subjects
         
@@ -28180,7 +28425,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         distances_y = None
         
         for group_name in group_names:
-            subjects = self.groups.get(group_name, [])
+            subjects = self._series_members(group_name)
             if not subjects:
                 continue
             
@@ -28393,9 +28638,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Check if we're in group comparison mode
         if self.plot_by_var.get() == "Group":
             selected_indices = self.viz_group_listbox.curselection()
-            if len(selected_indices) > 1:
+            # Count series, not listbox rows: one group split by Session is
+            # two series and belongs on the comparison path.
+            selected_groups = self.selected_series('visualization', self.viz_group_listbox)
+            if len(selected_groups) > 1:
                 # Multiple groups selected - do group comparison
-                selected_groups = [self.viz_group_listbox.get(i) for i in selected_indices]
                 self._plot_outback_group_comparison(fig, selected_groups)
                 return
         
@@ -28511,13 +28758,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Suppress G1 when no subject across the compared groups has a 2nd channel.
         if not self._any_subject_has_g1(
-                [s for g in group_names for s in self.groups.get(g, [])]):
+                [s for g in group_names for s in self._series_members(g)]):
             show_g1 = False
 
         # Collect data for each group
         group_data = {}
         for group_name in group_names:
-            subjects = self.groups.get(group_name, [])
+            subjects = self._series_members(group_name)
             out_g0 = []
             out_g1 = []
             back_g0 = []
@@ -28694,7 +28941,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # real stored-bout keys and label_a/label_b the channel designations.
         _slot_subjects = []
         for _g in group_names:
-            _slot_subjects.extend(self.groups.get(_g, []))
+            _slot_subjects.extend(self._series_members(_g))
         (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(_slot_subjects, max_slots=2)
 
         # Collect bouts per group AND track subjects for heatmap
@@ -28705,7 +28952,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         for group_name in group_names:
             group_bouts[group_name] = {'G0': [], 'G1': []}
-            subjects = self.groups.get(group_name, [])
+            subjects = self._series_members(group_name)
             
             # Apply exclusions if enabled - need to check both channels
             subjects_for_g0 = subjects
@@ -29540,7 +29787,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Collect subjects from selected groups
         all_subjects = []
         for group_name in selected_groups:
-            all_subjects.extend(self.groups.get(group_name, []))
+            all_subjects.extend(self._series_members(group_name))
         
         # Remove duplicates
         all_subjects = list(set(all_subjects))
@@ -29567,7 +29814,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         g1_data_by_group = {group: {} for group in selected_groups}
         
         for group_name in selected_groups:
-            group_subjects = self.groups.get(group_name, [])
+            group_subjects = self._series_members(group_name)
             
             for subject in group_subjects:
                 if subject not in self.processed_data:
@@ -29764,8 +30011,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if not sel:
                 messagebox.showerror("Error", "Please select at least one group")
                 return
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in sel]
-            group_members = {g: list(self.groups.get(g, [])) for g in selected_groups}
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
+            group_members = {g: list(self._series_members(g)) for g in selected_groups}
         else:
             sel = self.bout_analysis_subject_listbox.curselection()
             if not sel:
@@ -29875,10 +30122,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showerror("Error", "Please select at least one group")
                 return
             
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for group_name in selected_groups:
-                selected_subjects.extend(self.groups.get(group_name, []))
+                selected_subjects.extend(self._series_members(group_name))
             
             # Remove duplicates
             selected_subjects = list(set(selected_subjects))
@@ -29930,7 +30177,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subject_to_group = {}
         if self.bout_analysis_by_var.get() == "Group":
             for group_name in selected_groups:
-                for subject in self.groups.get(group_name, []):
+                for subject in self._series_members(group_name):
                     if subject in selected_subjects:
                         subject_to_group[subject] = group_name
         
@@ -31715,10 +31962,10 @@ cat("OK\n")
             if not sel:
                 messagebox.showerror("Error", "Please select at least one group")
                 return
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in sel]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for g in selected_groups:
-                selected_subjects.extend(self.groups.get(g, []))
+                selected_subjects.extend(self._series_members(g))
             selected_subjects = list(set(selected_subjects))
             if not selected_subjects:
                 messagebox.showerror("Error", "Selected groups have no members")
@@ -31746,7 +31993,7 @@ cat("OK\n")
         subject_to_group = {}
         if in_group_mode:
             for g in selected_groups:
-                for s in self.groups.get(g, []):
+                for s in self._series_members(g):
                     if s in selected_subjects:
                         subject_to_group[s] = g
 
@@ -33995,10 +34242,10 @@ cat("OK\n")
                 messagebox.showerror("Error", "Please select at least one group")
                 return
             
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for group_name in selected_groups:
-                selected_subjects.extend(self.groups.get(group_name, []))
+                selected_subjects.extend(self._series_members(group_name))
             
             # Remove duplicates
             selected_subjects = list(set(selected_subjects))
@@ -34121,7 +34368,7 @@ cat("OK\n")
         # If in group mode, store the group mappings
         if self.bout_analysis_by_var.get() == "Group":
             for group_name in selected_groups:
-                group_subjects = [s for s in self.groups.get(group_name, []) if s in selected_subjects]
+                group_subjects = [s for s in self._series_members(group_name) if s in selected_subjects]
                 if group_subjects:
                     self.bout_metrics_data[combo_key]['groups'][group_name] = group_subjects
         
@@ -35046,10 +35293,10 @@ cat("OK\n")
             if not selected_indices:
                 messagebox.showerror("Error", "Please select at least one group")
                 return
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for g in selected_groups:
-                selected_subjects.extend(self.groups.get(g, []))
+                selected_subjects.extend(self._series_members(g))
             selected_subjects = list(set(selected_subjects))
         else:
             selected_indices = self.bout_analysis_subject_listbox.curselection()
@@ -35094,7 +35341,7 @@ cat("OK\n")
         subject_to_group = {}
         if analysis_mode == "Group":
             for g in selected_groups:
-                for s in self.groups.get(g, []):
+                for s in self._series_members(g):
                     if s in selected_subjects:
                         subject_to_group[s] = g
 
@@ -35269,10 +35516,10 @@ cat("OK\n")
             if not selected_indices:
                 messagebox.showerror("Error", "Please select at least one group")
                 return
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for g in selected_groups:
-                selected_subjects.extend(self.groups.get(g, []))
+                selected_subjects.extend(self._series_members(g))
             selected_subjects = list(set(selected_subjects))
         else:
             selected_indices = self.bout_analysis_subject_listbox.curselection()
@@ -35312,7 +35559,7 @@ cat("OK\n")
         subject_to_group = {}
         if analysis_mode == "Group":
             for g in selected_groups:
-                for s in self.groups.get(g, []):
+                for s in self._series_members(g):
                     if s in selected_subjects:
                         subject_to_group[s] = g
 
@@ -35713,10 +35960,10 @@ cat("OK\n")
                 messagebox.showerror("Error", "Please select at least one group")
                 return
             
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in selected_indices]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for group_name in selected_groups:
-                selected_subjects.extend(self.groups.get(group_name, []))
+                selected_subjects.extend(self._series_members(group_name))
             selected_subjects = list(set(selected_subjects))
             
             if not selected_subjects:
@@ -35792,7 +36039,7 @@ cat("OK\n")
         subject_to_group = {}
         if self.bout_analysis_by_var.get() == "Group":
             for group_name in selected_groups:
-                for subject in self.groups.get(group_name, []):
+                for subject in self._series_members(group_name):
                     if subject in selected_subjects:
                         subject_to_group[subject] = group_name
         
@@ -35896,7 +36143,7 @@ cat("OK\n")
         groups_map = {}
         if analysis_mode == "Group":
             for group_name in selected_groups:
-                group_subjs = [s for s in self.groups.get(group_name, []) if s in subject_data]
+                group_subjs = [s for s in self._series_members(group_name) if s in subject_data]
                 if group_subjs:
                     groups_map[group_name] = group_subjs
         
@@ -36553,10 +36800,10 @@ cat("OK\n")
         # Determine which subjects to include based on current UI selection
         if analysis_mode == 'Group':
             sel_indices       = self.bout_analysis_group_listbox.curselection()
-            selected_groups   = [self.bout_analysis_group_listbox.get(i) for i in sel_indices]
+            selected_groups   = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
             for g in selected_groups:
-                selected_subjects.extend(self.groups.get(g, []))
+                selected_subjects.extend(self._series_members(g))
             selected_subjects = list(dict.fromkeys(selected_subjects))  # preserve order, dedupe
         else:
             sel_indices       = self.bout_analysis_subject_listbox.curselection()
@@ -36576,7 +36823,7 @@ cat("OK\n")
         subject_to_group = {}
         if analysis_mode == 'Group':
             for g in (selected_groups if analysis_mode == 'Group' else []):
-                for s in self.groups.get(g, []):
+                for s in self._series_members(g):
                     if s in selected_subjects:
                         subject_to_group[s] = g
         else:
@@ -36938,10 +37185,10 @@ cat("OK\n")
         analysis_mode = self.bout_analysis_by_var.get()
         if analysis_mode == 'Group':
             sel = self.bout_analysis_group_listbox.curselection()
-            selected_groups = [self.bout_analysis_group_listbox.get(i) for i in sel]
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             base_subjects = []
             for g in selected_groups:
-                base_subjects.extend(self.groups.get(g, []))
+                base_subjects.extend(self._series_members(g))
             base_subjects = list(dict.fromkeys(base_subjects))  # dedupe, keep order
             if not base_subjects:
                 messagebox.showerror("Error", "Please select at least one group with members.")
@@ -36958,7 +37205,7 @@ cat("OK\n")
         subject_to_group = {}
         if analysis_mode == 'Group':
             for g in selected_groups:
-                for s in self.groups.get(g, []):
+                for s in self._series_members(g):
                     if s in base_subjects:
                         subject_to_group[s] = g
         else:
@@ -38295,7 +38542,7 @@ cat("OK\n")
         if analysis_mode == 'Subject':
             total = len(selected_items)
         else:
-            total = sum(len(self.groups.get(g, [])) for g in selected_items)
+            total = sum(len(self._series_members(g)) for g in selected_items)
 
         # ── Heavy computation runs in a background thread ────────────────
         def _worker(q):
@@ -38879,6 +39126,8 @@ cat("OK\n")
         self.dec_prob_group_listbox.pack(side='left', fill='both', expand=True)
         _s2.pack(side='right', fill='y')
         self.dec_prob_group_listbox.config(yscrollcommand=_s2.set)
+        self._make_facet_controls(self._dec_prob_grp_container,
+                                  'decision_probability').pack(fill='x', pady=(4, 0))
 
         # Initialise to the default mode
         self._dec_prob_toggle_mode()
@@ -39276,8 +39525,8 @@ cat("OK\n")
                     messagebox.showwarning("Warning",
                                            "Please select at least one group.")
                     return
-                sel_groups = [self.dec_prob_group_listbox.get(i) for i in sel_idx]
-                group_subjects = {g: self.groups.get(g, []) for g in sel_groups}
+                sel_groups = self.selected_series('decision_probability', self.dec_prob_group_listbox)
+                group_subjects = {g: self._series_members(g) for g in sel_groups}
             else:
                 sel_idx = self.dec_prob_subject_listbox.curselection()
                 if not sel_idx:
@@ -40881,6 +41130,8 @@ cat("OK\n")
         self.kin_group_listbox.pack(side='left', fill='both', expand=True)
         _kg.pack(side='right', fill='y')
         self.kin_group_listbox.config(yscrollcommand=_kg.set)
+        self._make_facet_controls(self._kin_grp_container, 'kinematics').pack(
+            fill='x', pady=(4, 0))
 
         self._kin_toggle_mode()
 
@@ -41416,11 +41667,11 @@ cat("OK\n")
         """Return (mode, list-of-(subject, group_label)) from the active selector."""
         if self.kin_by_var.get() == "Group":
             idxs = self.kin_group_listbox.curselection()
-            groups = [self.kin_group_listbox.get(i) for i in idxs]
+            groups = self.selected_series('kinematics', self.kin_group_listbox)
             pairs = []
             seen = set()
             for g in groups:
-                for s in self.groups.get(g, []):
+                for s in self._series_members(g):
                     if s in self.processed_data and s not in seen and \
                             self.processed_data[s].get('has_position', False):
                         pairs.append((s, g))

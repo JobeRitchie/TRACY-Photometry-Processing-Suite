@@ -274,3 +274,118 @@ def test_delete_of_an_unknown_factor_is_a_no_op():
     p = _params()
     assert _M.delete_factor_from(p, 'Nope') == 0
     assert p['factor_definitions'] == ['Drug']
+
+
+# ---------------------------------------------------------------------------
+# Series: what a graphing tab actually draws
+# ---------------------------------------------------------------------------
+
+class _Series(_Facets):
+    facet_series = _G.facet_series
+    facet_series_for = _G.facet_series_for
+    _series_members = _G._series_members
+    selected_series = _G.selected_series
+
+    def __init__(self, *a, selections=None, **kw):
+        super().__init__(*a, **kw)
+        self._active_facet = None
+        self.facet_controls = {}
+        if selections is not None:
+            self.facet_controls['t'] = type(
+                'Stub', (), {'selections': lambda _s: selections})()
+
+
+GROUPS = {'Fentanyl': ['2F_pre', '2F_post'], 'Saline': ['3M_pre', '3M_post']}
+
+
+def test_the_default_selection_is_recognised_as_the_plain_group_fan_out():
+    assert _M.facet_is_inert({'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    assert not _M.facet_is_inert({'Group': SPLIT, 'Session': SPLIT})
+    assert not _M.facet_is_inert({'Group': COMBINE})
+    assert not _M.facet_is_inert({'Group': SPLIT, 'Session': 'pre'})
+
+
+def test_an_untouched_tab_gets_its_groups_back_verbatim():
+    """The inert case must take the original code path, not an equivalent one:
+    groups may overlap, and an overlapping subject is drawn in both groups there
+    but would land in exactly one facet series."""
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    assert app.facet_series_for('t', ['Fentanyl', 'Saline']) == ['Fentanyl', 'Saline']
+    assert app._active_facet is None
+    # ...and the members lookup falls through to the real group.
+    assert app._series_members('Fentanyl') == ['2F_pre', '2F_post']
+
+
+def test_splitting_session_regroups_the_selected_subjects():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': COMBINE, 'Session': SPLIT, 'Animal': COMBINE})
+    series = app.facet_series_for('t', ['Fentanyl', 'Saline'])
+    assert set(series) == {'pre', 'post'}
+    assert set(app._series_members('pre')) == {'2F_pre', '3M_pre'}
+    assert set(app._series_members('post')) == {'2F_post', '3M_post'}
+
+
+def test_group_by_session_gives_the_cross_product():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': SPLIT, 'Animal': COMBINE})
+    series = app.facet_series_for('t', ['Fentanyl', 'Saline'])
+    assert len(series) == 4
+    assert 'Fentanyl × pre' in series
+    assert app._series_members('Fentanyl × post') == ['2F_post']
+
+
+def test_filtering_to_a_level_shrinks_the_pool():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': 'post', 'Animal': COMBINE})
+    series = app.facet_series_for('t', ['Fentanyl', 'Saline'])
+    assert series == ['Fentanyl', 'Saline']
+    assert app._series_members('Fentanyl') == ['2F_post']
+    assert app._series_members('Saline') == ['3M_post']
+
+
+def test_the_pool_is_the_selected_groups_only():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': COMBINE, 'Session': SPLIT, 'Animal': COMBINE})
+    app.facet_series_for('t', ['Fentanyl'])
+    assert app._series_members('pre') == ['2F_pre']
+
+
+def test_empty_series_do_not_take_a_colour():
+    """A level nobody in the selection is at must not occupy a legend entry."""
+    app = _Series(SUBJECTS, groups=GROUPS, params={
+        'factor_definitions': ['Dose'],
+        'subject_factors': {'2F_pre': {'Dose': 'high'}},
+        'factor_level_order': {'Dose': ['high', 'low']}},
+        selections={'Group': COMBINE, 'Session': COMBINE,
+                    'Animal': COMBINE, 'Dose': SPLIT})
+    series = app.facet_series_for('t', ['Fentanyl'])
+    assert 'low' not in series
+    assert series == ['high', UNASSIGNED]
+
+
+def test_series_follow_the_declared_level_order_not_the_data():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  params={'factor_level_order': {'Session': ['pre', 'post']}},
+                  selections={'Group': COMBINE, 'Session': SPLIT, 'Animal': COMBINE})
+    assert app.facet_series_for('t', ['Fentanyl', 'Saline']) == ['pre', 'post']
+    app.params['factor_level_order']['Session'] = ['post', 'pre']
+    assert app.facet_series_for('t', ['Fentanyl', 'Saline']) == ['post', 'pre']
+
+
+def test_a_tab_with_no_facet_control_behaves_as_before():
+    app = _Series(SUBJECTS, groups=GROUPS)
+    assert app.facet_series_for('missing', ['Fentanyl']) == ['Fentanyl']
+    assert app._series_members('Fentanyl') == ['2F_pre', '2F_post']
+
+
+def test_facet_series_order_builds_the_cross_product_in_order():
+    got = _M.facet_series_order(
+        ['Group', 'Session'],
+        {'Group': ['Fentanyl', 'Saline'], 'Session': ['pre', 'post']})
+    assert got == ['Fentanyl × pre', 'Fentanyl × post',
+                   'Saline × pre', 'Saline × post']
+
+
+def test_nothing_split_is_a_single_series():
+    assert _M.facet_series_order([], {}) == ['All']
