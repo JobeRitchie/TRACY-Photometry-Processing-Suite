@@ -2276,7 +2276,11 @@ class FPAnalysisGUI:
 
         scroll_host = ttk.Frame(left)
         scroll_host.grid(row=0, column=0, sticky='nsew')
-        column = self.make_scrollable(scroll_host)
+        # An unconstrained Canvas asks for its Tk default of 10 cm, which is a
+        # physical measure and so grows with the display DPI -- at 150% it alone
+        # would claim ~570 px and the controls column would be twice its
+        # intended width. Ask for the width we actually want instead.
+        column = self.make_scrollable(scroll_host, width=self.ui_px(column_px))
 
         selection = ttk.LabelFrame(column, text=selection_title, padding=4)
         selection.pack(fill='x')
@@ -2290,7 +2294,9 @@ class FPAnalysisGUI:
         output_host = ttk.Frame(container)
         output_host.grid(row=0, column=1, sticky='nsew', pady=self.ui_px(4),
                          padx=(0, self.ui_px(4)))
-        output = self.make_scrollable(output_host)
+        # Output takes every spare pixel, so its request is only a floor on how
+        # narrow the window may get; keep it modest for the same reason.
+        output = self.make_scrollable(output_host, width=self.ui_px(320))
         return selection, settings, output, actions
 
     def register_option_clusters(self, tab_key, plot_type_var, clusters, table,
@@ -2347,7 +2353,7 @@ class FPAnalysisGUI:
             except Exception:
                 pass
 
-    def make_scrollable(self, parent, fit_width=False):
+    def make_scrollable(self, parent, fit_width=False, width=None):
         """Wrap `parent` in a scrolling viewport and return the inner frame.
 
         Content taller than the window stays reachable by scrolling instead of
@@ -2359,6 +2365,8 @@ class FPAnalysisGUI:
         outer.pack(fill=tk.BOTH, expand=True)
         canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0,
                            background=self.colors['bg_light'])
+        if width is not None:
+            canvas.configure(width=width)
         vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
         inner = ttk.Frame(canvas)
         win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
@@ -3775,115 +3783,103 @@ class FPAnalysisGUI:
         """Tab for behavioral metrics analysis"""
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Behavioral Data")
-        
-        # Create canvas with scrollbar for scrollable content
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
 
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups",
+            settings_title="Analysis Settings")
 
-        _scroll_win_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        # Pin the scrollable content to the visible canvas width so a wide child
-        # (the many-column metrics table below) can't stretch the whole frame
-        # past the viewport, which would push centered plots off to the right.
-        canvas.bind(
-            "<Configure>",
-            lambda e, _id=_scroll_win_id: canvas.itemconfigure(_id, width=e.width)
-        )
-
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
-
-        # Control panel
-        control_frame = ttk.LabelFrame(scrollable_frame, text="Analysis Controls", padding=5)
-        control_frame.pack(fill='x', padx=5, pady=5)
-        
-        # Group vs Subject selection mode
-        ttk.Label(control_frame, text="Analyze by:").grid(row=0, column=0, sticky='w', padx=5)
+        # ---------------------------------------------------------------- Selection
+        mode_frame = ttk.Frame(selection)
+        mode_frame.pack(fill='x')
+        ttk.Label(mode_frame, text="Analyze by:").pack(side='left')
         self.behav_plot_by_var = tk.StringVar(value="Subject")
-        behav_plot_by_frame = ttk.Frame(control_frame)
-        behav_plot_by_frame.grid(row=0, column=1, sticky='w', padx=5)
-        ttk.Radiobutton(behav_plot_by_frame, text="Subject", variable=self.behav_plot_by_var, 
-                       value="Subject", command=self.toggle_behav_subject_group_mode).pack(side='left', padx=5)
-        ttk.Radiobutton(behav_plot_by_frame, text="Group", variable=self.behav_plot_by_var, 
-                       value="Group", command=self.toggle_behav_subject_group_mode).pack(side='left', padx=5)
-        
-        # Subject selection
-        ttk.Label(control_frame, text="Subject(s):").grid(row=1, column=0, sticky='nw', padx=3)
-        
-        subject_frame = ttk.Frame(control_frame)
-        subject_frame.grid(row=1, column=1, rowspan=2, padx=3, sticky='nsew')
-        
-        self.behav_subject_listbox = tk.Listbox(subject_frame, selectmode='extended', height=10, width=20, exportselection=False)
+        ttk.Radiobutton(mode_frame, text="Subject", variable=self.behav_plot_by_var,
+                        value="Subject",
+                        command=self.toggle_behav_subject_group_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Radiobutton(mode_frame, text="Group", variable=self.behav_plot_by_var,
+                        value="Group",
+                        command=self.toggle_behav_subject_group_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
+
+        # The subject and group selectors share one slot, so exactly one is
+        # packed at a time and the hidden one leaves no gap behind.
+        selector = ttk.Frame(selection)
+        selector.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+
+        self.behav_subject_frame = ttk.Frame(selector)
+        ttk.Label(self.behav_subject_frame, text="Subject(s):").pack(anchor='w')
+        subject_holder = ttk.Frame(self.behav_subject_frame)
+        subject_holder.pack(fill='both', expand=True)
+        # Kept short on purpose: the Selection zone shares a scroll region with
+        # Settings, so a tall list would push the settings out of view.
+        self.behav_subject_listbox = tk.Listbox(
+            subject_holder, selectmode='extended', height=7, exportselection=False)
         self.behav_subject_listbox.pack(side='left', fill='both', expand=True)
-        
-        scrollbar = ttk.Scrollbar(subject_frame, orient='vertical', command=self.behav_subject_listbox.yview)
-        scrollbar.pack(side='right', fill='y')
-        self.behav_subject_listbox.config(yscrollcommand=scrollbar.set)
-        
-        # Group selection (initially hidden)
-        self.behav_group_label = ttk.Label(control_frame, text="Group(s):")
-        
-        behav_group_frame = ttk.Frame(control_frame)
+        subject_scrollbar = ttk.Scrollbar(subject_holder, orient='vertical',
+                                          command=self.behav_subject_listbox.yview)
+        subject_scrollbar.pack(side='right', fill='y')
+        self.behav_subject_listbox.config(yscrollcommand=subject_scrollbar.set)
+        self.behav_subject_frame.pack(fill='both', expand=True)
 
-        behav_list_holder = ttk.Frame(behav_group_frame)
-        behav_list_holder.pack(side='left', fill='both', expand=True)
-        self.behav_group_listbox = tk.Listbox(behav_list_holder, selectmode='extended', height=10, width=20, exportselection=False)
+        self.behav_group_frame = ttk.Frame(selector)
+        self.behav_group_label = ttk.Label(self.behav_group_frame, text="Group(s):")
+        self.behav_group_label.pack(anchor='w')
+        behav_list_holder = ttk.Frame(self.behav_group_frame)
+        behav_list_holder.pack(fill='both', expand=True)
+        self.behav_group_listbox = tk.Listbox(
+            behav_list_holder, selectmode='extended', height=5, exportselection=False)
         self.behav_group_listbox.pack(side='left', fill='both', expand=True)
-
-        behav_group_scrollbar = ttk.Scrollbar(behav_list_holder, orient='vertical', command=self.behav_group_listbox.yview)
+        behav_group_scrollbar = ttk.Scrollbar(behav_list_holder, orient='vertical',
+                                              command=self.behav_group_listbox.yview)
         behav_group_scrollbar.pack(side='right', fill='y')
         self.behav_group_listbox.config(yscrollcommand=behav_group_scrollbar.set)
 
-        self._make_facet_controls(behav_group_frame, 'behavioral').pack(
-            side='left', fill='y', padx=(8, 0))
+        self._make_facet_controls(self.behav_group_frame, 'behavioral').pack(
+            fill='x', pady=(self.ui_px(6), 0))
 
-        # Store for later use
-        self.behav_group_frame = behav_group_frame
-        
-        # Time binning option
+        # ---------------------------------------------------------------- Settings
+        bins_frame = ttk.Frame(settings)
+        bins_frame.pack(fill='x')
         self.use_time_bins = tk.BooleanVar(value=False)
-        ttk.Checkbutton(control_frame, text="Use Time Bins", variable=self.use_time_bins,
-                       command=self.update_bin_entry_state).grid(row=0, column=2, sticky='w', padx=5)
-        
-        ttk.Label(control_frame, text="Bin Size (sec):").grid(row=0, column=3, sticky='w', padx=5)
+        ttk.Checkbutton(bins_frame, text="Use time bins", variable=self.use_time_bins,
+                        command=self.update_bin_entry_state).pack(anchor='w')
+
+        bin_size_frame = ttk.Frame(bins_frame)
+        bin_size_frame.pack(fill='x', pady=(self.ui_px(3), 0))
+        ttk.Label(bin_size_frame, text="Bin size (sec):").pack(side='left')
         self.time_bin_var = tk.StringVar(value=str(self.params['time_bin_size']))
-        self.time_bin_entry = ttk.Entry(control_frame, textvariable=self.time_bin_var, width=10, state='disabled')
-        self.time_bin_entry.grid(row=0, column=4, padx=5)
-        
-        # Exclusions checkbox
-        ttk.Checkbutton(control_frame, text="Apply exclusions", 
-                       variable=self.use_exclusions_behavioral).grid(row=1, column=2, sticky='w', padx=5)
-        
-        # Buttons
-        ttk.Button(control_frame, text="Calculate Metrics", 
-                  command=self.calculate_behavioral_metrics).grid(row=0, column=5, padx=5)
-        ttk.Button(control_frame, text="Export to CSV", 
-                  command=self.export_behavioral_metrics).grid(row=0, column=6, padx=5)
-        ttk.Button(control_frame, text="Visualize Data",
-                  command=self.visualize_behavioral_data).grid(row=0, column=7, padx=5)
-        
-        # Embedded visualization area (populated by visualize_behavioral_data
-        # instead of opening a separate window). Shown above the metrics table.
-        self.behav_viz_container = ttk.LabelFrame(scrollable_frame, text="Visualization", padding=5)
-        self.behav_viz_container.pack(fill='both', expand=True, padx=5, pady=(5, 5))
+        self.time_bin_entry = ttk.Entry(bin_size_frame, textvariable=self.time_bin_var,
+                                        width=8, state='disabled')
+        self.time_bin_entry.pack(side='left', padx=(self.ui_px(6), 0))
+
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_behavioral).pack(
+            anchor='w', pady=(self.ui_px(6), 0))
+
+        # ---------------------------------------------------------------- Actions
+        ttk.Button(actions, text="Calculate Metrics",
+                   command=self.calculate_behavioral_metrics).pack(fill='x')
+        ttk.Button(actions, text="Visualize Data",
+                   command=self.visualize_behavioral_data).pack(
+            fill='x', pady=(self.ui_px(4), 0))
+        ttk.Button(actions, text="Export to CSV",
+                   command=self.export_behavioral_metrics).pack(
+            fill='x', pady=(self.ui_px(4), 0))
+
+        # ---------------------------------------------------------------- Output
+        # Populated by visualize_behavioral_data instead of opening a separate
+        # window. Shown above the metrics table.
+        self.behav_viz_container = ttk.LabelFrame(output, text="Visualization", padding=5)
+        self.behav_viz_container.pack(fill='both', expand=True)
         ttk.Label(self.behav_viz_container,
-                  text='Click "Visualize Data" above to plot behavioral metrics here.',
-                  foreground='gray').pack(anchor='w', padx=5, pady=5)
+                  text='Click "Visualize Data" to plot behavioral metrics here.',
+                  foreground='gray').pack(anchor='w', padx=self.ui_px(5),
+                                          pady=self.ui_px(5))
 
-        # Results display (below the visualization)
-        results_frame = ttk.LabelFrame(scrollable_frame, text="Behavioral Metrics", padding=5)
-        results_frame.pack(fill='both', expand=True, padx=5, pady=(0, 5))
+        results_frame = ttk.LabelFrame(output, text="Behavioral Metrics", padding=5)
+        results_frame.pack(fill='both', expand=True, pady=(self.ui_px(5), 0))
 
-        # Create treeview for results
         tree_container = ttk.Frame(results_frame)
         tree_container.pack(fill='both', expand=True)
 
@@ -22620,20 +22616,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def toggle_behav_subject_group_mode(self):
         """Toggle between subject and group selection mode in behavioral data tab"""
+        # The two selectors share one slot in the Selection zone, so exactly one
+        # is packed at a time and the other leaves no gap behind.
         if self.behav_plot_by_var.get() == "Group":
-            # Hide subject selection, show group selection
-            self.behav_subject_listbox.master.grid_remove()
-            self.behav_group_label.grid(row=1, column=0, sticky='nw', padx=5)
-            self.behav_group_frame.grid(row=1, column=1, rowspan=2, padx=5, sticky='nsew')
-            # Update group list
+            self.behav_subject_frame.pack_forget()
+            self.behav_group_frame.pack(fill='both', expand=True)
             self.behav_group_listbox.delete(0, 'end')
             for group_name in self.groups.keys():
                 self.behav_group_listbox.insert('end', group_name)
+            self.refresh_facet_controls()
         else:
-            # Show subject selection, hide group selection
-            self.behav_group_label.grid_remove()
-            self.behav_group_frame.grid_remove()
-            self.behav_subject_listbox.master.grid(row=1, column=1, rowspan=2, padx=5, sticky='nsew')
+            self.behav_group_frame.pack_forget()
+            self.behav_subject_frame.pack(fill='both', expand=True)
     
     def _open_bout_settings(self):
         """Modal dialog for Bout Analysis metrics, analysis window, and axis controls."""
