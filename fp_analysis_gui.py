@@ -64,6 +64,97 @@ WIDGET_PAD = 3
 _MAX_BOUTS_UNSET = object()
 
 
+# ── Animal / session identity ───────────────────────────────────────────────
+# A subject ID is one recording.  When the same animal is recorded on more than
+# one day the IDs usually encode that (`2FA` and `2FB` are animal `2F` on days
+# A and B), but nothing in the pipeline knew it: every subject was an
+# independent animal.  That matters for pooled z-scoring and, more urgently,
+# for mixed-model grouping, where treating repeated measures as independent is
+# anticonservative.
+#
+# The split is a regex over the subject ID with two named groups.  These
+# functions are module level and Tk-free so they can be tested directly.
+#
+# Naming conventions differ between experiments, so the pattern is chosen from
+# these presets (or typed by hand).  A separated suffix is the preferred style
+# because the session is explicit and can be a word — `2F_pre` / `2F_post` reads
+# in an exported table where `2FA` / `2FB` does not.  The underscore patterns
+# split on the LAST separator, so `Mouse_1_pre` is animal `Mouse_1`, session
+# `pre`.
+SESSION_PATTERN_PRESETS = {
+    'Subject_Session  (2F_pre, 2F_post)':  r'^(?P<animal>.+)_(?P<session>[^_]+)$',
+    'Subject-Session  (2F-pre, 2F-post)':  r'^(?P<animal>.+)-(?P<session>[^-]+)$',
+    'SubjectSession   (2FA, 2FB)':         r'^(?P<animal>.+?)(?P<session>[A-Za-z])$',
+    'No sessions      (each ID is one animal)': '',
+}
+DEFAULT_SESSION_PATTERN = SESSION_PATTERN_PRESETS['Subject_Session  (2F_pre, 2F_post)']
+
+
+def split_subject_id(subject_id, pattern=DEFAULT_SESSION_PATTERN):
+    """Split one subject ID into ``(animal_id, session_label)``.
+
+    The pattern must supply an ``animal`` group; ``session`` is optional.
+    Anything that does not match -- or that matches with an empty animal --
+    falls back to ``(subject_id, '')``, i.e. "this recording is its own
+    animal", which is the pre-existing behaviour.
+    """
+    sid = str(subject_id)
+    if not pattern:
+        return sid, ''
+    try:
+        m = re.match(pattern, sid)
+    except re.error:
+        return sid, ''
+    if not m:
+        return sid, ''
+    groups = m.groupdict()
+    animal = groups.get('animal')
+    if not animal:  # pattern has no 'animal' group, or it matched empty
+        return sid, ''
+    return animal, groups.get('session') or ''
+
+
+def derive_animal_map(subject_ids, pattern=DEFAULT_SESSION_PATTERN, overrides=None):
+    """Map every subject ID to ``(animal_id, session_label)`` for a whole project.
+
+    Returns ``(mapping, adopted)``.
+
+    The project-level view exists because a per-subject split cannot tell a real
+    multi-session design from a coincidence.  A separator pattern is fairly safe,
+    but the trailing-letter preset would happily turn `Control`/`Treated` into
+    animals `Contro` and `Treate`, and even an underscore appears in plenty of
+    IDs that encode something other than a session.  So the split is only
+    *adopted* when it actually groups something: at least one derived animal must
+    own more than one subject.  Otherwise every subject stays its own animal and
+    ``adopted`` is False.
+
+    This guard matters because the consumers are correctness-sensitive -- a
+    spurious merge would pool two different animals' signals and would collapse
+    two independent mixed-model groups into one.
+
+    ``overrides`` is ``{subject_id: animal_id}`` and always wins; an overridden
+    subject also counts towards adoption, so a hand-linked pair is honoured even
+    when the pattern finds nothing.
+    """
+    from collections import Counter
+
+    overrides = overrides or {}
+    raw = {}
+    for sid in subject_ids:
+        sid = str(sid)
+        if sid in overrides and overrides[sid]:
+            _, session = split_subject_id(sid, pattern)
+            raw[sid] = (str(overrides[sid]), session)
+        else:
+            raw[sid] = split_subject_id(sid, pattern)
+
+    counts = Counter(animal for animal, _ in raw.values())
+    adopted = any(n > 1 for n in counts.values())
+    if not adopted:
+        return {sid: (sid, '') for sid in raw}, False
+    return raw, True
+
+
 class _ProgressCancelled(Exception):
     """Raised inside a background worker when the user hits Cancel on the
     detailed progress window, so the run aborts cleanly (not as an error)."""
@@ -1057,6 +1148,13 @@ class FPAnalysisGUI:
             # a property of the recording, measured from the timestamps during
             # processing and stored per subject as 'photometry_fps'; read it via
             # get_fps() rather than reintroducing a hand-set global.
+            # How a subject ID splits into animal + session, so repeated recordings
+            # of one animal can be recognised (see derive_animal_map).  Chosen from
+            # SESSION_PATTERN_PRESETS; the default splits on the last underscore
+            # ('2F_post' -> animal '2F', session 'post') and is ignored unless it
+            # actually groups subjects together.
+            'session_pattern': DEFAULT_SESSION_PATTERN,
+            'animal_overrides': {},  # {subject_id: animal_id} — hand-linked exceptions
             'boutframes_video_fps': 30,  # Frame rate of source video used to create boutframes
             'auto_scale_boutframes': False,  # Auto-scale boutframe numbers to photometry FPS
             'precut_correct_boutframes': True,  # Subtract precut/n_led_states offset from boutframes to align with post-precut FP data
@@ -2255,6 +2353,138 @@ class FPAnalysisGUI:
         self.refresh_projects_list()
         self.update_project_status()
         
+    _IDENTITY_CUSTOM_LABEL = 'Custom regex…'
+
+    def _build_identity_options(self, parent):
+        """Picker for how subject IDs split into animal + session, with a live
+        preview of the grouping it produces.
+
+        The preview is the point: the split changes which recordings a mixed
+        model treats as independent, so it should be visible before it is
+        trusted rather than inferred from a plot afterwards.
+        """
+        frame = ttk.LabelFrame(parent, text="Animals & Sessions", padding=5)
+        frame.pack(fill='both', expand=True, padx=5, pady=5)
+
+        ttk.Label(frame,
+                  text="When one animal is recorded more than once, the subject IDs usually say so.\n"
+                       "Telling TRACY how they are built lets it treat those recordings as repeated\n"
+                       "measures of one animal instead of separate animals — which is what mixed\n"
+                       "models (FLMM) need in order not to understate their error bars.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(600), justify='left').pack(anchor='w', pady=(0, 5))
+
+        row = ttk.Frame(frame)
+        row.pack(fill='x', pady=2)
+        ttk.Label(row, text="ID style:").pack(side='left', padx=(0, 5))
+
+        current = self._session_pattern()
+        label_by_pattern = {v: k for k, v in SESSION_PATTERN_PRESETS.items()}
+        self.session_pattern_var = tk.StringVar(
+            value=label_by_pattern.get(current, self._IDENTITY_CUSTOM_LABEL))
+        self.session_pattern_combo = ttk.Combobox(
+            row, textvariable=self.session_pattern_var, state='readonly', width=42,
+            values=list(SESSION_PATTERN_PRESETS.keys()) + [self._IDENTITY_CUSTOM_LABEL])
+        self.session_pattern_combo.pack(side='left')
+        self.session_pattern_combo.bind(
+            '<<ComboboxSelected>>', lambda _e: self._on_session_pattern_changed())
+
+        custom_row = ttk.Frame(frame)
+        custom_row.pack(fill='x', pady=2)
+        ttk.Label(custom_row, text="Pattern:").pack(side='left', padx=(0, 5))
+        self.session_pattern_custom_var = tk.StringVar(value=current)
+        self.session_pattern_custom_entry = ttk.Entry(
+            custom_row, textvariable=self.session_pattern_custom_var, width=46)
+        self.session_pattern_custom_entry.pack(side='left')
+        ttk.Label(custom_row, text="(needs named groups: animal, session)",
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=6)
+        self.session_pattern_custom_entry.bind(
+            '<KeyRelease>', lambda _e: self._on_session_pattern_changed(from_entry=True))
+
+        ttk.Button(frame, text="Refresh preview", style='Compact.TButton',
+                   command=self._refresh_identity_preview).pack(anchor='w', pady=(4, 2))
+
+        preview_box = ttk.Frame(frame)
+        preview_box.pack(fill='both', expand=True, pady=(2, 0))
+        self.identity_preview = tk.Text(preview_box, height=10, wrap='none',
+                                        font=('Consolas', 9))
+        pv_scroll = ttk.Scrollbar(preview_box, orient='vertical',
+                                  command=self.identity_preview.yview)
+        self.identity_preview.configure(yscrollcommand=pv_scroll.set, state='disabled')
+        self.identity_preview.pack(side='left', fill='both', expand=True)
+        pv_scroll.pack(side='right', fill='y')
+
+        self._sync_identity_widgets()
+        self._refresh_identity_preview()
+
+        # The subject set changes as projects are processed or loaded, and there
+        # is no single refresh hook to hang this off. Rebuilding whenever the tab
+        # becomes visible keeps the preview honest without touching those paths.
+        parent.bind('<Map>', lambda _e: self._refresh_identity_preview())
+
+    def _sync_identity_widgets(self):
+        """Enable the free-text pattern box only when 'Custom regex…' is chosen."""
+        is_custom = self.session_pattern_var.get() == self._IDENTITY_CUSTOM_LABEL
+        self.session_pattern_custom_entry.configure(
+            state='normal' if is_custom else 'disabled')
+
+    def _on_session_pattern_changed(self, from_entry=False):
+        if not from_entry:
+            label = self.session_pattern_var.get()
+            if label != self._IDENTITY_CUSTOM_LABEL:
+                self.session_pattern_custom_var.set(SESSION_PATTERN_PRESETS[label])
+            self._sync_identity_widgets()
+        self.params['session_pattern'] = self.session_pattern_custom_var.get()
+        self._animal_map_adopted = None   # let the next map log its verdict again
+        self._refresh_identity_preview()
+
+    def _refresh_identity_preview(self):
+        """Show the animal → sessions grouping the current pattern produces."""
+        if not hasattr(self, 'identity_preview'):
+            return
+        subjects = sorted(self.processed_data.keys())
+        pattern = self.params.get('session_pattern', DEFAULT_SESSION_PATTERN)
+
+        lines = []
+        if not subjects:
+            lines.append("No processed subjects yet — process or load a project to preview.")
+        else:
+            try:
+                re.compile(pattern) if pattern else None
+            except re.error as exc:
+                lines.append(f"Pattern is not a valid regex: {exc}")
+                subjects = []
+
+        if subjects:
+            mapping, adopted = derive_animal_map(
+                subjects, pattern, self.params.get('animal_overrides') or {})
+            by_animal = {}
+            for sid in subjects:
+                animal, session = mapping[sid]
+                by_animal.setdefault(animal, []).append((session, sid))
+
+            if adopted:
+                repeated = sum(1 for v in by_animal.values() if len(v) > 1)
+                lines.append(f"{len(subjects)} recording(s) → {len(by_animal)} animal(s); "
+                             f"{repeated} with repeated sessions.")
+            else:
+                lines.append(f"{len(subjects)} recording(s); these IDs encode no repeated "
+                             "sessions, so each is treated as its own animal.")
+                lines.append("(A split is only used when it actually groups recordings "
+                             "together — this guards against a pattern that merely "
+                             "chops the last letter off unrelated IDs.)")
+            lines.append("")
+            width = max((len(a) for a in by_animal), default=6)
+            for animal in sorted(by_animal):
+                entries = sorted(by_animal[animal])
+                shown = ', '.join(f"{sid} [{sess or '-'}]" for sess, sid in entries)
+                lines.append(f"  {animal.ljust(width)}  ({len(entries)})  {shown}")
+
+        self.identity_preview.configure(state='normal')
+        self.identity_preview.delete('1.0', 'end')
+        self.identity_preview.insert('1.0', '\n'.join(lines))
+        self.identity_preview.configure(state='disabled')
+
     def create_processing_tab(self):
         """Tab for data processing"""
         tab = ttk.Frame(self.project_notebook)
@@ -2389,6 +2619,9 @@ class FPAnalysisGUI:
         advanced_nb.add(offset_outer, text="Offset Bout Definitions")
         naming_outer = ttk.Frame(advanced_nb)
         advanced_nb.add(naming_outer, text="File Naming (Batch)")
+        identity_outer = ttk.Frame(advanced_nb)
+        advanced_nb.add(identity_outer, text="Animals & Sessions")
+        self._build_identity_options(identity_outer)
 
         # Offset Bout Definitions
         offset_frame = ttk.LabelFrame(offset_outer, text="Offset Bout Definitions", padding=5)
@@ -11165,7 +11398,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # "Apply Settings & Re-extract Bouts" still works after reload
                     # (especially for TTL-derived boutframes that aren't the file
                     # configured in the UI).
-                    'boutframes_file': data.get('boutframes_file')
+                    'boutframes_file': data.get('boutframes_file'),
+                    # Mean/SD each channel was z-scored by. Kept because pooled
+                    # z-scoring across an animal's sessions rescales the stored
+                    # z-scores, and these moments cannot be recovered from
+                    # corrected_* after smoothing has rewritten it in place.
+                    'zscore_stats': data.get('zscore_stats') or {}
                 }
                 metadata_file = os.path.join(project_path, 'processed', f'{subject}_metadata.json')
                 with open(metadata_file, 'w') as f:
@@ -11592,6 +11830,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if hasattr(self, 'boutframes_video_fps_var'):
                 self.boutframes_video_fps_var.set(str(self.params.get('boutframes_video_fps', 30)))
 
+            # Animal/session ID style, so a reopened project shows the pattern it
+            # was analysed with rather than the build-time default.
+            if hasattr(self, 'session_pattern_var'):
+                _pat = self._session_pattern()
+                _label_by_pattern = {v: k for k, v in SESSION_PATTERN_PRESETS.items()}
+                self.session_pattern_var.set(
+                    _label_by_pattern.get(_pat, self._IDENTITY_CUSTOM_LABEL))
+                self.session_pattern_custom_var.set(_pat)
+                self._animal_map_adopted = None
+                self._sync_identity_widgets()
+                self._refresh_identity_preview()
+
             # Signal smoothing UI vars
             if hasattr(self, 'processing_rolling_avg_enabled'):
                 self.processing_rolling_avg_enabled.set(bool(self.params.get('processing_rolling_avg_enabled', False)))
@@ -11738,6 +11988,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 stored_bf = metadata.get('boutframes_file')
                                 if stored_bf:
                                     subject_data['boutframes_file'] = stored_bf
+                                # Restore the per-channel z-scoring moments. Absent
+                                # for projects processed before they were recorded —
+                                # those subjects simply cannot be pooled until they
+                                # are reprocessed.
+                                stored_zs = metadata.get('zscore_stats')
+                                if stored_zs:
+                                    subject_data['zscore_stats'] = {
+                                        str(k): {'n': int(v['n']),
+                                                 'mean': float(v['mean']),
+                                                 'sd': float(v['sd'])}
+                                        for k, v in stored_zs.items()
+                                    }
 
                         # Load 470nm data if available
                         data_470_file = os.path.join(processed_dir, f'{subject}_data_470.csv')
@@ -12685,7 +12947,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 for key, var in entries.items():
                     value_str = var.get().strip()
                     # Check if this is a string parameter (file naming patterns, maze type)
-                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method', 'boutframe_processing_style', 'processing_smoothing_method', 'ttl_format', 'decay_strictness']:
+                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method', 'boutframe_processing_style', 'processing_smoothing_method', 'ttl_format', 'decay_strictness', 'session_pattern']:
                         self.params[key] = value_str
                     # Check if this is a boolean parameter
                     elif key in ['baseline_correct_bouts', 'processing_rolling_avg_enabled', 'auto_scale_boutframes', 'precut_correct_boutframes', 'bout_exclude_enabled']:
@@ -12886,6 +13148,103 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return float(counts.most_common(1)[0][0])
 
         return float(getattr(self, 'detected_photometry_fps', None) or self.FPS_FALLBACK)
+
+    # ======================== Animal / Session Identity ========================
+
+    def _session_pattern(self):
+        """The regex currently used to split subject IDs into animal + session."""
+        pat = self.params.get('session_pattern', DEFAULT_SESSION_PATTERN)
+        return pat if pat is not None else DEFAULT_SESSION_PATTERN
+
+    def get_animal_map(self, subject_ids=None):
+        """``{subject_id: (animal_id, session_label)}`` for the current project.
+
+        Derived on demand rather than stored per subject: the mapping depends on
+        the whole subject set (see derive_animal_map's adoption rule) and on a
+        pattern the user can change, so a cached copy would go stale silently.
+        Only the pattern and the manual overrides are persisted.
+        """
+        ids = list(subject_ids) if subject_ids is not None else list(self.processed_data.keys())
+        mapping, adopted = derive_animal_map(
+            ids, self._session_pattern(), self.params.get('animal_overrides') or {})
+        if adopted != getattr(self, '_animal_map_adopted', None):
+            self._animal_map_adopted = adopted
+            if adopted:
+                n_animals = len({a for a, _ in mapping.values()})
+                self.log_message(f"  Subject IDs resolve to {n_animals} animal(s) across {len(ids)} recording(s).")
+            else:
+                self.log_message("  Subject IDs do not encode repeated sessions; each is treated as its own animal.")
+        return mapping
+
+    def get_animal_id(self, subject_id):
+        """Animal owning *subject_id*, falling back to the subject ID itself."""
+        return self.get_animal_map().get(str(subject_id), (str(subject_id), ''))[0]
+
+    def get_session_label(self, subject_id):
+        """Session label for *subject_id* ('' when the IDs encode no session)."""
+        return self.get_animal_map().get(str(subject_id), (str(subject_id), ''))[1]
+
+    def cluster_codes(self, subjects, log=None):
+        """Integer grouping codes for a mixed model's random intercept.
+
+        Returns ``(codes, n_clusters, clustered_by_animal)``.
+
+        The random effect must be keyed on the *animal*, not the recording.  When
+        an animal contributes two sessions, grouping by subject ID declares those
+        repeated measures independent, which understates the standard errors and
+        makes the test anticonservative.  Where the IDs encode no repeats this is
+        identical to the previous subject-keyed behaviour.
+
+        Takes *log* so worker threads can route the message through their
+        progress queue rather than touching Tk.
+        """
+        log = log or self.log_message
+        subj_list = [str(s) for s in list(subjects)]
+        mapping, adopted = derive_animal_map(
+            sorted(set(subj_list)), self._session_pattern(),
+            self.params.get('animal_overrides') or {})
+
+        keys = [mapping.get(s, (s, ''))[0] for s in subj_list]
+        uniq = {k: i for i, k in enumerate(sorted(set(keys)))}
+        codes = np.array([uniq[k] for k in keys])
+
+        n_subj = len(set(subj_list))
+        if adopted and len(uniq) < n_subj:
+            log(f"  Random intercept grouped by animal: {n_subj} recordings -> "
+                f"{len(uniq)} animals (repeated sessions are not independent).")
+        return codes, len(uniq), adopted and len(uniq) < n_subj
+
+    def _animal_ids_for(self, subjects, log=None):
+        """Per-row animal IDs as strings, for the R engines' ``(1 | id)`` term.
+
+        The string form of what cluster_codes returns, so both engines group the
+        random intercept the same way.
+        """
+        subj_list = [str(s) for s in list(subjects)]
+        mapping, _ = derive_animal_map(
+            sorted(set(subj_list)), self._session_pattern(),
+            self.params.get('animal_overrides') or {})
+        return [mapping.get(s, (s, ''))[0] for s in subj_list]
+
+    @staticmethod
+    def _record_zscore_stats(result, wavelength, channel, channel_data):
+        """Store the mean/SD/n a channel was z-scored by, before z-scoring it.
+
+        Pooled z-scoring across an animal's sessions is an affine rescale of the
+        z-scores we already have, but only if the per-session moments survive.
+        They cannot be recovered afterwards: smoothing rewrites `corrected_*` in
+        place before the project is saved, so recomputing from it would derive
+        the moments from smoothed data.  ddof=0 matches scipy.stats.zscore.
+        """
+        arr = np.asarray(channel_data, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return
+        result.setdefault('zscore_stats', {})[f'{wavelength}_{channel}'] = {
+            'n': int(arr.size),
+            'mean': float(np.mean(arr)),
+            'sd': float(np.std(arr, ddof=0)),
+        }
 
     # ======================== Spike Detection ========================
 
@@ -14248,6 +14607,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 channel_data = corrected_470[:, 2 + ch]
                 # Check for zero variance before z-scoring
                 if np.std(channel_data) > 1e-10:  # Very small threshold to avoid division by zero
+                    self._record_zscore_stats(result, '470', ch, channel_data)
                     zscore_cols.append(stats.zscore(channel_data))
                 else:
                     self.log_message(f"    Warning: Channel {ch} has zero variance, setting z-scores to zero")
@@ -14317,6 +14677,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 channel_data = corrected_570[:, 2 + ch]
                 # Check for zero variance before z-scoring
                 if np.std(channel_data) > 1e-10:  # Very small threshold to avoid division by zero
+                    self._record_zscore_stats(result, '570', ch, channel_data)
                     zscore_cols.append(stats.zscore(channel_data))
                 else:
                     self.log_message(f"    Warning: Channel {ch} (570nm) has zero variance, setting z-scores to zero")
@@ -29187,9 +29548,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         log = log or self.log_message
         n, L = Z.shape
-        uniq_subj = {s: i for i, s in enumerate(sorted(set(subjects.tolist())))}
-        subj_codes = np.array([uniq_subj[s] for s in subjects])
-        n_subjects = len(uniq_subj)
+        # Grouping is by animal, so an animal's repeated sessions share one
+        # random intercept instead of being treated as independent subjects.
+        subj_codes, n_subjects, _ = self.cluster_codes(subjects, log=log)
 
         # Design X (constant across timepoints); coef_idx = column of interest.
         cols = [np.ones(n)]
@@ -29443,9 +29804,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         logf = log or self.log_message
 
         n, L = Z.shape
-        uniq_subj = {s: i for i, s in enumerate(sorted(set(subjects.tolist())))}
-        subj_codes = np.array([uniq_subj[s] for s in subjects])
-        n_subjects = len(uniq_subj)
+        # Grouping is by animal — see cluster_codes.
+        subj_codes, n_subjects, _ = self.cluster_codes(subjects, log=logf)
 
         levels = sorted(set(str(f) for f in factor))
         if ref_level is None or str(ref_level) not in levels:
@@ -29729,7 +30089,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         script_path = os.path.join(tmpdir, 'run.R')
 
         meta = pd.DataFrame({
-            'id': [str(s) for s in subjects],
+            # (1 | id) is the random intercept, so id must be the animal rather
+            # than the recording — see cluster_codes. Keeps the R engine's
+            # grouping identical to the Python engine's.
+            'id': self._animal_ids_for(subjects, log=log),
             'group': [str(g) if g is not None else 'NA' for g in groups],
             'bout_order': np.asarray(orders, float),
         })
@@ -29821,7 +30184,8 @@ cat("OK\n")
         out_csv = os.path.join(tmpdir, 'out.csv')
         script_path = os.path.join(tmpdir, 'run.R')
 
-        meta = pd.DataFrame({'id': [str(s) for s in subjects],
+        # id is the (1 | id) random intercept — the animal, not the recording.
+        meta = pd.DataFrame({'id': self._animal_ids_for(subjects, log=log),
                              'fac': [str(f) for f in factor]})
         ydf = pd.DataFrame(Z, columns=[f'Y.{k+1}' for k in range(L)])
         pd.concat([meta, ydf], axis=1).to_csv(data_csv, index=False)
