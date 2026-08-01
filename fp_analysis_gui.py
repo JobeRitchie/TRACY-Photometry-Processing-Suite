@@ -397,6 +397,30 @@ def facet_series_order(split_factors, levels_by_factor):
     return labels
 
 
+# Which option clusters each plot type actually uses. Kept as a table rather
+# than a predicate hung off each widget so a tab's whole disclosure rule can be
+# read in one place, and so one generic handler drives every tab. A plot type
+# absent from the table shows everything -- never hiding a control the user
+# might need is the safe direction to fail.
+VIZ_OPTIONS_BY_PLOT = {
+    'Signal Integrity':                 {'integrity'},
+    'Raw Data':                         {'channels'},
+    'Normalized (dF/F)':                {'channels'},
+    'Motion Corrected':                 {'channels'},
+    'Z-scored':                         {'channels'},
+    'Bouts Overlay':                    {'channels', 'behavior', 'overlay', 'bouts'},
+    'Extracted Bouts':                  {'channels', 'behavior', 'bouts'},
+    'Bout Length Bins':                 {'channels', 'behavior', 'bouts'},
+    'Compare Across Bouts':             {'channels', 'behavior', 'bout_number', 'bouts'},
+    'Position Heatmap':                 {'heatmap'},
+    'Zone Entry Bouts':                 {'channels', 'entry_type', 'bouts'},
+    'Zone Averages':                    {'channels'},
+    'Distance from Center (Euclidean)': {'channels'},
+    'Distance from Center':             {'channels'},
+    'Out/Back':                         {'channels'},
+}
+
+
 class FacetControls(ttk.Frame):
     """A column of one dropdown per factor: combine, split, or a single level.
 
@@ -2214,6 +2238,114 @@ class FPAnalysisGUI:
                 except Exception:
                     pass
         return win
+
+    # Every graphing tab puts the same kind of thing in the same place, so the
+    # app is learned once rather than per tab. Selection (who is plotted) and
+    # Settings (how) stack in a left column; Output (the figure) fills the rest.
+    def make_layout_zones(self, parent, selection_title="Selection",
+                          settings_title="Settings", column_px=300):
+        """Return the tab's ``(selection, settings, output, actions)`` frames.
+
+        Building the arrangement here rather than hand-laying each tab is what
+        makes the consistency survive later edits.
+
+        Selection and Settings share **one** scroll region rather than one each:
+        nested scroll regions are a usability trap, and on a short screen the
+        thing the user needs to reach could be in either zone. Actions sit
+        outside it, pinned to the bottom of the column as established by the
+        v1.9.0 accessibility pass, so the buttons never scroll away. Output
+        scrolls separately, because a tall figure and a long option list are
+        genuinely independent.
+
+        The column is sized with ui_px and a grid weight, never a character
+        count, so it stays proportional under Windows display scaling.
+        """
+        container = ttk.Frame(parent)
+        container.pack(fill='both', expand=True)
+        container.grid_rowconfigure(0, weight=1)
+        # weight 0 keeps the controls at their measured width and hands every
+        # extra pixel to the figure, which is the zone that benefits from them.
+        container.grid_columnconfigure(0, weight=0, minsize=self.ui_px(column_px))
+        container.grid_columnconfigure(1, weight=1)
+
+        left = ttk.Frame(container)
+        left.grid(row=0, column=0, sticky='nsew', padx=(self.ui_px(4), self.ui_px(6)),
+                  pady=self.ui_px(4))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(0, weight=1)          # the scrolling part absorbs slack
+
+        scroll_host = ttk.Frame(left)
+        scroll_host.grid(row=0, column=0, sticky='nsew')
+        column = self.make_scrollable(scroll_host)
+
+        selection = ttk.LabelFrame(column, text=selection_title, padding=4)
+        selection.pack(fill='x')
+
+        settings = ttk.LabelFrame(column, text=settings_title, padding=4)
+        settings.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+
+        actions = ttk.Frame(left)
+        actions.grid(row=1, column=0, sticky='ew', pady=(self.ui_px(4), 0))
+
+        output_host = ttk.Frame(container)
+        output_host.grid(row=0, column=1, sticky='nsew', pady=self.ui_px(4),
+                         padx=(0, self.ui_px(4)))
+        output = self.make_scrollable(output_host)
+        return selection, settings, output, actions
+
+    def register_option_clusters(self, tab_key, plot_type_var, clusters, table,
+                                 always=()):
+        """Show only the option clusters the current plot type uses.
+
+        *clusters* maps a name to a container frame that was gridded once and is
+        then shown or hidden whole. Hiding a whole container is what keeps a
+        hidden cluster from leaving a reserved gap -- hiding individual widgets
+        would collapse their contents but keep their grid rows.
+
+        *table* is ``{plot_type: {cluster_name, ...}}``. Keeping it a table
+        rather than a predicate per widget means the whole disclosure rule for a
+        tab can be read in one place, and one handler drives every tab.
+        """
+        if not hasattr(self, '_option_clusters'):
+            self._option_clusters = {}
+        self._option_clusters[tab_key] = (plot_type_var, clusters, table, set(always))
+        plot_type_var.trace('w', lambda *_a: self.apply_option_disclosure(tab_key))
+        # Called once here as well as on change, so the initial state is
+        # established rather than inherited from however the frames were built.
+        self.apply_option_disclosure(tab_key)
+
+    def apply_option_disclosure(self, tab_key):
+        """Re-apply *tab_key*'s disclosure rule for the current plot type."""
+        entry = getattr(self, '_option_clusters', {}).get(tab_key)
+        if not entry:
+            return
+        plot_type_var, clusters, table, always = entry
+        try:
+            plot_type = plot_type_var.get()
+        except Exception:
+            return
+        # Match the longest key that the plot type contains, so "Distance from
+        # Center (Euclidean)" cannot be captured by "Distance from Center".
+        wanted = table.get(plot_type)
+        if wanted is None:
+            for key in sorted(table, key=len, reverse=True):
+                if key in plot_type:
+                    wanted = table[key]
+                    break
+        if wanted is None:
+            # An unrecognised plot type shows everything. Hiding a control the
+            # user needs is worse than showing one they do not.
+            wanted = set(clusters)
+        wanted = set(wanted) | always
+
+        for name, frame in clusters.items():
+            try:
+                if name in wanted:
+                    frame.grid()
+                else:
+                    frame.grid_remove()
+            except Exception:
+                pass
 
     def make_scrollable(self, parent, fit_width=False):
         """Wrap `parent` in a scrolling viewport and return the inner frame.
@@ -4429,124 +4561,152 @@ class FPAnalysisGUI:
         self.refresh_exclusions_list()
         
     def create_visualization_tab(self):
-        """Tab for data visualization"""
+        """Tab for data visualization.
+
+        Laid out in the standard zones (see make_layout_zones): who is plotted
+        on the left, how it is plotted below that, the figure on the right. The
+        settings zone shows only the options the current plot type uses --
+        heatmap bin size for heatmaps, entry type for zone-entry bouts -- which
+        is what VIZ_OPTIONS_BY_PLOT declares.
+        """
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Visualization")
-        
-        # Create canvas with scrollbar for scrollable content
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
-        
-        # Control panel
-        control_frame = ttk.LabelFrame(scrollable_frame, text="Plot Controls", padding=5)
-        control_frame.pack(fill='x', padx=5, pady=5)
-        
-        # Group vs Subject selection mode
-        ttk.Label(control_frame, text="Plot by:").grid(row=0, column=0, sticky='w', padx=5)
+
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups", settings_title="Plot Settings")
+
+        # ── Selection zone ───────────────────────────────────────────────────
+        mode_row = ttk.Frame(selection)
+        mode_row.pack(fill='x')
+        ttk.Label(mode_row, text="Plot by:").pack(side='left', padx=(0, 4))
         self.plot_by_var = tk.StringVar(value="Subject")
-        plot_by_frame = ttk.Frame(control_frame)
-        plot_by_frame.grid(row=0, column=1, sticky='w', padx=5)
-        ttk.Radiobutton(plot_by_frame, text="Subject", variable=self.plot_by_var, 
-                       value="Subject", command=self.toggle_subject_group_mode).pack(side='left', padx=5)
-        ttk.Radiobutton(plot_by_frame, text="Group", variable=self.plot_by_var, 
-                       value="Group", command=self.toggle_subject_group_mode).pack(side='left', padx=5)
-        
-        # Subject selection with multi-select listbox
-        ttk.Label(control_frame, text="Subject(s):").grid(row=1, column=0, sticky='nw', padx=3)
-        
-        subject_frame = ttk.Frame(control_frame)
-        subject_frame.grid(row=1, column=1, rowspan=2, padx=3, sticky='nsew')
-        
-        self.viz_subject_listbox = tk.Listbox(subject_frame, selectmode='extended', height=10, width=20)
+        ttk.Radiobutton(mode_row, text="Subject", variable=self.plot_by_var,
+                        value="Subject", command=self.toggle_subject_group_mode).pack(side='left')
+        ttk.Radiobutton(mode_row, text="Group", variable=self.plot_by_var,
+                        value="Group", command=self.toggle_subject_group_mode).pack(side='left', padx=(6, 0))
+
+        # Subject and group selectors occupy the same slot; the mode toggle
+        # swaps which one is packed, so neither leaves a gap behind.
+        self.viz_selection_holder = ttk.Frame(selection)
+        self.viz_selection_holder.pack(fill='both', expand=True, pady=(4, 0))
+
+        self.viz_subject_frame = ttk.Frame(self.viz_selection_holder)
+        ttk.Label(self.viz_subject_frame, text="Subject(s):").pack(anchor='w')
+        subject_list_holder = ttk.Frame(self.viz_subject_frame)
+        subject_list_holder.pack(fill='both', expand=True)
+        # Kept short on purpose: the Selection zone shares a scroll region with
+        # Settings, so a tall list pushes the plot options out of view.
+        self.viz_subject_listbox = tk.Listbox(subject_list_holder, selectmode='extended',
+                                              height=7, exportselection=False)
         self.viz_subject_listbox.pack(side='left', fill='both', expand=True)
-        
-        scrollbar = ttk.Scrollbar(subject_frame, orient='vertical', command=self.viz_subject_listbox.yview)
+        scrollbar = ttk.Scrollbar(subject_list_holder, orient='vertical',
+                                  command=self.viz_subject_listbox.yview)
         scrollbar.pack(side='right', fill='y')
         self.viz_subject_listbox.config(yscrollcommand=scrollbar.set)
-        
-        # Group selection (initially hidden)
-        self.viz_group_label = ttk.Label(control_frame, text="Group(s):")
-        
-        group_frame = ttk.Frame(control_frame)
+        self.viz_subject_frame.pack(fill='both', expand=True)      # default mode
 
+        group_frame = ttk.Frame(self.viz_selection_holder)
+        self.viz_group_label = ttk.Label(group_frame, text="Group(s):")
+        self.viz_group_label.pack(anchor='w')
         group_list_holder = ttk.Frame(group_frame)
-        group_list_holder.pack(side='left', fill='both', expand=True)
-        self.viz_group_listbox = tk.Listbox(group_list_holder, selectmode='extended', height=10, width=20)
+        group_list_holder.pack(fill='both', expand=True)
+        self.viz_group_listbox = tk.Listbox(group_list_holder, selectmode='extended',
+                                            height=5, exportselection=False)
         self.viz_group_listbox.pack(side='left', fill='both', expand=True)
-
-        group_scrollbar = ttk.Scrollbar(group_list_holder, orient='vertical', command=self.viz_group_listbox.yview)
+        group_scrollbar = ttk.Scrollbar(group_list_holder, orient='vertical',
+                                        command=self.viz_group_listbox.yview)
         group_scrollbar.pack(side='right', fill='y')
         self.viz_group_listbox.config(yscrollcommand=group_scrollbar.set)
 
-        # The facet column sits beside the group list, not instead of it: the
+        # The facet column sits under the group list, not instead of it: the
         # groups choose which subjects are in play, the facet decides how they
         # divide into series. Untouched, it splits on Group and combines
         # everything else, which is the plot this tab always drew.
         self._make_facet_controls(group_frame, 'visualization').pack(
-            side='left', fill='y', padx=(8, 0))
-
-        # Store these for later use
+            fill='x', pady=(6, 0))
         self.viz_group_frame = group_frame
-        
-        ttk.Label(control_frame, text="Plot Type:").grid(row=1, column=2, sticky='w', padx=5)
+
+        self.viz_info_label = ttk.Label(
+            selection,
+            text="Tip: hold Ctrl to select several. Channels and wavelengths overlay.",
+            foreground='blue', font=('Segoe UI', 8),
+            wraplength=self.ui_px(260), justify='left')
+        self.viz_info_label.pack(anchor='w', pady=(4, 0))
+
+        # ── Settings zone: one container per cluster, shown or hidden whole ───
+        settings.grid_columnconfigure(0, weight=1)
+        clusters = {}
+        row = 0
+
+        def cluster(name, always=False):
+            """A container that the disclosure handler shows or hides as a unit."""
+            nonlocal row
+            frame = ttk.Frame(settings)
+            frame.grid(row=row, column=0, sticky='ew', pady=(0, 4))
+            frame.grid_columnconfigure(1, weight=1)
+            row += 1
+            if not always:
+                clusters[name] = frame
+            return frame
+
+        # Plot type — always visible; it is what drives everything else.
+        type_box = cluster('plot_type', always=True)
+        ttk.Label(type_box, text="Plot Type:").grid(row=0, column=0, sticky='w')
         self.plot_type_var = tk.StringVar(value="corrected")
         plot_types = ["Signal Integrity", "Raw Data", "Normalized (dF/F)", "Motion Corrected", "Z-scored",
-                     "Bouts Overlay", "Extracted Bouts", "Bout Length Bins", "Compare Across Bouts", "Position Heatmap",
-                     "Zone Entry Bouts", "Zone Averages", "Distance from Center", "Distance from Center (Euclidean)", "Out/Back"]
-        ttk.Combobox(control_frame, textvariable=self.plot_type_var, values=plot_types, width=20).grid(row=1, column=3, padx=5)
-        
-        # Channel selection checkboxes (for overlaying)
-        ttk.Label(control_frame, text="Channels:").grid(row=2, column=2, sticky='w', padx=5)
-        channel_select_frame = ttk.Frame(control_frame)
-        channel_select_frame.grid(row=2, column=3, sticky='w', padx=5)
-        # Dynamic channel checkboxes (populated when a subject is selected)
+                      "Bouts Overlay", "Extracted Bouts", "Bout Length Bins", "Compare Across Bouts", "Position Heatmap",
+                      "Zone Entry Bouts", "Zone Averages", "Distance from Center", "Distance from Center (Euclidean)", "Out/Back"]
+        ttk.Combobox(type_box, textvariable=self.plot_type_var,
+                     values=plot_types, width=22).grid(row=0, column=1, sticky='ew', padx=(4, 0))
+
+        # Channels and wavelengths.
+        chan_box = cluster('channels')
+        ttk.Label(chan_box, text="Channels:").grid(row=0, column=0, sticky='w')
+        channel_select_frame = ttk.Frame(chan_box)
+        channel_select_frame.grid(row=0, column=1, sticky='w', padx=(4, 0))
         self.viz_channel_check_frame = ttk.Frame(channel_select_frame)
         self.viz_channel_check_frame.pack(side='left')
-        self.viz_channel_vars = []  # list of IntVar for each channel checkbox
+        self.viz_channel_vars = []      # list of IntVar for each channel checkbox
         # Legacy two-channel booleans preserved for backward compatibility
         self.show_g0 = tk.BooleanVar(value=True)
         self.show_g1 = tk.BooleanVar(value=True)
-        
-        # Wavelength selection checkboxes
-        ttk.Label(control_frame, text="Wavelengths:").grid(row=2, column=4, sticky='w', padx=5)
-        wavelength_select_frame = ttk.Frame(control_frame)
-        wavelength_select_frame.grid(row=2, column=5, sticky='w', padx=5)
+
+        ttk.Label(chan_box, text="Wavelengths:").grid(row=1, column=0, sticky='w')
+        wavelength_select_frame = ttk.Frame(chan_box)
+        wavelength_select_frame.grid(row=1, column=1, sticky='w', padx=(4, 0))
         self.show_470 = tk.BooleanVar(value=True)
         self.show_570 = tk.BooleanVar(value=True)
-        ttk.Checkbutton(wavelength_select_frame, text="470nm", variable=self.show_470).pack(side='left', padx=5)
-        ttk.Checkbutton(wavelength_select_frame, text="570nm", variable=self.show_570).pack(side='left', padx=5)
-        
-        # Channel selection for heatmap (single channel only)
-        ttk.Label(control_frame, text="Heatmap Channel:").grid(row=3, column=2, sticky='w', padx=5)
+        ttk.Checkbutton(wavelength_select_frame, text="470nm", variable=self.show_470).pack(side='left')
+        ttk.Checkbutton(wavelength_select_frame, text="570nm", variable=self.show_570).pack(side='left', padx=(6, 0))
+
+        # Heatmap: channel, spatial bin, zone overlay.
+        heat_box = cluster('heatmap')
+        ttk.Label(heat_box, text="Heatmap Channel:").grid(row=0, column=0, sticky='w')
         self.channel_var = tk.StringVar(value="Ch0")
-        self.channel_combo = ttk.Combobox(control_frame, textvariable=self.channel_var, values=["Ch0", "Ch1", "Ch2", "Ch3"], 
-                    width=20, state='disabled')
-        self.channel_combo.grid(row=3, column=3, padx=5, sticky='w')
-        
-        # Channel selection for Signal Integrity (single subject view)
-        self.integrity_channel_label = ttk.Label(control_frame, text="SI Channel:")
-        self.integrity_channel_label.grid(row=3, column=4, sticky='w', padx=5)
+        self.channel_combo = ttk.Combobox(heat_box, textvariable=self.channel_var,
+                                          values=["Ch0", "Ch1", "Ch2", "Ch3"], width=12)
+        self.channel_combo.grid(row=0, column=1, sticky='w', padx=(4, 0))
+        ttk.Label(heat_box, text="Bin Size (cm):").grid(row=1, column=0, sticky='w')
+        self.spatial_bin_var = tk.StringVar(value=str(self.params['spatial_bin_size']))
+        self.spatial_bin_entry = ttk.Entry(heat_box, textvariable=self.spatial_bin_var, width=10)
+        self.spatial_bin_entry.grid(row=1, column=1, sticky='w', padx=(4, 0))
+        self.show_zone_overlay_var = tk.BooleanVar(value=True)
+        self.zone_overlay_button = ttk.Button(heat_box, text="Hide Zone Overlay",
+                                              style='Compact.TButton',
+                                              command=self.toggle_zone_overlay)
+        self.zone_overlay_button.grid(row=2, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+        # Signal integrity: channel, sensor mode, and the auto-exclude action.
+        integ_box = cluster('integrity')
+        ttk.Label(integ_box, text="SI Channel:").grid(row=0, column=0, sticky='w')
         self.integrity_channel_var = tk.StringVar(value="G0")
-        self.integrity_channel_combo = ttk.Combobox(control_frame, textvariable=self.integrity_channel_var, 
-                    values=["G0", "G1", "G2", "G3"], width=10, state='disabled')
-        self.integrity_channel_combo.grid(row=3, column=5, padx=5, sticky='w')
-        # Bind channel change to refresh plot (use after_idle to preserve selection)
-        self.integrity_channel_combo.bind('<<ComboboxSelected>>', lambda e: self.root.after_idle(self.generate_plot))
+        self.integrity_channel_combo = ttk.Combobox(
+            integ_box, textvariable=self.integrity_channel_var,
+            values=["G0", "G1", "G2", "G3"], width=10, state='disabled')
+        self.integrity_channel_combo.grid(row=0, column=1, sticky='w', padx=(4, 0))
+        # after_idle keeps the listbox selection intact while the plot redraws.
+        self.integrity_channel_combo.bind(
+            '<<ComboboxSelected>>', lambda e: self.root.after_idle(self.generate_plot))
 
         # Sensor mode: ignore the 415 nm isosbestic when scoring integrity.
         # GRAB-type sensors (e.g. GRABDA) have a 415 channel that does not act as a
@@ -4554,117 +4714,114 @@ class FPAnalysisGUI:
         # and quality is judged from the indicator channel alone.
         self.integrity_sensor_mode_var = tk.BooleanVar(value=False)
         self.integrity_sensor_check = ttk.Checkbutton(
-            control_frame, text="Sensor (ignore 415nm)",
+            integ_box, text="Sensor (ignore 415nm)",
             variable=self.integrity_sensor_mode_var,
             command=lambda: self.root.after_idle(self.generate_plot),
             state='disabled')
-        self.integrity_sensor_check.grid(row=3, column=6, padx=5, sticky='w')
-        
-        # Spatial binning for heatmap
-        ttk.Label(control_frame, text="Bin Size (cm):").grid(row=4, column=2, sticky='w', padx=5)
-        self.spatial_bin_var = tk.StringVar(value=str(self.params['spatial_bin_size']))
-        self.spatial_bin_entry = ttk.Entry(control_frame, textvariable=self.spatial_bin_var, width=10, state='disabled')
-        self.spatial_bin_entry.grid(row=4, column=3, padx=5, sticky='w')
-        self.show_zone_overlay_var = tk.BooleanVar(value=True)
-        
-        # Behavior selection for bout plots
-        ttk.Label(control_frame, text="Behavior:").grid(row=5, column=0, sticky='w', padx=5)
+        self.integrity_sensor_check.grid(row=1, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        ttk.Separator(integ_box, orient='horizontal').grid(
+            row=2, column=0, columnspan=2, sticky='ew', pady=(6, 3))
+        ttk.Label(integ_box, text="Auto-exclude below score:",
+                  font=('Segoe UI', 9, 'bold')).grid(row=3, column=0, columnspan=2, sticky='w')
+        excl_row = ttk.Frame(integ_box)
+        excl_row.grid(row=4, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        self.integrity_threshold_var = tk.StringVar(value="70")
+        ttk.Entry(excl_row, textvariable=self.integrity_threshold_var, width=8).pack(side='left')
+        ttk.Button(excl_row, text="Apply to Exclude", style='Compact.TButton',
+                   command=self.apply_integrity_threshold_to_exclusions).pack(side='left', padx=(6, 0))
+        ttk.Label(integ_box,
+                  text="Applies to the current selection only. Channels scoring below "
+                       "the threshold are added to the Exclusions tab.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').grid(
+                      row=5, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        # Behaviour selection for bout plots.
+        beh_box = cluster('behavior')
+        ttk.Label(beh_box, text="Behavior:").grid(row=0, column=0, sticky='w')
         self.behavior_var = tk.StringVar()
-        self.behavior_combo = ttk.Combobox(control_frame, textvariable=self.behavior_var, width=20, state='disabled')
-        self.behavior_combo.grid(row=5, column=1, padx=5)
-        
-        # Zone entry type selection for zone entry bouts
-        ttk.Label(control_frame, text="Entry Type:").grid(row=5, column=2, sticky='w', padx=5)
+        self.behavior_combo = ttk.Combobox(beh_box, textvariable=self.behavior_var, width=20)
+        self.behavior_combo.grid(row=0, column=1, sticky='ew', padx=(4, 0))
+
+        entry_box = cluster('entry_type')
+        ttk.Label(entry_box, text="Entry Type:").grid(row=0, column=0, sticky='w')
         zone_entry_types = list(self._get_zone_entry_type_map().keys())
         default_entry_type = zone_entry_types[0] if zone_entry_types else ""
         self.zone_entry_type_var = tk.StringVar(value=default_entry_type)
-        self.zone_entry_type_combo = ttk.Combobox(control_frame, textvariable=self.zone_entry_type_var, 
-                                                  values=zone_entry_types, width=20, state='disabled')
-        self.zone_entry_type_combo.grid(row=5, column=3, padx=5)
-        
-        # Bout number selection for "Compare Across Bouts"
-        ttk.Label(control_frame, text="Show Bout #:").grid(row=5, column=4, sticky='w', padx=5)
+        self.zone_entry_type_combo = ttk.Combobox(
+            entry_box, textvariable=self.zone_entry_type_var,
+            values=zone_entry_types, width=20)
+        self.zone_entry_type_combo.grid(row=0, column=1, sticky='ew', padx=(4, 0))
+
+        num_box = cluster('bout_number')
+        ttk.Label(num_box, text="Show Bout #:").grid(row=0, column=0, sticky='w')
         self.bout_number_var = tk.StringVar(value="All")
-        self.bout_number_combo = ttk.Combobox(control_frame, textvariable=self.bout_number_var, 
-                                              values=["All"], width=10, state='disabled')
-        self.bout_number_combo.grid(row=5, column=5, padx=5)
-        
-        # Bind behavior combobox to prevent selection clearing
-        # When behavior changes, we don't want to update subjects list
-        # (only plot type changes should update the behavior list)
-        
-        # Update behavior list when plot type changes
+        self.bout_number_combo = ttk.Combobox(num_box, textvariable=self.bout_number_var,
+                                              values=["All"], width=10)
+        self.bout_number_combo.grid(row=0, column=1, sticky='w', padx=(4, 0))
+
+        # Bout aggregation.
+        bouts_box = cluster('bouts')
+        self.viz_average_within_subject = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bouts_box, text="Average bouts/traces within subject",
+                        variable=self.viz_average_within_subject).grid(
+                            row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(bouts_box, text="Max Bouts/Subject:").grid(row=1, column=0, sticky='w')
+        max_bouts_frame = ttk.Frame(bouts_box)
+        max_bouts_frame.grid(row=1, column=1, sticky='w', padx=(4, 0))
+        self.viz_max_bouts_var = tk.StringVar(value="all")
+        ttk.Entry(max_bouts_frame, textvariable=self.viz_max_bouts_var, width=8).pack(side='left')
+        ttk.Label(max_bouts_frame, text='(number or "all")', foreground='gray',
+                  font=('Segoe UI', 8)).pack(side='left', padx=(4, 0))
+
+        # Bouts Overlay behaviour picker. None -> follow the Behavior dropdown
+        # (single behavior); otherwise a set of names chosen in the pop-up.
+        overlay_box = cluster('overlay')
+        self.viz_overlay_behaviors = None
+        ttk.Button(overlay_box, text="Select Behaviors…", style='Compact.TButton',
+                   command=self._open_overlay_behavior_selector).grid(row=0, column=0, sticky='w')
+        ttk.Button(overlay_box, text="Bout Overlay Style…", style='Compact.TButton',
+                   command=self._open_bout_overlay_style_dialog).grid(
+                       row=0, column=1, sticky='w', padx=(4, 0))
+        self.viz_overlay_behaviors_label = ttk.Label(
+            overlay_box, text="(follows dropdown)", foreground='gray', font=('Segoe UI', 8))
+        self.viz_overlay_behaviors_label.grid(row=1, column=0, columnspan=2, sticky='w')
+
+        # Always-on tail: exclusions and the advanced settings window.
+        misc_box = cluster('misc', always=True)
+        ttk.Checkbutton(misc_box, text="Apply exclusions (Exclusions tab)",
+                        variable=self.use_exclusions_viz).grid(
+                            row=0, column=0, columnspan=2, sticky='w')
+        ttk.Button(misc_box, text="Advanced Graph Settings…", style='Compact.TButton',
+                   command=self.open_graph_settings_window).grid(
+                       row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+        self.register_option_clusters('visualization', self.plot_type_var,
+                                      clusters, VIZ_OPTIONS_BY_PLOT)
+
+        # ── Actions: bottom-pinned so they stay reachable on a short screen ──
+        ttk.Button(actions, text="Generate Plot",
+                   command=self.generate_plot).pack(fill='x')
+        export_row = ttk.Frame(actions)
+        export_row.pack(fill='x', pady=(4, 0))
+        ttk.Button(export_row, text="Export Plot", style='Compact.TButton',
+                   command=self.export_plot).pack(side='left', expand=True, fill='x')
+        ttk.Button(export_row, text="Export CSV", style='Compact.TButton',
+                   command=self.export_plot_data).pack(side='left', expand=True, fill='x', padx=(4, 0))
+        ttk.Button(actions, text="Export Z-Score Traces (xlsx)", style='Compact.TButton',
+                   command=self.export_zscore_full_session).pack(fill='x', pady=(4, 0))
+
+        # Keep the selectors in step with the plot type and the selection.
         self.plot_type_var.trace('w', self.update_behavior_list)
         self.plot_type_var.trace('w', self.update_bout_number_selector)
-        # Update dynamic channel checkboxes when subject selection changes
         self.viz_subject_listbox.bind('<<ListboxSelect>>', self.on_viz_subject_selected)
-        self.viz_group_listbox.bind('<<ListboxSelect>>', lambda e: (self.update_behavior_list(), self.update_bout_number_selector()))
-        self.behavior_combo.bind('<<ComboboxSelected>>', lambda e: self.update_bout_number_selector())
-        
-        # Average within subject checkbox
-        self.viz_average_within_subject = tk.BooleanVar(value=False)
-        ttk.Checkbutton(control_frame, text="Average bouts/traces within subject", 
-                       variable=self.viz_average_within_subject).grid(row=6, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        
-        # Exclusions checkbox
-        ttk.Checkbutton(control_frame, text="Apply exclusions (Exclusions tab)",
-                       variable=self.use_exclusions_viz).grid(row=6, column=2, columnspan=2, sticky='w', padx=5, pady=5)
+        self.viz_group_listbox.bind('<<ListboxSelect>>',
+                                    lambda e: (self.update_behavior_list(),
+                                               self.update_bout_number_selector()))
+        self.behavior_combo.bind('<<ComboboxSelected>>',
+                                 lambda e: self.update_bout_number_selector())
 
-        # Behavior selection for the Bouts Overlay plot. None -> follow the
-        # Behavior dropdown (single behavior); otherwise a set of behavior names
-        # chosen via the pop-up selector below (may be several at once).
-        self.viz_overlay_behaviors = None
-        overlay_beh_frame = ttk.Frame(control_frame)
-        overlay_beh_frame.grid(row=6, column=4, columnspan=2, sticky='w', padx=5, pady=5)
-        ttk.Button(overlay_beh_frame, text="Select Behaviors…",
-                   command=self._open_overlay_behavior_selector).pack(side='left')
-        ttk.Button(overlay_beh_frame, text="Bout Overlay Style…",
-                   command=self._open_bout_overlay_style_dialog).pack(side='left', padx=(6, 0))
-        self.viz_overlay_behaviors_label = ttk.Label(
-            overlay_beh_frame, text="(follows dropdown)", foreground='gray',
-            font=('Segoe UI', 8))
-        self.viz_overlay_behaviors_label.pack(side='left', padx=(6, 0))
-        
-        # Max bouts per subject control
-        ttk.Label(control_frame, text="Max Bouts/Subject:").grid(row=7, column=0, sticky='w', padx=5, pady=5)
-        max_bouts_frame = ttk.Frame(control_frame)
-        max_bouts_frame.grid(row=7, column=1, sticky='w', padx=5)
-        self.viz_max_bouts_var = tk.StringVar(value="all")
-        ttk.Entry(max_bouts_frame, textvariable=self.viz_max_bouts_var, width=10).pack(side='left', padx=(0, 5))
-        ttk.Label(max_bouts_frame, text='(enter number or "all")', foreground='gray', font=('Segoe UI', 8)).pack(side='left')
-
-        ttk.Button(control_frame, text="Generate Plot", command=self.generate_plot).grid(row=1, column=4, padx=5)
-        ttk.Button(control_frame, text="Export Plot", command=self.export_plot).grid(row=1, column=5, padx=5)
-        ttk.Button(control_frame, text="Export Data CSV", command=self.export_plot_data).grid(row=1, column=6, padx=5)
-        ttk.Button(control_frame, text="Export Z-Score Traces (xlsx)", command=self.export_zscore_full_session).grid(row=1, column=7, padx=5)
-        self.zone_overlay_button = ttk.Button(control_frame, text="Hide Zone Overlay", command=self.toggle_zone_overlay)
-        self.zone_overlay_button.grid(row=8, column=0, padx=5, pady=5, sticky='w')
-        ttk.Button(control_frame, text="Advanced Graph Settings", command=self.open_graph_settings_window).grid(
-            row=8, column=1, padx=5, pady=5, sticky='w'
-        )
-        
-        # Info label - moved to row 9 to avoid overlap with controls above
-        self.viz_info_label = ttk.Label(control_frame, text="Tip: Hold Ctrl/Cmd to select multiple subjects. Check/uncheck channels/wavelengths to overlay.", 
-                                       foreground='blue', font=('Segoe UI', 8))
-        self.viz_info_label.grid(row=9, column=0, columnspan=6, sticky='w', padx=5, pady=(5, 0))
-        
-        # Signal Integrity threshold → auto-exclude row
-        ttk.Separator(control_frame, orient='horizontal').grid(row=10, column=0, columnspan=8, sticky='ew', padx=5, pady=(6, 2))
-        ttk.Label(control_frame, text="Signal Integrity – Auto Exclude:",
-                 font=('Segoe UI', 9, 'bold')).grid(row=11, column=0, columnspan=2, sticky='w', padx=5)
-        ttk.Label(control_frame,
-                 text="(applies to the currently selected groups/subjects only)",
-                 foreground='#a05a00', font=('Segoe UI', 8, 'italic')).grid(
-                     row=11, column=2, columnspan=5, sticky='w', padx=5)
-        ttk.Label(control_frame, text="Min. Integrity Score:").grid(row=12, column=0, sticky='w', padx=5, pady=(3, 5))
-        self.integrity_threshold_var = tk.StringVar(value="70")
-        ttk.Entry(control_frame, textvariable=self.integrity_threshold_var, width=8).grid(row=12, column=1, sticky='w', padx=5)
-        ttk.Button(control_frame, text="Apply to Exclude",
-                  command=self.apply_integrity_threshold_to_exclusions).grid(row=12, column=2, padx=5, pady=(3, 5))
-        ttk.Label(control_frame,
-                 text="Channels in the selected group(s) with overall score below threshold are added to the Exclusions tab.",
-                 foreground='gray', font=('Segoe UI', 8)).grid(row=12, column=3, columnspan=4, sticky='w', padx=5)
-        
         # Axis / Heatmap / Trace-styling controls live in the "Advanced Graph
         # Settings" window (button above) to keep this tab uncluttered. Their
         # backing variables are defined here so the settings window and the
@@ -4702,11 +4859,11 @@ class FPAnalysisGUI:
         self.viz_fig_width_var = tk.StringVar(value="auto")
         self.viz_fig_height_var = tk.StringVar(value="auto")
         self.viz_canvas_height_var = tk.StringVar(value="auto")
-        
-        # Matplotlib canvas
-        self.fig_frame = ttk.Frame(scrollable_frame)
-        self.fig_frame.pack(fill='both', expand=True, padx=10, pady=10)
-    
+
+        # ── Output zone ──────────────────────────────────────────────────────
+        self.fig_frame = ttk.Frame(output)
+        self.fig_frame.pack(fill='both', expand=True)
+
     def create_connectivity_analysis_tab(self):
         """Tab for spectral coherence analysis (Morlet wavelet / Welch)."""
         tab = ttk.Frame(self.data_notebook)
@@ -21769,19 +21926,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     # ======================== Visualization ========================
     
-    def toggle_subject_group_mode(self):
+    # NOTE: superseded by the definition further down this class, which is the
+    # one Python actually binds. Kept only so the older name still resolves.
+    def _toggle_subject_group_mode_legacy(self):
         """Toggle between subject and group selection mode in visualization"""
-        if self.plot_by_var.get() == "Subject":
-            # Show subject selection, hide group selection
-            self.viz_group_label.grid_remove()
-            self.viz_group_frame.grid_remove()
-        else:
-            # Hide subject selection, show group selection
-            self.viz_group_label.grid(row=1, column=0, sticky='nw', padx=5)
-            self.viz_group_frame.grid(row=1, column=1, rowspan=2, padx=5, sticky='nsew')
-            # Update group listbox
-            self.update_viz_groups()
-    
+        self.toggle_subject_group_mode()
+
     def update_viz_groups(self):
         """Update group list in visualization tab"""
         self.viz_group_listbox.delete(0, 'end')
@@ -22439,20 +22589,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def toggle_subject_group_mode(self):
         """Toggle between subject and group selection mode in visualization tab"""
+        # The two selectors share one slot in the Selection zone, so exactly one
+        # is packed at a time and the other leaves no gap behind.
         if self.plot_by_var.get() == "Group":
-            # Hide subject selection, show group selection
-            self.viz_subject_listbox.master.grid_remove()
-            self.viz_group_label.grid(row=1, column=0, sticky='nw', padx=5)
-            self.viz_group_frame.grid(row=1, column=1, rowspan=2, padx=5, sticky='nsew')
-            # Update group list
+            self.viz_subject_frame.pack_forget()
+            self.viz_group_frame.pack(fill='both', expand=True)
             self.viz_group_listbox.delete(0, 'end')
             for group_name in self.groups.keys():
                 self.viz_group_listbox.insert('end', group_name)
+            self.refresh_facet_controls()
         else:
-            # Show subject selection, hide group selection
-            self.viz_group_label.grid_remove()
-            self.viz_group_frame.grid_remove()
-            self.viz_subject_listbox.master.grid(row=1, column=1, rowspan=2, padx=5, sticky='nsew')
+            self.viz_group_frame.pack_forget()
+            self.viz_subject_frame.pack(fill='both', expand=True)
 
         # Keep selectors synchronized when mode changes.
         self.update_behavior_list()
