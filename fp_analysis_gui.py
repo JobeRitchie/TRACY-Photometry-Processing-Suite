@@ -9400,212 +9400,148 @@ class FPAnalysisGUI:
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Spike Analysis")
 
-        # Single scrollable column (controls + results table). Spike graphs open
-        # in their own windows (Visualize Spike Data / Analyze Spikes by Zone),
-        # matching how the other analysis tabs plot — no in-tab live preview.
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
+        # Spike graphs open in their own windows (Visualize Spike Data / Analyze
+        # Spikes by Zone), matching how the other analysis tabs plot, so the
+        # Output zone holds the results table rather than a figure.
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups",
+            settings_title="Detection Settings")
 
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        # ── Selection ────────────────────────────────────────────────────────
+        self.spike_mode_var = tk.StringVar(value="Subject")
+        mode_frame = ttk.Frame(selection)
+        mode_frame.pack(fill='x')
+        ttk.Label(mode_frame, text="Analyze by:").pack(side='left')
+        ttk.Radiobutton(mode_frame, text="Subject", variable=self.spike_mode_var,
+                        value="Subject",
+                        command=self.update_spike_selection_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Radiobutton(mode_frame, text="Group", variable=self.spike_mode_var,
+                        value="Group",
+                        command=self.update_spike_selection_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
+        # One listbox for both modes: update_spike_selection_mode refills it, so
+        # there is nothing to show or hide here.
+        list_container = ttk.Frame(selection)
+        list_container.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+        scrollbar_list = ttk.Scrollbar(list_container)
+        scrollbar_list.pack(side='right', fill='y')
+        self.spike_listbox = tk.Listbox(list_container, selectmode='multiple',
+                                        yscrollcommand=scrollbar_list.set, height=7,
+                                        exportselection=False)
+        self.spike_listbox.pack(side='left', fill='both', expand=True)
+        scrollbar_list.config(command=self.spike_listbox.yview)
 
-        main_frame = ttk.Frame(scrollable_frame)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # WARNING MESSAGE
-        warning_bg = tk.Frame(main_frame, bg='#FFF3CD', bd=1, relief='solid')
-        warning_bg.pack(fill=tk.X, pady=(0, 5))
+        # ── Settings ─────────────────────────────────────────────────────────
+        warning_bg = tk.Frame(settings, bg='#FFF3CD', bd=1, relief='solid')
+        warning_bg.pack(fill='x', pady=(0, self.ui_px(6)))
         warning_content = tk.Frame(warning_bg, bg='#FFF3CD')
-        warning_content.pack(fill=tk.X, padx=8, pady=5)
-        tk.Label(warning_content, text="WARNING",
-                 font=('Segoe UI', 10, 'bold'),
-                 bg='#FFF3CD', fg='#856404').pack(anchor=tk.W)
+        warning_content.pack(fill='x', padx=self.ui_px(6), pady=self.ui_px(4))
+        tk.Label(warning_content, text="WARNING", font=('Segoe UI', 10, 'bold'),
+                 bg='#FFF3CD', fg='#856404').pack(anchor='w')
         tk.Label(warning_content,
-                 text="Only perform transient analysis on clean signal data.\n"
+                 text="Only perform transient analysis on clean signal data. "
                       "Tune the detection parameters below, then run the analysis.",
                  font=('Segoe UI', 8), bg='#FFF3CD', fg='#856404',
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+                 justify='left', wraplength=self.ui_px(240)).pack(
+            anchor='w', pady=(self.ui_px(2), 0))
 
-        # ── Transient Detection Parameters ──────────────────────────────────
-        top_frame = ttk.LabelFrame(main_frame, text="Transient Detection Parameters", padding=5)
-        top_frame.pack(fill=tk.X, pady=(0, 5))
+        def _param(label, var, hint):
+            row = ttk.Frame(settings)
+            row.pack(fill='x', pady=(self.ui_px(2), 0))
+            ttk.Label(row, text=label).pack(side='left')
+            ttk.Entry(row, textvariable=var, width=8).pack(side='right')
+            ttk.Label(settings, text=hint, foreground='gray',
+                      font=('Segoe UI', 7), justify='left',
+                      wraplength=self.ui_px(240)).pack(anchor='w')
 
-        param_frame = ttk.Frame(top_frame)
-        param_frame.pack(fill=tk.X)
-
-        # Row 0
-        ttk.Label(param_frame, text="Threshold (MAD):").grid(
-            row=0, column=0, sticky=tk.W, padx=3, pady=2)
         self.spike_threshold_var = tk.StringVar(value=str(self.params['spike_threshold_mad']))
-        ttk.Entry(param_frame, textvariable=self.spike_threshold_var, width=8).grid(
-            row=0, column=1, padx=3, pady=2)
-        ttk.Label(param_frame, text="MADs above median  (lit: 2.0–3.0)",
-                  foreground='gray', font=('Segoe UI', 7)).grid(
-            row=0, column=2, sticky=tk.W, padx=3)
-
-        ttk.Label(param_frame, text="Min Width (frames):").grid(
-            row=0, column=3, sticky=tk.W, padx=3, pady=2)
+        _param("Threshold (MAD):", self.spike_threshold_var,
+               "MADs above median  (lit: 2.0–3.0)")
         self.spike_min_width_var = tk.StringVar(value=str(self.params['spike_min_width']))
-        ttk.Entry(param_frame, textvariable=self.spike_min_width_var, width=8).grid(
-            row=0, column=4, padx=3, pady=2)
-        ttk.Label(param_frame, text="(~67ms @ 30fps)",
-                  foreground='gray', font=('Segoe UI', 7)).grid(
-            row=0, column=5, sticky=tk.W, padx=3)
-
-        # Row 1
-        ttk.Label(param_frame, text="Max Width (frames):").grid(
-            row=1, column=0, sticky=tk.W, padx=3, pady=2)
+        _param("Min width (frames):", self.spike_min_width_var, "(~67ms @ 30fps)")
         self.spike_max_width_var = tk.StringVar(value=str(self.params['spike_max_width']))
-        ttk.Entry(param_frame, textvariable=self.spike_max_width_var, width=8).grid(
-            row=1, column=1, padx=3, pady=2)
-        ttk.Label(param_frame, text="(~3s @ 30fps, covers GCaMP6s decays)",
-                  foreground='gray', font=('Segoe UI', 7)).grid(
-            row=1, column=2, sticky=tk.W, padx=3)
-
-        ttk.Label(param_frame, text="Min Prominence (MAD):").grid(
-            row=1, column=3, sticky=tk.W, padx=3, pady=2)
+        _param("Max width (frames):", self.spike_max_width_var,
+               "(~3s @ 30fps, covers GCaMP6s decays)")
         self.spike_prominence_var = tk.StringVar(value=str(self.params['spike_min_prominence']))
-        ttk.Entry(param_frame, textvariable=self.spike_prominence_var, width=8).grid(
-            row=1, column=4, padx=3, pady=2)
-        ttk.Label(param_frame, text="(typical: 0.3–1.0)",
-                  foreground='gray', font=('Segoe UI', 7)).grid(
-            row=1, column=5, sticky=tk.W, padx=3)
-
-        # Row 2
-        ttk.Label(param_frame, text="Min Interval (frames):").grid(
-            row=2, column=0, sticky=tk.W, padx=3, pady=2)
+        _param("Min prominence (MAD):", self.spike_prominence_var, "(typical: 0.3–1.0)")
         self.spike_min_interval_var = tk.StringVar(value=str(self.params['spike_min_interval']))
-        ttk.Entry(param_frame, textvariable=self.spike_min_interval_var, width=8).grid(
-            row=2, column=1, padx=3, pady=2)
-        ttk.Label(param_frame, text="(~333ms @ 30fps)",
-                  foreground='gray', font=('Segoe UI', 7)).grid(
-            row=2, column=2, sticky=tk.W, padx=3)
+        _param("Min interval (frames):", self.spike_min_interval_var, "(~333ms @ 30fps)")
 
-        ttk.Label(param_frame, text="MAD Calculation:").grid(
-            row=2, column=3, sticky=tk.W, padx=3, pady=2)
+        ttk.Label(settings, text="MAD calculation:").pack(
+            anchor='w', pady=(self.ui_px(4), 0))
         self.spike_mad_mode_var = tk.StringVar(value="per_subject")
-        mad_mode_frame = ttk.Frame(param_frame)
-        mad_mode_frame.grid(row=2, column=4, columnspan=2, sticky=tk.W, padx=3, pady=2)
-        ttk.Radiobutton(mad_mode_frame, text="Per Subject",
+        mad_mode_frame = ttk.Frame(settings)
+        mad_mode_frame.pack(fill='x')
+        ttk.Radiobutton(mad_mode_frame, text="Per subject",
                         variable=self.spike_mad_mode_var, value="per_subject").pack(
-            side=tk.LEFT, padx=2)
-        ttk.Radiobutton(mad_mode_frame, text="Whole Dataset",
+            side='left')
+        ttk.Radiobutton(mad_mode_frame, text="Whole dataset",
                         variable=self.spike_mad_mode_var, value="whole_dataset").pack(
-            side=tk.LEFT, padx=2)
+            side='left', padx=(self.ui_px(6), 0))
 
-        # Apply button row
-        param_btn_frame = ttk.Frame(top_frame)
-        param_btn_frame.pack(pady=(5, 0))
-        ttk.Button(param_btn_frame, text="Apply Parameters",
-                   command=self.update_spike_parameters).pack(side=tk.LEFT, padx=3)
+        ttk.Button(settings, text="Apply Parameters",
+                   command=self.update_spike_parameters).pack(
+            fill='x', pady=(self.ui_px(6), 0))
 
-        # ── Analysis Mode + Channels + Subject Selection ─────────────────────
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Separator(settings, orient='horizontal').pack(
+            fill='x', pady=self.ui_px(6))
 
-        mode_frame = ttk.LabelFrame(control_frame, text="Analysis Mode", padding=5)
-        mode_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 3))
-
-        self.spike_mode_var = tk.StringVar(value="Subject")
-        ttk.Radiobutton(mode_frame, text="By Subject", variable=self.spike_mode_var,
-                        value="Subject",
-                        command=self.update_spike_selection_mode).pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(mode_frame, text="By Group", variable=self.spike_mode_var,
-                        value="Group",
-                        command=self.update_spike_selection_mode).pack(anchor=tk.W, pady=2)
-
-        # Dynamic channel checkboxes (replaces hardcoded G0/G1)
-        ch_header = ttk.Frame(mode_frame)
-        ch_header.pack(fill=tk.X, pady=(5, 2))
-        ttk.Label(ch_header, text="Channels:").pack(side=tk.LEFT)
+        ch_header = ttk.Frame(settings)
+        ch_header.pack(fill='x')
+        ttk.Label(ch_header, text="Channels:").pack(side='left')
         ttk.Button(ch_header, text="↻ Refresh", width=9,
-                   command=self.refresh_spike_channels).pack(side=tk.LEFT, padx=(4, 0))
+                   command=self.refresh_spike_channels).pack(side='right')
 
         # Initialize channel BoolVars – G0/G1 kept as named attrs for back-compat
         self.spike_show_g0 = tk.BooleanVar(value=True)
         self.spike_show_g1 = tk.BooleanVar(value=True)
         self.spike_channel_vars = {'G0': self.spike_show_g0, 'G1': self.spike_show_g1}
 
-        self.spike_channel_check_frame = ttk.Frame(mode_frame)
-        self.spike_channel_check_frame.pack(fill=tk.X)
+        self.spike_channel_check_frame = ttk.Frame(settings)
+        self.spike_channel_check_frame.pack(fill='x')
         self._rebuild_spike_channel_checkboxes(['G0', 'G1'])
 
-        ttk.Separator(mode_frame, orient='horizontal').pack(fill='x', pady=5)
-        ttk.Checkbutton(mode_frame, text="Apply exclusions",
-                        variable=self.use_exclusions_spike).pack(anchor=tk.W, pady=1)
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_spike).pack(
+            anchor='w', pady=(self.ui_px(6), 0))
 
-        # Subject / Group listbox
-        selection_frame = ttk.LabelFrame(control_frame, text="Select Subjects/Groups", padding=5)
-        selection_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(3, 0))
+        # ── Actions ──────────────────────────────────────────────────────────
+        for text, command in (
+                ("Run Spike Analysis", self.run_spike_analysis),
+                ("Visualize Spike Data", self.visualize_spike_data),
+                ("Analyze Spikes by Zone", self.visualize_spikes_by_zone),
+                ("Spikes by Bout Phase", self.analyze_spikes_by_bout_phase),
+                ("Export Results", self.export_spike_results)):
+            ttk.Button(actions, text=text, command=command).pack(
+                fill='x', pady=(0, self.ui_px(4)))
 
-        list_container = ttk.Frame(selection_frame)
-        list_container.pack(fill=tk.BOTH, expand=True)
-
-        scrollbar_list = ttk.Scrollbar(list_container)
-        scrollbar_list.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.spike_listbox = tk.Listbox(list_container, selectmode=tk.MULTIPLE,
-                                        yscrollcommand=scrollbar_list.set, height=6)
-        self.spike_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar_list.config(command=self.spike_listbox.yview)
-
-        # 2x2 grid of compact buttons so the four actions always fit the control
-        # pane (a single row overflowed it, clipping the last buttons).
-        btn_frame = ttk.Frame(selection_frame)
-        btn_frame.pack(fill=tk.X, pady=(5, 0))
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-
-        ttk.Button(btn_frame, text="Run Spike Analysis", style='Compact.TButton',
-                   command=self.run_spike_analysis).grid(
-            row=0, column=0, sticky='ew', padx=2, pady=2)
-        ttk.Button(btn_frame, text="Visualize Spike Data", style='Compact.TButton',
-                   command=self.visualize_spike_data).grid(
-            row=0, column=1, sticky='ew', padx=2, pady=2)
-        ttk.Button(btn_frame, text="Analyze Spikes by Zone", style='Compact.TButton',
-                   command=self.visualize_spikes_by_zone).grid(
-            row=1, column=0, sticky='ew', padx=2, pady=2)
-        ttk.Button(btn_frame, text="Export Results", style='Compact.TButton',
-                   command=self.export_spike_results).grid(
-            row=1, column=1, sticky='ew', padx=2, pady=2)
-        ttk.Button(btn_frame, text="Spikes by Bout Phase", style='Compact.TButton',
-                   command=self.analyze_spikes_by_bout_phase).grid(
-            row=2, column=0, columnspan=2, sticky='ew', padx=2, pady=2)
-
-        # ── Results Table ────────────────────────────────────────────────────
-        results_frame = ttk.LabelFrame(main_frame, text="Spike Analysis Results", padding=5)
-        results_frame.pack(fill=tk.BOTH, expand=True)
+        # ── Output: results table ────────────────────────────────────────────
+        results_frame = ttk.LabelFrame(output, text="Spike Analysis Results", padding=5)
+        results_frame.pack(fill='both', expand=True)
 
         table_frame = ttk.Frame(results_frame)
-        table_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 3))
+        table_frame.pack(fill='both', expand=True)
 
         y_scroll = ttk.Scrollbar(table_frame)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL)
-        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        y_scroll.pack(side='right', fill='y')
+        x_scroll = ttk.Scrollbar(table_frame, orient='horizontal')
+        x_scroll.pack(side='bottom', fill='x')
 
         columns = ('Subject', 'Group', 'Channel', 'Total Spikes', 'Spike Rate/min',
                    'Mean Amplitude', 'Mean Width (frames)', 'Mean Width (ms)')
         self.spike_tree = ttk.Treeview(table_frame, columns=columns, show='headings',
                                        yscrollcommand=y_scroll.set,
-                                       xscrollcommand=x_scroll.set, height=10)
+                                       xscrollcommand=x_scroll.set, height=14)
         y_scroll.config(command=self.spike_tree.yview)
         x_scroll.config(command=self.spike_tree.xview)
 
         col_widths = [100, 80, 60, 80, 100, 100, 120, 100]
         for col, width in zip(columns, col_widths):
             self.spike_tree.heading(col, text=col)
-            self.spike_tree.column(col, width=width, anchor=tk.CENTER)
-        self.spike_tree.pack(fill=tk.BOTH, expand=True)
+            self.spike_tree.column(col, width=self.ui_px(width), anchor='center')
+        self.spike_tree.pack(fill='both', expand=True)
 
         self.spike_context_menu = tk.Menu(self.spike_tree, tearoff=0)
         self.spike_context_menu.add_command(label="Copy Selected Rows",
