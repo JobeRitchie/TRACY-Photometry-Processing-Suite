@@ -421,6 +421,35 @@ VIZ_OPTIONS_BY_PLOT = {
 }
 
 
+# Kinematics parameters that only apply to some analyses. Every analysis is
+# listed, including the ones with no extra parameters: an entry missing from
+# the table falls back to showing every cluster, which would defeat the point.
+# Temporal bin, smoothing and max lag are not here -- they are always shown,
+# because Summarize reads them whatever analysis is selected.
+KIN_OPTIONS_BY_PLOT = {
+    'Velocity vs Signal (overlay)':                 set(),
+    'Velocity vs Signal (scatter)':                 set(),
+    'Velocity–Signal cross-correlation':            set(),
+    'Velocity–Signal coupling (summary bars)':      set(),
+    'Signal by velocity bin':                       {'nbins', 'vel_zscore'},
+    'Acceleration vs Signal (overlay)':             set(),
+    'Acceleration vs Signal (scatter)':             set(),
+    'Signal by acceleration bin':                   {'nbins'},
+    'Accelerating vs decelerating':                 set(),
+    'Radial velocity vs Signal':                    set(),
+    'Center vs Perimeter coupling':                 set(),
+    'Arena heatmap: Signal':                        {'spatial_bin'},
+    'Arena heatmap: Velocity':                      {'spatial_bin'},
+    'Arena heatmap: Acceleration':                  {'spatial_bin'},
+    '3D arena map (height=velocity, color=signal)': {'spatial_bin'},
+    'Velocity×Acceleration phase map (signal)':     {'nbins'},
+    'Movement-onset triggered signal':              {'move_thresh'},
+    'Distance-from-center vs Signal':               set(),
+    'Kinematic–Signal coupling by zone':            {'zone_kinematic'},
+    'Velocity & acceleration distribution':         set(),
+}
+
+
 class FacetControls(ttk.Frame):
     """A column of one dropdown per factor: combine, split, or a single level.
 
@@ -39180,21 +39209,6 @@ cat("OK\n")
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Decision Probability")
 
-        # ── Outer layout: fixed-width left panel + expanding right plot area ──
-        outer = ttk.Frame(tab)
-        outer.pack(fill='both', expand=True, padx=5, pady=5)
-
-        # Size the control column to its content (DPI-safe) so button labels
-        # aren't clipped by a hard-fixed pixel width, and wrap it in a scrolling
-        # viewport so a tall control stack stays reachable on short screens.
-        ctrl_outer = ttk.Frame(outer, width=CONTROL_PANEL_W)
-        ctrl_outer.pack(side='left', fill='y', padx=(0, 5))
-        ctrl_outer.pack_propagate(True)
-        ctrl_panel = self.make_scrollable(ctrl_outer, fit_width=True)
-
-        self.dec_prob_plot_frame = ttk.Frame(outer)
-        self.dec_prob_plot_frame.pack(side='left', fill='both', expand=True)
-
         # ── Variables ────────────────────────────────────────────────────────
         self.dec_prob_by_var         = tk.StringVar(value="Group")
         self.dec_prob_channel_var    = tk.StringVar(value="G0")
@@ -39215,66 +39229,81 @@ cat("OK\n")
         self.dec_prob_figure         = None
         self.dec_prob_canvas_widget  = None
 
-        # ── Selection mode ───────────────────────────────────────────────────
-        mode_frame = ttk.LabelFrame(ctrl_panel, text="Selection Mode", padding=5)
-        mode_frame.pack(fill='x', pady=(0, 5))
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups",
+            settings_title="Analysis Settings")
+        self.dec_prob_plot_frame = ttk.Frame(output)
+        self.dec_prob_plot_frame.pack(fill='both', expand=True)
+
+        # ── Selection ────────────────────────────────────────────────────────
+        mode_frame = ttk.Frame(selection)
+        mode_frame.pack(fill='x')
+        ttk.Label(mode_frame, text="Analyze by:").pack(side='left')
         ttk.Radiobutton(mode_frame, text="Subject", variable=self.dec_prob_by_var,
                         value="Subject",
-                        command=self._dec_prob_toggle_mode).pack(side='left')
+                        command=self._dec_prob_toggle_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
         ttk.Radiobutton(mode_frame, text="Group", variable=self.dec_prob_by_var,
                         value="Group",
-                        command=self._dec_prob_toggle_mode).pack(side='left', padx=(10, 0))
+                        command=self._dec_prob_toggle_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
 
-        # ── Subject selector (shown in Subject mode) ─────────────────────────
-        self._dec_prob_subj_container = ttk.LabelFrame(ctrl_panel, text="Subjects", padding=5)
+        # The two selectors share one slot, so exactly one is packed at a time
+        # and the hidden one leaves no gap behind.
+        selector = ttk.Frame(selection)
+        selector.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
 
+        self._dec_prob_subj_container = ttk.Frame(selector)
+        ttk.Label(self._dec_prob_subj_container, text="Subject(s):").pack(anchor='w')
         subj_inner = ttk.Frame(self._dec_prob_subj_container)
-        subj_inner.pack(fill='both')
+        subj_inner.pack(fill='both', expand=True)
         self.dec_prob_subject_listbox = tk.Listbox(
-            subj_inner, selectmode='extended', height=10, exportselection=False)
+            subj_inner, selectmode='extended', height=6, exportselection=False)
         _s1 = ttk.Scrollbar(subj_inner, orient='vertical',
                              command=self.dec_prob_subject_listbox.yview)
         self.dec_prob_subject_listbox.pack(side='left', fill='both', expand=True)
         _s1.pack(side='right', fill='y')
         self.dec_prob_subject_listbox.config(yscrollcommand=_s1.set)
 
-        # ── Group selector (shown in Group mode) ─────────────────────────────
-        self._dec_prob_grp_container = ttk.LabelFrame(ctrl_panel, text="Groups", padding=5)
-
+        self._dec_prob_grp_container = ttk.Frame(selector)
+        ttk.Label(self._dec_prob_grp_container, text="Group(s):").pack(anchor='w')
         grp_inner = ttk.Frame(self._dec_prob_grp_container)
-        grp_inner.pack(fill='both')
+        grp_inner.pack(fill='both', expand=True)
         self.dec_prob_group_listbox = tk.Listbox(
-            grp_inner, selectmode='extended', height=10, exportselection=False)
+            grp_inner, selectmode='extended', height=4, exportselection=False)
         _s2 = ttk.Scrollbar(grp_inner, orient='vertical',
                              command=self.dec_prob_group_listbox.yview)
         self.dec_prob_group_listbox.pack(side='left', fill='both', expand=True)
         _s2.pack(side='right', fill='y')
         self.dec_prob_group_listbox.config(yscrollcommand=_s2.set)
         self._make_facet_controls(self._dec_prob_grp_container,
-                                  'decision_probability').pack(fill='x', pady=(4, 0))
+                                  'decision_probability').pack(
+            fill='x', pady=(self.ui_px(6), 0))
 
         # Initialise to the default mode
         self._dec_prob_toggle_mode()
 
-        # ── Channel selector ─────────────────────────────────────────────────
-        ch_frame = ttk.LabelFrame(ctrl_panel, text="Channel", padding=5)
-        ch_frame.pack(fill='x', pady=(0, 5))
-        ttk.Combobox(ch_frame, textvariable=self.dec_prob_channel_var,
-                     values=["G0", "G1"], state='readonly', width=8).pack(side='left')
+        # ── Settings ─────────────────────────────────────────────────────────
+        ch_row = ttk.Frame(settings)
+        ch_row.pack(fill='x')
+        ttk.Label(ch_row, text="Channel:").pack(side='left')
+        ttk.Combobox(ch_row, textvariable=self.dec_prob_channel_var,
+                     values=["G0", "G1"], state='readonly', width=8).pack(side='right')
 
-        # ── Plot type ────────────────────────────────────────────────────────
-        plot_type_frame = ttk.LabelFrame(ctrl_panel, text="Plot Type", padding=5)
-        plot_type_frame.pack(fill='x', pady=(0, 5))
+        plot_type_frame = ttk.Frame(settings)
+        plot_type_frame.pack(fill='x', pady=(self.ui_px(6), 0))
+        ttk.Label(plot_type_frame, text="Plot as:").pack(side='left')
         ttk.Radiobutton(plot_type_frame, text="Line",
                         variable=self.dec_prob_plot_type_var,
-                        value="Line").pack(side='left')
+                        value="Line").pack(side='left', padx=(self.ui_px(6), 0))
         ttk.Radiobutton(plot_type_frame, text="Bar",
                         variable=self.dec_prob_plot_type_var,
-                        value="Bar").pack(side='left', padx=(10, 0))
+                        value="Bar").pack(side='left', padx=(self.ui_px(6), 0))
 
-        # ── Outcomes to show ─────────────────────────────────────────────────
-        zone_frame = ttk.LabelFrame(ctrl_panel, text="Decision Zones", padding=5)
-        zone_frame.pack(fill='x', pady=(0, 5))
+        ttk.Separator(settings, orient='horizontal').pack(
+            fill='x', pady=self.ui_px(6))
+
+        ttk.Label(settings, text="Decision zones:").pack(anchor='w')
         bases = self._dec_prob_base_categories()
         def _default_base(prefer, fallback_idx):
             for b in bases:
@@ -39283,44 +39312,45 @@ cat("OK\n")
             return bases[fallback_idx] if len(bases) > fallback_idx else (bases[0] if bases else "")
         self.dec_prob_from_var = tk.StringVar(value=_default_base('closed', 0))
         self.dec_prob_to_var   = tk.StringVar(value=_default_base('open', 1))
-        _fr = ttk.Frame(zone_frame); _fr.pack(fill='x', pady=1)
+        _fr = ttk.Frame(settings)
+        _fr.pack(fill='x', pady=(self.ui_px(2), 0))
         ttk.Label(_fr, text="From:", width=6).pack(side='left')
         self.dec_prob_from_combo = ttk.Combobox(_fr, textvariable=self.dec_prob_from_var,
-                                                 values=bases, width=14, state='readonly')
-        self.dec_prob_from_combo.pack(side='left')
-        _tr = ttk.Frame(zone_frame); _tr.pack(fill='x', pady=1)
+                                                 values=bases, state='readonly')
+        self.dec_prob_from_combo.pack(side='left', fill='x', expand=True)
+        _tr = ttk.Frame(settings)
+        _tr.pack(fill='x', pady=(self.ui_px(2), 0))
         ttk.Label(_tr, text="To:", width=6).pack(side='left')
         self.dec_prob_to_combo = ttk.Combobox(_tr, textvariable=self.dec_prob_to_var,
-                                               values=bases, width=14, state='readonly')
-        self.dec_prob_to_combo.pack(side='left')
+                                               values=bases, state='readonly')
+        self.dec_prob_to_combo.pack(side='left', fill='x', expand=True)
 
-        outcomes_frame = ttk.LabelFrame(ctrl_panel, text="Show Outcomes", padding=5)
-        outcomes_frame.pack(fill='x', pady=(0, 5))
+        ttk.Label(settings, text="Show outcomes:").pack(
+            anchor='w', pady=(self.ui_px(6), 0))
         self._dec_prob_explore_cb = ttk.Checkbutton(
-            outcomes_frame, variable=self.dec_prob_show_explore)
+            settings, variable=self.dec_prob_show_explore)
         self._dec_prob_explore_cb.pack(anchor='w')
         self._dec_prob_retreat_cb = ttk.Checkbutton(
-            outcomes_frame, variable=self.dec_prob_show_retreat)
+            settings, variable=self.dec_prob_show_retreat)
         self._dec_prob_retreat_cb.pack(anchor='w')
         self.dec_prob_from_var.trace_add('write', lambda *a: self._update_dec_prob_outcome_labels())
         self.dec_prob_to_var.trace_add('write', lambda *a: self._update_dec_prob_outcome_labels())
         self._update_dec_prob_outcome_labels()
 
-        # ── Apply exclusions ──────────────────────────────────────────────────
-        excl_frame = ttk.Frame(ctrl_panel)
-        excl_frame.pack(fill='x', pady=(0, 3))
-        ttk.Checkbutton(excl_frame, text="Apply exclusions",
-                        variable=self.use_exclusions_dec_prob).pack(anchor='w')
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_dec_prob).pack(
+            anchor='w', pady=(self.ui_px(6), 0))
 
-        # ── Action buttons ────────────────────────────────────────────────────
-        btn_frame = ttk.Frame(ctrl_panel)
-        btn_frame.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame, text="Settings", style='Compact.TButton',
-                   command=self.open_dec_prob_settings).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_frame, text="Run Analysis", style='Compact.TButton',
-                   command=self.run_decision_probability).pack(side='left', padx=3)
-        ttk.Button(btn_frame, text="Export", style='Compact.TButton',
-                   command=self.export_decision_probability).pack(side='left', padx=3)
+        ttk.Button(settings, text="⚙  Binning & Statistics Settings…",
+                   command=self.open_dec_prob_settings).pack(
+            fill='x', pady=(self.ui_px(8), 0))
+
+        # ── Actions ──────────────────────────────────────────────────────────
+        ttk.Button(actions, text="Run Analysis",
+                   command=self.run_decision_probability).pack(fill='x')
+        ttk.Button(actions, text="Export",
+                   command=self.export_decision_probability).pack(
+            fill='x', pady=(self.ui_px(4), 0))
 
         # ── Placeholder ───────────────────────────────────────────────────────
         self._dec_prob_show_placeholder()
@@ -39330,13 +39360,16 @@ cat("OK\n")
     def _dec_prob_toggle_mode(self):
         """Switch the selector panel between Subject and Group mode."""
         mode = self.dec_prob_by_var.get()
+        # The two selectors share one slot in the Selection zone, so exactly one
+        # is packed at a time and the other leaves no gap behind.
         if mode == "Group":
             self._dec_prob_subj_container.pack_forget()
-            self._dec_prob_grp_container.pack(fill='x', pady=(0, 5))
+            self._dec_prob_grp_container.pack(fill='both', expand=True)
             self.update_dec_prob_groups()
+            self.refresh_facet_controls()
         else:
             self._dec_prob_grp_container.pack_forget()
-            self._dec_prob_subj_container.pack(fill='x', pady=(0, 5))
+            self._dec_prob_subj_container.pack(fill='both', expand=True)
 
     def _dec_prob_show_placeholder(self):
         """Clear the plot area and show instructional placeholder text."""
@@ -41165,29 +41198,6 @@ cat("OK\n")
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Kinematics")
 
-        outer = ttk.Frame(tab)
-        outer.pack(fill='both', expand=True, padx=5, pady=5)
-
-        # Size the control column to its content (with a sensible minimum) so
-        # nothing is clipped — a hard-fixed pixel width overflowed at higher
-        # Windows DPI scaling, cutting off button labels.
-        ctrl_outer = ttk.Frame(outer, width=CONTROL_PANEL_W)
-        ctrl_outer.pack(side='left', fill='y', padx=(0, 5))
-        ctrl_outer.pack_propagate(True)
-        # The control stack is taller than a 768p viewport, which put the
-        # analysis buttons at its foot out of reach; scroll it instead.
-        ctrl_panel = self.make_scrollable(ctrl_outer, fit_width=True)
-
-        # BETA badge — this tab is new/experimental. Kept modest: at 26 pt it
-        # cost ~50 px of a control column that already overflows short screens.
-        beta_badge = tk.Label(ctrl_panel, text="BETA",
-                              font=('Segoe UI', 13, 'bold'),
-                              fg='white', bg='#e67e22', padx=8, pady=1)
-        beta_badge.pack(fill='x', pady=(0, 4))
-
-        self.kin_plot_frame = ttk.Frame(outer)
-        self.kin_plot_frame.pack(side='left', fill='both', expand=True)
-
         # ── Variables ──────────────────────────────────────────────────────
         self.kin_by_var        = tk.StringVar(value="Subject")
         self.kin_channel_var   = tk.StringVar(value="G0")
@@ -41223,107 +41233,160 @@ cat("OK\n")
                 'zmax':       '',           # 3-D map manual z max
             }
 
-        # ── Selection mode ─────────────────────────────────────────────────
-        mode_frame = ttk.LabelFrame(ctrl_panel, text="Selection Mode", padding=5)
-        mode_frame.pack(fill='x', pady=(0, 5))
-        ttk.Radiobutton(mode_frame, text="Subject", variable=self.kin_by_var,
-                        value="Subject", command=self._kin_toggle_mode).pack(side='left')
-        ttk.Radiobutton(mode_frame, text="Group", variable=self.kin_by_var,
-                        value="Group", command=self._kin_toggle_mode).pack(side='left', padx=(10, 0))
+        selection, settings, output, actions = self.make_layout_zones(
+            tab, selection_title="Subjects & Groups",
+            settings_title="Analysis Settings")
 
-        # ── Subject selector ───────────────────────────────────────────────
-        self._kin_subj_container = ttk.LabelFrame(ctrl_panel, text="Subjects", padding=5)
+        # ── Selection ──────────────────────────────────────────────────────
+        # BETA badge — this tab is new/experimental. Kept modest: at 26 pt it
+        # cost ~50 px of a control column that already overflows short screens.
+        tk.Label(selection, text="BETA", font=('Segoe UI', 13, 'bold'),
+                 fg='white', bg='#e67e22', padx=8, pady=1).pack(
+            fill='x', pady=(0, self.ui_px(4)))
+
+        mode_frame = ttk.Frame(selection)
+        mode_frame.pack(fill='x')
+        ttk.Label(mode_frame, text="Analyze by:").pack(side='left')
+        ttk.Radiobutton(mode_frame, text="Subject", variable=self.kin_by_var,
+                        value="Subject", command=self._kin_toggle_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Radiobutton(mode_frame, text="Group", variable=self.kin_by_var,
+                        value="Group", command=self._kin_toggle_mode).pack(
+            side='left', padx=(self.ui_px(6), 0))
+
+        # The two selectors share one slot, so exactly one is packed at a time
+        # and the hidden one leaves no gap behind.
+        selector = ttk.Frame(selection)
+        selector.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+
+        self._kin_subj_container = ttk.Frame(selector)
+        ttk.Label(self._kin_subj_container, text="Subject(s):").pack(anchor='w')
         subj_inner = ttk.Frame(self._kin_subj_container)
-        subj_inner.pack(fill='both')
+        subj_inner.pack(fill='both', expand=True)
         self.kin_subject_listbox = tk.Listbox(
-            subj_inner, selectmode='extended', height=8, exportselection=False)
+            subj_inner, selectmode='extended', height=6, exportselection=False)
         _ks = ttk.Scrollbar(subj_inner, orient='vertical',
                             command=self.kin_subject_listbox.yview)
         self.kin_subject_listbox.pack(side='left', fill='both', expand=True)
         _ks.pack(side='right', fill='y')
         self.kin_subject_listbox.config(yscrollcommand=_ks.set)
 
-        # ── Group selector ─────────────────────────────────────────────────
-        self._kin_grp_container = ttk.LabelFrame(ctrl_panel, text="Groups", padding=5)
+        self._kin_grp_container = ttk.Frame(selector)
+        ttk.Label(self._kin_grp_container, text="Group(s):").pack(anchor='w')
         grp_inner = ttk.Frame(self._kin_grp_container)
-        grp_inner.pack(fill='both')
+        grp_inner.pack(fill='both', expand=True)
         self.kin_group_listbox = tk.Listbox(
-            grp_inner, selectmode='extended', height=8, exportselection=False)
+            grp_inner, selectmode='extended', height=4, exportselection=False)
         _kg = ttk.Scrollbar(grp_inner, orient='vertical',
                             command=self.kin_group_listbox.yview)
         self.kin_group_listbox.pack(side='left', fill='both', expand=True)
         _kg.pack(side='right', fill='y')
         self.kin_group_listbox.config(yscrollcommand=_kg.set)
         self._make_facet_controls(self._kin_grp_container, 'kinematics').pack(
-            fill='x', pady=(4, 0))
+            fill='x', pady=(self.ui_px(6), 0))
 
         self._kin_toggle_mode()
 
-        # ── Channel + analysis ─────────────────────────────────────────────
-        sel_frame = ttk.LabelFrame(ctrl_panel, text="Signal & Analysis", padding=5)
-        sel_frame.pack(fill='x', pady=(0, 5))
-        ttk.Label(sel_frame, text="Channel:").grid(row=0, column=0, sticky='w', padx=3, pady=2)
+        # ── Settings ───────────────────────────────────────────────────────
+        # Each cluster is a container gridded once and then shown or hidden
+        # whole, so a hidden one leaves no reserved gap.
+        settings.grid_columnconfigure(0, weight=1)
+        clusters = {}
+        row = [0]
+
+        def cluster(name):
+            frame = ttk.Frame(settings)
+            frame.grid(row=row[0], column=0, sticky='ew', pady=(0, self.ui_px(4)))
+            frame.grid_columnconfigure(1, weight=1)
+            row[0] += 1
+            clusters[name] = frame
+            return frame
+
+        def entry_row(parent, label, var, r):
+            ttk.Label(parent, text=label).grid(row=r, column=0, sticky='w', pady=self.ui_px(2))
+            ttk.Entry(parent, textvariable=var, width=8).grid(
+                row=r, column=1, sticky='e', pady=self.ui_px(2))
+
+        signal = cluster('signal')
+        ttk.Label(signal, text="Channel:").grid(row=0, column=0, sticky='w',
+                                                pady=self.ui_px(2))
         self.kin_channel_combo = ttk.Combobox(
-            sel_frame, textvariable=self.kin_channel_var,
+            signal, textvariable=self.kin_channel_var,
             values=["G0", "G1"], state='readonly', width=8)
-        self.kin_channel_combo.grid(row=0, column=1, sticky='w', padx=3, pady=2)
-        ttk.Label(sel_frame, text="Analysis:").grid(row=1, column=0, sticky='w', padx=3, pady=2)
-        ttk.Combobox(sel_frame, textvariable=self.kin_analysis_var,
-                     values=self.KIN_ANALYSES, state='readonly', width=30).grid(
-            row=1, column=1, sticky='w', padx=3, pady=2)
-        ttk.Label(sel_frame, text="Zone-plot kinematic:").grid(row=2, column=0, sticky='w', padx=3, pady=2)
-        ttk.Combobox(sel_frame, textvariable=self.kin_zone_kinematic_var,
-                     values=["Velocity", "Acceleration"], state='readonly', width=12).grid(
-            row=2, column=1, sticky='w', padx=3, pady=2)
+        self.kin_channel_combo.grid(row=0, column=1, sticky='e', pady=self.ui_px(2))
+        ttk.Label(signal, text="Analysis:").grid(row=1, column=0, columnspan=2,
+                                                 sticky='w', pady=(self.ui_px(4), 0))
+        ttk.Combobox(signal, textvariable=self.kin_analysis_var,
+                     values=self.KIN_ANALYSES, state='readonly').grid(
+            row=2, column=0, columnspan=2, sticky='ew')
 
-        # ── Parameters ─────────────────────────────────────────────────────
-        param_frame = ttk.LabelFrame(ctrl_panel, text="Parameters", padding=5)
-        param_frame.pack(fill='x', pady=(0, 5))
+        zone = cluster('zone_kinematic')
+        ttk.Label(zone, text="Zone-plot kinematic:").grid(row=0, column=0, sticky='w')
+        ttk.Combobox(zone, textvariable=self.kin_zone_kinematic_var,
+                     values=["Velocity", "Acceleration"], state='readonly',
+                     width=12).grid(row=0, column=1, sticky='e')
 
-        def _prow(label, var, r, width=8):
-            ttk.Label(param_frame, text=label).grid(row=r, column=0, sticky='w', padx=3, pady=2)
-            ttk.Entry(param_frame, textvariable=var, width=width).grid(
-                row=r, column=1, sticky='w', padx=3, pady=2)
+        # Temporal bin, smoothing and max lag stay visible for every analysis:
+        # Summarize reads all three whatever is selected, so scoping them to the
+        # cross-correlation plots would hide settings that still take effect.
+        timing = cluster('timing')
+        entry_row(timing, "Temporal bin (s):", self.kin_tbin_var, 0)
+        entry_row(timing, "Smoothing window (frames):", self.kin_smooth_win_var, 1)
+        entry_row(timing, "Smoothing poly order:", self.kin_smooth_poly_var, 2)
+        entry_row(timing, "Max lag (s):", self.kin_maxlag_var, 3)
 
-        _prow("Temporal bin (s):", self.kin_tbin_var, 0)
-        _prow("Smoothing window (frames):", self.kin_smooth_win_var, 1)
-        _prow("Smoothing poly order:", self.kin_smooth_poly_var, 2)
-        _prow("# bins:", self.kin_nbins_var, 3)
-        _prow("Max lag (s):", self.kin_maxlag_var, 4)
-        _prow("Spatial bin (cm):", self.kin_spatial_bin_var, 5)
-        _prow("Movement threshold (cm/s):", self.kin_move_thresh_var, 6)
-        ttk.Checkbutton(param_frame, text="Bin by velocity z-score",
+        nbins = cluster('nbins')
+        entry_row(nbins, "# bins:", self.kin_nbins_var, 0)
+
+        velz = cluster('vel_zscore')
+        ttk.Checkbutton(velz, text="Bin by velocity z-score",
                         variable=self.kin_vel_zscore_var).grid(
-            row=7, column=0, columnspan=2, sticky='w', padx=3, pady=2)
-        ttk.Label(param_frame,
-                  text="Temporal bin averages frames before correlating, so each\n"
-                       "bin (not each frame) is one datapoint — avoids inflated n /\n"
-                       "spurious significance. Set 0 to disable. (Movement-onset\n"
-                       "stays at frame resolution.)",
-                  foreground='gray', font=('TkDefaultFont', 7), justify='left').grid(
-            row=8, column=0, columnspan=2, sticky='w', padx=3, pady=(2, 0))
+            row=0, column=0, columnspan=2, sticky='w')
+
+        spatial = cluster('spatial_bin')
+        entry_row(spatial, "Spatial bin (cm):", self.kin_spatial_bin_var, 0)
+
+        onset = cluster('move_thresh')
+        entry_row(onset, "Movement threshold (cm/s):", self.kin_move_thresh_var, 0)
+
+        note = cluster('note')
+        ttk.Label(note,
+                  text="Temporal bin averages frames before correlating, so each "
+                       "bin (not each frame) is one datapoint — avoids inflated n "
+                       "/ spurious significance. Set 0 to disable. "
+                       "(Movement-onset stays at frame resolution.)",
+                  foreground='gray', font=('TkDefaultFont', 7), justify='left',
+                  wraplength=self.ui_px(260)).grid(row=0, column=0, columnspan=2,
+                                                   sticky='w')
+
+        extras = cluster('extras')
+        ttk.Button(extras, text="⚙  Graph Settings…",
+                   command=self.open_kin_graph_settings).grid(
+            row=0, column=0, columnspan=2, sticky='ew')
+        ttk.Button(extras, text="ⓘ  Explain this plot",
+                   command=self.show_kin_explainer).grid(
+            row=1, column=0, columnspan=2, sticky='ew', pady=(self.ui_px(4), 0))
+
+        self.register_option_clusters(
+            'kinematics', self.kin_analysis_var, clusters, KIN_OPTIONS_BY_PLOT,
+            always=('signal', 'timing', 'note', 'extras'))
 
         # ── Actions ────────────────────────────────────────────────────────
-        btn_frame = ttk.Frame(ctrl_panel)
-        btn_frame.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame, text="Run", style='Compact.TButton',
-                   command=self.run_kinematics).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_frame, text="Summarize", style='Compact.TButton',
-                   command=self.summarize_kinematics).pack(side='left', padx=3)
-        ttk.Button(btn_frame, text="Export", style='Compact.TButton',
-                   command=self.export_kinematics).pack(side='left', padx=3)
+        ttk.Button(actions, text="Run", command=self.run_kinematics).pack(fill='x')
+        ttk.Button(actions, text="Summarize",
+                   command=self.summarize_kinematics).pack(
+            fill='x', pady=(self.ui_px(4), 0))
+        ttk.Button(actions, text="Export",
+                   command=self.export_kinematics).pack(
+            fill='x', pady=(self.ui_px(4), 0))
 
-        btn_frame2 = ttk.Frame(ctrl_panel)
-        btn_frame2.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame2, text="Graph Settings…", style='Compact.TButton',
-                   command=self.open_kin_graph_settings).pack(side='left', padx=(0, 3))
-        ttk.Button(btn_frame2, text="ⓘ Explain plot", style='Compact.TButton',
-                   command=self.show_kin_explainer).pack(side='left', padx=3)
-
-        # ── Results readout ────────────────────────────────────────────────
-        self.kin_results_label = ttk.Label(ctrl_panel, text="", wraplength=270,
-                                            foreground='gray', justify='left')
-        self.kin_results_label.pack(fill='x', pady=(2, 0))
+        # ── Output ─────────────────────────────────────────────────────────
+        self.kin_results_label = ttk.Label(output, text="", foreground='gray',
+                                           justify='left',
+                                           wraplength=self.ui_px(700))
+        self.kin_results_label.pack(fill='x', pady=(0, self.ui_px(4)))
+        self.kin_plot_frame = ttk.Frame(output)
+        self.kin_plot_frame.pack(fill='both', expand=True)
 
         self.update_kin_subjects()
         self._kin_show_placeholder()
@@ -41332,13 +41395,16 @@ cat("OK\n")
 
     def _kin_toggle_mode(self):
         """Switch the selector panel between Subject and Group mode."""
+        # The two selectors share one slot in the Selection zone, so exactly one
+        # is packed at a time and the other leaves no gap behind.
         if self.kin_by_var.get() == "Group":
             self._kin_subj_container.pack_forget()
-            self._kin_grp_container.pack(fill='x', pady=(0, 5))
+            self._kin_grp_container.pack(fill='both', expand=True)
             self.update_kin_groups()
+            self.refresh_facet_controls()
         else:
             self._kin_grp_container.pack_forget()
-            self._kin_subj_container.pack(fill='x', pady=(0, 5))
+            self._kin_subj_container.pack(fill='both', expand=True)
 
     def update_kin_subjects(self):
         """Refresh the Kinematics subject listbox (position-data subjects only)."""

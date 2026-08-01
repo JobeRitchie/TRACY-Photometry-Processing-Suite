@@ -389,3 +389,29 @@ def test_facet_series_order_builds_the_cross_product_in_order():
 
 def test_nothing_split_is_a_single_series():
     assert _M.facet_series_order([], {}) == ['All']
+
+
+# --------------------------------------------------------------------------
+# Contextual option disclosure
+# --------------------------------------------------------------------------
+# An analysis missing from the table falls back to showing every cluster, which
+# is the right default for an unknown plot type but wrong for a listed one --
+# it would quietly undo the disclosure. A typo in one of the en-dash or "x"
+# names is exactly how that happens, so pin the coverage.
+
+def test_every_kinematics_analysis_has_a_disclosure_entry():
+    missing = [a for a in _G.KIN_ANALYSES if a not in _M.KIN_OPTIONS_BY_PLOT]
+    assert missing == []
+
+
+def test_kinematics_disclosure_names_only_real_clusters():
+    known = {'zone_kinematic', 'nbins', 'vel_zscore', 'spatial_bin', 'move_thresh'}
+    for analysis, wanted in _M.KIN_OPTIONS_BY_PLOT.items():
+        assert set(wanted) <= known, analysis
+
+
+def test_kinematics_always_shown_settings_stay_out_of_the_table():
+    # Temporal bin, smoothing and max lag are read by Summarize whatever
+    # analysis is selected, so they are always visible rather than scoped.
+    for wanted in _M.KIN_OPTIONS_BY_PLOT.values():
+        assert 'timing' not in wanted
