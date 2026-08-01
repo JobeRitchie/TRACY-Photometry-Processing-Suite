@@ -1053,7 +1053,10 @@ class FPAnalysisGUI:
             'postboutframes': 90,  # 3 seconds at 30fps
             'maxlengthframe': 20000000,
             'precut': 100,
-            'fps': 30,
+            # NOTE: there is deliberately no 'fps' parameter.  The sampling rate is
+            # a property of the recording, measured from the timestamps during
+            # processing and stored per subject as 'photometry_fps'; read it via
+            # get_fps() rather than reintroducing a hand-set global.
             'boutframes_video_fps': 30,  # Frame rate of source video used to create boutframes
             'auto_scale_boutframes': False,  # Auto-scale boutframe numbers to photometry FPS
             'precut_correct_boutframes': True,  # Subtract precut/n_led_states offset from boutframes to align with post-precut FP data
@@ -1085,6 +1088,12 @@ class FPAnalysisGUI:
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
             'baseline_frames': 45,  # Number of prebout frames to use for baseline (default: half of preboutframes)
+            # How much of a decay must be visible before Tau/t½ report a value.
+            # 'strict'     — a full time constant (1-1/e) must be observed; fewest
+            #                values, least extrapolation.
+            # 'balanced'   — at least a half-decay must be observed (default).
+            # 'permissive' — accepts partial decays; most values, most biased.
+            'decay_strictness': 'balanced',
             # Signal smoothing (applied as final processing step).
             # 'processing_rolling_avg_enabled' is the master on/off switch (kept
             # under its original key for backward compatibility with old projects).
@@ -1154,6 +1163,7 @@ class FPAnalysisGUI:
         
         # Detected photometry frame rate (populated automatically during processing)
         self.detected_photometry_fps = None
+        self._mixed_fps_warned = False  # log the mixed-rate warning only once per session
         self.auto_scale_boutframes_var = tk.BooleanVar(value=False)
         self.precut_correct_boutframes_var = tk.BooleanVar(value=True)
         self.boutframes_video_fps_var = tk.StringVar(value='30')
@@ -4448,7 +4458,7 @@ class FPAnalysisGUI:
             return
 
         use_excl = self.use_exclusions_conn.get()
-        fs = float(self.params.get('fps', 30))
+        fs = self.get_fps()
         fmin = self.conn_params['static_fmin']
         fmax = self.conn_params['static_fmax']
         nperseg_sec = self.conn_params['static_nperseg_sec']
@@ -4555,7 +4565,7 @@ class FPAnalysisGUI:
             messagebox.showwarning("Invalid Channels", "Please select two different channels.")
             return
 
-        fs = float(self.params.get('fps', 30))
+        fs = self.get_fps()
         fmin = self.conn_params['static_fmin']
         fmax = self.conn_params['static_fmax']
         nperseg_sec = self.conn_params['static_nperseg_sec']
@@ -4997,7 +5007,7 @@ class FPAnalysisGUI:
         boutframes_file = self.boutframes_path_var.get()
         _use_file_fallback = bool(boutframes_file and os.path.exists(boutframes_file))
         use_excl = self.use_exclusions_conn.get()
-        fs = float(self.params.get('fps', 30))
+        fs = self.get_fps()
         pre_samples  = int(pre_sec * fs)
         post_samples = int(post_sec * fs)
         coh_nperseg_sec = min(
@@ -5651,7 +5661,7 @@ class FPAnalysisGUI:
         post_sec = r0_g.get('post_sec', 10.0)
         method   = r0_g.get('method', 'Morlet Wavelet')
 
-        fs          = self.params.get('fps', 30)
+        fs          = self.get_fps()
         pre_samples = int(pre_sec  * fs)
         post_samples= int(post_sec * fs)
         epoch_len   = pre_samples + post_samples
@@ -6305,7 +6315,7 @@ class FPAnalysisGUI:
             messagebox.showwarning("Invalid", "Please select different channels.")
             return
 
-        fs           = self.params.get('fps', 30)
+        fs           = self.get_fps()
         pre_samples  = int(pre_sec  * fs)
         post_samples = int(post_sec * fs)
         # nperseg for short epochs: no longer than 1/3 of the shorter window
@@ -6824,7 +6834,7 @@ class FPAnalysisGUI:
             ch1       = r['ch1']
             ch2       = r['ch2']
 
-            fs           = self.params.get('fps', 30)
+            fs           = self.get_fps()
             pre_samples  = int(pre_sec  * fs)
             post_samples = int(post_sec * fs)
             epoch_len    = pre_samples + post_samples
@@ -7100,7 +7110,7 @@ class FPAnalysisGUI:
             return
 
         # ── Welch parameters (from conn_params) ────────────────────────
-        fs = float(self.params.get('fps', 30))
+        fs = self.get_fps()
         nperseg_sec = float(self.conn_params.get('static_nperseg_sec', 20.0))
         nperseg_samples = int(nperseg_sec * fs)
         nfft = int(2 ** np.ceil(np.log2(nperseg_samples)))
@@ -7628,7 +7638,7 @@ class FPAnalysisGUI:
                     if not isinstance(beh_frames, (list, np.ndarray)):
                         continue
                     try:
-                        fps = self.params.get('fps', 30)
+                        fps = self.get_fps()
                         onset_times = np.asarray(beh_frames).flatten() / fps
                         for t_on in onset_times:
                             if times[0] <= t_on <= times[-1]:
@@ -8468,7 +8478,7 @@ class FPAnalysisGUI:
                                        "All selected subjects are excluded for the selected channels")
                 return
 
-        fps = self.params['fps']
+        fps = self.get_fps()
         mad_mode = self.spike_mad_mode_var.get()
 
         # Calculate whole-dataset MAD per channel if requested
@@ -8657,7 +8667,7 @@ class FPAnalysisGUI:
                 for member in members:
                     subject_to_group[member] = group_name
             
-            fps = self.params['fps']
+            fps = self.get_fps()
             
             # Create workbook
             wb = Workbook()
@@ -8752,7 +8762,7 @@ class FPAnalysisGUI:
                 for member in members:
                     subject_to_group[member] = group_name
             
-            fps = self.params['fps']
+            fps = self.get_fps()
 
             # Restrict to the current subject/group selection.
             sel_results = self._spike_results_for_selection()
@@ -8903,7 +8913,7 @@ class FPAnalysisGUI:
                 for member in members:
                     subject_to_group[member] = group_name
             
-            fps = self.params['fps']
+            fps = self.get_fps()
 
             # Restrict to the current subject/group selection.
             sel_results = self._spike_results_for_selection()
@@ -9370,7 +9380,7 @@ class FPAnalysisGUI:
             messagebox.showerror("Error", "Pre/Post window must be a positive number of seconds.")
             return
 
-        fps = self.params['fps']
+        fps = self.get_fps()
         active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
         apply_excl = self.use_exclusions_spike.get()
         group_mode = self.spike_mode_var.get() == "Group"
@@ -12104,7 +12114,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             try:
                                 entry_bout_data = self.extract_entry_bouts(
                                     subject_data['beh_synced'], subject_data['entry_frames'],
-                                    num_photometry_channels=self._beh_channel_count(subject_data))
+                                    num_photometry_channels=self._beh_channel_count(subject_data),
+                                    fps=subject_data.get('photometry_fps'))
                                 subject_data['entry_bouts'] = entry_bout_data
                                 self.log_message(f"    Regenerated entry bouts from entry_frames")
                             except Exception as e:
@@ -12127,7 +12138,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         zones.append('unknown')
                                 outback_data = self.calculate_outback_movements(
                                     beh_synced, zones,
-                                    n_channels=self._beh_channel_count(subject_data))
+                                    n_channels=self._beh_channel_count(subject_data),
+                                    fps=subject_data.get('photometry_fps'))
                                 if outback_data:
                                     subject_data['outback'] = outback_data
                                     self.log_message(f"    Regenerated Out/Back stats from behavior data")
@@ -12673,7 +12685,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 for key, var in entries.items():
                     value_str = var.get().strip()
                     # Check if this is a string parameter (file naming patterns, maze type)
-                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method', 'boutframe_processing_style', 'processing_smoothing_method', 'ttl_format']:
+                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method', 'boutframe_processing_style', 'processing_smoothing_method', 'ttl_format', 'decay_strictness']:
                         self.params[key] = value_str
                     # Check if this is a boolean parameter
                     elif key in ['baseline_correct_bouts', 'processing_rolling_avg_enabled', 'auto_scale_boutframes', 'precut_correct_boutframes', 'bout_exclude_enabled']:
@@ -12835,8 +12847,48 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 val = 0
             self.params[pkey] = max(0, val)
 
+    # ======================== Sampling Rate ========================
+
+    FPS_FALLBACK = 30.0  # only used before anything has been processed
+
+    def get_fps(self, subject=None):
+        """Sampling rate in Hz (samples per second per LED state).
+
+        The rate is measured from the recording's own timestamps during
+        processing (see process_fp_data) and stored per subject as
+        'photometry_fps'.  It is never a user setting — a hand-set global was
+        the historical source of silently analysing 20 Hz data at 30 Hz.
+
+        Pass *subject* whenever the caller is working on one subject — either its
+        subject ID or its processed_data entry, whichever the caller already has.
+        Group and dataset-level callers omit it and get the rate shared by the
+        processed subjects, or the most common rate if they disagree; a
+        disagreement is logged once, because frame-denominated windows (bout
+        windows, spike widths) do not mean the same duration across rates.
+        """
+        data = subject if isinstance(subject, dict) else self.processed_data.get(subject)
+        if isinstance(data, dict) and data.get('photometry_fps'):
+            return float(data['photometry_fps'])
+
+        rates = [round(float(d['photometry_fps']), 3)
+                 for d in self.processed_data.values()
+                 if isinstance(d, dict) and d.get('photometry_fps')]
+        if rates:
+            from collections import Counter
+            counts = Counter(rates)
+            if len(counts) > 1 and not self._mixed_fps_warned:
+                self._mixed_fps_warned = True
+                self.log_message(
+                    "  Warning: subjects were recorded at different sampling rates "
+                    f"({', '.join(f'{r:g} Hz x{n}' for r, n in sorted(counts.items()))}). "
+                    f"Group analyses use {counts.most_common(1)[0][0]:g} Hz; frame-denominated "
+                    "windows span different durations for the other subjects.")
+            return float(counts.most_common(1)[0][0])
+
+        return float(getattr(self, 'detected_photometry_fps', None) or self.FPS_FALLBACK)
+
     # ======================== Spike Detection ========================
-    
+
     def detect_spikes(self, signal, fps=30, global_mad=None):
         """Detect spikes in photometry signal using MAD-based threshold
         
@@ -12975,7 +13027,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return None
 
         data = self.processed_data[subject_id]
-        fps  = self.params['fps']
+        fps  = self.get_fps(subject_id)
 
         # Build a unified global MAD lookup (new API wins over legacy args)
         if global_mads is None:
@@ -13030,7 +13082,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if 'beh_synced' not in data or not data.get('has_position', False):
             return None
         
-        fps = self.params['fps']
+        fps = self.get_fps(subject_id)
         beh_synced = data['beh_synced']
         
         # Classify all frames into zones
@@ -14318,12 +14370,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if has_position:
                 self.log_message(f"  Processing position data (calibration, velocity, distance)...")
                 beh_synced = self.process_position_data(
-                    beh_synced, n_channels=result.get('num_photometry_channels'))
+                    beh_synced, n_channels=result.get('num_photometry_channels'),
+                    fps=result.get('photometry_fps'))
                 result['beh_synced'] = beh_synced
                 
                 # Detect zone entries and add entry flags
                 self.log_message(f"  Detecting zone entries...")
-                beh_synced, entry_frames = self.detect_zone_entries(beh_synced)
+                beh_synced, entry_frames = self.detect_zone_entries(
+                    beh_synced, fps=result.get('photometry_fps'))
                 result['beh_synced'] = beh_synced
                 result['entry_frames'] = entry_frames
                 
@@ -14353,7 +14407,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Calculate Out/Back movements in open arms
                 self.log_message(f"  Calculating Out/Back movements in open arms...")
                 outback_data = self.calculate_outback_movements(
-                    beh_synced, zones, n_channels=result.get('num_photometry_channels'))
+                    beh_synced, zones, n_channels=result.get('num_photometry_channels'),
+                    fps=result.get('photometry_fps'))
                 result['outback'] = outback_data
                 if outback_data:
                     if 'out' in outback_data and outback_data['out']['G0_n'] > 0:
@@ -14370,7 +14425,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if has_position and 'entry_frames' in result:
                 self.log_message(f"  Extracting zone entry-aligned photometry traces...")
                 entry_bout_data = self.extract_entry_bouts(beh_synced, result['entry_frames'],
-                                                            num_photometry_channels=result.get('num_photometry_channels'))
+                                                            num_photometry_channels=result.get('num_photometry_channels'),
+                                                            fps=result.get('photometry_fps'))
                 result['entry_bouts'] = entry_bout_data
         else:
             # No external behavior data - create synthetic timeline from FP data
@@ -14608,7 +14664,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         order = max(1, int(self.params.get('processing_butter_order', 2)))
         fs = self._estimate_processing_fs(result)
         if fs is None or not np.isfinite(fs) or fs <= 0:
-            fs = float(self.params.get('fps', 30) or 30)
+            fs = self.get_fps()
         nyq = fs / 2.0
         if cutoff <= 0:
             self.log_message("  Warning: Butterworth cutoff must be > 0 Hz; "
@@ -15061,7 +15117,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return beh_synced
     
-    def process_position_data(self, beh_synced, n_channels=None):
+    def process_position_data(self, beh_synced, n_channels=None, fps=None):
         """Process position data (X, Y coordinates) if present
 
         Performs:
@@ -15160,7 +15216,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     f"position calibration skipped ({reason})")
 
         # 2. Calculate velocity
-        frame_rate = self.params['fps']
+        frame_rate = fps if fps is not None else self.get_fps()
         time_per_frame = 1.0 / frame_rate
         num_frames = len(beh_synced)
         velocity = np.zeros(num_frames)
@@ -15229,7 +15285,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return beh_synced
     
-    def detect_zone_entries(self, beh_synced):
+    def detect_zone_entries(self, beh_synced, fps=None):
         """Detect zone entries using simple transition detection
         
         This function identifies transitions into maze-relevant zone classes.
@@ -15243,7 +15299,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             Updated beh_synced array with additional columns for entry flags
             Dictionary with entry frame numbers for each zone type
         """
-        fps = self.params['fps']
+        fps = fps if fps is not None else self.get_fps()
         # Use OFT-specific thresholds for OFT and Custom Arena; EPM thresholds for EPM/EPM_Complex
         _maze_type_early = self.params.get('maze_type', 'EPM')
         if _maze_type_early in ('OFT', 'Custom Arena'):
@@ -15844,7 +15900,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         max_y_position = max_dist_metrics['max_y_position']
         zone_radius = 2.5  # 5cm zone
         
-        fps = self.params['fps']
+        fps = self.get_fps()
         min_duration_frames = int(0.5 * fps)  # 0.5 second minimum
         
         # Get Y distances and positions (distance-from-center-Y is the last kinematics column)
@@ -15890,7 +15946,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return entry_frames
     
-    def calculate_outback_movements(self, beh_synced, zones, n_channels=None):
+    def calculate_outback_movements(self, beh_synced, zones, n_channels=None, fps=None):
         """Calculate photometry averages for Out and Back movements in open arms
         
         Detects directional movement in open arms:
@@ -15935,7 +15991,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Calculate velocity in Y-direction (open arms are on Y-axis)
         # Positive velocity = moving up (positive Y), negative = moving down (negative Y)
         y_velocity = np.zeros(len(beh_synced))
-        fps = self.params['fps']
+        fps = fps if fps is not None else self.get_fps()
         
         for i in range(1, len(beh_synced)):
             if not (np.isnan(beh_synced[i, 3]) or np.isnan(beh_synced[i-1, 3])):
@@ -16120,7 +16176,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showerror("Error", "Invalid bin size. Please enter a number.")
                 return
             
-            fps = self.params['fps']
+            fps = self.get_fps()
             distal_threshold = self.params['distal_threshold']
             
             # Clear previous results
@@ -18252,7 +18308,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self._mixed_window_warn_sig = sig
             messagebox.showwarning("Mixed Bout Windows", msg)
 
-    def extract_entry_bouts(self, beh_synced, entry_frames_dict, num_photometry_channels=None):
+    def extract_entry_bouts(self, beh_synced, entry_frames_dict, num_photometry_channels=None, fps=None):
         """Extract photometry traces aligned to zone entries
         
         Similar to extract_bouts but triggered by zone entry events.
@@ -18273,7 +18329,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         postbout = self.params['postboutframes']
         baseline_correct = self.params['baseline_correct_bouts']
         baseline_frames = self.params['baseline_frames']
-        fps = self.params['fps']
+        fps = fps if fps is not None else self.get_fps()
         
         # Detect available photometry columns (columns 6+ contain per-channel z-scores).
         # Use stored channel count when available to avoid counting non-photometry columns.
@@ -20891,10 +20947,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         variable=self.metric_auc).grid(row=1, column=2, sticky='w', padx=5, pady=2)
         ttk.Checkbutton(mf, text="Half-Decay Time (t½)",
                         variable=self.metric_t_half).grid(row=2, column=0, sticky='w', padx=5, pady=2)
-        ttk.Label(mf, text="Tau/t½ report N/A when the window holds no measurable decay "
-                           "(set the window to bracket the transient)",
+        dec_row = ttk.Frame(mf)
+        dec_row.grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(4, 0))
+        ttk.Label(dec_row, text="Decay fit:").pack(side='left')
+        self.decay_strictness_var = tk.StringVar(
+            value=str(self.params.get('decay_strictness', 'balanced')).lower())
+        dec_cb = ttk.Combobox(dec_row, textvariable=self.decay_strictness_var, width=12,
+                              state='readonly',
+                              values=['strict', 'balanced', 'permissive'])
+        dec_cb.pack(side='left', padx=4)
+        dec_cb.bind('<<ComboboxSelected>>',
+                    lambda _e: self.params.__setitem__(
+                        'decay_strictness', self.decay_strictness_var.get()))
+        ttk.Label(mf, text="Tau/t½ report N/A when the window holds no measurable decay. "
+                           "Stricter = fewer but more trustworthy values; set the analysis "
+                           "window to bracket the transient.",
                   foreground='gray', font=('Segoe UI', 7)).grid(
-            row=3, column=0, columnspan=3, sticky='w', padx=5, pady=(2, 0))
+            row=4, column=0, columnspan=3, sticky='w', padx=5, pady=(2, 0))
         auc_row = ttk.Frame(mf)
         auc_row.grid(row=2, column=2, sticky='w', padx=20, pady=2)
         ttk.Radiobutton(auc_row, text="All",   variable=self.metric_auc_mode, value="both").pack(side='left', padx=2)
@@ -23045,7 +23114,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                           and self.integrity_sensor_mode_var.get())
 
         all_channel_metrics = []
-        fps = self.params.get('fps', 30)
+        fps = self.get_fps(data)
 
         # Process first available wavelength
         if has_470:
@@ -23144,7 +23213,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      ha='center', va='center', fontsize=14)
             return
 
-        fps = self.params.get('fps', 30)
+        fps = self.get_fps(data)
         sensor_mode = bool(getattr(self, 'integrity_sensor_mode_var', None)
                            and self.integrity_sensor_mode_var.get())
 
@@ -23719,7 +23788,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
         # Get parameters - but note that loaded bouts may have been extracted with different params
-        fps = self.params['fps']
+        fps = self.get_fps(data)
         current_prebout = self.params['preboutframes']
         current_postbout = self.params['postboutframes']
 
@@ -24215,7 +24284,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                     bout_data = data['bouts']
                     prebout = self.params.get('preboutframes', 0)
-                    fps = self.params.get('fps', 1.0)
+                    fps = self.get_fps()
 
                     # Get max bouts limit and averaging setting
                     max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
@@ -24505,7 +24574,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         continue
 
                     bout_type_data = data['entry_bouts'][entry_key]
-                    fps = self.params['fps']
+                    fps = self.get_fps()
                     prebout = self.params['preboutframes']
                     
                     # Get max bouts limit and averaging setting
@@ -24621,7 +24690,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Check which format the data is in
                 if "Extracted Bouts" in plot_type and all(isinstance(d, dict) and 'behavior' in d for d in all_data):
                     # Extracted bouts with behavior AND channel separation - export one CSV per behavior-channel combination
-                    fps = self.params['fps']
+                    fps = self.get_fps()
                     prebout = self.params['preboutframes']
                     
                     # Group bouts by behavior and channel
@@ -24680,7 +24749,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 elif "Zone Entry Bouts" in plot_type and all(isinstance(d, dict) for d in all_data):
                     # Wide format for zone entry bouts
                     # Combine all subject bouts into a single DataFrame
-                    fps = self.params['fps']
+                    fps = self.get_fps()
                     prebout = self.params['preboutframes']
                     
                     # Find the maximum bout length across all subjects
@@ -25220,7 +25289,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         bout_data = display_data
         entry_label = selected_entry_type
         
-        fps = self.params['fps']
+        fps = self.get_fps(data)
         prebout = self.params['preboutframes']
         
         show_g0 = self.show_g0.get()
@@ -25904,7 +25973,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         show_g1 = self.show_g1.get()
         average_within_subject = self.viz_average_within_subject.get()
         prebout = self.params.get('preboutframes', 90)
-        fps = self.params.get('fps', 30)
+        fps = self.get_fps()
         
         # Get max bouts limit
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
@@ -26072,7 +26141,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         show_g1 = self.show_g1.get()
         average_within_subject = self.viz_average_within_subject.get()
         prebout = self.params.get('preboutframes', 90)
-        fps = self.params.get('fps', 30)
+        fps = self.get_fps()
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
 
@@ -27287,7 +27356,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
         
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params['preboutframes']
         average_within_subject = self.viz_average_within_subject.get()
 
@@ -27656,7 +27725,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
         
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params['preboutframes']
         
         # Determine layout based on what data exists
@@ -27851,7 +27920,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
         
-        fps = self.params['fps']
+        fps = self.get_fps(data)
         current_prebout = self.params['preboutframes']
         current_postbout = self.params['postboutframes']
         
@@ -28034,7 +28103,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         ha='center', va='center', fontsize=14)
                 return
         
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params['preboutframes']
         
         # Determine layout
@@ -28237,7 +28306,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         ha='center', va='center', fontsize=14)
                 return
         
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params['preboutframes']
         
         # Create group-specific base colors
@@ -28388,7 +28457,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             messagebox.showerror("Error", "No channels detected.")
             return
 
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params['preboutframes']
         max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         apply_excl = self.use_exclusions_bout.get()
@@ -28575,7 +28644,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Calculate metrics for each bout number
         # Metrics: peak, average in window, AUC
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params['preboutframes']
 
         # Determine the series to draw: one per group in Group mode, otherwise
@@ -28901,14 +28970,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # max-statistic band). Structured so an optional R/fastFMM backend can be
     # slotted into _fit_timecourse later without UI change.
 
-    def _collect_flmm_traces(self, selected_subjects, behavior, channel, subject_to_group):
+    def _collect_flmm_traces(self, selected_subjects, behavior, channel, subject_to_group,
+                             max_bouts=_MAX_BOUTS_UNSET):
         """Gather per-bout peri-event traces + metadata for time-course modeling.
 
         Returns (Z, subjects, groups, orders, L) where Z is (n_bouts, L), or
         None if no usable data. Traces are truncated to the common minimum
         length L so the result is a rectangular matrix aligned at onset.
+
+        ``max_bouts`` defaults to reading the Tk entry; a worker thread must pass
+        the already-resolved limit instead (Tk vars are not thread-safe).
         """
-        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        if max_bouts is _MAX_BOUTS_UNSET:
+            max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         traces, subj_list, grp_list, order_list = [], [], [], []
         for subject in selected_subjects:
             if subject not in self.processed_data:
@@ -28949,15 +29023,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 np.array(order_list, dtype=float), L)
 
     def _collect_flmm_contrast(self, subjects, ref_behaviors, comp_behaviors,
-                               channel, ref_label, comp_label):
+                               channel, ref_label, comp_label,
+                               max_bouts=_MAX_BOUTS_UNSET):
         """Collect bouts for a behavior contrast: reference behavior(s) vs
         comparison behavior(s), tagging each bout with its condition label.
 
         Returns (Z, subjects, conditions, orders, L) where ``conditions`` holds
         ref_label / comp_label per bout — i.e. the 2-level factor whose baseline
         is the reference behavior. None if no usable data.
+
+        ``max_bouts`` defaults to reading the Tk entry; a worker thread must pass
+        the already-resolved limit instead (Tk vars are not thread-safe).
         """
-        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        if max_bouts is _MAX_BOUTS_UNSET:
+            max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         traces, subj_list, cond_list, order_list = [], [], [], []
         for subject in subjects:
             if subject not in self.processed_data:
@@ -29082,11 +29161,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return (Z, np.array(subj_list, dtype=object),
                 np.array(chan_list, dtype=object), L)
 
-    def _fit_timecourse(self, Z, subjects, groups, orders, reference, ref_level=None):
+    def _fit_timecourse(self, Z, subjects, groups, orders, reference, ref_level=None,
+                        progress=None, log=None):
         """FUI step 1: fit a random-intercept mixed model at every timepoint.
 
         ``ref_level`` (optional) names the baseline level of the 2-level factor
         for between-groups / contrast designs, so β(t) = (other level) − (ref).
+
+        ``progress(frac, detail)`` (optional) is called as the per-timepoint fits
+        advance; ``log`` (optional) replaces self.log_message so a worker thread
+        can route messages through the progress queue instead of touching Tk.
 
         Returns a dict with the coefficient-of-interest trace plus the pieces
         needed to build the GLS coefficient covariance:
@@ -29101,6 +29185,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         import warnings
         import statsmodels.api as sm
 
+        log = log or self.log_message
         n, L = Z.shape
         uniq_subj = {s: i for i, s in enumerate(sorted(set(subjects.tolist())))}
         subj_codes = np.array([uniq_subj[s] for s in subjects])
@@ -29136,6 +29221,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fallback_logged = False
 
         for t in range(L):
+            if progress is not None and (t % 8 == 0 or t == L - 1):
+                progress(t / max(1, L - 1), f"fitting timepoint {t + 1}/{L}")
             y = Z[:, t]
             mask = np.isfinite(y)
             if mask.sum() < p + 1:
@@ -29184,15 +29271,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     sig2[t] = float(np.sum(ols.resid ** 2) / dof)
                     if use_mixed and not fallback_logged:
                         fallback_logged = True
-                        self.log_message(
-                            "FLMM: mixed model did not converge at some timepoints "
+                        log("FLMM: mixed model did not converge at some timepoints "
                             "— used OLS fallback there.")
                 except Exception:
                     continue
             eta[mask, t] = yt - Xt @ fp   # marginal residuals for the cluster cov
 
         if not use_mixed and reference != 'zero':
-            self.log_message("FLMM: single subject — random effect dropped (OLS).")
+            log("FLMM: single subject — random effect dropped (OLS).")
         return {
             'beta': beta, 'se': se, 'n_subjects': n_subjects,
             'X': X, 'subj_codes': subj_codes, 'coef_idx': coef_idx,
@@ -29584,15 +29670,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._r_fastfmm_cache = ok
         return ok
 
-    def _flmm_r_engine(self, Z, subjects, groups, orders, reference, ref_level=None):
+    # Analyses that have no fastFMM implementation and always run in Python.
+    # The pairwise matrix derives every level-vs-level contrast from ONE joint
+    # Python fit's coefficient covariance, which fui() does not return.
+    _FLMM_PYTHON_ONLY_REFERENCES = {'pairwise'}
+
+    def _flmm_effective_engine(self, reference, engine, r_available=None):
+        """Resolve the engine that will *actually* run, given the chosen analysis.
+
+        Returns ``(engine, note)`` where ``note`` explains any override (None when
+        the request is honoured verbatim). Single source of truth for both the
+        confirmation dialog and the run itself, so the dialog can never promise an
+        engine the run won't use.
+        """
+        if r_available is None:
+            r_available = self._flmm_r_available()
+        if reference in self._FLMM_PYTHON_ONLY_REFERENCES:
+            if engine == 'r':
+                return 'python', ("The pairwise matrix has no fastFMM implementation — "
+                                  "every pair is derived from one joint Python fit's "
+                                  "coefficient covariance, which fui() does not return. "
+                                  "It will run on the Python FUI engine.")
+            return 'python', None
+        if engine == 'r' and not r_available:
+            return 'python', ("R / fastFMM was not detected, so the Python FUI engine "
+                              "will be used.")
+        return engine, None
+
+    def _flmm_r_engine(self, Z, subjects, groups, orders, reference, ref_level=None,
+                       log=None):
         """Run the real fastFMM::fui via Rscript. Returns (beta, se, qn) of the
         smoothed coefficient of interest, or None on any failure.
 
         ``ref_level`` (optional) re-levels the group factor so it is the
-        baseline, matching the Python engine's β(t) = (other) − (ref)."""
+        baseline, matching the Python engine's β(t) = (other) − (ref).
+        ``log`` (optional) receives failure messages; defaults to log_message but
+        a worker thread must pass a queue-backed callback (Tk is not
+        thread-safe)."""
         import tempfile
         import shutil
         import pandas as pd
+        log = log or self.log_message
         rs = self._flmm_find_rscript()
         if not rs:
             return None
@@ -29667,8 +29785,8 @@ cat("OK\n")
                 capture_output=True, text=True, timeout=600,
                 creationflags=self._flmm_subprocess_flags())
             if not os.path.exists(out_csv) or not os.path.exists(qn_csv):
-                self.log_message("FLMM (R): fastFMM run failed:\n"
-                                 + (res.stderr or res.stdout or '')[-500:])
+                log("FLMM (R): fastFMM run failed:\n"
+                    + (res.stderr or res.stdout or '')[-500:])
                 return None
             out = pd.read_csv(out_csv)
             qn = float(pd.read_csv(qn_csv)['qn'].iloc[0])
@@ -29678,18 +29796,22 @@ cat("OK\n")
                 return None
             return beta, se, qn
         except Exception as e:
-            self.log_message(f"FLMM (R): backend error — {e}")
+            log(f"FLMM (R): backend error — {e}")
             return None
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _flmm_r_factor_engine(self, Z, subjects, factor, ref_level):
+    def _flmm_r_factor_engine(self, Z, subjects, factor, ref_level, log=None):
         """Run the real fastFMM::fui for the multi-level factor model
         Y ~ fac + (1|id) with ref_level as baseline. Returns
-        (coef_labels, betas KxL, ses KxL, qns) or None."""
+        (coef_labels, betas KxL, ses KxL, qns) or None.
+
+        ``log`` (optional) receives failure messages; a worker thread must pass a
+        queue-backed callback instead of the default Tk logger."""
         import tempfile
         import shutil
         import pandas as pd
+        log = log or self.log_message
         rs = self._flmm_find_rscript()
         if not rs:
             return None
@@ -29737,8 +29859,8 @@ cat("OK\n")
                 capture_output=True, text=True, timeout=900,
                 creationflags=self._flmm_subprocess_flags())
             if not os.path.exists(out_csv):
-                self.log_message("FLMM (R factor): run failed:\n"
-                                 + (res.stderr or res.stdout or '')[-500:])
+                log("FLMM (R factor): run failed:\n"
+                    + (res.stderr or res.stdout or '')[-500:])
                 return None
             out = pd.read_csv(out_csv)
             ncoef = sum(1 for c in out.columns if c.startswith('beta_'))
@@ -29753,7 +29875,7 @@ cat("OK\n")
                 labels[0] = '(Intercept)'
             return labels, np.array(betas), np.array(ses), qns
         except Exception as e:
-            self.log_message(f"FLMM (R factor): backend error — {e}")
+            log(f"FLMM (R factor): backend error — {e}")
             return None
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -29761,14 +29883,19 @@ cat("OK\n")
     ALL_OTHER_BEHAVIORS = "‹all other behaviors›"
 
     def _flmm_reference_dialog(self, can_acrossbouts, can_groups, r_available,
-                               behaviors=None, default_behavior=None):
-        """Modal picker for the reference point + engine. Returns dict or None.
+                               behaviors=None, default_behavior=None,
+                               channels=None, default_channels=None):
+        """Modal picker for the reference point + channels + engine. Returns dict
+        or None.
 
         ``behaviors`` (optional list) enables the Behavior-contrast option, which
         compares one behavior (the baseline / 0-point) against another behavior
-        (or all other behaviors pooled).
+        (or all other behaviors pooled).  ``channels`` populates the multi-select
+        channel list — the analysis is repeated for each ticked channel.
         """
         behaviors = behaviors or []
+        channels = list(channels or [])
+        default_channels = set(default_channels or ([channels[0]] if channels else []))
         can_contrast = len(behaviors) >= 2
         dlg = tk.Toplevel(self.root)
         dlg.title("Time-Course Statistics (FLMM-style)")
@@ -29823,21 +29950,125 @@ cat("OK\n")
             ref_b_combo.configure(state='disabled')
             comp_b_combo.configure(state='disabled')
 
+        # --- Behaviors in the factor model (one model over the ticked levels) ---
+        ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=8)
+        beh_head = ttk.Label(dlg, text="Behaviors in the factor model:",
+                             font=('Segoe UI', 9, 'bold'))
+        beh_head.pack(anchor='w', padx=12)
+        beh_outer = ttk.Frame(dlg)
+        beh_outer.pack(fill='x', padx=22, pady=(2, 0))
+        beh_vars = {}
+        for i, b in enumerate(behaviors):
+            v = tk.BooleanVar(value=True)
+            beh_vars[b] = v
+            ttk.Checkbutton(beh_outer, text=b, variable=v).grid(
+                row=i // 3, column=i % 3, sticky='w', padx=(0, 14), pady=1)
+        beh_btns = ttk.Frame(dlg)
+        beh_btns.pack(fill='x', padx=22, pady=(2, 0))
+
+        def _set_all_behs(state):
+            for v in beh_vars.values():
+                v.set(state)
+        beh_all = ttk.Button(beh_btns, text="All", width=6,
+                             command=lambda: _set_all_behs(True))
+        beh_all.pack(side='left')
+        beh_none = ttk.Button(beh_btns, text="None", width=6,
+                              command=lambda: _set_all_behs(False))
+        beh_none.pack(side='left', padx=(4, 0))
+        beh_hint = ttk.Label(beh_btns, text="", foreground='gray',
+                             font=('Segoe UI', 8))
+        beh_hint.pack(side='left', padx=(10, 0))
+
+        # --- Channels (multi-select; the analysis is repeated per channel) ---
+        ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=8)
+        ttk.Label(dlg, text="Channels:", font=('Segoe UI', 9, 'bold')).pack(
+            anchor='w', padx=12)
+        chan_outer = ttk.Frame(dlg)
+        chan_outer.pack(fill='x', padx=22, pady=(2, 0))
+        chan_vars = {}
+        # Wrap into rows of 4 so many-region recordings don't stretch the dialog
+        # past the screen and hide the Run button.
+        per_row = 4
+        for i, ch in enumerate(channels):
+            v = tk.BooleanVar(value=(ch in default_channels))
+            chan_vars[ch] = v
+            ttk.Checkbutton(chan_outer, text=ch, variable=v).grid(
+                row=i // per_row, column=i % per_row, sticky='w', padx=(0, 14), pady=1)
+        if channels and not any(v.get() for v in chan_vars.values()):
+            chan_vars[channels[0]].set(True)
+        chan_btns = ttk.Frame(dlg)
+        chan_btns.pack(fill='x', padx=22, pady=(2, 0))
+
+        def _set_all_chans(state):
+            for v in chan_vars.values():
+                v.set(state)
+        ttk.Button(chan_btns, text="All", width=6,
+                   command=lambda: _set_all_chans(True)).pack(side='left')
+        ttk.Button(chan_btns, text="None", width=6,
+                   command=lambda: _set_all_chans(False)).pack(side='left', padx=(4, 0))
+        ttk.Label(chan_btns, text="each ticked channel is analysed separately",
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=(10, 0))
+
         # Engine selection
         ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=8)
         ttk.Label(dlg, text="Engine:", font=('Segoe UI', 9, 'bold')).pack(
             anchor='w', padx=12)
         engine_var = tk.StringVar(value=('r' if r_available else 'python'))
-        ttk.Radiobutton(
+        r_radio = ttk.Radiobutton(
             dlg, text="R fastFMM (exact)" + ("" if r_available else " — not detected"),
             variable=engine_var, value='r',
-            state=('normal' if r_available else 'disabled')).pack(anchor='w', padx=22, pady=1)
-        ttk.Radiobutton(
+            state=('normal' if r_available else 'disabled'))
+        r_radio.pack(anchor='w', padx=22, pady=1)
+        py_radio = ttk.Radiobutton(
             dlg, text="Python FUI (no R needed; bands ~5–10% vs fastFMM)",
-            variable=engine_var, value='python').pack(anchor='w', padx=22, pady=1)
+            variable=engine_var, value='python')
+        py_radio.pack(anchor='w', padx=22, pady=1)
+        engine_note = ttk.Label(dlg, text="", foreground='#b26a00',
+                                font=('Segoe UI', 8), wraplength=self.ui_px(430),
+                                justify='left')
+        engine_note.pack(anchor='w', padx=22)
         if not r_available:
             ttk.Label(dlg, text="Install R + the fastFMM package to enable the exact engine.",
                       foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=22)
+
+        # Keep the engine controls honest: analyses with no fastFMM implementation
+        # must not leave the R radio selectable, or the run silently ignores it.
+        # ``forced`` remembers only an override *we* made, so switching away and
+        # back restores R without ever overriding a deliberate Python choice.
+        forced = {'from': None}
+
+        def _sync_engine_controls(*_):
+            # Behaviour picker only bites on the factor model; grey it out
+            # elsewhere so it can't look like it applies to every analysis.
+            is_factor = ref_var.get() == 'factor'
+            st = 'normal' if is_factor else 'disabled'
+            for w in list(beh_outer.winfo_children()) + [beh_all, beh_none]:
+                try:
+                    w.configure(state=st)
+                except tk.TclError:
+                    pass
+            beh_head.configure(foreground=('' if is_factor else 'gray'))
+            beh_hint.configure(text=("one model over the ticked behaviors"
+                                     if is_factor
+                                     else "applies to the factor model only"))
+            python_only = ref_var.get() in self._FLMM_PYTHON_ONLY_REFERENCES
+            if python_only:
+                if engine_var.get() == 'r':
+                    forced['from'] = 'r'
+                    engine_var.set('python')
+                r_radio.configure(state='disabled')
+                engine_note.configure(
+                    text="This analysis has no fastFMM implementation — it always "
+                         "runs on the Python FUI engine.")
+            else:
+                if r_available:
+                    r_radio.configure(state='normal')
+                    if forced['from'] == 'r':
+                        engine_var.set('r')
+                forced['from'] = None
+                engine_note.configure(text="")
+        ref_var.trace_add('write', _sync_engine_controls)
+        _sync_engine_controls()
 
         ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=8)
         pw_var = tk.BooleanVar(value=False)
@@ -29852,11 +30083,30 @@ cat("OK\n")
         btns.pack(fill='x', padx=12, pady=10)
 
         def _ok():
-            result['value'] = {'reference': ref_var.get(),
+            sel_chan = [c for c in channels if chan_vars[c].get()]
+            if channels and not sel_chan:
+                messagebox.showerror("Error", "Select at least 1 channel.", parent=dlg)
+                return
+            sel_beh = [b for b in behaviors if beh_vars[b].get()]
+            if ref_var.get() == 'factor':
+                if len(sel_beh) < 2:
+                    messagebox.showerror(
+                        "Error", "The factor model needs at least 2 behaviors.",
+                        parent=dlg)
+                    return
+                if ref_b_var.get() not in sel_beh:
+                    messagebox.showerror(
+                        "Error",
+                        f"The reference behavior '{ref_b_var.get()}' must be one "
+                        f"of the ticked behaviors.", parent=dlg)
+                    return
+            result['value'] = {'behaviors': sel_beh,
+                               'reference': ref_var.get(),
                                'pointwise_only': bool(pw_var.get()),
                                'engine': engine_var.get(),
                                'ref_behavior': ref_b_var.get(),
-                               'comp_behavior': comp_b_var.get()}
+                               'comp_behavior': comp_b_var.get(),
+                               'channels': sel_chan}
             dlg.destroy()
 
         ttk.Button(btns, text="Run", command=_ok).pack(side='right', padx=(4, 0))
@@ -29865,93 +30115,254 @@ cat("OK\n")
         self.root.wait_window(dlg)
         return result['value']
 
-    def _run_flmm_factor(self, subjects_sel, channel, behaviors, ref_level,
-                         engine, pointwise_only, factor_kind="behavior"):
-        """Fit ONE multi-level factor model (every behavior vs the reference) and
-        draw the multi-panel figure + summary. Matches fastFMM's factor analysis."""
-        collected = self._collect_flmm_factor(subjects_sel, behaviors, channel)
+    _FLMM_REFERENCE_TITLES = {
+        'zero': "Signal ≠ 0 over time",
+        'across_bouts': "Across bouts (effect of bout order)",
+        'between_groups': "Between groups",
+        'interaction': "Across-bouts × group interaction",
+        'behavior_contrast': "Behavior contrast",
+        'factor': "Factor: all behaviors vs a reference",
+        'pairwise': "Pairwise matrix: every behavior vs every other",
+    }
+
+    def _flmm_confirm_run(self, reference, engine, engine_note, rows):
+        """Confirmation step shown after Run: spells out exactly what is about to
+        be computed and — critically — which engine will *actually* be used, so an
+        analysis that silently falls back to Python can never be mistaken for a
+        fastFMM result. Returns True to proceed."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirm analysis")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        out = {'ok': False}
+
+        accent = tk.Frame(dlg, height=4, bg='#3E82BE')
+        accent.pack(fill='x', side='top')
+        frame = ttk.Frame(dlg, padding=(18, 14, 18, 12))
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(frame, text="About to run", font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text=self._FLMM_REFERENCE_TITLES.get(reference, reference),
+                  foreground='#555', font=('Segoe UI', 9)).pack(anchor='w', pady=(0, 8))
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill='x')
+        for r, (k, v) in enumerate(rows):
+            ttk.Label(grid, text=f"{k}:", font=('Segoe UI', 9, 'bold')).grid(
+                row=r, column=0, sticky='ne', padx=(0, 10), pady=1)
+            ttk.Label(grid, text=v, wraplength=self.ui_px(360), justify='left',
+                      font=('Segoe UI', 9)).grid(row=r, column=1, sticky='w', pady=1)
+
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=10)
+        eng_row = ttk.Frame(frame)
+        eng_row.pack(fill='x')
+        ttk.Label(eng_row, text="Engine:", font=('Segoe UI', 9, 'bold')).pack(side='left')
+        eng_text = ("R fastFMM (exact)" if engine == 'r'
+                    else "Python FUI (built-in approximation)")
+        tk.Label(eng_row, text=eng_text, font=('Segoe UI', 10, 'bold'),
+                 fg=('#1b6b2f' if engine == 'r' else '#b26a00')).pack(side='left', padx=(8, 0))
+        if engine_note:
+            tk.Label(frame, text="⚠  " + engine_note, fg='#b26a00',
+                     font=('Segoe UI', 8), wraplength=self.ui_px(430),
+                     justify='left').pack(anchor='w', pady=(6, 0))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill='x', pady=(14, 0))
+
+        def _go():
+            out['ok'] = True
+            dlg.destroy()
+        ttk.Button(btns, text="Run", command=_go).pack(side='right', padx=(6, 0))
+        ttk.Button(btns, text="Back", command=dlg.destroy).pack(side='right')
+        dlg.update_idletasks()
+        self.root.wait_window(dlg)
+        return out['ok']
+
+    def _compute_flmm_factor_panel(self, subjects_sel, channel, behaviors, ref_level,
+                                   engine, pointwise_only, factor_kind,
+                                   max_bouts, q=None, base=0.0, span=1.0,
+                                   use_exclusions=False):
+        """Worker: fit ONE multi-level factor model for a single channel.
+
+        Returns (panel, warn). Runs off the main thread — every Tk-dependent value
+        must already be resolved by the caller and all messages go through ``q``.
+        """
+        logq = (lambda m: q.put(('log', m))) if q is not None else self.log_message
+        prog = (self._phase_progress(q, f"Channel {channel}", base, span)
+                if q is not None else None)
+        if use_exclusions:
+            subjects_sel = self.get_included_subjects_for_channel(subjects_sel, channel)
+            if not subjects_sel:
+                return None, f"{channel}: all selected subjects are excluded."
+        collected = self._collect_flmm_factor(subjects_sel, behaviors, channel,
+                                              max_bouts=max_bouts)
         if collected is None:
-            messagebox.showwarning("No Data", "No usable bouts for the factor model.")
-            return
+            return None, f"{channel}: no usable bouts for the factor model."
         Z, subjects, factor, L = collected
         levels = sorted(set(str(f) for f in factor))
         if len(levels) < 2:
-            messagebox.showwarning(
-                "Need ≥2 levels",
-                f"The factor model needs ≥2 {factor_kind}s with bouts (found {len(levels)}).")
-            return
+            return None, (f"{channel}: the factor model needs ≥2 {factor_kind}s "
+                          f"with bouts (found {len(levels)}).")
         if ref_level not in levels:
             ref_level = levels[0]
         n_subjects = len(set(subjects.tolist()))
         behavior_label = f"all {factor_kind}s (ref = {ref_level})"
 
-        self.root.config(cursor="watch")
-        self.root.update()
+        # Budget: model fit, then the level-vs-level contrasts that the
+        # per-subject peak-effect summary is built from.
+        def _phase(frac_base, frac_span, label):
+            if q is None:
+                return None
+            return self._phase_progress(q, f"{label} — {channel}",
+                                        base + span * frac_base, span * frac_span)
+
         coef_labels = betas_s = ses_s = c_stars = None
         backend_label = None
-        try:
-            if engine == 'r':
-                res = self._flmm_r_factor_engine(Z, subjects, factor, ref_level)
-                if res is not None:
-                    coef_labels, betas, ses, qns = res
-                    betas_s = [betas[j] for j in range(len(coef_labels))]
-                    ses_s = [ses[j] for j in range(len(coef_labels))]
-                    c_stars = [1.96 if pointwise_only else qns[j]
-                               for j in range(len(coef_labels))]
-                    backend_label = "R fastFMM (exact)"
-                else:
-                    self.root.config(cursor="")
-                    messagebox.showwarning(
-                        "fastFMM unavailable",
-                        "The R fastFMM factor run failed (see Log). Using Python FUI.")
-                    self.root.config(cursor="watch")
-                    engine = 'python'
-            if coef_labels is None:
-                fitf = self._fit_factor_timecourse(Z, subjects, factor, ref_level=ref_level)
-                coef_labels = fitf['coef_labels']
-                qns = self._flmm_factor_qn(fitf, pointwise_only)
-                betas_s, ses_s = [], []
-                for j in range(len(coef_labels)):
-                    bj, sj = self._flmm_smooth(fitf['betas'][j], fitf['ses'][j])
-                    betas_s.append(bj); ses_s.append(sj)
+        engine_note = None
+        fitf = None
+        if engine == 'r':
+            if prog is not None:
+                prog(0.05, "running R fastFMM…")
+            res = self._flmm_r_factor_engine(Z, subjects, factor, ref_level, log=logq)
+            if res is not None:
+                coef_labels, betas, ses, qns = res
+                betas_s = [betas[j] for j in range(len(coef_labels))]
+                ses_s = [ses[j] for j in range(len(coef_labels))]
                 c_stars = [1.96 if pointwise_only else qns[j]
                            for j in range(len(coef_labels))]
-                backend_label = "Python FUI (GLS coefficient covariance)"
-        finally:
-            self.root.config(cursor="")
+                backend_label = "R fastFMM (exact)"
+            else:
+                engine_note = (f"{channel}: the R fastFMM factor run failed "
+                               f"(see Log) — fell back to the Python FUI engine.")
+                logq(engine_note)
+        if coef_labels is None:
+            fitf = self._fit_factor_timecourse(
+                Z, subjects, factor, ref_level=ref_level,
+                progress=_phase(0.0, 0.55, "Factor fit"), log=logq)
+            coef_labels = fitf['coef_labels']
+            qns = self._flmm_factor_qn(fitf, pointwise_only)
+            betas_s, ses_s = [], []
+            for j in range(len(coef_labels)):
+                bj, sj = self._flmm_smooth(fitf['betas'][j], fitf['ses'][j])
+                betas_s.append(bj); ses_s.append(sj)
+            c_stars = [1.96 if pointwise_only else qns[j]
+                       for j in range(len(coef_labels))]
+            backend_label = "Python FUI (GLS coefficient covariance)"
 
-        fps = self.params['fps']
+        # Level-vs-level contrasts, computed as part of every run so the
+        # per-subject peak effect is always available for the plot and the PDF
+        # report. fui() does not return the joint coefficient covariance these
+        # need, so an R-engine run pays for one extra Python fit here; the Python
+        # engine reuses the fit it already did.
+        result = None
+        try:
+            if fitf is None:
+                fitf = self._fit_factor_timecourse(
+                    Z, subjects, factor, ref_level=ref_level,
+                    progress=_phase(0.4, 0.3, "Contrast fit"), log=logq)
+            result = self._flmm_pairwise_pmatrix(
+                fitf, levels, ref_level, progress=_phase(0.7, 0.3, "Contrasts"))
+        except _ProgressCancelled:
+            raise
+        except Exception as e:
+            logq(f"FLMM factor: peak-effect contrasts unavailable for {channel} — {e}")
+
+        fps = self.get_fps()
         prebout = min(self.params['preboutframes'], L - 1)
         time_axis = (np.arange(L) - prebout) / fps
-        self.flmm_timecourse_data = {
-            'kind': 'factor', 'time': time_axis, 'coef_labels': coef_labels,
+        panel = {
+            'channel': channel, 'time': time_axis, 'coef_labels': coef_labels,
             'ref_level': ref_level, 'betas': betas_s, 'ses': ses_s,
             'c_stars': c_stars, 'pointwise_only': pointwise_only,
-            'channel': channel, 'behavior': behavior_label, 'backend': backend_label,
+            'behavior': behavior_label, 'backend': backend_label,
+            'n_subjects': n_subjects, 'Z': Z, 'levels': levels,
+            'subjects': sorted(set(str(s) for s in subjects)),
+            # Per-subject traces power the peak-effect ("max difference") plot.
+            'subj_means': self._flmm_subject_means(Z, subjects, factor, levels, L),
+            '_raw_subjects': subjects, '_raw_factor': factor,
+            'engine_note': engine_note,
+            'result': result,
+            'contrast_backend': ("Python FUI (GLS coefficient covariance)"
+                                 if result is not None else None),
         }
+        return panel, None
 
-        for w in self.bout_histogram_frame.winfo_children():
-            w.destroy()
+    def _run_flmm_factor(self, subjects_sel, channels, behaviors, ref_level,
+                         engine, pointwise_only, factor_kind="behavior",
+                         max_bouts=None, use_exclusions=False):
+        """Fit the multi-level factor model (every behavior vs the reference) for
+        each selected channel behind a progress window, then draw the panels."""
+        channels = [channels] if isinstance(channels, str) else list(channels)
+        holder = {}
 
-        def _draw():
-            self.root.update_idletasks()
-            fig = self._build_flmm_factor_figure(
-                time_axis, coef_labels, ref_level, betas_s, ses_s, c_stars,
-                pointwise_only, channel, behavior_label)
-            canvas = self._embed_plot_canvas(fig, self.bout_histogram_frame)
-            self.current_bout_canvas = canvas
-            self.current_bout_figure = fig
-            self.bout_histogram_frame.update_idletasks()
-            self.bout_histogram_canvas.configure(
-                scrollregion=self.bout_histogram_canvas.bbox("all"))
+        def worker(q):
+            panels, order, warns = {}, [], []
+            C = max(1, len(channels))
+            for ci, ch in enumerate(channels):
+                if q.cancel_event.is_set():
+                    raise _ProgressCancelled()
+                q.put(('status', f"Channel {ch}  ({ci + 1}/{C})"))
+                panel, warn = self._compute_flmm_factor_panel(
+                    subjects_sel, ch, behaviors, ref_level, engine, pointwise_only,
+                    factor_kind, max_bouts, q=q, base=ci / C, span=1.0 / C,
+                    use_exclusions=use_exclusions)
+                if panel is None:
+                    warns.append(warn)
+                    continue
+                if panel.get('engine_note'):
+                    warns.append(panel['engine_note'])
+                panels[ch] = panel
+                order.append(ch)
+            holder['panels'], holder['order'], holder['warns'] = panels, order, warns
 
-        self.bout_histogram_canvas.after(10, _draw)
-        lines = self._flmm_factor_stats_lines(
-            coef_labels, ref_level, behavior_label, channel, Z, n_subjects,
-            time_axis, betas_s, ses_s, c_stars, pointwise_only, backend_label)
-        if isinstance(self.flmm_timecourse_data, dict):
-            self.flmm_timecourse_data['stats_lines'] = lines
-        self._display_bout_stats(lines)
+        def on_done():
+            panels, order = holder.get('panels', {}), holder.get('order', [])
+            warns = holder.get('warns', [])
+            if not order:
+                messagebox.showwarning(
+                    "No Data", "\n".join(warns) or "No usable bouts for the factor model.")
+                return
+            store = self._build_flmm_factor_store(panels, order, factor_kind)
+            self.flmm_timecourse_data = store
+            self._show_pairwise_panels(store)
+            if warns:
+                messagebox.showwarning("Some channels skipped", "\n".join(warns))
+
+        self._run_with_progress(
+            "Factor model", worker, on_done_fn=on_done, cancelable=True,
+            subtitle=f"{len(channels)} channel(s) · every {factor_kind} vs "
+                     f"{ref_level}")
+
+    def _build_flmm_factor_store(self, panels, order, factor_kind="behavior"):
+        """Wrap per-channel factor panels in the shared panel-store shape so the
+        channel selector, peak-effect button, exports and PDF report all work."""
+        def make_fig(key):
+            p = panels[key]
+            return self._build_flmm_factor_figure(
+                p['time'], p['coef_labels'], p['ref_level'], p['betas'], p['ses'],
+                p['c_stars'], p['pointwise_only'], p['channel'], p['behavior'])
+
+        def make_lines(key):
+            p = panels[key]
+            return self._flmm_factor_stats_lines(
+                p['coef_labels'], p['ref_level'], p['behavior'], p['channel'],
+                p['Z'], p['n_subjects'], p['time'], p['betas'], p['ses'],
+                p['c_stars'], p['pointwise_only'], p['backend'])
+
+        first = panels[order[0]]
+        return {
+            'kind': 'factor', 'order': order, 'panels': panels,
+            'selector_label': "Channel:", 'make_fig': make_fig,
+            'make_lines': make_lines, 'factor_kind': factor_kind,
+            'peak_effect': True,
+            # Flat keys keep single-panel consumers (titles, captions) working.
+            'time': first['time'], 'coef_labels': first['coef_labels'],
+            'ref_level': first['ref_level'], 'betas': first['betas'],
+            'ses': first['ses'], 'c_stars': first['c_stars'],
+            'pointwise_only': first['pointwise_only'], 'channel': first['channel'],
+            'behavior': first['behavior'], 'backend': first['backend'],
+        }
 
     def plot_timecourse_flmm(self):
         """Plot ▾ → FLMM-style time-course statistics over the bout window."""
@@ -29991,12 +30402,15 @@ cat("OK\n")
         behavior = self.bout_analysis_behavior_var.get()
         channel = self.bout_analysis_channel_var.get()
 
-        if self.use_exclusions_bout.get():
-            selected_subjects = self.get_included_subjects_for_channel(selected_subjects, channel)
-            if not selected_subjects:
-                messagebox.showwarning(
-                    "All Excluded", f"All selected subjects are excluded for channel {channel}")
-                return
+        # Exclusions are per subject *and* channel, so they are applied inside the
+        # per-channel workers rather than once here — otherwise a multi-channel run
+        # would apply the dropdown channel's exclusion list to every channel.
+        use_exclusions = bool(self.use_exclusions_bout.get())
+        if use_exclusions and not self.get_included_subjects_for_channel(
+                selected_subjects, channel):
+            messagebox.showwarning(
+                "All Excluded", f"All selected subjects are excluded for channel {channel}")
+            return
 
         subject_to_group = {}
         if in_group_mode:
@@ -30026,29 +30440,62 @@ cat("OK\n")
         can_groups = in_group_mode and len(gp_subj) == 2
         can_acrossbouts = _has_multiple_bouts(behavior)
         r_available = self._flmm_r_available()
+        all_channels = self._all_channel_names()
 
         choice = self._flmm_reference_dialog(
             can_acrossbouts, can_groups, r_available,
-            behaviors=available_behaviors, default_behavior=behavior)
+            behaviors=available_behaviors, default_behavior=behavior,
+            channels=all_channels, default_channels=[channel])
         if not choice:
             return
         reference = choice['reference']
         pointwise_only = choice['pointwise_only']
-        engine = choice['engine']
+        sel_channels = choice['channels'] or [channel]
+        # Resolve the engine ONCE, here, so what the confirmation promises is
+        # exactly what runs (analyses with no fastFMM path are forced to Python).
+        engine, engine_note = self._flmm_effective_engine(
+            reference, choice['engine'], r_available)
         ref_level = None
+
+        # Tk values the worker thread must never touch — resolve them up front.
+        max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+
+        who = (f"{len(selected_groups)} group(s): {', '.join(selected_groups)}"
+               if in_group_mode else f"{len(selected_subjects)} subject(s)")
+        rows = [("Channels", ", ".join(sel_channels)), ("Subjects", who)]
+        factor_behaviors = choice.get('behaviors') or available_behaviors
+        if reference == 'factor':
+            rows.append(("Behaviors", f"{len(factor_behaviors)}: "
+                                      + ", ".join(factor_behaviors)))
+        elif reference == 'pairwise':
+            rows.append(("Behaviors", f"{len(available_behaviors)} available"))
+        else:
+            rows.append(("Behavior", behavior or "—"))
+        if reference in ('factor', 'behavior_contrast'):
+            rows.append(("Reference", choice['ref_behavior'] or "—"))
+        if reference == 'behavior_contrast':
+            rows.append(("Compare to", choice['comp_behavior'] or "—"))
+        rows.append(("Bands", "pointwise only (95% CI)" if pointwise_only
+                     else "pointwise + simultaneous"))
+        if not self._flmm_confirm_run(reference, engine, engine_note, rows):
+            return
 
         if reference == 'factor':
             # One model across ALL behaviors; reference behavior = baseline.
-            self._run_flmm_factor(selected_subjects, channel, available_behaviors,
+            self._run_flmm_factor(selected_subjects, sel_channels, factor_behaviors,
                                   choice['ref_behavior'], engine, pointwise_only,
-                                  factor_kind="behavior")
+                                  factor_kind="behavior", max_bouts=max_bouts,
+                                  use_exclusions=use_exclusions)
             return
 
         if reference == 'pairwise':
             # Every behavior vs every other, FDR-corrected (Python FUI, no R).
-            self._run_flmm_pairwise(selected_subjects, channel, available_behaviors)
+            self._run_flmm_pairwise(selected_subjects, sel_channels[0],
+                                    available_behaviors,
+                                    default_channels=sel_channels)
             return
 
+        comp_behaviors = comp_label = ref_b = None
         if reference == 'behavior_contrast':
             ref_b = choice['ref_behavior']
             comp_sel = choice['comp_behavior']
@@ -30064,95 +30511,175 @@ cat("OK\n")
             else:
                 comp_behaviors = [comp_sel]
                 comp_label = comp_sel
-            collected = self._collect_flmm_contrast(
-                selected_subjects, [ref_b], comp_behaviors, channel, ref_b, comp_label)
-            if collected is None:
-                messagebox.showwarning(
-                    "No Data", f"No usable bouts for the {ref_b} vs {comp_label} contrast.")
-                return
-            Z, subjects, groups, orders, L = collected
-            present = set(groups.tolist())
-            if ref_b not in present or comp_label not in present:
-                messagebox.showwarning(
-                    "Need both conditions",
-                    f"Need bouts for both '{ref_b}' and '{comp_label}' "
-                    f"(found: {', '.join(sorted(present))}).")
-                return
-            groups_present = [ref_b, comp_label]   # reference level first
             ref_level = ref_b
-            behavior = f"{comp_label} vs {ref_b}"
-            reference = 'between_groups'            # identical model path
+            behavior_label = f"{comp_label} vs {ref_b}"
+            model_reference = 'between_groups'      # identical model path
         else:
             if not behavior:
                 messagebox.showerror("Error", "Please select a behavior")
                 return
-            collected = self._collect_flmm_traces(
-                selected_subjects, behavior, channel, subject_to_group)
-            if collected is None:
+            behavior_label = behavior
+            model_reference = reference
+
+        holder = {}
+
+        def worker(q):
+            panels, order, warns = {}, [], []
+            C = max(1, len(sel_channels))
+            for ci, ch in enumerate(sel_channels):
+                if q.cancel_event.is_set():
+                    raise _ProgressCancelled()
+                q.put(('status', f"Channel {ch}  ({ci + 1}/{C})"))
+                panel, warn = self._compute_flmm_timecourse_panel(
+                    selected_subjects, ch, behavior, behavior_label, reference,
+                    model_reference, ref_level, ref_b, comp_behaviors, comp_label,
+                    subject_to_group, engine, pointwise_only, max_bouts,
+                    q=q, base=ci / C, span=1.0 / C, use_exclusions=use_exclusions)
+                if panel is None:
+                    warns.append(warn)
+                    continue
+                if panel.get('engine_note'):
+                    warns.append(panel['engine_note'])
+                panels[ch] = panel
+                order.append(ch)
+            holder['panels'], holder['order'], holder['warns'] = panels, order, warns
+
+        def on_done():
+            panels, order = holder.get('panels', {}), holder.get('order', [])
+            warns = holder.get('warns', [])
+            if not order:
                 messagebox.showwarning(
-                    "No Data", f"No usable bout traces for {behavior} / {channel}.")
+                    "No Data", "\n".join(warns)
+                    or f"No usable bout traces for {behavior_label}.")
                 return
+            store = self._build_flmm_timecourse_store(panels, order)
+            self.flmm_timecourse_data = store
+            self._show_pairwise_panels(store)
+            if warns:
+                messagebox.showwarning("Some channels skipped", "\n".join(warns))
+
+        self._run_with_progress(
+            "Time-course statistics", worker, on_done_fn=on_done, cancelable=True,
+            subtitle=f"{len(sel_channels)} channel(s) · "
+                     f"{self._FLMM_REFERENCE_TITLES.get(reference, reference)}")
+
+    def _compute_flmm_timecourse_panel(self, selected_subjects, channel, behavior,
+                                       behavior_label, reference, model_reference,
+                                       ref_level, ref_b, comp_behaviors, comp_label,
+                                       subject_to_group, engine, pointwise_only,
+                                       max_bouts, q=None, base=0.0, span=1.0,
+                                       use_exclusions=False):
+        """Worker: fit the single-coefficient time-course model for one channel.
+
+        Returns (panel, warn). Runs off the main thread — no Tk access.
+        """
+        logq = (lambda m: q.put(('log', m))) if q is not None else self.log_message
+        prog = (self._phase_progress(q, f"Channel {channel}", base, span)
+                if q is not None else None)
+        if use_exclusions:
+            selected_subjects = self.get_included_subjects_for_channel(
+                selected_subjects, channel)
+            if not selected_subjects:
+                return None, f"{channel}: all selected subjects are excluded."
+
+        if reference == 'behavior_contrast':
+            collected = self._collect_flmm_contrast(
+                selected_subjects, [ref_b], comp_behaviors, channel, ref_b,
+                comp_label, max_bouts=max_bouts)
+            if collected is None:
+                return None, (f"{channel}: no usable bouts for the "
+                              f"{ref_b} vs {comp_label} contrast.")
+            Z, subjects, groups, orders, L = collected
+            present = set(groups.tolist())
+            if ref_b not in present or comp_label not in present:
+                return None, (f"{channel}: need bouts for both '{ref_b}' and "
+                              f"'{comp_label}' (found: {', '.join(sorted(present))}).")
+            groups_present = [ref_b, comp_label]    # reference level first
+        else:
+            collected = self._collect_flmm_traces(
+                selected_subjects, behavior, channel, subject_to_group,
+                max_bouts=max_bouts)
+            if collected is None:
+                return None, f"{channel}: no usable bout traces for {behavior}."
             Z, subjects, groups, orders, L = collected
             groups_present = sorted(set(g for g in groups.tolist() if g is not None))
-            if reference in ('between_groups', 'interaction') and len(groups_present) != 2:
-                messagebox.showerror(
-                    "Need 2 groups",
-                    "Between-groups / interaction analysis requires exactly two groups "
-                    "selected in Group mode.")
-                return
+            if model_reference in ('between_groups', 'interaction') and len(groups_present) != 2:
+                return None, (f"{channel}: between-groups / interaction analysis "
+                              f"requires exactly two groups (found "
+                              f"{len(groups_present)}).")
 
         n_subjects = len(set(subjects.tolist()))
-        self.root.config(cursor="watch")
-        self.root.update()
-        try:
-            backend_label = None
-            beta_s = se_s = None
-            if engine == 'r':
-                res = self._flmm_r_engine(Z, subjects, groups, orders, reference,
-                                          ref_level=ref_level)
-                if res is not None:
-                    beta_s, se_s, qn = res
-                    c_star = 1.96 if pointwise_only else qn
-                    backend_label = "R fastFMM (exact)"
-                else:
-                    self.root.config(cursor="")
-                    messagebox.showwarning(
-                        "fastFMM unavailable",
-                        "The R fastFMM run failed (see Log). Falling back to the "
-                        "Python FUI engine.")
-                    self.root.config(cursor="watch")
-                    engine = 'python'
-            if beta_s is None:  # python engine (chosen or fallback)
-                fit = self._fit_timecourse(Z, subjects, groups, orders, reference,
-                                           ref_level=ref_level)
-                beta_s, se_s = self._flmm_smooth(fit['beta'], fit['se'])
-                qn, qn_method = self._flmm_python_qn(
-                    fit, Z, groups, reference, pointwise_only)
-                c_star = qn
-                backend_label = f"Python FUI ({qn_method})"
-            (ci_lo, ci_hi, sci_lo, sci_hi, sig_pt, sig_sim) = self._flmm_assemble_bands(
-                beta_s, se_s, c_star)
-        finally:
-            self.root.config(cursor="")
+        backend_label = None
+        beta_s = se_s = None
+        engine_note = None
+        if engine == 'r':
+            if prog is not None:
+                prog(0.05, "running R fastFMM…")
+            res = self._flmm_r_engine(Z, subjects, groups, orders, model_reference,
+                                      ref_level=ref_level, log=logq)
+            if res is not None:
+                beta_s, se_s, qn = res
+                c_star = 1.96 if pointwise_only else qn
+                backend_label = "R fastFMM (exact)"
+            else:
+                engine_note = (f"{channel}: the R fastFMM run failed (see Log) — "
+                               f"fell back to the Python FUI engine.")
+                logq(engine_note)
+        if beta_s is None:      # python engine (chosen or fallback)
+            fit = self._fit_timecourse(Z, subjects, groups, orders, model_reference,
+                                       ref_level=ref_level, progress=prog, log=logq)
+            beta_s, se_s = self._flmm_smooth(fit['beta'], fit['se'])
+            qn, qn_method = self._flmm_python_qn(
+                fit, Z, groups, model_reference, pointwise_only)
+            c_star = qn
+            backend_label = f"Python FUI ({qn_method})"
+        (ci_lo, ci_hi, sci_lo, sci_hi, sig_pt, sig_sim) = self._flmm_assemble_bands(
+            beta_s, se_s, c_star)
 
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = min(self.params['preboutframes'], L - 1)
         time_axis = (np.arange(L) - prebout) / fps
-        self.flmm_timecourse_data = {
-            'time': time_axis, 'beta': beta_s, 'se': se_s,
+        return {
+            'channel': channel, 'time': time_axis, 'beta': beta_s, 'se': se_s,
             'ci_lo': ci_lo, 'ci_hi': ci_hi, 'sci_lo': sci_lo, 'sci_hi': sci_hi,
             'sig_pointwise': sig_pt, 'sig_simultaneous': sig_sim,
-            'reference': reference, 'behavior': behavior, 'channel': channel,
+            'reference': model_reference, 'behavior': behavior_label,
             'c_star': c_star, 'pointwise_only': pointwise_only,
-            'backend': backend_label,
-        }
+            'backend': backend_label, 'Z': Z, 'groups': groups,
+            'groups_present': groups_present, 'n_subjects': n_subjects,
+            'engine_note': engine_note,
+        }, None
 
-        self._draw_flmm_plot(Z, groups, time_axis, reference, beta_s, ci_lo, ci_hi,
-                             sci_lo, sci_hi, sig_sim, pointwise_only, behavior,
-                             channel, groups_present)
-        self._report_flmm_stats(reference, behavior, channel, Z, n_subjects,
-                                groups_present, time_axis, sig_sim, sig_pt,
-                                c_star, pointwise_only, backend_label)
+    def _build_flmm_timecourse_store(self, panels, order):
+        """Wrap per-channel time-course panels in the shared panel-store shape."""
+        def make_fig(key):
+            p = panels[key]
+            return self._build_flmm_figure(
+                p['Z'], p['groups'], p['time'], p['reference'], p['beta'],
+                p['ci_lo'], p['ci_hi'], p['sci_lo'], p['sci_hi'],
+                p['sig_simultaneous'], p['pointwise_only'], p['behavior'],
+                p['channel'], p['groups_present'])
+
+        def make_lines(key):
+            p = panels[key]
+            return self._flmm_stats_lines(
+                p['reference'], p['behavior'], p['channel'], p['Z'],
+                p['n_subjects'], p['groups_present'], p['time'],
+                p['sig_simultaneous'], p['sig_pointwise'], p['c_star'],
+                p['pointwise_only'], p['backend'])
+
+        first = panels[order[0]]
+        store = {
+            'kind': 'timecourse', 'order': order, 'panels': panels,
+            'selector_label': "Channel:", 'make_fig': make_fig,
+            'make_lines': make_lines,
+        }
+        # Flat keys keep single-panel consumers (clipboard export, captions) working.
+        for k in ('time', 'beta', 'se', 'ci_lo', 'ci_hi', 'sci_lo', 'sci_hi',
+                  'sig_pointwise', 'sig_simultaneous', 'reference', 'behavior',
+                  'channel', 'c_star', 'pointwise_only', 'backend'):
+            store[k] = first[k]
+        return store
 
     def _build_flmm_figure(self, Z, groups, time_axis, reference, beta, ci_lo, ci_hi,
                            sci_lo, sci_hi, sig_sim, pointwise_only, behavior, channel,
@@ -30544,9 +31071,12 @@ cat("OK\n")
                 'subjects': panel.get('subjects', [])}
 
     def _flmm_pairwise_dialog(self, behaviors, channels, default_behaviors,
-                              default_channel):
+                              default_channel, default_channels=None):
         """Popup to pick behaviors (checkboxes), channels (checkboxes) and the
-        comparison mode. Returns {behaviors, channels, mode} or None."""
+        comparison mode. Returns {behaviors, channels, mode} or None.
+
+        ``default_channels`` (optional) pre-ticks a whole set — used to carry the
+        channel selection forward from the reference-point dialog."""
         dlg = tk.Toplevel(self.root)
         dlg.title("Pairwise Comparison — behaviors, channels, mode")
         dlg.transient(self.root)
@@ -30601,11 +31131,12 @@ cat("OK\n")
         chan_frame = ttk.Frame(body)
         chan_frame.grid(row=1, column=1, sticky='nw')
         chan_vars = {}
+        preset_chan = set(default_channels or [default_channel])
         for ch in channels:
-            v = tk.BooleanVar(value=(ch == default_channel))
+            v = tk.BooleanVar(value=(ch in preset_chan))
             chan_vars[ch] = v
             ttk.Checkbutton(chan_frame, text=ch, variable=v).pack(anchor='w', pady=1)
-        if default_channel not in channels and channels:
+        if channels and not any(v.get() for v in chan_vars.values()):
             chan_vars[channels[0]].set(True)
 
         # --- Mode ---
@@ -30662,14 +31193,16 @@ cat("OK\n")
         self.root.wait_window(dlg)
         return result['value']
 
-    def _run_flmm_pairwise(self, subjects_sel, default_channel, all_behaviors):
+    def _run_flmm_pairwise(self, subjects_sel, default_channel, all_behaviors,
+                           default_channels=None):
         """Entry point for pairwise behavior comparison. Opens the behavior/channel/
         mode popup, then runs the (potentially long) computation in a background
         thread behind a detailed progress window so the GUI stays responsive.
         Python FUI engine (no R needed)."""
         channels = self._all_channel_names()
         choice = self._flmm_pairwise_dialog(
-            all_behaviors, channels, all_behaviors, default_channel)
+            all_behaviors, channels, all_behaviors, default_channel,
+            default_channels=default_channels)
         if not choice:
             return
         mode = choice['mode']
@@ -30754,7 +31287,7 @@ cat("OK\n")
                                                  progress=pair_p)
             if result is None:
                 continue
-            fps = self.params['fps']
+            fps = self.get_fps()
             prebout = min(self.params['preboutframes'], L - 1)
             panels[channel] = {
                 'levels': levels, 'result': result,
@@ -30837,7 +31370,7 @@ cat("OK\n")
                     rec['x'], rec['y'] = x, y
                     recs[(i, j)] = rec
                     raw_records.append((beh, i, j))
-            fps = self.params['fps']
+            fps = self.get_fps()
             prebout = min(self.params['preboutframes'], L - 1)
             per_beh[beh] = {
                 'levels': levels, 'records': recs, 'ref_level': ref,
@@ -30912,7 +31445,10 @@ cat("OK\n")
         sel_var = tk.StringVar(value=keys[0])
 
         top = ttk.Frame(self.bout_histogram_frame)
-        has_peak = store.get('kind') == 'pairwise_within' and any(
+        # Peak-effect ("max difference") is available wherever the panels carry
+        # each animal's own trace — the within-channel pairwise matrix and the
+        # factor model both do.
+        has_peak = store.get('kind') in ('pairwise_within', 'factor') and any(
             p.get('subj_means') for p in store.get('panels', {}).values())
         if (len(keys) > 1 and store.get('selector_label')) or has_peak:
             top.pack(fill='x', padx=6, pady=(6, 0))
@@ -31063,17 +31599,65 @@ cat("OK\n")
         self.log_message(f"Exported per-subject peak effect → {path}")
         return path
 
+    def _flmm_compute_peak_records(self, panel, key, then):
+        """Fill in a factor panel's level-vs-level contrasts (the records the
+        peak-effect table reads) behind a progress window, then call ``then``.
+
+        The factor figure itself may have been drawn by R fastFMM, but fui() does
+        not return the joint coefficient covariance every pair needs, so these
+        contrasts come from one joint Python GLS fit. The peak-effect window
+        labels that provenance so the two are never conflated."""
+        Z = panel.get('Z')
+        subjects = panel.get('_raw_subjects')
+        factor = panel.get('_raw_factor')
+        if Z is None or subjects is None or factor is None:
+            messagebox.showinfo("Peak effect", "Not enough data to summarise.")
+            return
+        holder = {}
+
+        def worker(q):
+            p1 = self._phase_progress(q, "Joint factor fit", 0.0, 0.6)
+            fitf = self._fit_factor_timecourse(
+                Z, subjects, factor, ref_level=panel['ref_level'],
+                progress=p1, log=lambda m: q.put(('log', m)))
+            p2 = self._phase_progress(q, "Level-vs-level contrasts", 0.6, 0.4)
+            holder['result'] = self._flmm_pairwise_pmatrix(
+                fitf, panel['levels'], panel['ref_level'], progress=p2)
+
+        def on_done():
+            if holder.get('result') is None:
+                messagebox.showinfo("Peak effect",
+                                    "Could not compute the level contrasts.")
+                return
+            panel['result'] = holder['result']
+            panel['contrast_backend'] = "Python FUI (GLS coefficient covariance)"
+            then()
+
+        self._run_with_progress(
+            "Peak effect", worker, on_done_fn=on_done, cancelable=True,
+            subtitle=f"{key} · pairwise contrasts for the peak-effect summary")
+
     def _flmm_show_peak_effect(self, store, key):
         """Pop-out window: per-subject peak-effect violin for one panel, with a
-        control-level selector and a CSV export.  Only meaningful for within-channel
-        panels (which carry the per-subject traces)."""
+        control-level selector and a CSV export.  Available for any panel that
+        carries the per-subject traces (pairwise within-channel and the factor
+        model)."""
         panels = store.get('panels', {})
         panel = panels.get(key)
         if not panel or not panel.get('subj_means'):
             messagebox.showinfo(
                 "Peak effect",
                 "Per-subject peak-effect plots are available for the "
-                "within-channel comparison (which carries each animal's trace).")
+                "within-channel comparison and the factor model (which carry "
+                "each animal's trace).")
+            return
+        if panel.get('result') is None:
+            # Factor panels don't carry level-vs-level contrasts: the peak window
+            # and its FDR p come from a joint Python fit computed on demand (the
+            # R engine's fui() does not return the coefficient covariance these
+            # contrasts need). Cached on the panel so it's paid once.
+            self._flmm_compute_peak_records(panel, key,
+                                            lambda: self._flmm_show_peak_effect(store, key))
             return
         table0 = self._flmm_peak_effect_table(panel)
         if table0 is None:
@@ -31091,6 +31675,19 @@ cat("OK\n")
         ref_combo = ttk.Combobox(ctrl_row, textvariable=ref_var, state='readonly',
                                  width=22, values=list(panel['levels']))
         ref_combo.pack(side='left')
+
+        # Be explicit when the contrasts behind the stars came from a different
+        # engine than the panel's own bands (factor + R fastFMM).
+        panel_backend = panel.get('backend')
+        contrast_backend = panel.get('contrast_backend')
+        if contrast_backend and panel_backend and contrast_backend != panel_backend:
+            ttk.Label(win, foreground='#b26a00', font=('Segoe UI', 8),
+                      wraplength=self.ui_px(520), justify='left',
+                      text=(f"Peak windows and p-values come from {contrast_backend}; "
+                            f"the factor bands on the main panel came from "
+                            f"{panel_backend}. fui() does not return the joint "
+                            f"coefficient covariance these contrasts require.")
+                      ).pack(anchor='w', padx=10, pady=(0, 2))
 
         body = ttk.Frame(win)
         body.pack(fill='both', expand=True, padx=6, pady=6)
@@ -31624,47 +32221,61 @@ cat("OK\n")
                 f"Pairwise comparison ({label}, {n_rows} rows) copied to "
                 f"clipboard.\nPaste into Excel or Prism.")
             return
+        # Factor / time-course results are stored per channel; export every panel
+        # with a Channel column so a multi-channel run doesn't silently export
+        # only the one on screen.
+        panels = d.get('panels') or {}
+        order = d.get('order') or []
         if d.get('kind') == 'factor':
-            # Wide table: Time + per-coefficient beta/SE/sig
-            time = d['time']
-            headers = ['Time_s']
-            for lab in d['coef_labels']:
+            # Wide table: Channel + Time + per-coefficient beta/SE/sig
+            plist = [panels[k] for k in order] if order else [d]
+            labels = plist[0]['coef_labels']
+            headers = ['Channel', 'Time_s']
+            for lab in labels:
                 tag = 'intercept' if lab == '(Intercept)' else lab
                 headers += [f'beta[{tag}]', f'SE[{tag}]', f'sig[{tag}]']
             rows = ['\t'.join(headers)]
-            for i in range(len(time)):
-                cells = [f"{time[i]:.4f}"]
-                for j in range(len(d['coef_labels'])):
-                    b = d['betas'][j][i]; s = d['ses'][j][i]
-                    thr = 1.96 if d['pointwise_only'] else d['c_stars'][j]
-                    sig = '1' if (s > 0 and abs(b / s) > thr) else '0'
-                    cells += [f"{b:.6f}", f"{s:.6f}", sig]
-                rows.append('\t'.join(cells))
+            for p in plist:
+                time = p['time']
+                for i in range(len(time)):
+                    cells = [str(p.get('channel', '')), f"{time[i]:.4f}"]
+                    for j in range(len(p['coef_labels'])):
+                        b = p['betas'][j][i]; s = p['ses'][j][i]
+                        thr = 1.96 if p['pointwise_only'] else p['c_stars'][j]
+                        sig = '1' if (s > 0 and abs(b / s) > thr) else '0'
+                        cells += [f"{b:.6f}", f"{s:.6f}", sig]
+                    rows.append('\t'.join(cells))
             tsv = '\n'.join(rows)
             self.root.clipboard_clear()
             self.root.clipboard_append(tsv)
+            chans = ', '.join(order) if order else d.get('channel', '')
             messagebox.showinfo(
                 "Copied",
-                f"Factor-model stats ({d['behavior']}/{d['channel']}) copied to "
+                f"Factor-model stats ({d['behavior']}; {chans}) copied to "
                 f"clipboard.\nPaste into Excel or Prism.")
             return
-        headers = ['Time_s', 'beta', 'SE', 'CI_lo', 'CI_hi',
+        plist = [panels[k] for k in order] if order else [d]
+        headers = ['Channel', 'Time_s', 'beta', 'SE', 'CI_lo', 'CI_hi',
                    'simCI_lo', 'simCI_hi', 'sig_pointwise', 'sig_simultaneous']
         rows = ['\t'.join(headers)]
-        for i in range(len(d['time'])):
-            rows.append('\t'.join([
-                f"{d['time'][i]:.4f}", f"{d['beta'][i]:.6f}", f"{d['se'][i]:.6f}",
-                f"{d['ci_lo'][i]:.6f}", f"{d['ci_hi'][i]:.6f}",
-                f"{d['sci_lo'][i]:.6f}", f"{d['sci_hi'][i]:.6f}",
-                '1' if d['sig_pointwise'][i] else '0',
-                '1' if d['sig_simultaneous'][i] else '0',
-            ]))
+        for p in plist:
+            ch = str(p.get('channel', ''))
+            for i in range(len(p['time'])):
+                rows.append('\t'.join([
+                    ch,
+                    f"{p['time'][i]:.4f}", f"{p['beta'][i]:.6f}", f"{p['se'][i]:.6f}",
+                    f"{p['ci_lo'][i]:.6f}", f"{p['ci_hi'][i]:.6f}",
+                    f"{p['sci_lo'][i]:.6f}", f"{p['sci_hi'][i]:.6f}",
+                    '1' if p['sig_pointwise'][i] else '0',
+                    '1' if p['sig_simultaneous'][i] else '0',
+                ]))
         tsv = '\n'.join(rows)
         self.root.clipboard_clear()
         self.root.clipboard_append(tsv)
+        chans = ', '.join(order) if order else d.get('channel', '')
         messagebox.showinfo(
             "Copied",
-            f"Time-course stats ({d['reference']}, {d['behavior']}/{d['channel']}) "
+            f"Time-course stats ({d['reference']}, {d['behavior']}; {chans}) "
             f"copied to clipboard.\nPaste into Excel or Prism.")
 
     # ---------------------- FLMM PDF report export ----------------------------
@@ -31704,19 +32315,78 @@ cat("OK\n")
         messagebox.showinfo("Report saved",
                             f"FLMM report written ({n_panels} panel(s)):\n{path}")
 
+    def _flmm_peak_effect_report_panel(self, d, key):
+        """Yield (caption, figure, lines) for one panel's per-subject peak effect,
+        or nothing when that panel carries no per-subject traces/contrasts."""
+        panel = (d.get('panels') or {}).get(key)
+        if not panel or not panel.get('subj_means') or panel.get('result') is None:
+            return
+        try:
+            table = self._flmm_peak_effect_table(panel)
+            if table is None:
+                return
+            fig = self._build_flmm_peak_effect_figure(table, key)
+        except Exception as e:
+            self.log_message(f"FLMM report: peak-effect panel '{key}' failed — {e}")
+            return
+        yield (f"{key}: per-subject peak effect vs {table['ref_level']}", fig,
+               self._flmm_peak_effect_lines(table, key, panel))
+
+    def _flmm_peak_effect_lines(self, table, channel, panel=None):
+        """Text summary of the per-subject peak-effect table for the PDF report."""
+        ref = table['ref_level']
+        lines = [
+            f"Per-subject peak effect — {channel}",
+            "",
+            f"Control / reference level : {ref}",
+            "Each animal's signed z at the group peak time inside that level's",
+            "significant window (peak read from the group mean, not per animal,",
+            "so the summary is not biased upward).",
+            "",
+            f"{'level':<22}{'peak_t(s)':>10}{'n':>5}{'median':>10}{'p_FDR':>10}  sig_window(s)",
+            "-" * 88,
+        ]
+        for lev in table['order']:
+            info = table['per_level'][lev]
+            vals = [v for v in info['values'].values() if np.isfinite(v)]
+            med = np.median(vals) if vals else float('nan')
+            p = info['p_fdr']
+            pstr = "control" if info['is_control'] else (
+                f"{p:.4g}" if np.isfinite(p) else "n/a")
+            wins = "; ".join(f"{a:.2f}..{b:.2f}" for a, b in info['sig_windows'])
+            lines.append(f"{str(lev):<22}{info['peak_t']:>10.3f}{len(vals):>5}"
+                         f"{med:>10.3f}{pstr:>10}  {wins or ('—' if info['is_control'] else 'ns')}")
+        if panel is not None:
+            cb, pb = panel.get('contrast_backend'), panel.get('backend')
+            if cb and pb and cb != pb:
+                lines += ["", f"Peak windows / p-values engine : {cb}",
+                          f"Factor band engine             : {pb}",
+                          "(fui() does not return the joint coefficient covariance",
+                          " these level-vs-level contrasts require.)"]
+            elif cb:
+                lines += ["", f"Engine : {cb}"]
+        return lines
+
     def _flmm_report_panels(self, d):
         """Yield (caption, figure_or_None, stats_lines) for each panel of the last
         FLMM result, so the report covers every generated plot."""
         kind = d.get('kind')
-        if kind in ('pairwise_within', 'pairwise_across'):
+        if d.get('make_fig') and d.get('order'):
             for key in d['order']:
                 if kind == 'pairwise_within':
                     cap = f"Within channel — {key}"
-                elif key == '(all behaviors)':
-                    cap = "Same behavior across channels"
+                elif kind == 'pairwise_across':
+                    cap = ("Same behavior across channels" if key == '(all behaviors)'
+                           else f"Across channels — behavior: {key}")
                 else:
-                    cap = f"Across channels — behavior: {key}"
+                    # factor / time-course: one panel per channel
+                    panel = (d.get('panels') or {}).get(key, {})
+                    cap = f"{key}: {panel.get('behavior', d.get('behavior', ''))}"
                 yield cap, d['make_fig'](key), d['make_lines'](key)
+                # Every panel that carries per-subject traces also contributes its
+                # peak-effect ("max difference") figure — the readers always want it.
+                for pcap, pfig, plines in self._flmm_peak_effect_report_panel(d, key):
+                    yield pcap, pfig, plines
         else:
             # factor / single time-course: reuse the on-screen figure + stashed text
             cap = f"{d.get('channel', '')}: {d.get('behavior', 'FLMM time-course')}"
@@ -31734,7 +32404,8 @@ cat("OK\n")
         kind = d.get('kind', 'flmm')
         pretty = {'pairwise_within': "Pairwise (within channel)",
                   'pairwise_across': "Pairwise (same behavior across channels)",
-                  'factor': "Factor model", 'single': "Time-course"}.get(kind, "FLMM")
+                  'factor': "Factor model", 'single': "Time-course",
+                  'timecourse': "Time-course"}.get(kind, "FLMM")
         panels = list(self._flmm_report_panels(d))
 
         with PdfPages(path) as pdf:
@@ -32202,7 +32873,7 @@ cat("OK\n")
                 
                 if calc_deriv:
                     # Calculate first derivative within analysis window, scaled by fps
-                    fps = self.params.get('fps', 1)
+                    fps = self.get_fps()
                     derivative = np.diff(post_bout_data) * fps  # Convert to z-score per second
                     max_deriv = np.max(np.abs(derivative))
                     row_values.append(f"{max_deriv:.3f}")
@@ -32272,6 +32943,20 @@ cat("OK\n")
     # locate the peak on a lightly smoothed copy, and estimate the level the
     # transient rose from and decays back toward.
 
+    # How much of the decay must be observed before tau is reported, as
+    # (minimum fraction of the amplitude that must be lost, cap on tau as a
+    # multiple of the observed decay length).  Measured on a 29-subject
+    # dataset: 'strict' returned tau for ~33% of bouts, 'balanced' ~68%,
+    # 'permissive' ~71%.  The extra bouts are the ones whose decay is only
+    # partly visible, so they carry a positive bias (~+17% vs ~+7% against
+    # injected known decays) -- the count of ACCURATE estimates is about the
+    # same either way, so this trades precision for coverage.
+    DECAY_STRICTNESS = {
+        'strict':     (1.0 - 1.0 / np.e, 1.0),
+        'balanced':   (0.50, 2.0),
+        'permissive': (0.40, 3.0),
+    }
+
     @staticmethod
     def _decay_fill_nans(data):
         """Trim NaN edges and linearly interpolate interior NaNs.
@@ -32295,7 +32980,7 @@ cat("OK\n")
     def _decay_smooth(self, data):
         """Short (~200 ms) moving average used only for peak finding and level
         estimates, so a single noisy sample can never define the peak."""
-        w = int(round((self.params.get('fps', 1) or 1) / 5.0))
+        w = int(round(self.get_fps() / 5.0))
         w = max(3, min(w, max(3, len(data) // 10)))
         if w % 2 == 0:
             w += 1
@@ -32327,7 +33012,7 @@ cat("OK\n")
         data = self._decay_fill_nans(data)
         if len(data) < 5:
             return None
-        fps = self.params.get('fps', 1) or 1
+        fps = self.get_fps()
         sm = self._decay_smooth(data)
 
         # Orientation is decided against the level at the START of the window.
@@ -32336,8 +33021,14 @@ cat("OK\n")
         # which inverted clean positive transients and put the "peak" at frame 0.
         lead_n = int(np.clip(round(fps * 0.5), 3, max(3, len(sm) // 4)))
         center = float(np.median(sm[:lead_n]))
-        pos_idx = int(np.argmax(sm))
-        neg_idx = int(np.argmin(sm))
+        # Look for the peak only in the FIRST HALF of the window.  The transient
+        # of interest is the one following the bout onset; searching the whole
+        # window let a late spontaneous event become "the" peak, with no room
+        # left for it to decay.  On a 70 s window that inflated the median tau
+        # nearly tenfold relative to the same bouts measured over 30 s.
+        search_end = max(5, len(sm) // 2)
+        pos_idx = int(np.argmax(sm[:search_end]))
+        neg_idx = int(np.argmin(sm[:search_end]))
         if (center - sm[neg_idx]) > (sm[pos_idx] - center):
             sig, sm, center, peak_idx = -data, -sm, -center, neg_idx  # flip
         else:
@@ -32374,7 +33065,7 @@ cat("OK\n")
             return None
         sig, sm, baseline, peak_idx = oriented
 
-        fps = self.params.get('fps', 1) or 1
+        fps = self.get_fps()
 
         # Fit only the descending phase, starting at the peak
         decay = sig[peak_idx:]
@@ -32410,13 +33101,18 @@ cat("OK\n")
         decay_sm = decay_sm[:stop]
         n = len(decay)
 
-        # The window must contain at least one full time constant of decay
-        # (1 - 1/e of the amplitude).  Below that, amplitude and time constant
-        # trade off freely and the fit extrapolates well past the recorded data:
-        # a true 5 s decay observed for 4 s was being reported as 0.8 s.
+        # Enough of the decay must be visible for tau to be identifiable at all.
+        # Below that, amplitude and time constant trade off freely and the fit
+        # extrapolates past the recorded data: a true 5 s decay observed for 4 s
+        # was reported as 0.8 s.  How much is "enough" is the user's call --
+        # requiring a full time constant is the most trustworthy but returns the
+        # fewest values, so Settings exposes it (see DECAY_STRICTNESS).
+        min_fall, tau_cap = self.DECAY_STRICTNESS.get(
+            str(self.params.get('decay_strictness', 'balanced')).lower(),
+            self.DECAY_STRICTNESS['balanced'])
         tail_n = max(3, n // 10)
         end_level = float(np.median(decay_sm[-tail_n:]))
-        if (decay_sm[0] - end_level) < (1.0 - 1.0 / np.e) * amp:
+        if (decay_sm[0] - end_level) < min_fall * amp:
             return None
 
         x = np.arange(n, dtype=float)
@@ -32469,8 +33165,8 @@ cat("OK\n")
         r2, tau_frames = best
         if r2 < 0.5:
             return None  # not exponential-shaped; a number here would be noise
-        if tau_frames > n:
-            return None  # slower than the window is long -> not measurable here
+        if tau_frames > tau_cap * n:
+            return None  # slower than the window can resolve -> not measurable
         return tau_frames / fps  # frames -> seconds
 
     def calculate_t_half(self, data):
@@ -32489,7 +33185,7 @@ cat("OK\n")
             return None
         sig, sm, baseline, peak_idx = oriented
 
-        fps = self.params.get('fps', 1) or 1
+        fps = self.get_fps()
 
         amp = float(sm[peak_idx] - baseline)
         if amp <= max(3.0 * self._decay_noise_sigma(sig), 1e-6):
@@ -32759,7 +33455,7 @@ cat("OK\n")
         if col is None:
             return [], 'no_data'
 
-        fps = self.params.get('fps', 30)
+        fps = self.get_fps(data)
         prebout = self.params.get('preboutframes', 90)
         postbout = self.params.get('postboutframes', 90)
         baseline_correct = self.params.get('baseline_correct_bouts', False)
@@ -32909,7 +33605,7 @@ cat("OK\n")
         """Draw one averaged trace per length bin on the given axis."""
         COLORS = ['#2196F3', '#E53935', '#43A047', '#FB8C00', '#8E24AA',
                   '#00ACC1', '#F4511E', '#6D4C41']
-        fps = self.params.get('fps', 30)
+        fps = self.get_fps()
         prebout = self.params.get('preboutframes', 90)
         mean_width, _trace_width, _alpha = self.get_trace_styling()
         plotted = False
@@ -33059,7 +33755,7 @@ cat("OK\n")
             messagebox.showinfo("No Bins", "No length bins defined. Use 'Edit Length Bins…' first.")
             return
 
-        fps = self.params['fps']
+        fps = self.get_fps()
         prebout = self.params.get('preboutframes', 90)
         max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
 
@@ -33277,7 +33973,7 @@ cat("OK\n")
             messagebox.showerror("Error", "Window end frame must be greater than window start frame")
             return
 
-        fps      = self.params['fps']
+        fps      = self.get_fps()
         pre_frames = self.params.get('preboutframes', 90)
         max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
 
@@ -33770,7 +34466,7 @@ cat("OK\n")
                         subject_to_group[subject] = group_name
         
         pre_frames = self.params.get('preboutframes', 90)
-        fps = self.params.get('fps', 1)
+        fps = self.get_fps()
         
         # Calculate per-bout metrics for each subject, then split first/last
         subject_data = {}  # {subject: {'first': {metric: [vals]}, 'last': {metric: [vals]}, 'n_total': int}}
@@ -34777,7 +35473,7 @@ cat("OK\n")
         by_subject = {}
         rows = []
         total_bouts = 0
-        fps = self.params.get('fps', 1)
+        fps = self.get_fps()
 
         for subject in selected_subjects:
             if subject not in self.processed_data:
@@ -36307,7 +37003,7 @@ cat("OK\n")
         scale = preset_scale.get(preset, 1.0)
 
         return {
-            'fs': self.params.get('fps', 30),
+            'fs': self.get_fps(),
             'static_fmin':      cp['static_fmin'],
             'static_fmax':      cp['static_fmax'],
             'static_nperseg':   cp['static_nperseg_sec'],
@@ -37196,7 +37892,7 @@ cat("OK\n")
                                      f"Please check settings values:\n{exc}")
                 return
 
-            fps              = self.params['fps']
+            fps              = self.get_fps()
             lookahead_frames = max(1, round(lookahead_sec * fps))
             bin_edges        = np.arange(range_min,
                                          range_max + bin_width * 0.5,
@@ -38278,7 +38974,7 @@ cat("OK\n")
                 v = min(hi, v)
             return int(round(v)) if integer else v
 
-        fps = float(self.params.get('fps', 30) or 30)
+        fps = self.get_fps()
         cfg = {
             'fps': fps,
             'sg_win': _f(self.sig_link_sg_win_var, 11, 3, 199, integer=True),
@@ -39253,7 +39949,7 @@ cat("OK\n")
         if bs.shape[1] < self._beh_width(nch):
             return None
 
-        fps = float(self.params.get('fps', 30) or 30)
+        fps = self.get_fps(data)
         dt = 1.0 / fps
         n = len(bs)
         if n < 5:

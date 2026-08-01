@@ -46,15 +46,23 @@ _G = _load_gui_module().FPAnalysisGUI
 
 class _Metrics:
     """Stub exposing the decay metrics; they touch nothing but self.params."""
+    DECAY_STRICTNESS = _G.DECAY_STRICTNESS
     _decay_fill_nans = staticmethod(_G._decay_fill_nans)
     _decay_noise_sigma = staticmethod(_G._decay_noise_sigma)
     _decay_smooth = _G._decay_smooth
     _orient_transient = _G._orient_transient
     calculate_tau = _G.calculate_tau
     calculate_t_half = _G.calculate_t_half
+    get_fps = _G.get_fps
+    FPS_FALLBACK = _G.FPS_FALLBACK
 
-    def __init__(self, fps=FPS):
-        self.params = {'fps': fps}
+    def __init__(self, fps=FPS, strictness='balanced'):
+        self.params = {'decay_strictness': strictness}
+        # The sampling rate is a property of the recording, not a parameter:
+        # get_fps() reads it from the processed subject (see fp_analysis_gui).
+        self.processed_data = {'stub': {'photometry_fps': fps}}
+        self._mixed_fps_warned = False
+        self.log_message = lambda *_args, **_kw: None
 
 
 @pytest.fixture
@@ -160,9 +168,58 @@ def test_pure_noise_yields_no_decay_estimate(m, seed):
     assert m.calculate_t_half(noise) is None
 
 
-def test_decay_slower_than_the_window_is_refused(m):
-    """Regression 4: only ~18% of a 20 s decay is visible in a 5 s window."""
+@pytest.mark.parametrize('strictness', ['strict', 'balanced', 'permissive'])
+def test_decay_slower_than_the_window_is_refused(m, strictness):
+    """Regression 4: only ~18% of a 20 s decay is visible in a 5 s window --
+    too little for any strictness level to identify a time constant."""
+    m.params['decay_strictness'] = strictness
     assert m.calculate_tau(make_transient(20.0, 150, noise=0.1)) is None
+
+
+# ---------------------------------------------------------------------------
+# Decay strictness (precision vs coverage)
+# ---------------------------------------------------------------------------
+
+def test_strictness_levels_are_ordered_from_least_to_most_permissive():
+    falls = [_G.DECAY_STRICTNESS[k][0] for k in ('strict', 'balanced', 'permissive')]
+    caps = [_G.DECAY_STRICTNESS[k][1] for k in ('strict', 'balanced', 'permissive')]
+    assert falls == sorted(falls, reverse=True)   # less fall required as it loosens
+    assert caps == sorted(caps)                   # longer taus tolerated
+
+
+def test_a_partly_observed_decay_is_refused_when_strict_and_kept_when_permissive():
+    """The setting must actually change the yield: a decay cut off partway is
+    exactly the case the levels disagree about."""
+    # 4 s decay seen for ~3.6 s: ~59% of the amplitude is lost, which sits
+    # between the balanced (50%) and strict (63%) thresholds.
+    partial = make_transient(4.0, 150, noise=0.05)
+    assert _Metrics(strictness='strict').calculate_tau(partial) is None
+    assert _Metrics(strictness='permissive').calculate_tau(partial) is not None
+
+
+def test_a_fully_observed_decay_is_reported_at_every_strictness():
+    full = make_transient(1.0, 600, noise=0.1)
+    for level in ('strict', 'balanced', 'permissive'):
+        tau = _Metrics(strictness=level).calculate_tau(full)
+        assert tau is not None, level
+        assert tau == pytest.approx(1.0, rel=0.15), level
+
+
+def test_unknown_strictness_falls_back_to_balanced():
+    weird = _Metrics(strictness='nonsense')
+    known = _Metrics(strictness='balanced')
+    data = make_transient(1.0, 300, noise=0.1)
+    assert weird.calculate_tau(data) == pytest.approx(known.calculate_tau(data))
+
+
+def test_late_spontaneous_event_does_not_become_the_peak(m):
+    """The peak search is limited to the first half of the window, so a bigger
+    unrelated event later on cannot hijack the measurement."""
+    data = make_transient(1.0, 600)
+    data[400:430] += 12.0                       # much larger, late, unrelated
+    sig, sm, baseline, peak_idx = m._orient_transient(data)
+    assert peak_idx < 300                       # still the onset transient
+    assert m.calculate_tau(data) == pytest.approx(1.0, rel=0.15)
 
 
 def test_monotonic_rise_has_no_decay(m):
