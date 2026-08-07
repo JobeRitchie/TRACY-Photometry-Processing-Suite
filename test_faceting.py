@@ -155,15 +155,28 @@ class _Facets:
     get_subject_factors = _G.get_subject_factors
     get_factor_definitions = _G.get_factor_definitions
     facet = _G.facet
+    # The real property, so a test that sets groups exercises the same
+    # conversion into Group-factor levels that the app performs.
+    groups = _G.groups
+    series_factor = _G.series_factor
+    clear_subject_factors = _G.clear_subject_factors
+    migrate_legacy_groups = _G.migrate_legacy_groups
+    reset_factors = _G.reset_factors
+    _apply_factor_payload = _G._apply_factor_payload
+    _factor_payload = _G._factor_payload
+    _FACTOR_DERIVED = _G._FACTOR_DERIVED
 
     def __init__(self, subjects, groups=None, params=None):
         self.params = {'session_pattern': _M.DEFAULT_SESSION_PATTERN,
                        'animal_overrides': {}, 'factor_definitions': [],
-                       'subject_factors': {}}
+                       'subject_factors': {}, 'factor_level_order': {},
+                       'series_factor': 'Group'}
         self.params.update(params or {})
         self.processed_data = {s: {} for s in subjects}
-        self.groups = groups or {}
         self.log_message = lambda *a, **k: None
+        self.root = None
+        if groups:
+            self.groups = groups
 
 
 def test_group_and_session_are_available_without_being_configured():
@@ -174,11 +187,45 @@ def test_group_and_session_are_available_without_being_configured():
     assert labels['2F_post'] == 'Fentanyl × post'
 
 
-def test_existing_groups_are_mirrored_so_nothing_that_reads_them_breaks():
+def test_groups_are_stored_as_levels_of_the_group_factor():
     app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre', '2F_post']})
     factors = app.get_subject_factors()
     assert factors['2F_pre']['Group'] == 'Fentanyl'
     assert 'Group' not in factors['3M_pre']       # ungrouped stays ungrouped
+    # ...and that assignment is what is actually persisted.
+    assert app.params['subject_factors']['2F_pre'] == {'Group': 'Fentanyl'}
+
+
+def test_the_groups_view_reads_back_what_was_assigned():
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']})
+    assert app.groups == {'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']}
+
+
+def test_groups_come_back_in_the_declared_plot_order():
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']})
+    app.params['factor_level_order']['Group'] = ['Saline', 'Fentanyl']
+    assert list(app.groups) == ['Saline', 'Fentanyl']
+
+
+def test_assigning_groups_replaces_rather_than_accumulates():
+    """Loading a project's groups must not leave the previous project's behind."""
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre', '2F_post']})
+    app.groups = {'Vehicle': ['3M_pre']}
+    assert app.groups == {'Vehicle': ['3M_pre']}
+
+
+def test_a_subject_in_two_groups_keeps_the_first():
+    """A factor level is singular; the overlap is reported, not silently split."""
+    legacy = {'Fentanyl': ['2F_pre'], 'Responders': ['2F_pre', '3M_pre']}
+    app = _Facets(SUBJECTS, groups=legacy)
+    assert app.get_subject_factors()['2F_pre']['Group'] == 'Fentanyl'
+    assert _M.legacy_group_overlaps(legacy) == {'2F_pre': ['Fentanyl', 'Responders']}
+
+
+def test_clearing_a_subject_takes_it_out_of_its_group():
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre', '2F_post']})
+    app.clear_subject_factors('2F_pre')
+    assert app.groups == {'Fentanyl': ['2F_post']}
 
 
 def test_a_user_defined_factor_joins_the_built_ins():
@@ -192,9 +239,68 @@ def test_a_user_defined_factor_joins_the_built_ins():
 
 
 def test_a_hand_assigned_level_overrides_the_derived_one():
-    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre']},
-                  params={'subject_factors': {'2F_pre': {'Group': 'Reassigned'}}})
-    assert app.get_subject_factors()['2F_pre']['Group'] == 'Reassigned'
+    """Session is derived from the ID, but an explicit assignment still wins."""
+    app = _Facets(SUBJECTS,
+                  params={'subject_factors': {'2F_pre': {'Session': 'baseline'}}})
+    assert app.get_subject_factors()['2F_pre']['Session'] == 'baseline'
+    assert app.get_subject_factors()['2F_post']['Session'] == 'post'
+
+
+# ---------------------------------------------------------------------------
+# Animal is only a factor when it actually pools recordings
+# ---------------------------------------------------------------------------
+
+def test_animal_is_offered_when_subjects_share_an_animal():
+    app = _Facets(SUBJECTS)
+    assert 'Animal' in app.get_factor_definitions()
+    assert app.get_subject_factors()['2F_pre']['Animal'] == '2F'
+
+
+def test_animal_is_suppressed_when_it_is_one_level_per_subject():
+    """One animal per recording makes Animal a restatement of the subject list
+    rather than a way of dividing subjects -- a dead dropdown on every tab."""
+    app = _Facets(['Control7', 'Control8', 'Treated3'])
+    assert 'Animal' not in app.get_factor_definitions()
+    assert 'Animal' not in app.get_subject_factors()['Control7']
+
+
+def test_group_is_always_offered_even_before_anything_is_assigned():
+    """It is the factor the graphing tabs plot, so an empty one is a prompt."""
+    app = _Facets(['Control7', 'Control8'])
+    assert app.get_factor_definitions()[0] == 'Group'
+
+
+# ---------------------------------------------------------------------------
+# Migrating a project saved before groups became a factor
+# ---------------------------------------------------------------------------
+
+def test_legacy_groups_convert_to_group_factor_assignments():
+    payload = _M.legacy_groups_to_factors(
+        {'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']})
+    assert payload['subject_factors'] == {'2F_pre': {'Group': 'Fentanyl'},
+                                          '3M_pre': {'Group': 'Saline'}}
+    assert payload['factor_level_order'] == {'Group': ['Fentanyl', 'Saline']}
+
+
+def test_loading_an_old_project_adopts_its_groups():
+    app = _Facets(SUBJECTS)
+    assert app.migrate_legacy_groups({'Fentanyl': ['2F_pre', '2F_post']}) is True
+    assert app.groups == {'Fentanyl': ['2F_pre', '2F_post']}
+    assert app._legacy_group_notice           # the user is told where they went
+
+
+def test_migration_does_not_overwrite_assignments_the_project_already_has():
+    """The legacy key is still written for backwards compatibility, so it can be
+    a stale mirror of the factor assignments -- which are the newer copy."""
+    app = _Facets(SUBJECTS, groups={'Vehicle': ['3M_pre']})
+    assert app.migrate_legacy_groups({'Fentanyl': ['2F_pre']}) is False
+    assert app.groups == {'Vehicle': ['3M_pre']}
+
+
+def test_a_project_with_no_groups_at_all_is_left_alone():
+    app = _Facets(SUBJECTS)
+    assert app.migrate_legacy_groups({}) is False
+    assert app.groups == {}
 
 
 def test_an_empty_factor_still_gets_a_control():
@@ -285,6 +391,7 @@ class _Series(_Facets):
     facet_series_for = _G.facet_series_for
     _series_members = _G._series_members
     selected_series = _G.selected_series
+    fill_group_listbox = _G.fill_group_listbox
 
     def __init__(self, *a, selections=None, **kw):
         super().__init__(*a, **kw)
@@ -305,22 +412,39 @@ def test_the_default_selection_is_recognised_as_the_plain_group_fan_out():
     assert not _M.facet_is_inert({'Group': SPLIT, 'Session': 'pre'})
 
 
-def test_an_untouched_tab_gets_its_groups_back_verbatim():
-    """The inert case must take the original code path, not an equivalent one:
-    groups may overlap, and an overlapping subject is drawn in both groups there
-    but would land in exactly one facet series."""
+def test_an_untouched_tab_draws_one_series_per_group():
+    """The default column reproduces the plain group fan-out -- now from a pool
+    of subjects rather than from a list of group names."""
     app = _Series(SUBJECTS, groups=GROUPS,
                   selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
-    assert app.facet_series_for('t', ['Fentanyl', 'Saline']) == ['Fentanyl', 'Saline']
-    assert app._active_facet is None
-    # ...and the members lookup falls through to the real group.
+    assert app.facet_series_for('t', SUBJECTS) == ['Fentanyl', 'Saline']
     assert app._series_members('Fentanyl') == ['2F_pre', '2F_post']
+
+
+def test_deselecting_a_subject_shrinks_its_group_without_touching_factors():
+    """The point of selecting subjects in group mode: drop one member of a group
+    from the plot without editing the design on the Factors tab."""
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    pool = [s for s in SUBJECTS if s != '2F_post']
+    assert app.facet_series_for('t', pool) == ['Fentanyl', 'Saline']
+    assert app._series_members('Fentanyl') == ['2F_pre']
+    assert app._series_members('Saline') == ['3M_pre', '3M_post']
+    # The assignment itself is untouched, so the subject comes back on reselect.
+    assert app.groups['Fentanyl'] == ['2F_pre', '2F_post']
+
+
+def test_a_group_can_be_dropped_by_deselecting_all_its_members():
+    """Selecting groups was the old unit of selection; it is still expressible."""
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    assert app.facet_series_for('t', GROUPS['Fentanyl']) == ['Fentanyl']
 
 
 def test_splitting_session_regroups_the_selected_subjects():
     app = _Series(SUBJECTS, groups=GROUPS,
                   selections={'Group': COMBINE, 'Session': SPLIT, 'Animal': COMBINE})
-    series = app.facet_series_for('t', ['Fentanyl', 'Saline'])
+    series = app.facet_series_for('t', SUBJECTS)
     assert set(series) == {'pre', 'post'}
     assert set(app._series_members('pre')) == {'2F_pre', '3M_pre'}
     assert set(app._series_members('post')) == {'2F_post', '3M_post'}
@@ -329,7 +453,7 @@ def test_splitting_session_regroups_the_selected_subjects():
 def test_group_by_session_gives_the_cross_product():
     app = _Series(SUBJECTS, groups=GROUPS,
                   selections={'Group': SPLIT, 'Session': SPLIT, 'Animal': COMBINE})
-    series = app.facet_series_for('t', ['Fentanyl', 'Saline'])
+    series = app.facet_series_for('t', SUBJECTS)
     assert len(series) == 4
     assert 'Fentanyl × pre' in series
     assert app._series_members('Fentanyl × post') == ['2F_post']
@@ -338,17 +462,24 @@ def test_group_by_session_gives_the_cross_product():
 def test_filtering_to_a_level_shrinks_the_pool():
     app = _Series(SUBJECTS, groups=GROUPS,
                   selections={'Group': SPLIT, 'Session': 'post', 'Animal': COMBINE})
-    series = app.facet_series_for('t', ['Fentanyl', 'Saline'])
+    series = app.facet_series_for('t', SUBJECTS)
     assert series == ['Fentanyl', 'Saline']
     assert app._series_members('Fentanyl') == ['2F_post']
     assert app._series_members('Saline') == ['3M_post']
 
 
-def test_the_pool_is_the_selected_groups_only():
+def test_the_pool_is_the_selected_subjects_only():
     app = _Series(SUBJECTS, groups=GROUPS,
                   selections={'Group': COMBINE, 'Session': SPLIT, 'Animal': COMBINE})
-    app.facet_series_for('t', ['Fentanyl'])
+    app.facet_series_for('t', GROUPS['Fentanyl'])
     assert app._series_members('pre') == ['2F_pre']
+
+
+def test_a_subject_listed_twice_is_pooled_once():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    app.facet_series_for('t', ['2F_pre', '2F_pre', '2F_post'])
+    assert app._series_members('Fentanyl') == ['2F_pre', '2F_post']
 
 
 def test_empty_series_do_not_take_a_colour():
@@ -359,7 +490,7 @@ def test_empty_series_do_not_take_a_colour():
         'factor_level_order': {'Dose': ['high', 'low']}},
         selections={'Group': COMBINE, 'Session': COMBINE,
                     'Animal': COMBINE, 'Dose': SPLIT})
-    series = app.facet_series_for('t', ['Fentanyl'])
+    series = app.facet_series_for('t', GROUPS['Fentanyl'])
     assert 'low' not in series
     assert series == ['high', UNASSIGNED]
 
@@ -368,15 +499,112 @@ def test_series_follow_the_declared_level_order_not_the_data():
     app = _Series(SUBJECTS, groups=GROUPS,
                   params={'factor_level_order': {'Session': ['pre', 'post']}},
                   selections={'Group': COMBINE, 'Session': SPLIT, 'Animal': COMBINE})
-    assert app.facet_series_for('t', ['Fentanyl', 'Saline']) == ['pre', 'post']
+    assert app.facet_series_for('t', SUBJECTS) == ['pre', 'post']
     app.params['factor_level_order']['Session'] = ['post', 'pre']
-    assert app.facet_series_for('t', ['Fentanyl', 'Saline']) == ['post', 'pre']
+    assert app.facet_series_for('t', SUBJECTS) == ['post', 'pre']
 
 
-def test_a_tab_with_no_facet_control_behaves_as_before():
+def test_a_tab_with_no_facet_control_falls_back_to_the_series_factor():
+    """No column (or one not built yet) must still draw the historical plot
+    rather than collapsing every subject into one series."""
     app = _Series(SUBJECTS, groups=GROUPS)
-    assert app.facet_series_for('missing', ['Fentanyl']) == ['Fentanyl']
+    assert app.facet_series_for('missing', SUBJECTS) == ['Fentanyl', 'Saline']
     assert app._series_members('Fentanyl') == ['2F_pre', '2F_post']
+
+
+# ---------------------------------------------------------------------------
+# The pool listbox: what group mode actually offers to select
+# ---------------------------------------------------------------------------
+
+class _Listbox:
+    """Just enough of tk.Listbox for the pool selector."""
+
+    def __init__(self):
+        self._items, self._sel = [], set()
+
+    def get(self, i):
+        return self._items[i]
+
+    def size(self):
+        return len(self._items)
+
+    def curselection(self):
+        return tuple(sorted(self._sel))
+
+    def delete(self, first, last=None):
+        self._items, self._sel = [], set()
+
+    def insert(self, where, value):
+        self._items.append(value)
+
+    def selection_set(self, i):
+        self._sel.add(i)
+
+    def selected(self):
+        return [self._items[i] for i in sorted(self._sel)]
+
+
+def test_group_mode_offers_every_subject_not_the_group_names():
+    """The bug this replaced: a project whose subjects carry no Group level got
+    an empty listbox and no way to plot anything."""
+    app = _Series(SUBJECTS)                       # no group assignments at all
+    assert app.groups == {}
+    box = _Listbox()
+    app.fill_group_listbox(box)
+    assert box.selected() == sorted(SUBJECTS)
+
+
+def test_an_untouched_pool_starts_fully_selected():
+    app = _Series(SUBJECTS, groups=GROUPS)
+    box = _Listbox()
+    app.fill_group_listbox(box)
+    assert box.selected() == sorted(SUBJECTS)
+
+
+def test_refilling_keeps_a_narrowed_selection():
+    """Factors are edited on another tab while a graphing tab sits there with a
+    selection, so a refresh must not quietly widen the plot back out."""
+    app = _Series(SUBJECTS, groups=GROUPS)
+    box = _Listbox()
+    app.fill_group_listbox(box)
+    box._sel = {box._items.index('2F_pre')}
+    app.fill_group_listbox(box)
+    assert box.selected() == ['2F_pre']
+
+
+def test_a_subject_that_leaves_the_project_leaves_the_pool():
+    app = _Series(SUBJECTS, groups=GROUPS)
+    box = _Listbox()
+    app.fill_group_listbox(box)
+    box._sel = {box._items.index(s) for s in ('2F_pre', '3M_pre')}
+    del app.processed_data['2F_pre']
+    app.fill_group_listbox(box)
+    assert '2F_pre' not in box._items
+    assert box.selected() == ['3M_pre']
+
+
+def test_selecting_nothing_plots_everything():
+    """An unused filter is inert -- an empty pool would mean the tab silently
+    drew nothing the first time it was touched."""
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    box = _Listbox()
+    app.fill_group_listbox(box)
+    box._sel = set()
+    assert app.selected_series('t', box) == ['Fentanyl', 'Saline']
+    # Members follow the listbox, which lists subjects alphabetically.
+    assert set(app._series_members('Fentanyl')) == {'2F_pre', '2F_post'}
+
+
+def test_the_selection_reaches_the_series():
+    app = _Series(SUBJECTS, groups=GROUPS,
+                  selections={'Group': SPLIT, 'Session': COMBINE, 'Animal': COMBINE})
+    box = _Listbox()
+    app.fill_group_listbox(box)
+    box._sel = {box._items.index(s) for s in ('2F_pre', '3M_post')}
+    assert app.selected_series('t', box) == ['Fentanyl', 'Saline']
+    assert app._series_members('Fentanyl') == ['2F_pre']
+    assert app._series_members('Saline') == ['3M_post']
 
 
 def test_facet_series_order_builds_the_cross_product_in_order():
@@ -415,3 +643,88 @@ def test_kinematics_always_shown_settings_stay_out_of_the_table():
     # analysis is selected, so they are always visible rather than scoped.
     for wanted in _M.KIN_OPTIONS_BY_PLOT.values():
         assert 'timing' not in wanted
+
+
+# ---------------------------------------------------------------------------
+# Project boundaries and importing another project's assignments
+# ---------------------------------------------------------------------------
+
+def test_a_new_project_starts_with_no_factors_of_its_own():
+    """params is merged key by key on load, so a project whose config predates a
+    key would otherwise inherit the last project's assignments."""
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre']})
+    app.params['subject_factors']['2F_pre']['Sex'] = 'F'
+    app.reset_factors()
+    assert app.params['subject_factors'] == {}
+    assert app.params['factor_definitions'] == ['Group']
+    assert app.groups == {}
+
+
+def test_importing_assignments_overwrites_only_the_factors_it_carries():
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre', '2F_post']})
+    subjects, names = app._apply_factor_payload({
+        'factor_definitions': ['Sex'],
+        'subject_factors': {'2F_pre': {'Sex': 'F'}, '3M_pre': {'Sex': 'M'}},
+        'factor_level_order': {'Sex': ['F', 'M']}}, merge=True)
+    assert names == ['Sex'] and subjects == ['2F_pre', '3M_pre']
+    factors = app.get_subject_factors()
+    assert factors['2F_pre'] == {'Group': 'Fentanyl', 'Session': 'pre', 'Animal': '2F',
+                                 'Sex': 'F'}
+    assert app.groups == {'Fentanyl': ['2F_pre', '2F_post']}   # untouched
+    assert app.params['factor_level_order']['Sex'] == ['F', 'M']
+
+
+def test_a_round_trip_through_the_payload_preserves_the_assignments():
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']})
+    saved = app._factor_payload()
+    fresh = _Facets(SUBJECTS)
+    fresh._apply_factor_payload(saved, merge=False)
+    assert fresh.groups == {'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']}
+
+
+def test_an_import_never_creates_a_derived_factor_as_a_stored_one():
+    """Session is derived; adding it to factor_definitions would leave a
+    duplicate that outlives the IDs it came from."""
+    app = _Facets(SUBJECTS)
+    app._apply_factor_payload(
+        {'subject_factors': {'2F_pre': {'Session': 'pre'}}}, merge=True)
+    assert 'Session' not in app.params['factor_definitions']
+
+
+# ---------------------------------------------------------------------------
+# The series factor is a pointer, so "Group" is a default name, not a fixture
+# ---------------------------------------------------------------------------
+
+def test_the_series_factor_defaults_to_group():
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre']})
+    assert app.series_factor == 'Group'
+
+
+def test_renaming_the_series_factor_carries_the_groups_with_it():
+    """The listboxes follow the pointer, so renaming Group does not empty them."""
+    app = _Facets(SUBJECTS, groups={'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']})
+    _M.rename_factor_in(app.params, 'Group', 'Drug')
+    app.params['series_factor'] = 'Drug'
+    assert app.series_factor == 'Drug'
+    assert app.groups == {'Fentanyl': ['2F_pre'], 'Saline': ['3M_pre']}
+    assert app.get_factor_definitions()[0] == 'Drug'
+
+
+def test_nominating_another_factor_replots_by_it():
+    app = _Facets(SUBJECTS, params={'subject_factors': {
+        '2F_pre': {'Sex': 'F'}, '3M_pre': {'Sex': 'M'}}})
+    app.params['series_factor'] = 'Sex'
+    assert app.groups == {'F': ['2F_pre'], 'M': ['3M_pre']}
+
+
+def test_a_declared_level_survives_having_no_members():
+    """Naming the groups before filling them is how people work; a level that
+    vanished the moment it was emptied would read as a bug."""
+    app = _Facets(SUBJECTS)
+    app.params['factor_level_order']['Group'] = ['Fentanyl', 'Saline']
+    # No members yet, so nothing is plotted...
+    assert app.groups == {}
+    # ...but the declaration is what the level list and assign box read.
+    assert app.params['factor_level_order']['Group'] == ['Fentanyl', 'Saline']
+    app.params['subject_factors']['2F_pre'] = {'Group': 'Saline'}
+    assert app.groups == {'Saline': ['2F_pre']}

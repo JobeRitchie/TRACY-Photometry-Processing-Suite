@@ -24,6 +24,7 @@ import re
 import sys
 import json
 import subprocess
+from collections import Counter
 from pathlib import Path
 import openpyxl
 from openpyxl import Workbook, load_workbook
@@ -37,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.10.1"
-APP_VERSION_DATE = "July 27, 2026"
+APP_VERSION = "1.11.0"
+APP_VERSION_DATE = "August 7, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -236,6 +237,10 @@ def invert_affine(ab):
 FACTOR_COMBINE = '— combine —'
 FACTOR_SPLIT = '— split —'
 FACTOR_UNASSIGNED = '(unassigned)'
+# Experimental groups are a factor like any other -- "Group" is simply the one
+# the graphing tabs plot as series by default.  There is no separate group
+# designation system any more; self.groups is a view onto this factor's levels.
+GROUP_FACTOR = 'Group'
 
 
 def facet_subjects(subject_ids, subject_factors, selections, factor_order=None):
@@ -300,6 +305,23 @@ def factor_levels(subject_ids, subject_factors, factor, level_order=None):
     return ordered + rest + tail
 
 
+def natural_sort_key(text):
+    """Sort key that orders embedded numbers numerically.
+
+    Subject IDs are letters and numbers ("A2", "A10"), so a plain string sort
+    puts A10 before A2. Digit runs compare as integers and everything else
+    case-insensitively as text.
+    """
+    key = []
+    for part in re.split(r'(\d+)', str(text)):
+        if not part:
+            continue
+        # The (0, n, '') / (1, 0, s) shape keeps ints and strings comparable:
+        # numbers sort before text at the same position.
+        key.append((0, int(part), '') if part.isdigit() else (1, 0, part.lower()))
+    return key
+
+
 def levels_from_ids(subject_ids, pattern):
     """Read a factor level out of each subject ID with *pattern*.
 
@@ -361,6 +383,38 @@ def delete_factor_from(params, name):
             removed += 1
     (params.get('factor_level_order') or {}).pop(name, None)
     return removed
+
+
+def legacy_groups_to_factors(groups):
+    """Convert a pre-factor ``{group: [subject, ...]}`` map to a factor payload.
+
+    Projects saved before grouping became a factor stored membership directly,
+    and a group could hold a subject that another group also held.  A factor
+    level is singular, so an overlapping subject is placed in the first group
+    that claims it and the rest is reported by ``legacy_group_overlaps`` -- the
+    conversion never silently picks a winner without saying so.
+    """
+    assignments, order = {}, []
+    for gname, members in (groups or {}).items():
+        gname = str(gname)
+        if gname not in order:
+            order.append(gname)
+        for sid in members or []:
+            assignments.setdefault(str(sid), {}).setdefault(GROUP_FACTOR, gname)
+    return {
+        'factor_definitions': [GROUP_FACTOR],
+        'subject_factors': assignments,
+        'factor_level_order': {GROUP_FACTOR: order},
+    }
+
+
+def legacy_group_overlaps(groups):
+    """``{subject: [group, ...]}`` for subjects that were in more than one group."""
+    seen = {}
+    for gname, members in (groups or {}).items():
+        for sid in members or []:
+            seen.setdefault(str(sid), []).append(str(gname))
+    return {sid: names for sid, names in seen.items() if len(names) > 1}
 
 
 def facet_is_inert(selections):
@@ -459,7 +513,10 @@ class FacetControls(ttk.Frame):
     the tab plotted before factors existed.
     """
 
-    def __init__(self, parent, app, on_change=None, header="Facet by:"):
+    # "Split series by" rather than "Facet by": the column sits under a list of
+    # subjects and its job is to say how that pool divides into plotted series,
+    # which is the one thing a reader needs to know without learning the word.
+    def __init__(self, parent, app, on_change=None, header="Split series by:"):
         super().__init__(parent)
         self.app = app
         self._on_change = on_change
@@ -1541,13 +1598,19 @@ class FPAnalysisGUI:
             # actually groups subjects together.
             'session_pattern': DEFAULT_SESSION_PATTERN,
             'animal_overrides': {},  # {subject_id: animal_id} — hand-linked exceptions
-            # User-defined factors for faceting: names, per-subject levels, and
-            # the display order of each factor's levels (which drives series
-            # order and colour assignment, so it must not be alphabetical by
-            # accident).  Group/Session/Animal are derived, not stored here.
-            'factor_definitions': [],
+            # Factors for faceting: names, per-subject levels, and the display
+            # order of each factor's levels (which drives series order and
+            # colour assignment, so it must not be alphabetical by accident).
+            # Group is an ordinary stored factor -- it is where subject grouping
+            # now lives, replacing the old Groups tab.  Session and Animal are
+            # still derived from the subject IDs rather than stored.
+            'factor_definitions': [GROUP_FACTOR],
             'subject_factors': {},
             'factor_level_order': {},
+            # Which factor the graphing tabs plot as their series. Renaming that
+            # factor moves this pointer, so it is not a name the user is stuck
+            # with.
+            'series_factor': GROUP_FACTOR,
             'boutframes_video_fps': 30,  # Frame rate of source video used to create boutframes
             'auto_scale_boutframes': False,  # Auto-scale boutframe numbers to photometry FPS
             'precut_correct_boutframes': True,  # Subtract precut/n_led_states offset from boutframes to align with post-precut FP data
@@ -1641,8 +1704,10 @@ class FPAnalysisGUI:
         self.project_dir = str(Path.home() / "FP_Projects")
         self.current_project = None
         self.processed_data = {}
-        self.groups = {}  # Dictionary: group_name -> list of subject_ids
-        self.groups_mutually_exclusive_var = tk.BooleanVar(value=True)
+        # There is no groups store: self.groups is a property over the Group
+        # factor, and factors are reset at every project boundary. See the
+        # Factors section.
+        self.reset_factors()
         self.spike_data = {}  # Dictionary: subject_id -> spike analysis results
         self.connectivity_results = {}  # Dictionary: subject/group -> connectivity analysis results
         self.exclusions = {}  # Dictionary: subject_id -> list of excluded channels (e.g., ['G0', 'R1'])
@@ -2361,7 +2426,7 @@ class FPAnalysisGUI:
         if not hasattr(self, '_option_clusters'):
             self._option_clusters = {}
         self._option_clusters[tab_key] = (plot_type_var, clusters, table, set(always))
-        plot_type_var.trace('w', lambda *_a: self.apply_option_disclosure(tab_key))
+        plot_type_var.trace_add('write', lambda *_a: self.apply_option_disclosure(tab_key))
         # Called once here as well as on change, so the initial state is
         # established rather than inherited from however the frames were built.
         self.apply_option_disclosure(tab_key)
@@ -2530,6 +2595,14 @@ class FPAnalysisGUI:
             except tk.TclError:
                 pass
         style.configure('TLabelframe', borderwidth=1)
+        # A Treeview row keeps ttk's fixed 20 px height whatever the font is, so
+        # at any scale above 1.0 the rows overlap and the text is clipped top and
+        # bottom. Every tree in the app (subject x factor grid, exclusions,
+        # per-subject shifts) is fed from here.
+        try:
+            style.configure('Treeview', rowheight=px(22))
+        except tk.TclError:
+            pass
         # Trim the default label/checkbutton/radiobutton padding so dense
         # control panels stack in noticeably less vertical space.
         for _w in ('TLabel', 'TCheckbutton', 'TRadiobutton'):
@@ -2627,7 +2700,6 @@ class FPAnalysisGUI:
         self.create_project_tab()
         self.create_processing_tab()
         self.create_boutframes_tab()
-        self.create_groups_tab()
         self.create_factors_tab()
         self.create_exclusions_tab()
         # Data-group subtabs
@@ -3147,9 +3219,20 @@ class FPAnalysisGUI:
         ttk.Entry(input_frame, textvariable=self.boutframes_path_var, width=50).grid(row=2, column=1, pady=2)
         ttk.Button(input_frame, text="Browse", command=self.browse_boutframes).grid(row=2, column=2, padx=3)
 
+        # How the workbook's sheets map onto this project's recordings.  Filled
+        # in by _update_boutframes_layout_label() whenever a file is chosen or
+        # the subject list changes; multi-session projects are the case where
+        # the answer is not obvious from the sheet names alone.
+        self.boutframes_layout_label = ttk.Label(
+            input_frame,
+            text="One worksheet per subject.  Multi-session projects may instead "
+                 "key sheets by animal and add a 'Session' column.",
+            foreground='gray', font=('Segoe UI', 8))
+        self.boutframes_layout_label.grid(row=3, column=1, columnspan=2, sticky='w', pady=(0, 4))
+
         # Boutframes FPS scaling
         boutframes_scale_frame = ttk.Frame(input_frame)
-        boutframes_scale_frame.grid(row=3, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        boutframes_scale_frame.grid(row=4, column=0, columnspan=3, sticky='w', pady=(0, 4))
         ttk.Checkbutton(boutframes_scale_frame,
                         text="Auto-scale boutframes to photometry FPS during processing",
                         variable=self.auto_scale_boutframes_var).pack(side='left', padx=(0, 12))
@@ -3167,7 +3250,7 @@ class FPAnalysisGUI:
 
         # Precut boutframe correction
         boutframes_precut_row = ttk.Frame(input_frame)
-        boutframes_precut_row.grid(row=4, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        boutframes_precut_row.grid(row=5, column=0, columnspan=3, sticky='w', pady=(0, 4))
         ttk.Checkbutton(boutframes_precut_row,
                         text="Correct boutframes for precut (subtract precut ÷ n_LED_states offset)",
                         variable=self.precut_correct_boutframes_var).pack(side='left', padx=(0, 8))
@@ -3176,10 +3259,10 @@ class FPAnalysisGUI:
                   foreground='gray', font=('Segoe UI', 8)).pack(side='left')
 
         # TTL/DigitalIOs file
-        ttk.Label(input_frame, text="TTL/DigitalIOs File (optional):").grid(row=5, column=0, sticky='w', pady=2)
+        ttk.Label(input_frame, text="TTL/DigitalIOs File (optional):").grid(row=6, column=0, sticky='w', pady=2)
         self.ttl_path_var = tk.StringVar()
         ttl_entry_frame = ttk.Frame(input_frame)
-        ttl_entry_frame.grid(row=5, column=1, columnspan=2, sticky='ew', pady=2)
+        ttl_entry_frame.grid(row=6, column=1, columnspan=2, sticky='ew', pady=2)
         ttk.Entry(ttl_entry_frame, textvariable=self.ttl_path_var, width=50).pack(side=tk.LEFT)
         ttk.Button(ttl_entry_frame, text="Browse", command=self.browse_ttl).pack(side=tk.LEFT, padx=3)
         ttk.Button(ttl_entry_frame, text="❓", width=3, command=self.show_ttl_help).pack(side=tk.LEFT, padx=3)
@@ -3193,9 +3276,9 @@ class FPAnalysisGUI:
             'Paired (onset/offset) — start & end bouts':   'pairs_startend',
         }
         self._ttl_format_label_by_value = {v: k for k, v in self._ttl_format_labels.items()}
-        ttk.Label(input_frame, text="Raw TTL event format:").grid(row=6, column=0, sticky='w', pady=2)
+        ttk.Label(input_frame, text="Raw TTL event format:").grid(row=7, column=0, sticky='w', pady=2)
         _ttl_fmt_frame = ttk.Frame(input_frame)
-        _ttl_fmt_frame.grid(row=6, column=1, columnspan=2, sticky='ew', pady=2)
+        _ttl_fmt_frame.grid(row=7, column=1, columnspan=2, sticky='ew', pady=2)
         self.ttl_format_var = tk.StringVar(
             value=self._ttl_format_label_by_value.get(
                 self.params.get('ttl_format', 'pairs_start'),
@@ -3757,28 +3840,25 @@ class FPAnalysisGUI:
         total_after = 0
         any_end = False
         try:
-            wb = load_workbook(boutframes_file, read_only=True)
-            sheets = wb.sheetnames
-            wb.close()
+            recordings = list(self.iter_boutframes_recordings(boutframes_file))
         except Exception as e:
             messagebox.showerror("Error", f"Could not read boutframes file:\n{e}")
             return
 
-        for sheet in sheets:
-            try:
-                df = pd.read_excel(boutframes_file, sheet_name=sheet)
-            except Exception:
-                continue
+        for sheet, subject_id, df in recordings:
             behaviors, has_end = self._parse_boutframes_dataframe(df)
             any_end = any_end or has_end
             sheet_before = 0
             sheet_excl = 0
             beh_lines = []
+            # Shifts/precut are per recording, so key them on the subject when
+            # the sheet is an animal's rather than a recording's.
+            shift_key = subject_id if subject_id is not None else sheet
             for name, raw_start, raw_end in behaviors:
                 if len(raw_start) == 0:
                     continue
-                start = self._transform_boutframe_values(raw_start, sheet, as_int=True)
-                end = (self._transform_boutframe_values(raw_end, sheet, as_int=False)
+                start = self._transform_boutframe_values(raw_start, shift_key, as_int=True)
+                end = (self._transform_boutframe_values(raw_end, shift_key, as_int=False)
                        if raw_end is not None else None)
                 exclude_before = self.params.get('exclude_frames_before', 0)
                 _m = start >= exclude_before
@@ -3869,7 +3949,7 @@ class FPAnalysisGUI:
         self.behav_subject_frame.pack(fill='both', expand=True)
 
         self.behav_group_frame = ttk.Frame(selector)
-        self.behav_group_label = ttk.Label(self.behav_group_frame, text="Group(s):")
+        self.behav_group_label = ttk.Label(self.behav_group_frame, text="Subjects to include:")
         self.behav_group_label.pack(anchor='w')
         behav_list_holder = ttk.Frame(self.behav_group_frame)
         behav_list_holder.pack(fill='both', expand=True)
@@ -3941,153 +4021,12 @@ class FPAnalysisGUI:
         tree_container.grid_rowconfigure(0, weight=1)
         tree_container.grid_columnconfigure(0, weight=1)
 
-    def create_groups_tab(self):
-        """Tab for creating and managing subject groups"""
-        tab = ttk.Frame(self.project_notebook)
-        self.project_notebook.add(tab, text="Groups")
-        
-        # Create canvas with scrollbar for scrollable content
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        self._register_tab_mousewheel(tab, canvas, scrollable_frame)
-        
-        # Main container with two columns
-        main_container = ttk.Frame(scrollable_frame)
-        main_container.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # Left panel: Group Management
-        left_panel = ttk.LabelFrame(main_container, text="Group Management", padding=5)
-        left_panel.grid(row=0, column=0, sticky='nsew', padx=(0, 3))
-        
-        # Group creation
-        create_frame = ttk.Frame(left_panel)
-        create_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Label(create_frame, text="New Group Name:").pack(side='left', padx=(0, 5))
-        self.new_group_var = tk.StringVar()
-        ttk.Entry(create_frame, textvariable=self.new_group_var, width=20).pack(side='left', padx=(0, 5))
-        ttk.Button(create_frame, text="Create Group", command=self.create_group).pack(side='left')
-        
-        # Group list
-        ttk.Label(left_panel, text="Existing Groups:").pack(anchor='w', pady=(0, 3))
-        
-        group_list_frame = ttk.Frame(left_panel)
-        group_list_frame.pack(fill='both', expand=True)
-        
-        self.group_listbox = tk.Listbox(group_list_frame, selectmode='single', height=8, exportselection=False)
-        self.group_listbox.pack(side='left', fill='both', expand=True)
-        self.group_listbox.bind('<<ListboxSelect>>', self.on_group_selected)
-        self.group_listbox.bind('<Double-Button-1>', lambda e: self.rename_group())
-        self.group_listbox.bind('<Delete>', lambda e: self.delete_group())
-        
-        group_scrollbar = ttk.Scrollbar(group_list_frame, orient='vertical', command=self.group_listbox.yview)
-        group_scrollbar.pack(side='right', fill='y')
-        self.group_listbox.config(yscrollcommand=group_scrollbar.set)
-        
-        # Group control buttons
-        group_btn_frame = ttk.Frame(left_panel)
-        group_btn_frame.pack(fill='x', pady=(10, 0))
-        
-        ttk.Button(group_btn_frame, text="Rename Group", command=self.rename_group).pack(side='left', padx=(0, 5))
-        ttk.Button(group_btn_frame, text="Delete Group", command=self.delete_group).pack(side='left', padx=(0, 5))
-        ttk.Button(group_btn_frame, text="Move Up", command=self.move_group_up).pack(side='left', padx=(5, 5))
-        ttk.Button(group_btn_frame, text="Move Down", command=self.move_group_down).pack(side='left', padx=(0, 5))
-        
-        # Second row for save/load buttons
-        group_btn_frame2 = ttk.Frame(left_panel)
-        group_btn_frame2.pack(fill='x', pady=(5, 0))
-        
-        ttk.Button(group_btn_frame2, text="💾 Save Groups", command=self.save_groups_to_file).pack(side='left', padx=(0, 5))
-        ttk.Button(group_btn_frame2, text="📂 Load Groups", command=self.load_groups_from_file).pack(side='left', padx=(0, 5))
-        ttk.Button(group_btn_frame2, text="Import from Project", command=self.import_groups_from_project).pack(side='left', padx=(0, 5))
-        ttk.Button(group_btn_frame2, text="🔄 Refresh", command=self.refresh_groups_display).pack(side='left')
-        
-        # Middle panel: Available Subjects
-        middle_panel = ttk.LabelFrame(main_container, text="Available Subjects", padding=5)
-        middle_panel.grid(row=0, column=1, sticky='nsew', padx=3)
-
-        self.group_exclusivity_button = ttk.Button(
-            middle_panel,
-            text="",
-            command=self.toggle_group_exclusivity
-        )
-        self.group_exclusivity_button.pack(fill='x', pady=(0, 6))
-        self._update_group_exclusivity_button_label()
-        
-        available_list_frame = ttk.Frame(middle_panel)
-        available_list_frame.pack(fill='both', expand=True)
-        
-        self.available_subjects_listbox = tk.Listbox(available_list_frame, selectmode='extended', height=12, exportselection=False, font=('TkDefaultFont', 9))
-        self.available_subjects_listbox.pack(side='left', fill='both', expand=True)
-        self.available_subjects_listbox.bind('<Double-Button-1>', lambda e: self.add_subjects_to_group())
-        
-        avail_scrollbar = ttk.Scrollbar(available_list_frame, orient='vertical', command=self.available_subjects_listbox.yview)
-        avail_scrollbar.pack(side='right', fill='y')
-        self.available_subjects_listbox.config(yscrollcommand=avail_scrollbar.set)
-        
-        # Add/Remove buttons
-        btn_frame = ttk.Frame(middle_panel)
-        btn_frame.pack(fill='x', pady=(10, 0))
-        
-        ttk.Button(btn_frame, text="Add to Group →", command=self.add_subjects_to_group).pack(side='left', padx=(0, 5))
-        ttk.Button(btn_frame, text="← Remove from Group", command=self.remove_subjects_from_group).pack(side='left')
-        
-        # Right panel: Group Members
-        right_panel = ttk.LabelFrame(main_container, text="Group Members", padding=5)
-        right_panel.grid(row=0, column=2, sticky='nsew', padx=(3, 0))
-        
-        self.group_name_label = ttk.Label(right_panel, text="Select a group", font=('TkDefaultFont', 10, 'bold'))
-        self.group_name_label.pack(anchor='w', pady=(0, 5))
-        
-        self.group_stats_label = ttk.Label(right_panel, text="", font=('TkDefaultFont', 9), foreground='gray')
-        self.group_stats_label.pack(anchor='w', pady=(0, 5))
-        
-        members_list_frame = ttk.Frame(right_panel)
-        members_list_frame.pack(fill='both', expand=True)
-        
-        self.group_members_listbox = tk.Listbox(members_list_frame, selectmode='extended', height=12, exportselection=False, font=('TkDefaultFont', 9))
-        self.group_members_listbox.pack(side='left', fill='both', expand=True)
-        self.group_members_listbox.bind('<Double-Button-1>', lambda e: self.remove_subjects_from_group())
-        self.group_members_listbox.bind('<Delete>', lambda e: self.remove_subjects_from_group())
-        
-        members_scrollbar = ttk.Scrollbar(members_list_frame, orient='vertical', command=self.group_members_listbox.yview)
-        members_scrollbar.pack(side='right', fill='y')
-        self.group_members_listbox.config(yscrollcommand=members_scrollbar.set)
-        
-        # Configure grid weights
-        main_container.grid_rowconfigure(0, weight=1)
-        main_container.grid_columnconfigure(0, weight=1)
-        main_container.grid_columnconfigure(1, weight=1)
-        main_container.grid_columnconfigure(2, weight=1)
-        
-        # Add info label at bottom
-        info_label = ttk.Label(tab, 
-                              text="💡 Tip: Groups are saved as .tracy files in your project folder.",
-                              font=('Segoe UI', 9),
-                              foreground='blue',
-                              wraplength=self.ui_px(500))
-        info_label.pack(side='bottom', fill='x', padx=10, pady=5)
-        
     # ======================== Factors ========================
-    # Derived factors are computed from data that already exists (self.groups,
-    # the subject-ID pattern) rather than stored, so they cannot drift out of
-    # sync with it. They can still be overridden per subject: a stored level
-    # always wins in get_subject_factors().
-    _FACTOR_DERIVED = ('Group', 'Session', 'Animal')
+    # Derived factors are computed from the subject-ID pattern rather than
+    # stored, so they cannot drift out of sync with it. They can still be
+    # overridden per subject: a stored level always wins in
+    # get_subject_factors().
+    _FACTOR_DERIVED = ('Session', 'Animal')
 
     def create_factors_tab(self):
         """Tab for defining factors and assigning their levels to subjects.
@@ -4106,7 +4045,14 @@ class FPAnalysisGUI:
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        # A canvas window keeps its requested size, so without this the grid of
+        # subjects stops at whatever it asked for and leaves the rest of the tab
+        # empty -- with the assignment buttons clipped at that edge. Height only
+        # grows to fill; past that the canvas scrolls as before.
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+            window_id, width=e.width,
+            height=max(e.height, scrollable_frame.winfo_reqheight())))
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -4116,8 +4062,10 @@ class FPAnalysisGUI:
                   text="A factor is any way of dividing subjects — Group, Session, Drug, Sex, Day.\n"
                        "Graphing tabs can combine a factor's levels, split into one series per level, or\n"
                        "filter to a single level, and splitting two factors at once gives the cross-product\n"
-                       "(\"Fentanyl × Post\"). Group, Session and Animal are derived automatically; assigning\n"
-                       "a level here overrides the derived one for that subject.",
+                       "(\"Fentanyl × Post\"). Your experimental groups are the levels of whichever factor is\n"
+                       "marked “plotted as series” — Group by default, but rename it or press 'Plot as series'\n"
+                       "on another. Session and Animal are derived from the subject IDs; a level assigned here\n"
+                       "overrides the derived one for that subject.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(760), justify='left').pack(anchor='w', padx=8, pady=(8, 2))
 
@@ -4145,12 +4093,12 @@ class FPAnalysisGUI:
 
         factor_btns = ttk.Frame(factor_frame)
         factor_btns.pack(fill='x', pady=(6, 0))
-        ttk.Button(factor_btns, text="New…", style='Compact.TButton',
-                   command=self.create_factor).pack(side='left', padx=(0, 4))
-        ttk.Button(factor_btns, text="Rename…", style='Compact.TButton',
-                   command=self.rename_factor).pack(side='left', padx=(0, 4))
-        ttk.Button(factor_btns, text="Delete", style='Compact.TButton',
-                   command=self.delete_factor).pack(side='left')
+        self.button_grid(factor_btns, [
+            ("New…", self.create_factor),
+            ("Rename…", self.rename_factor),
+            ("Delete", self.delete_factor),
+            ("Plot as series", self.set_series_factor),
+        ], cols=2, style='Compact.TButton')
 
         # Level display order drives series order and colour assignment on every
         # plot, so it is user-controlled rather than alphabetical by accident.
@@ -4169,12 +4117,25 @@ class FPAnalysisGUI:
 
         level_btns = ttk.Frame(level_frame)
         level_btns.pack(fill='x', pady=(6, 0))
-        ttk.Button(level_btns, text="▲ Up", style='Compact.TButton',
-                   command=lambda: self.move_factor_level(-1)).pack(side='left', padx=(0, 4))
-        ttk.Button(level_btns, text="▼ Down", style='Compact.TButton',
-                   command=lambda: self.move_factor_level(1)).pack(side='left', padx=(0, 4))
-        ttk.Button(level_btns, text="Rename…", style='Compact.TButton',
-                   command=self.rename_factor_level).pack(side='left')
+        self.button_grid(level_btns, [
+            ("New level…", self.create_factor_level),
+            ("Rename…", self.rename_factor_level),
+            ("▲ Up", lambda: self.move_factor_level(-1)),
+            ("▼ Down", lambda: self.move_factor_level(1)),
+            ("Delete", self.delete_factor_level),
+        ], cols=2, style='Compact.TButton')
+
+        # Assignments used to live in .tracy files written by the Groups tab.
+        # They still travel between projects, but now as whole factor sets.
+        file_frame = ttk.LabelFrame(left_panel, text="Assignments", padding=5)
+        file_frame.pack(fill='x', pady=(6, 0))
+        file_btns = ttk.Frame(file_frame)
+        file_btns.pack(fill='x')
+        self.button_grid(file_btns, [
+            ("💾 Save…", self.save_factors_to_file),
+            ("📂 Load…", self.load_factors_from_file),
+            ("Import from project…", self.import_factors_from_project),
+        ], cols=2, style='Compact.TButton')
 
         # ── Right: the subject × factor grid and the assignment actions ───────
         right_panel = ttk.LabelFrame(main_container, text="Subject Assignments", padding=5)
@@ -4199,6 +4160,35 @@ class FPAnalysisGUI:
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
+        # The grid is editable like a spreadsheet so a design already typed up in
+        # Excel can be pasted in whole, rather than re-entered a level at a time.
+        # Clicking sets the anchor cell -- the paste origin -- since a Treeview
+        # selects whole rows and has no cell cursor of its own.
+        self.factor_tree.bind('<Button-1>', self._on_factor_cell_click, add='+')
+        self.factor_tree.bind('<Double-Button-1>', self._on_factor_cell_double_click)
+        self.factor_tree.bind('<Return>', lambda _e: self._edit_anchor_cell())
+        self.factor_tree.bind('<F2>', lambda _e: self._edit_anchor_cell())
+        self.factor_tree.bind('<Key>', self._on_factor_tree_key)
+        self.factor_tree.bind('<Delete>', lambda _e: self.clear_factor_cells())
+        for seq in ('<Control-v>', '<Control-V>'):
+            self.factor_tree.bind(seq, lambda _e: self.paste_factor_cells())
+        for seq in ('<Control-c>', '<Control-C>'):
+            self.factor_tree.bind(seq, lambda _e: self.copy_factor_cells())
+        for seq in ('<Control-z>', '<Control-Z>'):
+            self.factor_tree.bind(seq, lambda _e: self.undo_factor_edit())
+
+        paste_frame = ttk.Frame(right_panel)
+        paste_frame.pack(fill='x', pady=(6, 0))
+        self.factor_anchor_label = ttk.Label(paste_frame, text="Paste target: (click a cell)",
+                                             foreground='gray', font=('Segoe UI', 8))
+        self.factor_anchor_label.pack(side='left', padx=(0, 8))
+        ttk.Button(paste_frame, text="📋 Paste from Excel", style='Compact.TButton',
+                   command=self.paste_factor_cells).pack(side='left', padx=(0, 4))
+        ttk.Button(paste_frame, text="Copy", style='Compact.TButton',
+                   command=self.copy_factor_cells).pack(side='left', padx=(0, 4))
+        ttk.Button(paste_frame, text="↶ Undo", style='Compact.TButton',
+                   command=self.undo_factor_edit).pack(side='left')
+
         # Bulk assignment. Per-subject editing alone is unusable at 23 subjects,
         # so the primary action is "assign this level to everything selected".
         assign_frame = ttk.Frame(right_panel)
@@ -4221,8 +4211,13 @@ class FPAnalysisGUI:
                        self.factor_tree.get_children())).pack(side='left')
 
         ttk.Label(right_panel,
-                  text="New levels are created by typing one in the box — it does not have to exist yet.",
-                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 0))
+                  text="New levels are created by typing one in the box — it does not have to exist yet. "
+                       "Click a column heading to sort by it (again to reverse); factor columns sort in "
+                       "level plot order. Double-click or F2 edits a cell; Ctrl+V pastes a block from "
+                       "Excel starting at the clicked cell, Ctrl+C copies the selected rows, Delete "
+                       "clears them and Ctrl+Z undoes the last grid edit.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(560), justify='left').pack(anchor='w', pady=(3, 0))
 
         auto_frame = ttk.Frame(right_panel)
         auto_frame.pack(fill='x', pady=(6, 0))
@@ -4247,10 +4242,10 @@ class FPAnalysisGUI:
         main_container.grid_columnconfigure(1, weight=1)
 
         self.refresh_factors_display()
-        # The subject set and self.groups both change from elsewhere (processing,
-        # project load, the Groups tab) with no single hook to hang this off.
-        # Rebuilding when the tab becomes visible keeps the grid honest without
-        # threading a callback through all of those paths.
+        # The subject set changes from elsewhere (processing, project load) with
+        # no single hook to hang this off. Rebuilding when the tab becomes
+        # visible keeps the grid honest without threading a callback through all
+        # of those paths.
         tab.bind('<Map>', lambda _e: self.refresh_factors_display())
 
     def _selected_factor(self):
@@ -4265,15 +4260,23 @@ class FPAnalysisGUI:
         """Rebuild the factor list, the level list and the assignment grid."""
         if not hasattr(self, 'factor_tree'):
             return
+        # The rows are about to be deleted out from under any open cell editor.
+        self._end_factor_cell_edit(commit=False)
         subjects = sorted(self.processed_data.keys())
         factors = self.get_factor_definitions(subjects)
         assignments = self.get_subject_factors(subjects)
+        subjects = self._factor_sorted_subjects(subjects, factors, assignments)
 
         previous = self._selected_factor()
         self._factor_names = factors
         self.factor_listbox.delete(0, 'end')
         for name in factors:
-            marker = '  (derived)' if name in self._FACTOR_DERIVED else ''
+            if name == self.series_factor:
+                marker = '  ← plotted as series'
+            elif name in self._FACTOR_DERIVED:
+                marker = '  (derived from subject IDs)'
+            else:
+                marker = ''
             self.factor_listbox.insert('end', f"{name}{marker}")
         if factors:
             index = factors.index(previous) if previous in factors else 0
@@ -4283,13 +4286,19 @@ class FPAnalysisGUI:
         selected_rows = set(self.factor_tree.selection())
         self.factor_tree.delete(*self.factor_tree.get_children())
         self.factor_tree['columns'] = factors
-        self.factor_tree.heading('#0', text='Subject')
+        # Clicking a heading sorts by that column; clicking it again reverses.
+        self.factor_tree.heading('#0', text=f"Subject{self._factor_sort_arrow('#0')}",
+                                 command=lambda: self.sort_factor_tree('#0'))
         self.factor_tree.column('#0', width=self.ui_px(150),
                                 minwidth=self.ui_px(90), stretch=False)
         for name in factors:
-            self.factor_tree.heading(name, text=name)
-            self.factor_tree.column(name, width=self.ui_px(110),
-                                    minwidth=self.ui_px(60), stretch=False, anchor='w')
+            self.factor_tree.heading(
+                name, text=f"{name}{self._factor_sort_arrow(name)}",
+                command=lambda n=name: self.sort_factor_tree(n))
+            # Group levels are phrases ("Female Fentanyl"), not codes, so the
+            # column has to be wide enough to read one.
+            self.factor_tree.column(name, width=self.ui_px(150),
+                                    minwidth=self.ui_px(70), stretch=True, anchor='w')
         for sid in subjects:
             levels = assignments.get(sid) or {}
             self.factor_tree.insert('', 'end', iid=sid, text=sid,
@@ -4304,10 +4313,63 @@ class FPAnalysisGUI:
         else:
             self.factor_status_label.config(
                 text=f"{len(subjects)} subject(s) · {len(factors)} factor(s). "
-                     "Blank cells are unassigned and plot as “(unassigned)”.")
+                     f"The graphing tabs list the levels of “{self.series_factor}” "
+                     "as their groups. Blank cells are unassigned and plot as "
+                     "“(unassigned)”.")
+        self._update_factor_anchor_label()
         self._on_factor_selected()
         # A factor created here is useless until the graphing tabs offer it.
         self.refresh_facet_controls()
+
+    # ── Sorting the assignment grid ──────────────────────────────────────────
+    # The grid is rebuilt from scratch on every refresh (subjects appear from
+    # processing, levels change on assignment), so the sort is held as state and
+    # re-applied to the rows rather than shuffled in place in the Treeview.
+
+    def _factor_sort_state(self):
+        """Current ``(column, reverse)``; '#0' is the Subject column."""
+        return getattr(self, '_factor_sort', ('#0', False))
+
+    def _factor_sort_arrow(self, column):
+        """Heading suffix marking the sorted column and its direction."""
+        col, reverse = self._factor_sort_state()
+        if column != col:
+            return ''
+        return '  ▼' if reverse else '  ▲'
+
+    def sort_factor_tree(self, column):
+        """Sort the assignment grid by *column*, reversing on a repeat click."""
+        col, reverse = self._factor_sort_state()
+        self._factor_sort = (column, not reverse if column == col else False)
+        self.refresh_factors_display()
+
+    def _factor_sorted_subjects(self, subjects, factors, assignments):
+        """Order subjects for the grid according to the current sort."""
+        column, reverse = self._factor_sort_state()
+        # Subject order is the tiebreak within a level, and it stays ascending
+        # when a factor column is reversed -- flipping it too would scramble the
+        # rows a user is reading down.
+        rows = sorted(subjects, key=natural_sort_key)
+        if column == '#0' or column not in factors:
+            return rows[::-1] if (reverse and column == '#0') else rows
+
+        # A factor's levels sort in their declared plot order, not
+        # alphabetically: that is the order the same levels appear in on every
+        # plot, so the grid matches what the legend will say. Levels with no
+        # declared position follow alphabetically, unassigned subjects last.
+        order = (self.params.get('factor_level_order') or {}).get(column) or []
+        rank = {lv: i for i, lv in enumerate(order)}
+
+        def key(sid):
+            level = str((assignments.get(sid) or {}).get(column) or '')
+            if not level:
+                return (2, len(order), [])
+            if level in rank:
+                return (0, rank[level], [])
+            return (1, len(order), natural_sort_key(level))
+
+        # sorted() is stable, so subjects stay in natural order within a level.
+        return sorted(rows, key=key, reverse=reverse)
 
     def _on_factor_selected(self):
         """Refresh the level list and assignment box for the chosen factor."""
@@ -4319,12 +4381,28 @@ class FPAnalysisGUI:
             self.factor_assign_combo['values'] = []
             return
         subjects = sorted(self.processed_data.keys())
+        order = (self.params.get('factor_level_order') or {}).get(factor) or []
         levels = [lv for lv in factor_levels(
-            subjects, self.get_subject_factors(subjects), factor,
-            (self.params.get('factor_level_order') or {}).get(factor))
+            subjects, self.get_subject_factors(subjects), factor, order)
             if lv != FACTOR_UNASSIGNED]
+        # A level nobody is at yet still belongs in the list: you name the groups
+        # first and fill them afterwards at least as often as the reverse, and a
+        # level that vanished the moment it was emptied would look like a bug.
+        counts = {lv: 0 for lv in levels}
+        for sid in subjects:
+            lv = (self.get_subject_factors(subjects).get(sid) or {}).get(factor)
+            if lv in counts:
+                counts[lv] += 1
+        for declared in order:
+            if declared not in counts:
+                counts[declared] = 0
+                levels.append(declared)
+        levels.sort(key=lambda lv: order.index(lv) if lv in order else len(order))
+
+        self.factor_level_listbox.delete(0, 'end')
         for level in levels:
-            self.factor_level_listbox.insert('end', level)
+            self.factor_level_listbox.insert('end', f"{level}   (n={counts[level]})")
+        self._factor_level_names = levels
         self.factor_assign_combo['values'] = levels
 
     def create_factor(self):
@@ -4354,8 +4432,8 @@ class FPAnalysisGUI:
             messagebox.showinfo(
                 "Derived Factor",
                 f"'{factor}' is derived automatically and cannot be renamed.\n\n"
-                "Group comes from the Groups tab; Session and Animal come from the "
-                "ID style on Processing → Animals & Sessions.")
+                "Session and Animal come from the ID style on "
+                "Processing → Animals & Sessions.")
             return
         new = tk.simpledialog.askstring(
             "Rename Factor", f"New name for '{factor}':",
@@ -4368,7 +4446,13 @@ class FPAnalysisGUI:
             return
 
         rename_factor_in(self.params, factor, new)
+        # The graphing tabs plot one nominated factor as their series. Renaming
+        # it moves the nomination with it, so "Group" is a default name rather
+        # than a word the user is stuck with.
+        if factor == self.series_factor:
+            self.params['series_factor'] = new
         self.refresh_factors_display()
+        self.update_groups_ui()
         self.log_message(f"Renamed factor '{factor}' to '{new}'")
 
     def delete_factor(self):
@@ -4380,19 +4464,50 @@ class FPAnalysisGUI:
             messagebox.showinfo(
                 "Derived Factor",
                 f"'{factor}' is derived automatically and cannot be deleted.\n\n"
-                "It disappears on its own when nothing produces it — Group when no "
-                "groups exist, Session when the IDs encode no sessions.")
+                "It disappears on its own when nothing produces it — Session when "
+                "the IDs encode no sessions, Animal when no animal has more than "
+                "one recording.")
             return
         assigned = sum(1 for levels in (self.params.get('subject_factors') or {}).values()
                        if factor in levels)
+        # Deleting the factor the tabs plot is allowed, but it empties every
+        # group listbox, so say so rather than letting the plots go quiet.
+        series_note = ("\n\nIt is also the factor the graphing tabs plot as their "
+                       "series, so their group lists stay empty until you press "
+                       "'Plot as series' on another factor."
+                       if factor == self.series_factor else "")
         if not messagebox.askyesno(
                 "Delete Factor",
                 f"Delete factor '{factor}'?\n\n"
-                f"{assigned} subject assignment(s) will be removed."):
+                f"{assigned} subject assignment(s) will be removed.{series_note}"):
             return
         delete_factor_from(self.params, factor)
+        if factor == self.series_factor:
+            self.params['series_factor'] = GROUP_FACTOR
         self.refresh_factors_display()
+        self.update_groups_ui()
         self.log_message(f"Deleted factor '{factor}'")
+
+    def set_series_factor(self):
+        """Nominate the selected factor as the one the graphing tabs plot.
+
+        Every tab's group list is the levels of one factor. Which factor that is
+        used to be hard-wired to "Group"; making it a choice is what lets Group
+        be renamed, deleted, or replaced by the factor that actually names the
+        comparison ("Drug", "Genotype").
+        """
+        factor = self._selected_factor()
+        if not factor:
+            return
+        if factor in self._FACTOR_DERIVED:
+            messagebox.showinfo(
+                "Derived Factor",
+                f"'{factor}' is derived from the subject IDs. Plotting it as the "
+                "series works, but its levels change whenever the ID style does.")
+        self.params['series_factor'] = factor
+        self.refresh_factors_display()
+        self.update_groups_ui()
+        self.log_message(f"Graphing tabs now plot '{factor}' as their series")
 
     def assign_factor_level(self):
         """Assign the typed level to every subject selected in the grid."""
@@ -4439,6 +4554,415 @@ class FPAnalysisGUI:
                 cleared += 1
         self.refresh_factors_display()
         self.log_message(f"Cleared {factor} from {cleared} subject(s)")
+
+    # ── The assignment grid as a spreadsheet ─────────────────────────────────
+    # Most designs are already typed up in Excel, so the grid takes a pasted
+    # block whole instead of making the user re-enter it a level at a time.
+    # A Treeview selects whole rows and has no cell cursor, so the "anchor" --
+    # the last cell clicked -- stands in for one, and is where a paste starts.
+
+    _FACTOR_UNDO_DEPTH = 20
+
+    def _factor_columns(self):
+        """Factor names in grid column order."""
+        return list(self.factor_tree['columns'])
+
+    def _factor_cell_at(self, x, y):
+        """``(subject, factor)`` under a point, or ``(None, None)`` off a cell."""
+        row = self.factor_tree.identify_row(y)
+        column = self.factor_tree.identify_column(x)
+        # '#0' is the subject column: it names the row rather than holding a
+        # level, so it is not editable and cannot anchor a paste.
+        if not row or not column or column == '#0':
+            return None, None
+        columns = self._factor_columns()
+        try:
+            index = int(column[1:]) - 1
+        except ValueError:
+            return None, None
+        if not 0 <= index < len(columns):
+            return None, None
+        return row, columns[index]
+
+    def _factor_anchor_indices(self):
+        """``(row_index, column_index)`` the next paste starts at, or None.
+
+        Falls back to the top-left cell so Ctrl+V does something sensible
+        before any cell has been clicked.
+        """
+        rows = list(self.factor_tree.get_children())
+        columns = self._factor_columns()
+        if not rows or not columns:
+            return None
+        anchor = getattr(self, '_factor_anchor', None)
+        if anchor and anchor[0] in rows and anchor[1] in columns:
+            return rows.index(anchor[0]), columns.index(anchor[1])
+        return 0, 0
+
+    def _update_factor_anchor_label(self):
+        """Show which cell a paste would start at."""
+        if not hasattr(self, 'factor_anchor_label'):
+            return
+        anchor = getattr(self, '_factor_anchor', None)
+        rows = self.factor_tree.get_children()
+        if anchor and anchor[0] in rows and anchor[1] in self._factor_columns():
+            self.factor_anchor_label.config(
+                text=f"Paste target: {anchor[0]} · {anchor[1]}")
+        else:
+            self.factor_anchor_label.config(text="Paste target: (click a cell)")
+
+    def _on_factor_cell_click(self, event):
+        """Move the anchor to the clicked cell."""
+        if self.factor_tree.identify_region(event.x, event.y) != 'cell':
+            return
+        sid, factor = self._factor_cell_at(event.x, event.y)
+        if not sid:
+            return
+        self._factor_anchor = (sid, factor)
+        self._update_factor_anchor_label()
+        # Following the click with the factor list keeps "Assign to selected"
+        # and the level list pointed at the column being worked on.
+        names = getattr(self, '_factor_names', [])
+        if factor in names:
+            self.factor_listbox.selection_clear(0, 'end')
+            self.factor_listbox.selection_set(names.index(factor))
+            self._on_factor_selected()
+
+    def _on_factor_cell_double_click(self, event):
+        """Edit the double-clicked cell (headings still sort)."""
+        if self.factor_tree.identify_region(event.x, event.y) != 'cell':
+            return None
+        sid, factor = self._factor_cell_at(event.x, event.y)
+        if not sid:
+            return None
+        self._factor_anchor = (sid, factor)
+        self._update_factor_anchor_label()
+        self._begin_factor_cell_edit(sid, factor)
+        return 'break'
+
+    def _on_factor_tree_key(self, event):
+        """Typing a printable character starts editing the anchor cell."""
+        if event.state & 0x0004:  # Control held: a shortcut, not typing
+            return None
+        if len(event.char) != 1 or not event.char.isprintable():
+            return None
+        anchor = getattr(self, '_factor_anchor', None)
+        if not anchor or anchor[0] not in self.factor_tree.get_children():
+            return None
+        self._begin_factor_cell_edit(anchor[0], anchor[1], initial=event.char)
+        return 'break'
+
+    def _edit_anchor_cell(self):
+        """Open the editor on the anchor cell (Return / F2)."""
+        anchor = getattr(self, '_factor_anchor', None)
+        if anchor and anchor[0] in self.factor_tree.get_children():
+            self._begin_factor_cell_edit(anchor[0], anchor[1])
+        return 'break'
+
+    def _begin_factor_cell_edit(self, sid, factor, initial=None):
+        """Float an editor over one cell.
+
+        A combobox rather than an entry: the existing levels are what you
+        usually want, but a new one is just as often typed in, and the
+        assignment box on this tab already works that way.
+        """
+        self._end_factor_cell_edit(commit=False)
+        self.factor_tree.see(sid)
+        bbox = self.factor_tree.bbox(sid, factor)
+        if not bbox:  # column scrolled out of view horizontally
+            return
+        x, y, width, height = bbox
+        # The cell being edited is the anchor, so Return/Tab step from here
+        # rather than from wherever the anchor happened to be left.
+        self._factor_anchor = (sid, factor)
+        self._update_factor_anchor_label()
+
+        columns = self._factor_columns()
+        values = self.factor_tree.item(sid, 'values')
+        index = columns.index(factor) if factor in columns else -1
+        current = str(values[index]) if 0 <= index < len(values) else ''
+
+        order = (self.params.get('factor_level_order') or {}).get(factor) or []
+        subjects = sorted(self.processed_data.keys())
+        known = [lv for lv in factor_levels(subjects, self.get_subject_factors(subjects),
+                                            factor, order) if lv != FACTOR_UNASSIGNED]
+
+        var = tk.StringVar(value=current if initial is None else initial)
+        editor = ttk.Combobox(self.factor_tree, textvariable=var, values=known)
+        editor.place(x=x, y=y, width=width, height=height)
+        editor.focus_set()
+        if initial is None:
+            editor.select_range(0, 'end')
+        else:
+            editor.icursor('end')
+        editor.bind('<Return>', lambda _e: self._end_factor_cell_edit(commit=True, move=(1, 0)))
+        editor.bind('<Tab>', lambda _e: self._end_factor_cell_edit(commit=True, move=(0, 1)))
+        editor.bind('<Escape>', lambda _e: self._end_factor_cell_edit(commit=False))
+        editor.bind('<FocusOut>', lambda _e: self._end_factor_cell_edit(commit=True))
+        self._factor_editor = (editor, var, sid, factor)
+
+    def _end_factor_cell_edit(self, commit=True, move=None):
+        """Close the cell editor, writing its value back when *commit*."""
+        state = getattr(self, '_factor_editor', None)
+        # FocusOut fires while the editor is being torn down, so a commit can
+        # re-enter this on its way out.
+        if not state or getattr(self, '_factor_editor_closing', False):
+            return 'break'
+        self._factor_editor_closing = True
+        try:
+            editor, var, sid, factor = state
+            value = var.get().strip()
+            self._factor_editor = None
+            editor.destroy()
+            if commit and self._write_factor_cells(
+                    [(sid, factor, value)], f"edit {sid} · {factor}"):
+                self.refresh_factors_display()
+                self.log_message(
+                    f"Set {factor}='{value}' for {sid}" if value
+                    else f"Cleared {factor} for {sid}")
+        finally:
+            self._factor_editor_closing = False
+        if move:
+            self._move_factor_anchor(*move)
+        self.factor_tree.focus_set()
+        return 'break'
+
+    def _move_factor_anchor(self, row_step, column_step):
+        """Step the anchor after an edit, stopping at the grid edge."""
+        rows = list(self.factor_tree.get_children())
+        columns = self._factor_columns()
+        indices = self._factor_anchor_indices()
+        if not indices:
+            return
+        row = min(max(indices[0] + row_step, 0), len(rows) - 1)
+        column = min(max(indices[1] + column_step, 0), len(columns) - 1)
+        self._factor_anchor = (rows[row], columns[column])
+        self.factor_tree.see(rows[row])
+        self._update_factor_anchor_label()
+
+    def _write_factor_cells(self, updates, label):
+        """Apply ``[(subject, factor, level)]`` to the stored assignments.
+
+        An empty level clears the cell; for a derived factor that removes the
+        override, so the subject falls back to its derived level.  Returns the
+        number of cells actually changed, and records an undo point only if
+        that is non-zero -- a no-op paste should not cost the user their undo.
+        """
+        subjects = sorted(self.processed_data.keys())
+        displayed = self.get_subject_factors(subjects)
+        stored = self.params.get('subject_factors') or {}
+
+        pending = []
+        for sid, factor, level in updates:
+            level = str(level).strip()
+            if level:
+                # Compare against what the cell shows, so pasting a value a
+                # derived factor already supplies does not create a pointless
+                # override.
+                if level != str((displayed.get(sid) or {}).get(factor) or ''):
+                    pending.append((sid, factor, level))
+            elif (stored.get(sid) or {}).get(factor):
+                pending.append((sid, factor, ''))
+        if not pending:
+            return 0
+
+        self._push_factor_undo(label)
+        stored = self.params.setdefault('subject_factors', {})
+        order_map = self.params.setdefault('factor_level_order', {})
+        for sid, factor, level in pending:
+            if level:
+                stored.setdefault(sid, {})[factor] = level
+                # A new level goes to the end of the plot order rather than
+                # being sorted in, matching "Assign to selected".
+                order = order_map.setdefault(factor, [])
+                if level not in order:
+                    order.append(level)
+            else:
+                stored.get(sid, {}).pop(factor, None)
+        return len(pending)
+
+    def _push_factor_undo(self, label):
+        """Snapshot the assignments before a grid edit.
+
+        A positional paste is the one edit here that can go wrong wholesale --
+        a block landing one row off silently reassigns every subject under it --
+        so the grid carries its own undo rather than leaving the project file
+        as the only way back.
+        """
+        stack = getattr(self, '_factor_undo_stack', None)
+        if stack is None:
+            stack = self._factor_undo_stack = []
+        stack.append((
+            label,
+            {sid: dict(levels) for sid, levels
+             in (self.params.get('subject_factors') or {}).items()},
+            {factor: list(order) for factor, order
+             in (self.params.get('factor_level_order') or {}).items()},
+        ))
+        del stack[:-self._FACTOR_UNDO_DEPTH]
+
+    def undo_factor_edit(self):
+        """Roll back the last grid edit."""
+        stack = getattr(self, '_factor_undo_stack', None)
+        if not stack:
+            messagebox.showinfo("Nothing to Undo",
+                                "No grid edit to undo in this session.")
+            return 'break'
+        label, assignments, order = stack.pop()
+        self.params['subject_factors'] = assignments
+        self.params['factor_level_order'] = order
+        self.refresh_factors_display()
+        self.update_groups_ui()
+        self.log_message(f"Undid factor grid edit ({label})")
+        return 'break'
+
+    @staticmethod
+    def parse_clipboard_table(text):
+        """Split a copied spreadsheet block into rows of cells.
+
+        Excel and Sheets both put a block on the clipboard as tab-separated
+        cells, one line per row.  Trailing blank lines are dropped -- Excel
+        adds one -- but interior blanks are kept, since a blank cell in the
+        middle of a block means "clear this one".
+        """
+        text = str(text).replace('\r\n', '\n').replace('\r', '\n')
+        rows = [line.split('\t') for line in text.split('\n')]
+        while rows and not any(cell.strip() for cell in rows[-1]):
+            rows.pop()
+        return rows
+
+    def paste_factor_cells(self):
+        """Paste a spreadsheet block into the grid from the anchor cell.
+
+        The block fills down and right exactly as it sits in Excel, so what
+        lands where depends on the grid's current sort order.  A header row is
+        dropped when it matches the column names, and a leading subject-ID
+        column is offered up for skipping, because both come along with an
+        Excel selection far more often than they are meant as levels.
+        """
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ''
+        block = self.parse_clipboard_table(text) if str(text).strip() else []
+        if not block:
+            messagebox.showinfo("Nothing to Paste",
+                                "The clipboard has no spreadsheet block on it.")
+            return 'break'
+
+        rows = list(self.factor_tree.get_children())
+        columns = self._factor_columns()
+        indices = self._factor_anchor_indices()
+        if not indices:
+            messagebox.showinfo("Nothing to Fill",
+                                "There are no subjects or factors to paste into.")
+            return 'break'
+        start_row, start_column = indices
+
+        notes = []
+        header = [cell.strip() for cell in block[0]]
+        if len(block) > 1 and header == columns[start_column:start_column + len(header)]:
+            block = block[1:]
+            notes.append("ignored the header row")
+
+        known_ids = set(rows)
+        first_column = [row[0].strip() for row in block if row and row[0].strip()]
+        if (len(columns) - start_column) >= 1 and len(block[0]) > 1 and first_column \
+                and all(value in known_ids for value in first_column):
+            if messagebox.askyesno(
+                    "Subject ID Column",
+                    "The first column of the pasted block is subject IDs, not levels.\n\n"
+                    f"Skip it and paste the remaining {len(block[0]) - 1} column(s) "
+                    f"starting at '{columns[start_column]}'?\n\n"
+                    "Choose No to paste it as a level column exactly as copied."):
+                block = [row[1:] for row in block]
+                notes.append("skipped the subject ID column")
+
+        updates = []
+        clipped_rows = max(0, len(block) - (len(rows) - start_row))
+        clipped_columns = 0
+        for row_offset, line in enumerate(block):
+            row_index = start_row + row_offset
+            if row_index >= len(rows):
+                break
+            clipped_columns = max(clipped_columns,
+                                  len(line) - (len(columns) - start_column))
+            for column_offset, cell in enumerate(line):
+                column_index = start_column + column_offset
+                if column_index >= len(columns):
+                    break
+                updates.append((rows[row_index], columns[column_index], cell))
+
+        changed = self._write_factor_cells(
+            updates, f"paste {len(block)}×{len(block[0])} at "
+                     f"{rows[start_row]} · {columns[start_column]}")
+        self.refresh_factors_display()
+        self.update_groups_ui()
+
+        summary = (f"Pasted {changed} cell(s) from {rows[start_row]} · "
+                   f"{columns[start_column]}")
+        if notes:
+            summary += " (" + ", ".join(notes) + ")"
+        self.log_message(summary)
+        # Only interrupt when the paste did not fit or did not fully apply --
+        # a clean paste is its own confirmation, visible in the grid.
+        if clipped_rows or clipped_columns > 0 or notes or not changed:
+            detail = [f"{changed} cell(s) updated."]
+            if notes:
+                detail.append("Pasting " + " and ".join(notes) + ".")
+            if clipped_rows:
+                detail.append(f"{clipped_rows} row(s) ran past the last subject "
+                              "and were ignored.")
+            if clipped_columns > 0:
+                detail.append(f"{clipped_columns} column(s) ran past the last "
+                              "factor and were ignored.")
+            if not changed:
+                detail.append("Every pasted value already matched the grid.")
+            detail.append("Ctrl+Z (or ↶ Undo) takes this back.")
+            messagebox.showinfo("Paste Complete", "\n\n".join(detail))
+        return 'break'
+
+    def copy_factor_cells(self):
+        """Copy the selected rows to the clipboard, ready to paste into Excel.
+
+        The subject IDs come along as the first column so the block is
+        readable in the spreadsheet; pasting it back offers to skip them.
+        """
+        display = list(self.factor_tree.get_children())
+        selected = set(self.factor_tree.selection())
+        chosen = [sid for sid in display if sid in selected] or display
+        if not chosen:
+            return 'break'
+        columns = self._factor_columns()
+        assignments = self.get_subject_factors(sorted(self.processed_data.keys()))
+        lines = ['\t'.join(['Subject'] + columns)]
+        for sid in chosen:
+            levels = assignments.get(sid) or {}
+            lines.append('\t'.join([sid] + [str(levels.get(f, '')) for f in columns]))
+        self.root.clipboard_clear()
+        self.root.clipboard_append('\n'.join(lines))
+        self.log_message(f"Copied {len(chosen)} subject row(s) to the clipboard")
+        return 'break'
+
+    def clear_factor_cells(self):
+        """Clear the anchor's column for every selected row (Delete)."""
+        anchor = getattr(self, '_factor_anchor', None)
+        columns = self._factor_columns()
+        if not anchor or anchor[1] not in columns:
+            messagebox.showinfo("No Cell Chosen",
+                                "Click a cell first — Delete clears that column "
+                                "for the selected rows.")
+            return 'break'
+        factor = anchor[1]
+        display = list(self.factor_tree.get_children())
+        selected = set(self.factor_tree.selection())
+        chosen = [sid for sid in display if sid in selected] or [anchor[0]]
+        changed = self._write_factor_cells(
+            [(sid, factor, '') for sid in chosen], f"clear {factor}")
+        self.refresh_factors_display()
+        self.update_groups_ui()
+        self.log_message(f"Cleared {factor} for {changed} subject(s)")
+        return 'break'
 
     def auto_assign_factor(self):
         """Populate the selected factor from the subject IDs by regex.
@@ -4493,13 +5017,55 @@ class FPAnalysisGUI:
         self.refresh_factors_display()
         self.log_message(f"Auto-assigned {factor} for {len(derived)} subject(s) from /{pattern}/")
 
+    def _selected_level(self):
+        """Level highlighted in the level list, without its "(n=…)" suffix."""
+        names = getattr(self, '_factor_level_names', [])
+        sel = self.factor_level_listbox.curselection()
+        if not sel or sel[0] >= len(names):
+            return None
+        return names[sel[0]]
+
+    def create_factor_level(self):
+        """Declare a level of the selected factor before anyone is at it.
+
+        Naming the groups first and filling them afterwards is the way most
+        people expect to work -- and it is what the old Groups tab's "Create
+        Group" did. A declared level lives in the plot order, so it survives an
+        empty membership and keeps its place in the series order.
+        """
+        factor = self._selected_factor()
+        if not factor:
+            messagebox.showwarning("No Factor", "Select a factor on the left first.")
+            return
+        if factor in self._FACTOR_DERIVED:
+            messagebox.showinfo(
+                "Derived Factor",
+                f"Levels of '{factor}' come from the subject IDs, so a new one "
+                "here would not survive the next time they are derived.")
+            return
+        name = tk.simpledialog.askstring(
+            "New Level", f"New level of {factor} (e.g. Fentanyl, Saline):",
+            parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        order = self.params.setdefault('factor_level_order', {}).setdefault(factor, [])
+        if name in order:
+            messagebox.showwarning("Duplicate", f"{factor} already has a level '{name}'.")
+            return
+        order.append(name)
+        self.refresh_factors_display()
+        # Point the assignment box at it, since filling it is the next step.
+        self.factor_assign_level_var.set(name)
+        self.log_message(f"Added {factor} level '{name}'")
+
     def move_factor_level(self, delta):
         """Move the highlighted level up or down in plot order."""
         factor = self._selected_factor()
         sel = self.factor_level_listbox.curselection()
         if not factor or not sel:
             return
-        levels = list(self.factor_level_listbox.get(0, 'end'))
+        levels = list(getattr(self, '_factor_level_names', []))
         i = sel[0]
         j = i + delta
         if not 0 <= j < len(levels):
@@ -4510,7 +5076,7 @@ class FPAnalysisGUI:
         self.factor_level_listbox.selection_set(j)
 
     def rename_factor_level(self):
-        """Rename a level of a user-defined factor across all subjects."""
+        """Rename a level of a stored factor across all subjects."""
         factor = self._selected_factor()
         sel = self.factor_level_listbox.curselection()
         if not factor or not sel:
@@ -4518,12 +5084,11 @@ class FPAnalysisGUI:
         if factor in self._FACTOR_DERIVED:
             messagebox.showinfo(
                 "Derived Factor",
-                f"Levels of '{factor}' come from elsewhere, so renaming one here would "
-                "be undone the next time it is derived.\n\n"
-                "Rename the group on the Groups tab, or change the ID style on "
-                "Processing → Animals & Sessions.")
+                f"Levels of '{factor}' come from the subject IDs, so renaming one "
+                "here would be undone the next time it is derived.\n\n"
+                "Change the ID style on Processing → Animals & Sessions instead.")
             return
-        old = self.factor_level_listbox.get(sel[0])
+        old = self._selected_level()
         new = tk.simpledialog.askstring(
             "Rename Level", f"New name for level '{old}' of {factor}:",
             initialvalue=old, parent=self.root)
@@ -4539,6 +5104,199 @@ class FPAnalysisGUI:
                 new if lv == old else lv for lv in order]
         self.refresh_factors_display()
         self.log_message(f"Renamed {factor} level '{old}' to '{new}'")
+
+    def delete_factor_level(self):
+        """Unassign a level from every subject and drop it from the plot order.
+
+        This is how a group is deleted now: the subjects that were in it become
+        unassigned rather than disappearing, so nothing is lost by mistake.
+        """
+        factor = self._selected_factor()
+        sel = self.factor_level_listbox.curselection()
+        if not factor or not sel:
+            return
+        if factor in self._FACTOR_DERIVED:
+            messagebox.showinfo(
+                "Derived Factor",
+                f"Levels of '{factor}' come from the subject IDs, so deleting one "
+                "here would only bring it straight back.")
+            return
+        level = self._selected_level()
+        stored = self.params.get('subject_factors') or {}
+        holders = [sid for sid, levels in stored.items() if levels.get(factor) == level]
+        if not messagebox.askyesno(
+                "Delete Level",
+                f"Delete {factor} level '{level}'?\n\n"
+                f"{len(holders)} subject(s) become unassigned. The subjects "
+                "themselves are not removed."):
+            return
+        for sid in holders:
+            stored[sid].pop(factor, None)
+        order = (self.params.get('factor_level_order') or {}).get(factor)
+        if order:
+            self.params['factor_level_order'][factor] = [lv for lv in order if lv != level]
+        self.refresh_factors_display()
+        self.log_message(f"Deleted {factor} level '{level}' from {len(holders)} subject(s)")
+
+    # ---- Assignment files ---------------------------------------------------
+    # A .tracy file used to carry groups between projects. It now carries the
+    # whole factor set, because groups are one factor among several and a cohort
+    # sheet that restored only the groups would leave the rest half-applied.
+
+    def _factor_payload(self):
+        """The three structures that define the project's factors."""
+        return {
+            'factor_definitions': list(self.params.get('factor_definitions') or []),
+            'subject_factors': {sid: dict(levels) for sid, levels
+                                in (self.params.get('subject_factors') or {}).items()
+                                if levels},
+            'factor_level_order': {f: list(order) for f, order
+                                   in (self.params.get('factor_level_order') or {}).items()},
+        }
+
+    def _apply_factor_payload(self, payload, merge=True):
+        """Adopt factors from *payload*. Returns (subjects, factor names).
+
+        With *merge*, an incoming level overwrites the same subject+factor and
+        leaves everything else alone -- importing a Drug assignment should not
+        silently wipe the Group one. Without it the factor set is replaced.
+        """
+        incoming = {str(sid): {str(f): str(lv) for f, lv in (levels or {}).items() if lv}
+                    for sid, levels in (payload.get('subject_factors') or {}).items()}
+        names = sorted({f for levels in incoming.values() for f in levels}
+                       | {str(f) for f in (payload.get('factor_definitions') or [])})
+
+        if not merge:
+            self.params['subject_factors'] = {}
+            self.params['factor_definitions'] = [GROUP_FACTOR]
+            self.params['factor_level_order'] = {}
+
+        stored = self.params.setdefault('subject_factors', {})
+        for sid, levels in incoming.items():
+            stored.setdefault(sid, {}).update(levels)
+
+        defined = self.params.setdefault('factor_definitions', [])
+        for name in names:
+            if name not in defined and name not in self._FACTOR_DERIVED:
+                defined.append(name)
+
+        order_map = self.params.setdefault('factor_level_order', {})
+        for name, order in (payload.get('factor_level_order') or {}).items():
+            existing = order_map.setdefault(str(name), [])
+            for level in order or []:
+                if str(level) not in existing:
+                    existing.append(str(level))
+        return sorted(incoming), names
+
+    def save_factors_to_file(self):
+        """Write the factor definitions and assignments to a .tracy file."""
+        payload = self._factor_payload()
+        if not payload['subject_factors']:
+            messagebox.showwarning(
+                "Nothing to Save",
+                "No factor levels are assigned yet. Assign some in the grid first.")
+            return
+        filepath = filedialog.asksaveasfilename(
+            title="Save Factor Assignments",
+            defaultextension=".tracy",
+            filetypes=[("TRACY files", "*.tracy"), ("All files", "*.*")],
+            initialdir=os.path.join(self.project_dir, self.current_project or ''),
+            initialfile=f"{self.current_project or 'factors'}_factors.tracy")
+        if not filepath:
+            return
+        payload['project_name'] = self.current_project
+        try:
+            with open(filepath, 'w') as fh:
+                json.dump(payload, fh, indent=4)
+        except Exception as exc:
+            messagebox.showerror("Save Error", f"Could not save factors:\n{exc}")
+            return
+        self.log_message(f"Saved factor assignments to {filepath}")
+        messagebox.showinfo(
+            "Saved", f"Factor assignments saved to:\n{filepath}")
+
+    def load_factors_from_file(self):
+        """Read factor assignments from a .tracy file, old or new format."""
+        filepath = filedialog.askopenfilename(
+            title="Load Factor Assignments",
+            filetypes=[("TRACY files", "*.tracy"), ("JSON files", "*.json"),
+                       ("All files", "*.*")],
+            initialdir=os.path.join(self.project_dir, self.current_project or ''))
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'r') as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read the file:\n{exc}")
+            return
+        self._adopt_factor_source(data, os.path.basename(filepath))
+
+    def import_factors_from_project(self):
+        """Copy another project's factor assignments into this one."""
+        projects = []
+        if os.path.isdir(self.project_dir):
+            projects = sorted(
+                name for name in os.listdir(self.project_dir)
+                if os.path.isfile(os.path.join(self.project_dir, name,
+                                               'project_config.json'))
+                and name != self.current_project)
+        if not projects:
+            messagebox.showinfo("No Projects", "No other projects were found to import from.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select Project to Import Factors From",
+            initialdir=self.project_dir,
+            filetypes=[("Project config", "project_config.json"),
+                       ("TRACY files", "*.tracy"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, 'r') as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Import Error", f"Could not read that project:\n{exc}")
+            return
+        self._adopt_factor_source(data, os.path.basename(os.path.dirname(path)) or path)
+
+    def _adopt_factor_source(self, data, source_label):
+        """Apply factors from a loaded config/.tracy dict, confirming first.
+
+        Accepts a project config (factors under 'parameters'), a factor file, or
+        a pre-factor file that only has 'groups' -- the last is converted, which
+        is what makes an old cohort sheet still worth loading.
+        """
+        payload = data.get('parameters') if isinstance(data.get('parameters'), dict) else data
+        payload = {k: payload.get(k) for k in
+                   ('factor_definitions', 'subject_factors', 'factor_level_order')}
+        legacy = data.get('groups') or (data.get('parameters') or {}).get('groups')
+        if not payload.get('subject_factors') and legacy:
+            payload = legacy_groups_to_factors(legacy)
+
+        subjects = payload.get('subject_factors') or {}
+        if not subjects:
+            messagebox.showinfo(
+                "Nothing to Import",
+                f"{source_label} contains no factor assignments.")
+            return
+
+        known = set(self.processed_data.keys())
+        matched = [sid for sid in subjects if sid in known]
+        unmatched = len(subjects) - len(matched)
+        names = sorted({f for levels in subjects.values() for f in levels})
+        if not messagebox.askyesno(
+                "Import Factors",
+                f"Import from {source_label}?\n\n"
+                f"Factors: {', '.join(names) or '(none)'}\n"
+                f"{len(matched)} of {len(known)} subject(s) in this project are covered.\n"
+                + (f"{unmatched} assignment(s) name subjects this project does not have "
+                   "and will be kept in case they are processed later.\n" if unmatched else "")
+                + "\nExisting assignments for the same subject and factor are overwritten."):
+            return
+        self._apply_factor_payload(payload, merge=True)
+        self.refresh_factors_display()
+        self.update_groups_ui()
+        self.log_message(f"Imported factors from {source_label}: {', '.join(names)}")
 
     def create_exclusions_tab(self):
         """Tab for managing subject exclusions on a per-channel basis"""
@@ -4648,20 +5406,20 @@ class FPAnalysisGUI:
         self.viz_subject_frame.pack(fill='both', expand=True)      # default mode
 
         group_frame = ttk.Frame(self.viz_selection_holder)
-        self.viz_group_label = ttk.Label(group_frame, text="Group(s):")
+        self.viz_group_label = ttk.Label(group_frame, text="Subjects to include:")
         self.viz_group_label.pack(anchor='w')
         group_list_holder = ttk.Frame(group_frame)
         group_list_holder.pack(fill='both', expand=True)
         self.viz_group_listbox = tk.Listbox(group_list_holder, selectmode='extended',
-                                            height=5, exportselection=False)
+                                            height=7, exportselection=False)
         self.viz_group_listbox.pack(side='left', fill='both', expand=True)
         group_scrollbar = ttk.Scrollbar(group_list_holder, orient='vertical',
                                         command=self.viz_group_listbox.yview)
         group_scrollbar.pack(side='right', fill='y')
         self.viz_group_listbox.config(yscrollcommand=group_scrollbar.set)
 
-        # The facet column sits under the group list, not instead of it: the
-        # groups choose which subjects are in play, the facet decides how they
+        # The facet column sits under the subject list, not instead of it: the
+        # list chooses which subjects are in play, the facet decides how they
         # divide into series. Untouched, it splits on Group and combines
         # everything else, which is the plot this tab always drew.
         self._make_facet_controls(group_frame, 'visualization').pack(
@@ -4855,8 +5613,8 @@ class FPAnalysisGUI:
                    command=self.export_zscore_full_session).pack(fill='x', pady=(4, 0))
 
         # Keep the selectors in step with the plot type and the selection.
-        self.plot_type_var.trace('w', self.update_behavior_list)
-        self.plot_type_var.trace('w', self.update_bout_number_selector)
+        self.plot_type_var.trace_add('write', self.update_behavior_list)
+        self.plot_type_var.trace_add('write', self.update_bout_number_selector)
         self.viz_subject_listbox.bind('<<ListboxSelect>>', self.on_viz_subject_selected)
         self.viz_group_listbox.bind('<<ListboxSelect>>',
                                     lambda e: (self.update_behavior_list(),
@@ -4882,7 +5640,7 @@ class FPAnalysisGUI:
         self.heatmap_color_low_entry = self.heatmap_color_low_btn = None
         self.heatmap_color_mid_entry = self.heatmap_color_mid_btn = None
         self.heatmap_color_high_entry = self.heatmap_color_high_btn = None
-        self.heatmap_cmap_var.trace('w', self.update_heatmap_custom_colors)
+        self.heatmap_cmap_var.trace_add('write', self.update_heatmap_custom_colors)
 
         self.mean_linewidth_var = tk.StringVar(value="1.5")
         self.trace_linewidth_var = tk.StringVar(value="0.3")
@@ -4896,6 +5654,15 @@ class FPAnalysisGUI:
         # re-viewed without recomputing when the selection/settings are
         # unchanged. Holds {'sig', 'fig', 'refs'}.
         self._integrity_plot_cache = None
+        # Per-subject integrity metrics, which the whole-figure cache above
+        # cannot help with: changing the selection by one subject invalidates
+        # the figure but not the ~1s of work behind each of the others.
+        # {(subject, id(data), sensor): (data_ref, metrics)} -- the data ref is
+        # pinned so its id() cannot be reused by a later object.
+        self._integrity_metrics_cache = {}
+        # Set while a scoring pass is pumping the event loop; see
+        # _integrity_progress.
+        self._integrity_busy = False
 
         # Figure and canvas size variables
         self.viz_fig_width_var = tk.StringVar(value="auto")
@@ -6227,10 +6994,7 @@ class FPAnalysisGUI:
             boutframes_file = self.boutframes_path_var.get()
             if boutframes_file and os.path.exists(boutframes_file):
                 try:
-                    xl = pd.ExcelFile(boutframes_file)
-                    for sheet in xl.sheet_names:
-                        df = xl.parse(sheet, nrows=0)
-                        behaviors.update(str(c) for c in df.columns)
+                    behaviors.update(self.boutframes_behavior_columns(boutframes_file))
                 except Exception:
                     pass
         behaviors = sorted(behaviors)
@@ -6351,7 +7115,7 @@ class FPAnalysisGUI:
                         onset_frames = stored_bouts[beh_key]['onset_frames']
                     elif _use_file_fallback:
                         try:
-                            df_b = pd.read_excel(boutframes_file, sheet_name=subj)
+                            df_b = self.read_boutframes_sheet(boutframes_file, subj)
                             cols_ci = {str(c).lower(): c for c in df_b.columns}
                             bcol = cols_ci.get(behavior.lower())
                             if bcol:
@@ -7012,7 +7776,7 @@ class FPAnalysisGUI:
                     bfp = self.boutframes_path_var.get()
                     if bfp and os.path.exists(bfp):
                         try:
-                            df_b = pd.read_excel(bfp, sheet_name=subject)
+                            df_b = self.read_boutframes_sheet(bfp, subject)
                             cols_ci = {str(c).lower(): c for c in df_b.columns}
                             bcol = cols_ci.get(behavior.lower())
                             if bcol:
@@ -7540,10 +8304,7 @@ class FPAnalysisGUI:
                 "in the Input Setup tab.")
             return
         try:
-            xl = pd.ExcelFile(boutframes_file)
-            for sheet in xl.sheet_names:
-                df = xl.parse(sheet, nrows=0)
-                behaviors.update(str(c) for c in df.columns)
+            behaviors.update(self.boutframes_behavior_columns(boutframes_file))
             behaviors = sorted(behaviors)
             self.bout_epoch_behavior_combo['values'] = behaviors
             if behaviors and not self.bout_epoch_behavior_var.get():
@@ -7659,7 +8420,7 @@ class FPAnalysisGUI:
                         continue
                 elif _use_file_fallback:
                     try:
-                        df_bouts = pd.read_excel(boutframes_file, sheet_name=subject)
+                        df_bouts = self.read_boutframes_sheet(boutframes_file, subject)
                     except Exception as e:
                         q.put(('log', f"  Skipping {subject}: no boutframes sheet ({e})"))
                         continue
@@ -8155,7 +8916,7 @@ class FPAnalysisGUI:
                 boutframes_file = self.boutframes_path_var.get()
                 if boutframes_file and os.path.exists(boutframes_file):
                     try:
-                        df_b = pd.read_excel(boutframes_file, sheet_name=subject)
+                        df_b = self.read_boutframes_sheet(boutframes_file, subject)
                         cols_ci = {str(c).lower(): c for c in df_b.columns}
                         bcol = cols_ci.get(behavior.lower())
                         if bcol:
@@ -9202,7 +9963,7 @@ class FPAnalysisGUI:
         self._bout_subj_container.pack(fill='both', expand=True)
 
         self._bout_grp_container = ttk.Frame(self._bout_sel_frame)
-        ttk.Label(self._bout_grp_container, text="Group(s):").pack(anchor='w')
+        ttk.Label(self._bout_grp_container, text="Subjects to include:").pack(anchor='w')
         self.bout_analysis_group_frame = ttk.Frame(self._bout_grp_container)
         self.bout_analysis_group_frame.pack(fill='both', expand=True)
         self.bout_analysis_group_listbox = tk.Listbox(
@@ -11093,6 +11854,33 @@ for zone, heatmap and kinematics analyses). Processing also runs without this.
 One worksheet per subject (worksheet name = SubjectID); each column is a
 behavior, each cell a frame number where that behavior occurred. Needed only
 for bout-aligned analysis. TTL onset/offset files are also supported.
+
+Multi-session projects (see 'Repeated Sessions') may instead key worksheets by
+ANIMAL and add a 'Session' column, so one sheet holds every day that animal was
+recorded:
+>   Session   | Alcohol__start | Alcohol__end | Water__start | Water__end
+>   Alcohol   | 156            | 327          |              |
+>   Water     |                |              | 1097         | 1168
+Recording 'CAB01_Alcohol' then reads sheet 'CAB01', rows where Session=Alcohol.
+A sheet named for the recording itself still wins if you have one.
+"""),
+            ("Repeated Sessions", """
+When the same animal is recorded on several days, put the session in the
+subject ID and TRACY will keep the recordings together:
+
+> CAB01_AlcoholFPData.csv   -> animal 'CAB01', session 'Alcohol'
+> CAB01_FentanylFPData.csv  -> animal 'CAB01', session 'Fentanyl'
+
+What that buys you:
+• 'Session' and 'Animal' appear as factors on every tab, so you can facet,
+  split and compare days inside one project.
+• Mixed models put the random intercept on the ANIMAL, so an animal's repeated
+  days are not counted as independent subjects.
+• Boutframes can stay in one workbook — see 'Required Files & Naming'.
+
+The ID pattern is chosen on the Factors tab (default: split on the last
+underscore).  tools/combine_sessions.py turns one folder per session into a
+combined folder and a merged boutframes workbook in one command.
 """),
             ("Custom File Naming", """
 File naming is fully configurable on the Processing tab, so you don't have to
@@ -11131,7 +11919,9 @@ multi-channel handling with per-channel wavelength routing).
    Single-subject or batch modes are available.
 3. Bout Frames — (optional) import / edit boutframes or TTLs and align them to
    the photometry timeline.
-4. Groups — assign subjects to experimental groups for group comparisons.
+4. Factors — declare how your design divides subjects (Group, Drug, Sex, Day)
+   and assign each subject its levels. Group is what the graphing tabs plot as
+   series; every tab can also split or filter on any other factor.
 5. Analysis tabs (Data group) — Behavioral, Visualization, Coherence, Spike,
    Bout Analysis, Decision Probability, Kinematics.
 6. Export — most tabs export plots (PNG/SVG) and the underlying data (CSV/XLSX).
@@ -11141,7 +11931,8 @@ Project group:
 • Project — create / load projects and manage the workspace.
 • Processing — batch-process raw files into normalized signals.
 • Bout Frames — import, edit and time-align behavioral bouts / TTLs.
-• Groups — define subject groups for comparisons.
+• Factors — define the factors that divide your subjects and assign levels.
+  Experimental groups are the levels of the built-in Group factor.
 • Exclusions — exclude specific subject/channel combinations from analyses.
 
 Data group:
@@ -11197,6 +11988,77 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Factors replace Groups. A project is now described by as many factors as it
+    needs — Group, Sex, Session, Treatment, Dose — each with its own levels, edited on
+    the Factors tab in a spreadsheet-style table: click a cell to type, Tab/Enter and
+    the arrow keys to move, paste a block straight from Excel, Ctrl+Z to undo, and
+    click a column header to sort. Factor sets can be saved, loaded and imported from
+    another project. Existing projects are migrated on load — your old groups become
+    the levels of a "Group" factor — and a notice explains what happened if a subject
+    had been in more than one group.
+  • New — Split series by (every graphing tab). With "Plot by: Group" the subject list
+    is now the pool being plotted, and the "Split series by" column decides how that
+    pool divides. Left alone it splits on Group and combines the rest, which is one
+    series per group exactly as before. Set Session to split instead and you get one
+    series per session; set both and you get the cross-product; pin a factor to a
+    single level to filter the pool down to it. Deselecting a subject drops it from
+    whichever series it belongs to without editing the design, so it is a plot-level
+    exclusion you can undo by reselecting.
+  • New — Repeated sessions of one animal. Encode the session in the subject ID
+    (CAB01_Alcohol, CAB01_Fentanyl) and TRACY splits every ID into animal + session,
+    offers Session and Animal as factors on every tab, and keys mixed-model random
+    intercepts on the animal, so several days from one animal are no longer treated as
+    independent subjects. tools/combine_sessions.py merges one folder per session into
+    a combined project and a merged boutframes workbook.
+  • New — Pooled z-scoring across an animal's sessions (Processing). Z-scoring each
+    session on its own leaves an animal's days on different amplitude scales — on one
+    two-day pair the same channel's SDs were 1.23 and 4.53, so "2 z-scores" meant
+    something different on each day. Pooling z-scores an animal against all its
+    sessions together. It is applied as an exact affine rescale rather than a
+    reprocess, so it works on an already-loaded project, is numerically identical to
+    recomputing from the corrected trace, and can be switched back off.
+  • New — Session-aware boutframes. A workbook may now key its worksheets by animal
+    and tag each row with a Session (or Day) column, instead of needing one sheet per
+    recording. A sheet named for the recording itself still takes precedence, and
+    single-session workbooks are unaffected.
+  • Fix — Sampling rate was assumed to be 30 Hz. It is now read from the recording
+    itself, per subject. Any dataset recorded at another rate had every
+    seconds-denominated result scaled by the ratio — tau, half-decay, AUC over time,
+    zone-entry durations and kinematic velocity — which on a ~20 Hz recording was a
+    1.5× error. Re-run affected analyses to pick up the corrected values.
+  • New — Decay-fit strictness (Bout Analysis → Settings). Strict / Balanced /
+    Permissive trades how many bouts report a Tau against how much of the decay must
+    actually be observed before a time constant is trusted. The peak search is also
+    limited to the first half of the window, so a larger unrelated event later in the
+    window can no longer hijack the measurement.
+  • New — FLMM factor models. Fit every behavior against a reference, per channel,
+    with a pre-run dialog spelling out the model about to be fit, and the same channel
+    selector, peak-effect button, exports and PDF report as the time-course fit.
+  • Change — Every graphing tab rebuilt on one layout. Selection, Settings, Actions
+    and Output now sit in the same place on all eight tabs: who is analysed at the top
+    of the control column, the settings beneath it, the actions pinned at the foot
+    where they can no longer scroll out of reach, and the plot in the remaining space.
+    Long action rows wrap into a grid, which also fixes buttons that were clipped off
+    the right edge and unreachable — Coherence → Whole Session → Export among them.
+  • Change — Options that do not apply to the current plot are hidden rather than
+    shown and quietly ignored. Kinematics showed seven parameter entries for all
+    nineteen analyses though most read two of them; Visualization behaves the same
+    way. Settings that do still take effect are deliberately left visible.
+  • Fix — Signal Integrity was unusable on a large selection. Scoring is now cached
+    per subject, so re-plotting a 62-subject dashboard no longer repeats a minute of
+    work in a frozen window, and the table's height grows with the number of rows
+    instead of overlapping into an unreadable smear past ~40 subjects. Progress is
+    reported while it runs.
+  • Fix — A shorter plot drawn after a tall one could appear as an empty panel. The
+    output pane kept the scroll position from the previous figure, so the new plot was
+    drawn correctly but above the view — indistinguishable from Generate doing
+    nothing. The pane now returns to the top when the plot changes.
+  • Fix — TRACY would not start under Python 3.14 / Tcl 9. Variable traces used a Tcl
+    command removed in Tcl 9, so startup failed with `bad option "variable"` before
+    the window appeared.
+
+Version 1.10.1  •  July 27, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — Bout Analysis decay metrics (Tau and Half-Decay t½) were not fitting the
     decay. Four faults compounded: the baseline was read from the leading tenth of the
@@ -12008,6 +12870,7 @@ Version 1.0.0
                     self.update_bout_subjects()
                 except Exception as e:
                     self.log_message(f"Could not load boutframes editor: {e}")
+            self._update_boutframes_layout_label()
     
     def browse_ttl(self):
         filename = filedialog.askopenfilename(title="Select TTL File",
@@ -12179,7 +13042,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.current_project = project_name
         self.refresh_projects_list()  # Refresh the list
         self.processed_data = {}
-        self.groups = {}  # Clear groups for new project
+        self.reset_factors()  # A new project starts with no groups or factors
 
         # Clear all behavior dropdowns so stale behaviors from the prior project
         # don't appear in the new project's UI.
@@ -12215,6 +13078,72 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showwarning("Warning", "Project folder found but no saved data detected.\n"
                                                  "This may be a new or empty project.")
     
+    def save_project_config(self, quiet=False):
+        """Write project_config.json and the .tracy file only — no subject data.
+
+        Settings-only edits (parameters, zones, groups, exclusions, bout offsets,
+        boutframe shifts, file paths) all live in these two small JSON files.
+        Routing them through the full save_project() would rewrite every
+        subject's z-score / dF/F / behavior / bout CSVs unchanged, which on a
+        large cohort is a multi-minute progress bar for a few kB of settings.
+
+        Returns True if the config was written.
+        """
+        if not self.current_project:
+            if not quiet:
+                messagebox.showwarning("No Project", "No project is currently open")
+            return False
+
+        project_path = os.path.join(self.project_dir, self.current_project)
+        os.makedirs(project_path, exist_ok=True)
+
+        config = {
+            'project_name': self.current_project,
+            'parameters': self.params,
+            'zones': self.zones,  # Save zone definitions
+            'processed_subjects': list(self.processed_data.keys()),
+            # Groups live in parameters['subject_factors'] now. They are still
+            # written out in the old shape so a project saved here can be opened
+            # by an older TRACY, and so the loader has something to migrate.
+            'groups': self.groups,
+            'exclusions': self.exclusions,  # Save exclusion information
+            'bout_offsets': self.bout_offsets,  # Save offset bout definitions
+            'per_subject_boutframe_shifts': self.per_subject_boutframe_shifts,
+            'fpdata_path': self.fpdata_path_var.get(),
+            'boutframes_file': self.boutframes_path_var.get(),
+            'ttl_file': self.ttl_path_var.get()
+        }
+
+        try:
+            with open(os.path.join(project_path, 'project_config.json'), 'w') as f:
+                json.dump(config, f, indent=4)
+            self.log_message("  Saved project configuration")
+        except Exception as e:
+            self.log_message(f"  Error saving project config: {str(e)}")
+            if not quiet:
+                messagebox.showerror("Save Error", f"Failed to save project configuration: {str(e)}")
+            return False
+
+        # Also save a .tracy file (lightweight file for sharing groups/settings)
+        tracy_file = os.path.join(project_path, f'{self.current_project}.tracy')
+        tracy_config = {
+            'project_name': self.current_project,
+            'groups': self.groups,
+            'exclusions': self.exclusions,  # Include exclusion information
+            'parameters': self.params,
+            'zones': self.zones,  # Include zone definitions
+            'per_subject_boutframe_shifts': self.per_subject_boutframe_shifts,
+            'created_date': config.get('created_date', str(Path(project_path).stat().st_ctime)),
+            'last_modified': str(Path(project_path).stat().st_mtime)
+        }
+        try:
+            with open(tracy_file, 'w') as f:
+                json.dump(tracy_config, f, indent=4)
+        except Exception as e:
+            self.log_message(f"  Warning: Could not save .tracy file: {str(e)}")
+
+        return True
+
     def save_project(self, quiet=False, subjects=None, show_completion=None):
         """Save project configuration and data.
 
@@ -12296,54 +13225,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         os.makedirs(os.path.join(project_path, 'raw'), exist_ok=True)
         os.makedirs(os.path.join(project_path, 'figures'), exist_ok=True)
         
-        config = {
-            'project_name': self.current_project,
-            'parameters': self.params,
-            'zones': self.zones,  # Save zone definitions
-            'processed_subjects': list(self.processed_data.keys()),
-            'groups': self.groups,  # Save group information
-            'groups_mutually_exclusive': bool(self.groups_mutually_exclusive_var.get()),
-            'exclusions': self.exclusions,  # Save exclusion information
-            'bout_offsets': self.bout_offsets,  # Save offset bout definitions
-            'per_subject_boutframe_shifts': self.per_subject_boutframe_shifts,
-            'fpdata_path': self.fpdata_path_var.get(),
-            'boutframes_file': self.boutframes_path_var.get(),
-            'ttl_file': self.ttl_path_var.get()
-        }
-        
         update_progress("Saving project configuration...", "")
-        try:
-            with open(os.path.join(project_path, 'project_config.json'), 'w') as f:
-                json.dump(config, f, indent=4)
-            self.log_message("  Saved project configuration")
-        except Exception as e:
-            self.log_message(f"  Error saving project config: {str(e)}")
+        # The two settings files are written by the shared config-only helper.
+        if not self.save_project_config(quiet=quiet):
             if progress_window is not None:
                 progress_window.destroy()
-            if not quiet:
-                messagebox.showerror("Save Error", f"Failed to save project configuration: {str(e)}")
             return
-        
         update_progress("Saving .tracy file...", "")
-        # Also save a .tracy file (lightweight file for sharing groups/settings)
-        tracy_file = os.path.join(project_path, f'{self.current_project}.tracy')
-        tracy_config = {
-            'project_name': self.current_project,
-            'groups': self.groups,
-            'groups_mutually_exclusive': bool(self.groups_mutually_exclusive_var.get()),
-            'exclusions': self.exclusions,  # Include exclusion information
-            'parameters': self.params,
-            'zones': self.zones,  # Include zone definitions
-            'per_subject_boutframe_shifts': self.per_subject_boutframe_shifts,
-            'created_date': config.get('created_date', str(Path(project_path).stat().st_ctime)),
-            'last_modified': str(Path(project_path).stat().st_mtime)
-        }
-        try:
-            with open(tracy_file, 'w') as f:
-                json.dump(tracy_config, f, indent=4)
-        except Exception as e:
-            self.log_message(f"  Warning: Could not save .tracy file: {str(e)}")
-        
+
         # Save processed data (optimized - only essential files)
         subjects_saved = 0
 
@@ -12743,7 +13632,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Clear all existing project data to start fresh
         self.processed_data = {}
-        self.groups = {}
+        self.reset_factors()
         self.behavioral_results = []
         self.spike_data = {}
         
@@ -12839,15 +13728,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if hasattr(self, 'processing_savgol_poly_var'):
                 self.processing_savgol_poly_var.set(str(self.params.get('processing_savgol_polyorder', 3)))
 
-            # Load groups
-            self.groups = config.get('groups', {})
-            self.groups_mutually_exclusive_var.set(bool(config.get('groups_mutually_exclusive', True)))
-            self._update_group_exclusivity_button_label()
+            # Groups: stored as a factor now, migrated from the old key if needed
+            self.migrate_legacy_groups(config.get('groups'))
             if self.groups:
-                self.log_message(f"  Loaded {len(self.groups)} groups from config: {list(self.groups.keys())}")
+                self.log_message(f"  {len(self.groups)} group(s): {list(self.groups.keys())}")
             else:
-                self.log_message(f"  No groups found in project config")
-            
+                self.log_message("  No groups assigned in this project")
+
             # Load exclusions
             self.exclusions = config.get('exclusions', {})
             if self.exclusions:
@@ -13491,11 +14378,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if hasattr(self, 'spike_listbox'):
                     self.update_spike_selection_mode()
                 
-                # Update groups UI if groups tab exists
-                if hasattr(self, 'group_listbox'):
-                    self.log_message(f"  Updating groups UI with {len(self.groups)} groups")
-                    self.update_groups_ui()
-                    self.log_message(f"  Groups UI updated - listbox has {self.group_listbox.size()} items")
+                # Push the loaded Group factor into every tab's group listbox
+                self.update_groups_ui()
+                self.refresh_factors_display()
                 
                 if subjects_loaded > 0:
                     return True
@@ -13597,7 +14482,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 os.makedirs(os.path.join(project_path, 'processed'), exist_ok=True)
                 os.makedirs(os.path.join(project_path, 'figures'), exist_ok=True)
                 self.processed_data = {}
-                self.groups = {}  # Clear groups for new project
+                self.reset_factors()  # A new project starts with no factors
                 # Clear stale behavior dropdowns
                 self.behavior_combo['values'] = []
                 self.behavior_var.set('')
@@ -13615,6 +14500,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if success:
             self.update_project_status()
             self.update_bout_subjects()
+            self._update_boutframes_layout_label()
             self.update_viz_subjects()
             self.update_behav_subjects()
             self.update_bout_analysis_subjects()
@@ -13865,10 +14751,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.exclusions.pop(subject, None)
         if hasattr(self, 'per_subject_boutframe_shifts'):
             self.per_subject_boutframe_shifts.pop(subject, None)
-        if hasattr(self, 'groups'):
-            for members in self.groups.values():
-                if isinstance(members, list) and subject in members:
-                    members.remove(subject)
+        # self.groups is a view over the factor assignments, so the subject
+        # leaves its group by losing its levels rather than by list surgery.
+        self.clear_subject_factors(subject)
         if hasattr(self, 'per_subject_shifts_tree'):
             try:
                 self._refresh_per_subject_shifts_list()
@@ -13937,21 +14822,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             try:
                 for key, var in entries.items():
                     value_str = var.get().strip()
-                    # Check if this is a string parameter (file naming patterns, maze type)
-                    if key in ['fpdata_pattern', 'fpdata_suffix', 'timestamp_pattern', 'timestamp_suffix', 'maze_type', 'y_calibration_method', 'boutframe_processing_style', 'processing_smoothing_method', 'ttl_format', 'decay_strictness', 'session_pattern']:
-                        self.params[key] = value_str
-                    # Check if this is a boolean parameter
-                    elif key in ['baseline_correct_bouts', 'processing_rolling_avg_enabled', 'auto_scale_boutframes', 'precut_correct_boutframes', 'bout_exclude_enabled']:
-                        # Parse boolean values
+                    # How to parse the text is decided by the type the parameter
+                    # already holds, not by a hand-maintained key list: every new
+                    # string parameter would otherwise fall through to the numeric
+                    # branch and make this dialog unusable (e.g. 'series_factor'
+                    # = 'Group' -> int('Group')).
+                    current = self.params.get(key)
+                    if isinstance(current, bool):
                         if value_str.lower() in ['true', '1', 'yes', 'on']:
                             self.params[key] = True
                         elif value_str.lower() in ['false', '0', 'no', 'off']:
                             self.params[key] = False
                         else:
                             raise ValueError(f"{key} must be True or False")
-                    else:
-                        # Numeric parameter
+                    elif isinstance(current, (int, float)):
+                        # Numeric parameter — a typed decimal point promotes to float.
                         self.params[key] = float(value_str) if '.' in value_str else int(value_str)
+                    else:
+                        # Strings (file naming patterns, method choices) and any
+                        # None-valued parameter are stored verbatim.
+                        self.params[key] = value_str
                 
                 self.update_param_labels()
                 # Update UI elements that display parameters
@@ -13988,9 +14878,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if hasattr(self, 'processing_savgol_poly_var'):
                     self.processing_savgol_poly_var.set(str(self.params['processing_savgol_polyorder']))
                 
-                # Auto-save project to persist parameter changes
+                # Auto-save project to persist parameter changes. Only the
+                # settings files need rewriting — editing parameters here does
+                # not touch any processed subject array (the new values apply on
+                # the next process / re-extract), so a full save_project() would
+                # rewrite the whole cohort's CSVs unchanged.
                 if self.current_project:
-                    self.save_project()
+                    self.save_project_config()
                     self.log_message("Parameters updated and saved to project")
                 else:
                     self.log_message("Parameters updated (create/open a project to save them)")
@@ -14222,30 +15116,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def get_subject_factors(self, subject_ids=None):
         """``{subject_id: {factor: level}}`` for the current project.
 
-        Built-in factors are derived rather than stored, so they cannot drift:
-        Group mirrors self.groups (nothing that reads self.groups changes),
-        Animal and Session come from the ID pattern. User-defined factors from
-        self.subject_factors are layered on top and win on conflict, so a
-        hand-assigned level is never overwritten by a derived one.
+        Every factor a user can edit -- Group included -- is stored in
+        params['subject_factors'].  Session and Animal are instead derived from
+        the subject IDs, so they cannot drift out of step with the ID pattern; a
+        stored level still wins over a derived one, which is how an override is
+        expressed.
+
+        Animal is only offered when the IDs actually pool several recordings
+        onto one animal.  Otherwise it is one level per subject, which is not a
+        way of dividing subjects but a restatement of the subject list, and it
+        would clutter every facet column with a useless dropdown.
         """
         ids = [str(s) for s in (subject_ids if subject_ids is not None
                                 else self.processed_data.keys())]
         mapping = self.get_animal_map(ids)
         stored = self.params.get('subject_factors') or {}
 
-        group_of = {}
-        for gname, members in (self.groups or {}).items():
-            for sid in members:
-                group_of.setdefault(str(sid), gname)
+        animal_counts = Counter(animal for animal, _ in mapping.values())
+        animal_pools = any(n > 1 for n in animal_counts.values())
 
         out = {}
         for sid in ids:
             animal, session = mapping.get(sid, (sid, ''))
-            derived = {'Animal': animal}
+            derived = {}
+            if animal_pools:
+                derived['Animal'] = animal
             if session:
                 derived['Session'] = session
-            if sid in group_of:
-                derived['Group'] = group_of[sid]
             derived.update({k: v for k, v in (stored.get(sid) or {}).items() if v})
             out[sid] = derived
         return out
@@ -14256,13 +15153,174 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         present = set()
         for levels in factors.values():
             present.update(levels)
-        builtin = [f for f in ('Group', 'Session', 'Animal') if f in present]
+        # The series factor is always offered even with nothing assigned yet: it
+        # is what the graphing tabs plot, so an empty one is a prompt to fill it
+        # in rather than a factor that does not exist.
+        builtin = [self.series_factor] + [f for f in ('Session', 'Animal') if f in present]
         custom = sorted(present - set(builtin))
         # User-created factors with no assignments yet still deserve a control.
         for name in (self.params.get('factor_definitions') or []):
             if name not in builtin and name not in custom:
                 custom.append(name)
         return builtin + custom
+
+    # ---- Groups: a view onto the series factor ------------------------------
+    # Grouping used to be its own designation system with its own tab, its own
+    # storage and its own file format.  It is now just one factor -- the one the
+    # graphing tabs plot as their series, named by params['series_factor'] and
+    # called "Group" by default.  ~60 plotting sites ask "who is in this group",
+    # so self.groups survives as a derived mapping rather than being rewritten
+    # out of all of them.
+
+    @property
+    def series_factor(self):
+        """Name of the factor the graphing tabs plot as series.
+
+        A pointer rather than a fixed name so that factor is not a special case
+        the user is forbidden to rename: renaming it moves the pointer, and the
+        group listboxes follow.
+        """
+        return str(self.params.get('series_factor') or GROUP_FACTOR)
+
+    @property
+    def groups(self):
+        """``{group_name: [subject_id, ...]}`` read off the series factor.
+
+        Rebuilt on every access rather than cached: the assignments behind it
+        are edited on the Factors tab, and a cached copy would be exactly the
+        kind of second source of truth this change removes.  Levels come back in
+        the user's plot order, which is what the group listboxes display.
+
+        Mutating the returned dict does nothing -- assign to self.groups, or
+        edit params['subject_factors'], instead.
+        """
+        factor = self.series_factor
+        subjects = [str(s) for s in self.processed_data.keys()]
+        assignments = self.get_subject_factors(subjects)
+        order = (self.params.get('factor_level_order') or {}).get(factor)
+
+        members = {}
+        for sid in subjects:
+            level = (assignments.get(sid) or {}).get(factor)
+            if level:
+                members.setdefault(str(level), []).append(sid)
+        wanted = factor_levels(subjects, assignments, factor, order)
+        return {lv: members[lv] for lv in wanted if lv in members}
+
+    @groups.setter
+    def groups(self, mapping):
+        """Replace every Group assignment with *mapping*.
+
+        Only the project lifecycle uses this: clearing on a new project, and
+        importing the groups of a project saved before factors existed.  A
+        subject listed in two groups keeps the first -- a factor level is
+        singular, so overlapping groups cannot survive the trip.
+        """
+        factor = self.series_factor
+        stored = self.params.setdefault('subject_factors', {})
+        for levels in stored.values():
+            levels.pop(factor, None)
+
+        order = []
+        for gname, subjects in (mapping or {}).items():
+            gname = str(gname)
+            if gname not in order:
+                order.append(gname)
+            for sid in subjects or []:
+                levels = stored.setdefault(str(sid), {})
+                levels.setdefault(factor, gname)
+        self.params.setdefault('factor_level_order', {})[factor] = order
+
+    def clear_subject_factors(self, subject_id):
+        """Forget every factor level assigned to *subject_id*."""
+        (self.params.get('subject_factors') or {}).pop(str(subject_id), None)
+
+    def reset_factors(self):
+        """Drop every factor, level and assignment: a project boundary.
+
+        Factors live in self.params, which is merged key by key on load, so a
+        project whose config predates a key keeps whatever the last project put
+        there. For factors that is not a harmless default -- two projects can
+        use the same subject IDs, and the previous project's Sex or Drug
+        assignment would silently reappear against them.
+        """
+        self.params['subject_factors'] = {}
+        self.params['factor_definitions'] = [GROUP_FACTOR]
+        self.params['factor_level_order'] = {}
+        self.params['series_factor'] = GROUP_FACTOR
+
+    def migrate_legacy_groups(self, legacy_groups):
+        """Adopt a pre-factor project's ``groups`` map, then tell the user.
+
+        A project saved before this change carries its groups in its own key and
+        nothing in subject_factors. Dropping them would quietly unassign a whole
+        cohort, so they are converted into Group levels; the notice explains
+        where they went, because the tab the user would look for them on no
+        longer exists.
+
+        Nothing happens when the project already has Group assignments -- those
+        are the newer copy and must not be overwritten by a stale mirror written
+        for backwards compatibility.
+        """
+        stored = self.params.get('subject_factors') or {}
+        already = any(self.series_factor in (levels or {}) for levels in stored.values())
+        if already or not legacy_groups:
+            return False
+
+        overlaps = legacy_group_overlaps(legacy_groups)
+        self.groups = legacy_groups
+        kept = list(self.groups.keys())
+        # A group every one of whose members was already claimed survives the
+        # conversion with nobody in it. Those are the ones the user actually
+        # loses, so they are named rather than counted.
+        lost = [str(name) for name in legacy_groups if str(name) not in kept]
+        self.log_message(
+            f"  Migrated {len(kept)} legacy group(s) to the Group factor: {kept}")
+        if lost:
+            self.log_message(f"  Overlapping groups left with no members: {lost}")
+
+        overlap_note = ""
+        if overlaps:
+            # Naming every overlapping subject is noise once there are dozens;
+            # the useful fact is the rule that resolved them.
+            sample = ("" if len(overlaps) > 4 else " — " + ", ".join(
+                f"{sid} ({'/'.join(gs)})" for sid, gs in overlaps.items()))
+            overlap_note = (
+                f"{len(overlaps)} subject(s) were in more than one group{sample}. "
+                "A subject sits at one level of a factor, so each kept the first "
+                "group it was listed in.\n\n")
+        lost_note = ""
+        if lost:
+            lost_note = (
+                "These groups ended up empty because every member was claimed by "
+                f"an earlier group: {', '.join(lost)}.\n\n"
+                "Overlapping groups like these are usually one design expressed "
+                "the long way — a Sex factor and a Drug factor, say, rather than "
+                "a group per combination. Create them with 'New…' on the Factors "
+                "tab and any graphing tab can then split or cross them, which is "
+                "what the old overlapping groups were standing in for.\n\n")
+
+        self._legacy_group_notice = (
+            "This project was saved before TRACY replaced the Groups tab with the "
+            "Factors system, so its groups have been converted for you.\n\n"
+            "Group is now a factor and its levels are your groups: "
+            f"{', '.join(kept)}.\n\n"
+            + overlap_note + lost_note
+            + "Please review the assignments on Project → Factors. Saving the "
+              "project stores them in the new form.")
+        try:
+            self.root.after(400, self._show_legacy_group_notice)
+        except Exception:
+            pass
+        return True
+
+    def _show_legacy_group_notice(self):
+        """Show the pending migration notice once, after loading settles."""
+        notice = getattr(self, '_legacy_group_notice', None)
+        if not notice:
+            return
+        self._legacy_group_notice = None
+        messagebox.showwarning("Groups Are Now Factors", notice)
 
     def facet(self, subject_ids, selections):
         """Series labels for *subject_ids* under *selections*. See facet_subjects."""
@@ -14301,40 +15359,46 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return list(facet[name])
         return self.groups.get(name, [])
 
-    def facet_series_for(self, tab_key, group_names):
-        """Series names a graphing tab should plot, given its selected groups.
+    def facet_series_for(self, tab_key, subject_ids):
+        """Series names a graphing tab should plot, given its selected subjects.
 
-        Returns *group_names* untouched when the tab's facet column is inert,
-        so an untouched tab runs the original code path rather than an
-        equivalent-looking substitute. Otherwise the selected groups define the
-        pool of subjects and the facet decides how that pool is divided.
+        The selection is the pool and the facet column divides it -- the two
+        jobs the old group listbox conflated.  Left untouched the column splits
+        on the series factor and combines the rest, which reproduces the plain
+        one-series-per-group plot; deselecting a subject now drops it from its
+        group's series instead of requiring its factor level to be edited.
+
+        Always populates ``_active_facet``, so ``_series_members`` resolves a
+        series the same way whatever the column says.
         """
         control = getattr(self, 'facet_controls', {}).get(tab_key)
         selections = control.selections() if control is not None else {}
-        if not selections or facet_is_inert(selections):
-            self._active_facet = None
-            return list(group_names)
+        if not selections:
+            # No column on this tab (or not built yet): the historical plot.
+            selections = {self.series_factor: FACTOR_SPLIT}
 
         pool, seen = [], set()
-        for group_name in group_names:
-            # The pool is always real group membership: the facet divides the
-            # selection, it does not define it.
-            for sid in self.groups.get(group_name, []):
-                if sid not in seen:
-                    seen.add(sid)
-                    pool.append(sid)
+        for sid in subject_ids:
+            sid = str(sid)
+            if sid not in seen:
+                seen.add(sid)
+                pool.append(sid)
         series = self.facet_series(pool, selections)
         self._active_facet = {label: subjects for label, subjects in series}
         return [label for label, _ in series]
 
     def selected_series(self, tab_key, listbox):
-        """Series a graphing tab should draw: its selected groups, then its facet.
+        """Series a graphing tab should draw: its selected subjects, then its facet.
 
         Every plot path on a tab goes through here rather than reading the
         listbox itself, so the panels of one figure cannot disagree about what
         the series are.
         """
         names = [listbox.get(i) for i in listbox.curselection()]
+        if not names:
+            # An empty selection means "everything", not "nothing": the pool is
+            # a filter over the loaded subjects and an unused filter is inert.
+            names = [listbox.get(i) for i in range(listbox.size())]
         return self.facet_series_for(tab_key, names)
 
     def _make_facet_controls(self, parent, tab_key, on_change=None, **kwargs):
@@ -14893,6 +15957,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.root.update_idletasks()  # Allow GUI to update
             self.update_project_status()
             self.update_bout_subjects()
+            self._update_boutframes_layout_label()
             self.update_viz_subjects()
             self.update_behav_subjects()
             self.update_bout_analysis_subjects()
@@ -16153,10 +17218,22 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # Seed the merged sheet with any existing behaviors for this
                     # subject, dropping previously written TTL columns so repeated
                     # runs stay idempotent (TTL columns are refreshed, not stacked).
+                    # Where this recording's bouts live.  A per-animal workbook
+                    # holds several sessions in one sheet, so the TTL columns
+                    # must go into this recording's rows rather than into a new
+                    # per-recording sheet, which would shadow the animal's.
+                    target_sheet, target_session = (
+                        self.resolve_boutframes_sheet(target_path, subject_id)
+                        if os.path.exists(target_path) else (None, ''))
+                    if target_sheet is None:
+                        target_sheet, target_session = subject_id, ''
+
                     merged_cols = {}
                     if os.path.exists(target_path):
                         try:
-                            existing = pd.read_excel(target_path, sheet_name=subject_id)
+                            existing = self.filter_boutframes_rows(
+                                pd.read_excel(target_path, sheet_name=target_sheet),
+                                target_session)
                             for col in existing.columns:
                                 if self._boutframe_base_behavior(col) in ttl_base_behaviors:
                                     continue  # replaced below with fresh TTL data
@@ -16170,22 +17247,34 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     for beh, frames_list in ttl_grouped.items():
                         merged_cols[str(beh)] = list(frames_list)
 
-                    # Pad columns to equal length and write the subject's sheet.
+                    # Pad columns to equal length and write the subject's rows.
                     max_len = max((len(v) for v in merged_cols.values()), default=0)
                     frames_dict = {k: list(v) + [np.nan] * (max_len - len(v))
                                    for k, v in merged_cols.items()}
 
-                    if os.path.exists(target_path):
+                    if not os.path.exists(target_path):
+                        with pd.ExcelWriter(target_path, engine='openpyxl') as writer:
+                            pd.DataFrame(frames_dict).to_excel(
+                                writer, sheet_name=target_sheet, index=False)
+                    elif not target_session:
                         with pd.ExcelWriter(target_path, engine='openpyxl', mode='a',
                                             if_sheet_exists='replace') as writer:
-                            pd.DataFrame(frames_dict).to_excel(writer, sheet_name=subject_id, index=False)
+                            pd.DataFrame(frames_dict).to_excel(
+                                writer, sheet_name=target_sheet, index=False)
                     else:
-                        with pd.ExcelWriter(target_path, engine='openpyxl') as writer:
-                            pd.DataFrame(frames_dict).to_excel(writer, sheet_name=subject_id, index=False)
+                        wb_t = load_workbook(target_path)
+                        header, blocks = self._read_sheet_columns_by_session(wb_t, target_sheet)
+                        blocks[target_session] = {k: list(v) for k, v in frames_dict.items()}
+                        self._rewrite_sheet_columns_by_session(
+                            wb_t, target_sheet,
+                            header or self.BOUTFRAMES_SESSION_COLUMNS[0].title(), blocks)
+                        wb_t.save(target_path)
 
                     self.log_message(f"  Merged TTL behaviors into boutframes file: {target_path}")
                     self.log_message(
-                        f"    Sheet: {subject_id}, Behaviors: {list(frames_dict.keys())} "
+                        f"    Sheet: {target_sheet}"
+                        + (f" (session {target_session})" if target_session else "")
+                        + f", Behaviors: {list(frames_dict.keys())} "
                         f"(TTL-derived: {sorted(ttl_behaviors)}), Total TTL events: {len(ttl_boutframes)}")
 
                     # All downstream extraction reads this merged file.
@@ -17781,7 +18870,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Group mode - get selected groups and their members
                 selected_indices = self.behav_group_listbox.curselection()
                 if not selected_indices:
-                    messagebox.showwarning("Warning", "Please select at least one group.")
+                    messagebox.showwarning("Warning", "Please select at least one subject.")
                     return
                 
                 selected_groups = self.selected_series('behavioral', self.behav_group_listbox)
@@ -19248,6 +20337,226 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message(traceback.format_exc())
             return None
     
+    # ── Session-aware boutframes lookup ──────────────────────────────────
+    #
+    # A subject ID is one *recording* (`CAB01_Alcohol`), and a multi-session
+    # project holds several recordings per animal.  The boutframes workbook may
+    # therefore be laid out either way round:
+    #
+    #   per-recording  one sheet named `CAB01_Alcohol`  -- read whole
+    #   per-animal     one sheet named `CAB01` carrying a `Session` column
+    #                  -- read the rows whose Session is this recording's
+    #
+    # The per-animal form is what tools/combine_sessions.py writes, because one
+    # sheet per animal keeps "everything scored for CAB01" together and does not
+    # multiply the sheet count by the number of days.  Single-session projects
+    # have neither a session label nor a Session column and are unaffected.
+
+    def _boutframes_sheet_index(self, path):
+        """``{lowercased sheet name: real sheet name}`` for *path*, cached.
+
+        Cached on (path, mtime) because bout extraction resolves a sheet once
+        per recording per behaviour, and opening the workbook just to list its
+        sheets is far more expensive than reading one.
+        """
+        try:
+            key = (os.path.abspath(path), os.path.getmtime(path))
+        except OSError:
+            return {}
+        cached = getattr(self, '_bf_sheet_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            wb = load_workbook(path, read_only=True)
+            try:
+                index = {str(s).strip().lower(): s for s in wb.sheetnames}
+            finally:
+                wb.close()
+        except Exception:
+            return {}
+        self._bf_sheet_cache = (key, index)
+        return index
+
+    def resolve_boutframes_sheet(self, path, subject_id):
+        """Which worksheet of *path* holds the bouts for recording *subject_id*.
+
+        Returns ``(sheet_name, session_label)``.  ``sheet_name`` is None when
+        nothing matches; ``session_label`` is the session the rows must be
+        filtered to, or '' when the whole sheet belongs to this recording.
+        """
+        sid = str(subject_id)
+        index = self._boutframes_sheet_index(path)
+        if not index:
+            return None, ''
+
+        # A sheet named for the recording itself always wins: it is unambiguous,
+        # and it is what the TTL merge writes.
+        hit = index.get(sid.strip().lower())
+        if hit is not None:
+            return hit, ''
+
+        animal, session = split_subject_id(sid, self._session_pattern())
+        if session:
+            hit = index.get(str(animal).strip().lower())
+            if hit is not None:
+                return hit, session
+        return None, ''
+
+    @classmethod
+    def _session_column(cls, df):
+        """The column tagging each row with its session, if the sheet has one."""
+        for c in df.columns:
+            if str(c).strip().lower() in cls.BOUTFRAMES_SESSION_COLUMNS:
+                return c
+        return None
+
+    def read_boutframes_sheet(self, path, subject_id):
+        """Bouts for one recording as a DataFrame, session-filtered.
+
+        Raises the same way ``pd.read_excel`` did when there is no usable sheet,
+        so callers that already guard bout reading with try/except keep working.
+        """
+        sheet, session = self.resolve_boutframes_sheet(path, subject_id)
+        if sheet is None:
+            raise ValueError(
+                f"No boutframes sheet for '{subject_id}'. Expected a sheet named "
+                f"'{subject_id}', or one named for its animal with a "
+                f"'{self.BOUTFRAMES_SESSION_COLUMNS[0].title()}' column.")
+        df = pd.read_excel(path, sheet_name=sheet)
+        return self.filter_boutframes_rows(df, session)
+
+    def _update_boutframes_layout_label(self):
+        """Say, on the Processing tab, how the workbook maps onto this project.
+
+        "31 sheets" tells the user nothing when they have 93 recordings; whether
+        those sheets resolved is the thing worth showing, and it is the failure
+        that would otherwise only surface as "no bouts" much later.
+        """
+        label = getattr(self, 'boutframes_layout_label', None)
+        if label is None:
+            return
+        path = self.boutframes_path_var.get()
+        if not path or not os.path.exists(path):
+            label.config(
+                text="One worksheet per subject.  Multi-session projects may instead "
+                     "key sheets by animal and add a 'Session' column.",
+                foreground='gray')
+            return
+
+        index = self._boutframes_sheet_index(path)
+        subjects = list(self.processed_data)
+        if not subjects:
+            label.config(text=f"{len(index)} worksheet(s).  Process subjects to see "
+                              f"how they map onto recordings.", foreground='gray')
+            return
+
+        by_session = sum(1 for s in subjects
+                         if self.resolve_boutframes_sheet(path, s)[1])
+        missing = [s for s in subjects
+                   if self.resolve_boutframes_sheet(path, s)[0] is None]
+        parts = [f"{len(index)} sheet(s) → {len(subjects) - len(missing)}/"
+                 f"{len(subjects)} recording(s)"]
+        if by_session:
+            parts.append(f"{by_session} matched by animal + Session column")
+        if missing:
+            parts.append("no sheet for " + ", ".join(missing[:4])
+                         + (f" (+{len(missing) - 4} more)" if len(missing) > 4 else ""))
+        label.config(text="  |  ".join(parts),
+                     foreground='red' if missing else 'gray')
+
+    def boutframes_recording_for_sheet(self, path, sheet, behavior=None):
+        """The processed recording a worksheet belongs to, or None.
+
+        The Boutframes tab picks a *sheet*, but the per-subject shift, the
+        photometry rate and the session length it previews against are
+        properties of a *recording*.  With one sheet per animal that is a
+        one-to-many map, so *behaviour* breaks the tie: the recording whose
+        session actually scored it.
+        """
+        candidates = [sid for sid in self.processed_data
+                      if self.resolve_boutframes_sheet(path, sid)[0] == sheet]
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+        if behavior:
+            for sid in sorted(candidates):
+                try:
+                    df = self.read_boutframes_sheet(path, sid)
+                except Exception:
+                    continue
+                if behavior in df.columns and pd.to_numeric(
+                        df[behavior], errors='coerce').notna().any():
+                    return sid
+        return sorted(candidates)[0]
+
+    def boutframes_behavior_columns(self, path):
+        """Every behaviour column name in the workbook, session tags excluded."""
+        names = set()
+        with pd.ExcelFile(path) as xl:
+            for sheet in xl.sheet_names:
+                names.update(
+                    str(c) for c in xl.parse(sheet, nrows=0).columns
+                    if str(c).strip().lower() not in self.BOUTFRAMES_SESSION_COLUMNS)
+        return names
+
+    def iter_boutframes_recordings(self, path):
+        """Yield ``(label, subject_id_or_None, DataFrame)`` per recording in *path*.
+
+        Reports that summarise a whole workbook (the exclusion preview) have to
+        work one recording at a time, not one sheet at a time: a per-animal
+        sheet holds several sessions, and rules like the proximity gap are
+        meaningless applied across a boundary between two different days.
+
+        Recording IDs come from the processed project when there is one, so the
+        rows are attributed to real subjects.  With nothing processed yet the
+        sheets are split on their session column and labelled for display only,
+        which is enough for a preview.
+        """
+        index = self._boutframes_sheet_index(path)
+        if not index:
+            return
+
+        resolved = {}       # real sheet name -> [(label, subject_id, session)]
+        for sid in self.processed_data:
+            sheet, session = self.resolve_boutframes_sheet(path, sid)
+            if sheet is not None:
+                resolved.setdefault(sheet, []).append((str(sid), str(sid), session))
+
+        for sheet in index.values():
+            try:
+                df = pd.read_excel(path, sheet_name=sheet)
+            except Exception:
+                continue
+            if sheet in resolved:
+                for label, sid, session in sorted(resolved[sheet]):
+                    yield label, sid, self.filter_boutframes_rows(df, session)
+                continue
+            col = self._session_column(df)
+            if col is None:
+                yield str(sheet), None, df
+                continue
+            for session in df[col].dropna().astype(str).str.strip().unique():
+                yield (f"{sheet} [{session}]", None,
+                       self.filter_boutframes_rows(df, session))
+
+    def filter_boutframes_rows(self, df, session):
+        """Keep the rows of an animal-level sheet scored in *session*.
+
+        Sheets without a session column are returned unchanged -- that is the
+        single-session layout, and every row of them belongs to the recording.
+        """
+        col = self._session_column(df)
+        if col is None:
+            return df
+        if not session:
+            # A recording whose ID carries no session cannot claim rows tagged
+            # with one; fall back to the untagged rows, else the whole sheet.
+            blank = df[col].isna() | (df[col].astype(str).str.strip() == '')
+            return (df.loc[blank].drop(columns=[col]).reset_index(drop=True)
+                    if blank.any() else df.drop(columns=[col]))
+        want = str(session).strip().lower()
+        keep = df[col].astype(str).str.strip().str.lower() == want
+        return df.loc[keep].drop(columns=[col]).reset_index(drop=True)
+
     # ── Start/End boutframes helpers ─────────────────────────────────────
     @staticmethod
     def _boutframe_base_behavior(col):
@@ -19260,8 +20569,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return str(col)[:-len('__end')]
         return str(col)
 
-    @staticmethod
-    def _parse_boutframes_dataframe(df):
+    @classmethod
+    def _parse_boutframes_dataframe(cls, df):
         """Parse a boutframes sheet into behaviors with raw start/end frame arrays.
 
         Two formats are supported and may be mixed in the same sheet:
@@ -19279,7 +20588,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         has_end_any : bool
             True if at least one behavior carries end frames.
         """
-        cols = list(df.columns)
+        # A session tag is metadata about the row, not a behaviour scored in it;
+        # without this it would come back as a behaviour called "Session" whose
+        # frames are all NaN, and show up in every behaviour dropdown.
+        cols = [c for c in df.columns
+                if str(c).strip().lower() not in cls.BOUTFRAMES_SESSION_COLUMNS]
         end_map = {}      # base_name_lower -> end column
         for c in cols:
             cl = str(c).lower()
@@ -19614,8 +20927,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def extract_bouts(self, subject_id, beh_synced, boutframes_file):
         """Extract bout-aligned data"""
         try:
-            # Load boutframes for this subject
-            df = pd.read_excel(boutframes_file, sheet_name=subject_id)
+            # Load boutframes for this recording (session-filtered when the
+            # workbook keys sheets by animal -- see resolve_boutframes_sheet).
+            df = self.read_boutframes_sheet(boutframes_file, subject_id)
             
             bout_data = {}
             prebout = self.params['preboutframes']
@@ -20288,7 +21602,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         durations = []
         for sid in subjects:
             try:
-                df = pd.read_excel(bf, sheet_name=sid)
+                df = self.read_boutframes_sheet(bf, sid)
             except Exception:
                 continue
             behs, he = self._parse_boutframes_dataframe(df)
@@ -20535,14 +21849,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for path, sids in files.items():
                 shutil.copy2(path, path + ".bak")
                 wb = load_workbook(path)
+                # Several recordings can share one worksheet (a per-animal
+                # workbook), so update each sheet once with all of its sessions
+                # -- writing them one at a time would replace the sheet and
+                # discard the sibling sessions' bouts.
+                by_sheet = {}
                 for sid in sids:
-                    starts_raw, ends_raw = per_subject[sid]
-                    columns = self._read_sheet_columns(wb, sid, drop_names)
-                    columns[base_start] = list(starts_raw)
-                    if has_end:
-                        columns[base_end] = list(ends_raw)
-                    self._rewrite_sheet_columns(wb, sid, columns)
-                    written += 1
+                    sheet, session = self.resolve_boutframes_sheet(path, sid)
+                    if sheet is None:
+                        sheet, session = sid, ''
+                    by_sheet.setdefault(sheet, []).append((sid, session))
+
+                for sheet, members in by_sheet.items():
+                    session_header, blocks = self._read_sheet_columns_by_session(
+                        wb, sheet, drop_names)
+                    for sid, session in members:
+                        starts_raw, ends_raw = per_subject[sid]
+                        block = blocks.setdefault(session, {})
+                        block[base_start] = list(starts_raw)
+                        if has_end:
+                            block[base_end] = list(ends_raw)
+                        written += 1
+                    if session_header is None:
+                        self._rewrite_sheet_columns(wb, sheet, blocks.get('', {}))
+                    else:
+                        self._rewrite_sheet_columns_by_session(
+                            wb, sheet, session_header, blocks)
                 wb.save(path)
         except Exception as exc:
             messagebox.showerror("Write Failed",
@@ -20594,6 +21926,73 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 col.pop()
             columns[h] = col
         return columns
+
+    def _read_sheet_columns_by_session(self, wb, sheet, drop_names=None):
+        """Split a worksheet into one ``{header: [values]}`` dict per session.
+
+        Returns ``(session_header, {session_label: columns})``.  ``session_header``
+        is None for a sheet with no session column, in which case the single
+        block is keyed ''.  This is the row-preserving counterpart of
+        :meth:`_read_sheet_columns`: a per-animal sheet interleaves several
+        recordings, so a writer has to keep the other sessions' rows intact.
+        """
+        drop_names = {str(d).lower() for d in (drop_names or set())}
+        if sheet not in wb.sheetnames:
+            return None, {}
+        rows = list(wb[sheet].iter_rows(values_only=True))
+        if not rows:
+            return None, {}
+
+        headers = [("" if h is None else str(h)) for h in rows[0]]
+        session_idx = next((i for i, h in enumerate(headers)
+                            if h.strip().lower() in self.BOUTFRAMES_SESSION_COLUMNS), None)
+        if session_idx is None:
+            return None, {'': self._read_sheet_columns(wb, sheet, drop_names)}
+
+        session_header = headers[session_idx]
+        keep = [(i, h) for i, h in enumerate(headers)
+                if h and i != session_idx and h.lower() not in drop_names]
+
+        blocks = {}
+        for row in rows[1:]:
+            raw = row[session_idx] if session_idx < len(row) else None
+            label = '' if raw is None else str(raw).strip()
+            block = blocks.setdefault(label, {h: [] for _i, h in keep})
+            for i, h in keep:
+                block[h].append(row[i] if i < len(row) else None)
+        for block in blocks.values():
+            for col in block.values():
+                while col and col[-1] is None:
+                    col.pop()
+        return session_header, blocks
+
+    def _rewrite_sheet_columns_by_session(self, wb, sheet, session_header, blocks):
+        """Replace *sheet* with per-session blocks, session column first."""
+        headers = []
+        for block in blocks.values():
+            for h in block:
+                if h not in headers:
+                    headers.append(h)
+
+        if sheet in wb.sheetnames:
+            del wb[sheet]
+        ws = wb.create_sheet(sheet)
+        ws.cell(1, 1, session_header)
+        for ci, h in enumerate(headers, 2):
+            ws.cell(1, ci, h)
+
+        row_idx = 2
+        for label, block in blocks.items():
+            n = max((len(v) for v in block.values()), default=0)
+            for r in range(n):
+                ws.cell(row_idx, 1, label)
+                for ci, h in enumerate(headers, 2):
+                    values = block.get(h) or []
+                    v = values[r] if r < len(values) else None
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        continue
+                    ws.cell(row_idx, ci, v)
+                row_idx += 1
 
     @staticmethod
     def _rewrite_sheet_columns(wb, sheet, columns):
@@ -20768,16 +22167,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def _populate_per_subject_from_boutframes(self):
         """Add all subjects from the boutframes file (or processed data) with shift=0 if not already set."""
-        subjects = []
+        # Shifts are per RECORDING, so the processed subjects are the right list
+        # whenever there is one -- a per-animal boutframes workbook names its
+        # sheets after animals, which would key the shifts one level too high.
+        subjects = list(self.processed_data.keys())
         boutframes_file = self.boutframes_path_var.get()
-        if boutframes_file and os.path.exists(boutframes_file):
+        if not subjects and boutframes_file and os.path.exists(boutframes_file):
             try:
                 wb = load_workbook(boutframes_file, read_only=True)
                 subjects = wb.sheetnames
             except Exception:
                 pass
-        if not subjects:
-            subjects = list(self.processed_data.keys())
         if not subjects:
             messagebox.showinfo("Per-Subject Shifts",
                                 "No subjects found. Load a boutframes file or process subjects first.")
@@ -20960,7 +22360,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         try:
             df = pd.read_excel(boutframes_file, sheet_name=subject)
-            behaviors = list(df.columns)
+            behaviors = [str(c) for c in df.columns
+                         if str(c).strip().lower() not in self.BOUTFRAMES_SESSION_COLUMNS]
             self.preview_behavior_combo['values'] = behaviors
             if behaviors:
                 self.preview_behavior_combo.current(0)
@@ -20972,7 +22373,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not hasattr(self, 'preview_tree'):
             return
 
-        subject = self.bout_subject_var.get()
+        sheet = self.bout_subject_var.get()
         behavior = self.preview_behavior_var.get()
         boutframes_file = self.boutframes_path_var.get()
 
@@ -20980,10 +22381,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
 
-        if not subject or not behavior or not boutframes_file or not os.path.exists(boutframes_file):
+        if not sheet or not behavior or not boutframes_file or not os.path.exists(boutframes_file):
             self.preview_info_label.config(text="No data loaded.", foreground='gray')
             self._draw_scaled_preview_plot([], [], 0)
             return
+
+        # The combo lists worksheets; the rate, shift and session length below
+        # belong to the recording that sheet holds this behaviour for.
+        subject = self.boutframes_recording_for_sheet(
+            boutframes_file, sheet, behavior) or sheet
 
         # ── Compute scale factor ──────────────────────────────────────
         video_fps = float(self.params.get('boutframes_video_fps', 30))
@@ -21006,7 +22412,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # ── Load raw frames ───────────────────────────────────────────
         try:
-            df = pd.read_excel(boutframes_file, sheet_name=subject)
+            df = pd.read_excel(boutframes_file, sheet_name=sheet)
+            df = self.filter_boutframes_rows(
+                df, self.resolve_boutframes_sheet(boutframes_file, subject)[1])
             if behavior not in df.columns:
                 self.preview_info_label.config(text=f"Behavior '{behavior}' not found.", foreground='red')
                 return
@@ -21048,6 +22456,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             reason = "scaling disabled" if not scale_enabled else f"fps equal ({video_fps:.1f})"
             info = f"No scaling applied ({reason})  |  {len(raw_frames)} bouts"
             info_color = 'gray'
+
+        if subject != sheet:
+            info = f"{subject}  |  " + info
 
         if _manual_shift != 0:
             info += f"  |  Manual shift: {_manual_shift:+d} frames"
@@ -21110,634 +22521,57 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.preview_fig.tight_layout()
         self.preview_canvas.draw()
 
-    # ======================== Groups Management ========================
-    
+    # ======================== Groups ========================
+    # Groups are the levels of the Group factor, assigned on the Factors tab.
+    # The graphing tabs no longer select groups directly: they select a pool of
+    # subjects and a facet column splits it, so a group is a facet of the pool
+    # rather than the unit of selection.  What survives here is the fan-out that
+    # pushes a change to those pool listboxes.
+
+    def fill_group_listbox(self, listbox):
+        """Repopulate a tab's pool listbox with every subject, keeping the selection.
+
+        Plotting "by group" means choosing which subjects are in play and
+        letting the facet column decide how they divide into series.  The
+        listbox therefore lists subjects, not group names: a group is one facet
+        of the pool, so restricting a plot to some members of a group has to be
+        possible without editing the design on the Factors tab.
+
+        Refreshing is non-destructive -- factors are edited on another tab while
+        a graphing tab sits there with a selection, and a change elsewhere must
+        not silently empty the plot about to be drawn.  With nothing chosen yet
+        the whole pool is selected, so the tab draws something the first time it
+        is opened instead of presenting an empty list and no way forward.
+        """
+        if listbox is None:
+            return
+        chosen = {listbox.get(i) for i in listbox.curselection()}
+        listbox.delete(0, 'end')
+        for i, name in enumerate(sorted(str(s) for s in self.processed_data.keys())):
+            listbox.insert('end', name)
+            if not chosen or name in chosen:
+                listbox.selection_set(i)
+
+    # Attribute names of the group-mode listboxes. They hold the subject pool a
+    # tab plots from, one per graphing tab; the "group" in the name is historical.
+    POOL_LISTBOXES = ('viz_group_listbox', 'behav_group_listbox',
+                      'bout_analysis_group_listbox', 'dec_prob_group_listbox',
+                      'kin_group_listbox')
+
+    def refresh_pool_listboxes(self):
+        """Re-list the subjects in every tab's group-mode pool listbox."""
+        for attr in self.POOL_LISTBOXES:
+            self.fill_group_listbox(getattr(self, attr, None))
+
     def update_groups_ui(self):
-        """Update all group-related UI elements"""
-        # Debug logging
-        if self.groups:
-            self.log_message(f"[DEBUG] update_groups_ui called with {len(self.groups)} groups: {list(self.groups.keys())}")
-        else:
-            self.log_message(f"[DEBUG] update_groups_ui called but self.groups is empty")
-        
-        # Update group listbox (preserve insertion/order in self.groups)
-        self.group_listbox.delete(0, 'end')
-        for group_name in self.groups.keys():
-            self.group_listbox.insert('end', group_name)
-            self.log_message(f"[DEBUG] Inserted '{group_name}' into group_listbox")
-        
-        # Update available subjects
-        self.update_available_subjects()
+        """Refresh every listbox and facet column that shows the Group levels."""
+        names = list(self.groups.keys())
+        self.log_message(f"Groups (levels of the Group factor): {names or 'none assigned'}")
 
         # Group is a factor, so editing groups changes the facet columns' levels.
         self.refresh_facet_controls()
+        self.refresh_pool_listboxes()
 
-        # Clear group members if no group selected
-        if not self.group_listbox.curselection():
-            self.group_members_listbox.delete(0, 'end')
-            self.group_name_label.config(text="Select a group")
-        
-        # Update group lists in visualization and behavioral tabs if they're in group mode
-        if hasattr(self, 'viz_group_listbox') and self.plot_by_var.get() == "Group":
-            self.viz_group_listbox.delete(0, 'end')
-            for group_name in self.groups.keys():
-                self.viz_group_listbox.insert('end', group_name)
-        
-        if hasattr(self, 'behav_group_listbox') and hasattr(self, 'behav_plot_by_var') and self.behav_plot_by_var.get() == "Group":
-            self.behav_group_listbox.delete(0, 'end')
-            for group_name in self.groups.keys():
-                self.behav_group_listbox.insert('end', group_name)
-
-        if hasattr(self, 'dec_prob_group_listbox') and hasattr(self, 'dec_prob_by_var') and self.dec_prob_by_var.get() == "Group":
-            self.update_dec_prob_groups()
-    
-    def update_available_subjects(self):
-        """Update list of available subjects for the currently selected group."""
-        self.available_subjects_listbox.delete(0, 'end')
-        
-        # Get currently selected group
-        selected = self.group_listbox.curselection()
-        if not selected:
-            # No group selected, show all processed subjects
-            for subject in sorted(self.processed_data.keys()):
-                self.available_subjects_listbox.insert('end', subject)
-        else:
-            # Show subjects not in this group. In mutually exclusive mode,
-            # also hide subjects assigned to any other group.
-            group_name = self.group_listbox.get(selected[0])
-            group_members = set(self.groups.get(group_name, []))
-
-            assigned_elsewhere = set()
-            if self.groups_mutually_exclusive_var.get():
-                for other_group, members in self.groups.items():
-                    if other_group != group_name:
-                        assigned_elsewhere.update(members)
-            
-            for subject in sorted(self.processed_data.keys()):
-                if subject in group_members:
-                    continue
-                if self.groups_mutually_exclusive_var.get() and subject in assigned_elsewhere:
-                    continue
-                self.available_subjects_listbox.insert('end', subject)
-
-    def _update_group_exclusivity_button_label(self):
-        """Update button text for group assignment mode."""
-        if not hasattr(self, 'group_exclusivity_button'):
-            return
-
-        if self.groups_mutually_exclusive_var.get():
-            self.group_exclusivity_button.config(text="Mutually Exclusive: ON")
-        else:
-            self.group_exclusivity_button.config(text="Mutually Exclusive: OFF")
-
-    def toggle_group_exclusivity(self):
-        """Toggle whether subjects can belong to multiple groups."""
-        self.groups_mutually_exclusive_var.set(not self.groups_mutually_exclusive_var.get())
-        self._update_group_exclusivity_button_label()
-        self.update_available_subjects()
-
-        mode = "ON" if self.groups_mutually_exclusive_var.get() else "OFF"
-        self.log_message(f"Group mutual exclusivity set to: {mode}")
-
-    def _enforce_subject_exclusivity(self, target_group, subject_ids):
-        """Remove subjects from non-target groups when exclusivity is enabled."""
-        if not self.groups_mutually_exclusive_var.get():
-            return
-
-        for subject in subject_ids:
-            for other_group, members in self.groups.items():
-                if other_group == target_group:
-                    continue
-                while subject in members:
-                    members.remove(subject)
-    
-    def create_group(self):
-        """Create a new group"""
-        group_name = self.new_group_var.get().strip()
-        
-        if not group_name:
-            messagebox.showwarning("Invalid Name", "Please enter a group name.")
-            return
-        
-        if group_name in self.groups:
-            messagebox.showwarning("Duplicate Name", f"Group '{group_name}' already exists.")
-            return
-        
-        # Create new empty group
-        self.groups[group_name] = []
-        self.new_group_var.set('')
-        self.update_groups_ui()
-    
-    def rename_group(self):
-        """Rename selected group"""
-        selected = self.group_listbox.curselection()
-        if not selected:
-            messagebox.showwarning("No Selection", "Please select a group to rename.")
-            return
-        
-        old_name = self.group_listbox.get(selected[0])
-        new_name = tk.simpledialog.askstring("Rename Group", f"Enter new name for '{old_name}':", 
-                                             initialvalue=old_name)
-        
-        if not new_name or new_name == old_name:
-            return
-        
-        if new_name in self.groups:
-            messagebox.showwarning("Duplicate Name", f"Group '{new_name}' already exists.")
-            return
-        
-        # Rename group
-        self.groups[new_name] = self.groups.pop(old_name)
-        self.update_groups_ui()
-    
-    def delete_group(self):
-        """Delete selected group"""
-        selected = self.group_listbox.curselection()
-        if not selected:
-            messagebox.showwarning("No Selection", "Please select a group to delete.")
-            return
-        
-        group_name = self.group_listbox.get(selected[0])
-        
-        if not messagebox.askyesno("Confirm Delete", f"Delete group '{group_name}'?"):
-            return
-        
-        del self.groups[group_name]
-        self.update_groups_ui()
-
-    def move_group_up(self):
-        """Move the selected group up one position in the groups ordering"""
-        sel = self.group_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("No Selection", "Please select a group to move.")
-            return
-        idx = sel[0]
-        if idx == 0:
-            return  # already at top
-
-        keys = list(self.groups.keys())
-        # swap
-        keys[idx - 1], keys[idx] = keys[idx], keys[idx - 1]
-        # rebuild dict preserving new order
-        new_groups = {k: self.groups[k] for k in keys}
-        self.groups = new_groups
-        # refresh UI and keep selection on moved item
-        self.update_groups_ui()
-        self.group_listbox.selection_set(idx - 1)
-        self.on_group_selected()
-
-    def move_group_down(self):
-        """Move the selected group down one position in the groups ordering"""
-        sel = self.group_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("No Selection", "Please select a group to move.")
-            return
-        idx = sel[0]
-        keys = list(self.groups.keys())
-        if idx >= len(keys) - 1:
-            return  # already at bottom
-
-        # swap
-        keys[idx + 1], keys[idx] = keys[idx], keys[idx + 1]
-        new_groups = {k: self.groups[k] for k in keys}
-        self.groups = new_groups
-        self.update_groups_ui()
-        self.group_listbox.selection_set(idx + 1)
-        self.on_group_selected()
-    
-    def refresh_groups_display(self):
-        """Manually refresh the groups display - useful after loading a project"""
-        self.log_message(f"Refreshing groups display... Found {len(self.groups)} groups")
-        self.update_groups_ui()
-        if self.groups:
-            self.log_message(f"  Groups refreshed: {list(self.groups.keys())}")
-        else:
-            self.log_message(f"  No groups to display")
-    
-    def save_groups_to_file(self):
-        """Save groups to a standalone JSON file"""
-        if not self.groups:
-            messagebox.showwarning("No Groups", "No groups to save. Create groups first.")
-            return
-        
-        # Ask for save location
-        filepath = filedialog.asksaveasfilename(
-            title="Save Groups",
-            defaultextension=".json",
-            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
-            initialdir=self.project_dir if self.project_dir else str(Path.home())
-        )
-        
-        if not filepath:
-            return
-        
-        try:
-            # Prepare data to save
-            save_data = {
-                'groups': self.groups,
-                'groups_mutually_exclusive': bool(self.groups_mutually_exclusive_var.get()),
-                'created_date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'project_name': self.current_project if self.current_project else 'Unknown',
-                'num_groups': len(self.groups),
-                'total_subjects': len(set(subj for subjects in self.groups.values() for subj in subjects))
-            }
-            
-            # Save to file
-            with open(filepath, 'w') as f:
-                json.dump(save_data, f, indent=2)
-            
-            messagebox.showinfo("Success", f"Groups saved successfully to:\n{filepath}")
-            self.log_message(f"Saved {len(self.groups)} groups to {filepath}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save groups:\n{str(e)}")
-            self.log_message(f"ERROR: Failed to save groups: {str(e)}")
-    
-    def load_groups_from_file(self):
-        """Load groups from a standalone JSON file"""
-        # Ask for file location
-        filepath = filedialog.askopenfilename(
-            title="Load Groups",
-            filetypes=[("JSON Files", "*.json"), ("Tracy Project Files", "*.tracy"), ("All Files", "*.*")],
-            initialdir=self.project_dir if self.project_dir else str(Path.home())
-        )
-        
-        if not filepath:
-            return
-        
-        try:
-            # Load from file
-            with open(filepath, 'r') as f:
-                loaded_data = json.load(f)
-            
-            # Extract groups (handle both standalone group files and project files)
-            if 'groups' in loaded_data:
-                loaded_groups = loaded_data['groups']
-            else:
-                # Assume the entire file is the groups dictionary
-                loaded_groups = loaded_data
-
-            if isinstance(loaded_data, dict) and 'groups_mutually_exclusive' in loaded_data:
-                self.groups_mutually_exclusive_var.set(bool(loaded_data.get('groups_mutually_exclusive', True)))
-                self._update_group_exclusivity_button_label()
-            
-            # Also try to load exclusions if available
-            loaded_exclusions = loaded_data.get('exclusions', {}) if 'groups' in loaded_data else {}
-            
-            if not loaded_groups:
-                messagebox.showinfo("No Groups", "The selected file contains no groups.")
-                return
-            
-            # Check for conflicts
-            conflicts = [name for name in loaded_groups.keys() if name in self.groups]
-            
-            if conflicts:
-                # Ask how to handle conflicts
-                msg = f"Found {len(conflicts)} group(s) that already exist:\\n\\n"
-                msg += ', '.join(conflicts[:5])
-                if len(conflicts) > 5:
-                    msg += f", ... and {len(conflicts) - 5} more"
-                msg += "\\n\\nHow would you like to proceed?"
-                
-                dialog = tk.Toplevel(self.root)
-                dialog.title("Handle Conflicts")
-                self.fit_toplevel(dialog, 450, 250)
-                dialog.transient(self.root)
-                dialog.grab_set()
-                
-                ttk.Label(dialog, text=msg, wraplength=400, justify='left').pack(padx=20, pady=20)
-                
-                choice_var = tk.StringVar(value="merge")
-                ttk.Radiobutton(dialog, text="Merge (combine subjects from both)", 
-                               variable=choice_var, value="merge").pack(anchor='w', padx=40, pady=5)
-                ttk.Radiobutton(dialog, text="Replace (overwrite existing groups)", 
-                               variable=choice_var, value="replace").pack(anchor='w', padx=40, pady=5)
-                ttk.Radiobutton(dialog, text="Skip (keep existing, only add new)", 
-                               variable=choice_var, value="skip").pack(anchor='w', padx=40, pady=5)
-                ttk.Radiobutton(dialog, text="Cancel", 
-                               variable=choice_var, value="cancel").pack(anchor='w', padx=40, pady=5)
-                
-                result = {'action': None}
-                
-                def on_ok():
-                    result['action'] = choice_var.get()
-                    dialog.destroy()
-                
-                ttk.Button(dialog, text="OK", command=on_ok).pack(pady=10)
-                
-                self.root.wait_window(dialog)
-                
-                if result['action'] == 'cancel' or result['action'] is None:
-                    return
-                
-                conflict_resolution = result['action']
-            else:
-                conflict_resolution = "none"
-            
-            # Apply loaded groups
-            imported_count = 0
-            merged_count = 0
-            skipped_count = 0
-            
-            for group_name, subjects in loaded_groups.items():
-                if group_name in self.groups:
-                    if conflict_resolution == "skip":
-                        skipped_count += 1
-                        continue
-                    elif conflict_resolution == "replace":
-                        self.groups[group_name] = subjects
-                        imported_count += 1
-                    elif conflict_resolution == "merge":
-                        existing = set(self.groups[group_name])
-                        new = set(subjects)
-                        self.groups[group_name] = list(existing | new)
-                        merged_count += 1
-                else:
-                    self.groups[group_name] = subjects
-                    imported_count += 1
-            
-            # Update UI
-            self.update_groups_ui()
-            
-            # Load exclusions if available
-            if loaded_exclusions:
-                # Merge exclusions (only add new ones, don't overwrite existing)
-                for subject, channels in loaded_exclusions.items():
-                    if subject not in self.exclusions:
-                        self.exclusions[subject] = channels
-                    else:
-                        # Merge channel lists
-                        existing_channels = set(self.exclusions[subject])
-                        new_channels = set(channels)
-                        self.exclusions[subject] = list(existing_channels | new_channels)
-                self.log_message(f"  Loaded {len(loaded_exclusions)} exclusion entries")
-                # Refresh exclusions UI if it exists
-                if hasattr(self, 'refresh_exclusions_list'):
-                    self.refresh_exclusions_list()
-            
-            # Show results
-            result_msg = f"Groups loaded successfully!\\n\\n"
-            result_msg += f"Imported/Replaced: {imported_count}\\n"
-            if merged_count > 0:
-                result_msg += f"Merged: {merged_count}\\n"
-            if skipped_count > 0:
-                result_msg += f"Skipped: {skipped_count}"
-            if loaded_exclusions:
-                result_msg += f"\\nExclusions: {len(loaded_exclusions)} subjects"
-            
-            messagebox.showinfo("Success", result_msg)
-            self.log_message(f"Loaded groups from {filepath}: {imported_count} imported, {merged_count} merged, {skipped_count} skipped")
-            
-        except json.JSONDecodeError:
-            messagebox.showerror("Error", "The selected file is not a valid JSON file.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load groups:\\n{str(e)}")
-            self.log_message(f"ERROR: Failed to load groups: {str(e)}")
-    
-    def on_group_selected(self, event=None):
-        """Handle group selection with enhanced visual feedback"""
-        selected = self.group_listbox.curselection()
-        if not selected:
-            self.group_name_label.config(text="Select a group")
-            self.group_stats_label.config(text="")
-            self.group_members_listbox.delete(0, 'end')
-            return
-        
-        group_name = self.group_listbox.get(selected[0])
-        members = self.groups.get(group_name, [])
-        
-        # Update header with group name
-        self.group_name_label.config(text=f"Group: {group_name}")
-        
-        # Update statistics
-        stats_text = f"{len(members)} member(s)"
-        if members:
-            # Count how many members have processed data
-            processed_count = sum(1 for m in members if m in self.processed_data)
-            stats_text += f" \u2022 {processed_count} processed"
-        self.group_stats_label.config(text=stats_text)
-        
-        # Update members list with visual indicators
-        self.group_members_listbox.delete(0, 'end')
-        for member in sorted(members):
-            display_text = member
-            if member in self.processed_data:
-                display_text += " \u2713"  # Checkmark for processed
-            self.group_members_listbox.insert('end', display_text)
-        
-        # Update available subjects
-        self.update_available_subjects()
-    
-    def add_subjects_to_group(self):
-        """Add selected subjects to current group"""
-        # Get selected group
-        group_selected = self.group_listbox.curselection()
-        if not group_selected:
-            messagebox.showwarning("No Group Selected", "Please select a group first.")
-            return
-        
-        group_name = self.group_listbox.get(group_selected[0])
-        
-        # Get selected subjects
-        subject_selected = self.available_subjects_listbox.curselection()
-        if not subject_selected:
-            messagebox.showwarning("No Subjects Selected", "Please select subjects to add.")
-            return
-        
-        # Add subjects to group
-        subjects_to_add = [self.available_subjects_listbox.get(i) for i in subject_selected]
-        self._enforce_subject_exclusivity(group_name, subjects_to_add)
-        for subject in subjects_to_add:
-            if subject not in self.groups[group_name]:
-                self.groups[group_name].append(subject)
-        
-        # Update UI
-        self.on_group_selected()
-    
-    def remove_subjects_from_group(self):
-        """Remove selected subjects from current group"""
-        # Get selected group
-        group_selected = self.group_listbox.curselection()
-        if not group_selected:
-            messagebox.showwarning("No Group Selected", "Please select a group first.")
-            return
-        
-        group_name = self.group_listbox.get(group_selected[0])
-        
-        # Get selected members
-        member_selected = self.group_members_listbox.curselection()
-        if not member_selected:
-            messagebox.showwarning("No Members Selected", "Please select members to remove.")
-            return
-        
-        # Remove subjects from group. The listbox displays a checkmark for processed
-        # subjects (e.g. 'DG13 ✓'), so strip any non-name characters before matching.
-        subjects_to_remove = [self.group_members_listbox.get(i) for i in member_selected]
-        cleaned = [s.replace('\u2713', '').replace('✓', '').strip() for s in subjects_to_remove]
-        for subject in cleaned:
-            if subject in self.groups.get(group_name, []):
-                self.groups[group_name].remove(subject)
-        
-        # Update UI
-        self.on_group_selected()
-    
-    def import_groups_from_project(self):
-        """Import group assignments from another project"""
-        if not self.current_project:
-            messagebox.showwarning("No Project", "Please create or load a project first.")
-            return
-        
-        # Select project file to import from
-        filepath = filedialog.askopenfilename(
-            title="Select Project to Import Groups From",
-            filetypes=[("Tracy Project Files", "*.tracy"), ("All Files", "*.*")],
-            initialdir=self.project_dir
-        )
-        
-        if not filepath:
-            return
-        
-        try:
-            # Load the other project
-            with open(filepath, 'r') as f:
-                other_project = json.load(f)
-            
-            # Extract groups from other project
-            other_groups = other_project.get('groups', {})
-            if 'groups_mutually_exclusive' in other_project:
-                self.groups_mutually_exclusive_var.set(bool(other_project.get('groups_mutually_exclusive', True)))
-                self._update_group_exclusivity_button_label()
-            
-            if not other_groups:
-                messagebox.showinfo("No Groups", "The selected project has no groups to import.")
-                return
-            
-            # Check for conflicts and prepare import
-            conflicts = []
-            new_groups = []
-            
-            for group_name in other_groups.keys():
-                if group_name in self.groups:
-                    conflicts.append(group_name)
-                else:
-                    new_groups.append(group_name)
-            
-            # Build import summary message
-            summary = f"Found {len(other_groups)} group(s) in the selected project:\n\n"
-            
-            if new_groups:
-                summary += f"New groups ({len(new_groups)}): {', '.join(new_groups)}\n"
-            
-            if conflicts:
-                summary += f"\nConflicting groups ({len(conflicts)}): {', '.join(conflicts)}\n"
-                summary += "\nFor conflicting groups, choose how to handle them:"
-            
-            # Ask user how to proceed
-            if conflicts:
-                # Create custom dialog for conflict resolution
-                conflict_dialog = tk.Toplevel(self.root)
-                conflict_dialog.title("Import Groups - Resolve Conflicts")
-                self.fit_toplevel(conflict_dialog, 600, 400)
-                conflict_dialog.transient(self.root)
-                conflict_dialog.grab_set()
-                
-                # Reserve the button row before the expanding options frame; a
-                # long conflict list otherwise pushes it off a short screen.
-                button_frame = ttk.Frame(conflict_dialog)
-                button_frame.pack(side=tk.BOTTOM, fill='x', padx=10, pady=10)
-
-                # Summary label
-                summary_label = ttk.Label(conflict_dialog, text=summary, justify='left')
-                summary_label.pack(padx=10, pady=10, anchor='w')
-                
-                # Conflict resolution options
-                ttk.Separator(conflict_dialog, orient='horizontal').pack(fill='x', pady=10)
-                
-                conflict_frame = ttk.LabelFrame(conflict_dialog, text="Conflict Resolution", padding=10)
-                conflict_frame.pack(fill='both', expand=True, padx=10, pady=10)
-                
-                resolution_var = tk.StringVar(value="skip")
-                
-                ttk.Radiobutton(conflict_frame, text="Skip conflicting groups (only import new groups)",
-                               variable=resolution_var, value="skip").pack(anchor='w', pady=5)
-                ttk.Radiobutton(conflict_frame, text="Replace conflicting groups (overwrite existing)",
-                               variable=resolution_var, value="replace").pack(anchor='w', pady=5)
-                ttk.Radiobutton(conflict_frame, text="Merge conflicting groups (combine subjects)",
-                               variable=resolution_var, value="merge").pack(anchor='w', pady=5)
-                ttk.Radiobutton(conflict_frame, text="Cancel import",
-                               variable=resolution_var, value="cancel").pack(anchor='w', pady=5)
-                
-                # Buttons (row already pinned to the bottom above)
-                result = {'action': None}
-                
-                def on_ok():
-                    result['action'] = resolution_var.get()
-                    conflict_dialog.destroy()
-                
-                def on_cancel():
-                    result['action'] = 'cancel'
-                    conflict_dialog.destroy()
-                
-                ttk.Button(button_frame, text="OK", command=on_ok).pack(side='right', padx=5)
-                ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side='right')
-                
-                # Wait for dialog to close
-                self.root.wait_window(conflict_dialog)
-                
-                if result['action'] == 'cancel' or result['action'] is None:
-                    return
-                
-                conflict_resolution = result['action']
-            else:
-                # No conflicts, just confirm import
-                if not messagebox.askyesno("Import Groups", summary + "\n\nProceed with import?"):
-                    return
-                conflict_resolution = "skip"  # Doesn't matter since there are no conflicts
-            
-            # Perform the import
-            imported_count = 0
-            merged_count = 0
-            skipped_count = 0
-            
-            for group_name, subjects in other_groups.items():
-                if group_name in self.groups:
-                    # Conflicting group
-                    if conflict_resolution == "skip":
-                        skipped_count += 1
-                        continue
-                    elif conflict_resolution == "replace":
-                        self.groups[group_name] = subjects.copy()
-                        imported_count += 1
-                    elif conflict_resolution == "merge":
-                        # Merge - add subjects that aren't already in the group
-                        existing_subjects = set(self.groups[group_name])
-                        new_subjects = set(subjects)
-                        combined = list(existing_subjects | new_subjects)
-                        self.groups[group_name] = combined
-                        merged_count += 1
-                else:
-                    # New group
-                    self.groups[group_name] = subjects.copy()
-                    imported_count += 1
-            
-            # Update UI
-            self.update_groups_ui()
-            
-            # Show results
-            result_msg = f"Import completed:\n"
-            result_msg += f"- Imported/Replaced: {imported_count} group(s)\n"
-            if merged_count > 0:
-                result_msg += f"- Merged: {merged_count} group(s)\n"
-            if skipped_count > 0:
-                result_msg += f"- Skipped: {skipped_count} group(s)\n"
-            
-            messagebox.showinfo("Import Complete", result_msg)
-            
-        except json.JSONDecodeError:
-            messagebox.showerror("Error", "The selected file is not a valid Tracy project file.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to import groups: {str(e)}")
-    
     # ======================== Configuration Presets ========================
     
     def save_config_preset(self):
@@ -21869,9 +22703,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def update_viz_groups(self):
         """Update group list in visualization tab"""
-        self.viz_group_listbox.delete(0, 'end')
-        for group_name in self.groups.keys():
-            self.viz_group_listbox.insert('end', group_name)
+        self.fill_group_listbox(self.viz_group_listbox)
     
     def update_viz_subjects(self):
         """Update subject list in visualization tab"""
@@ -21889,7 +22721,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for i, subject in enumerate(sorted_subjects):
             if subject in selected_subjects:
                 self.viz_subject_listbox.selection_set(i)
-    
+
+        # The group-mode listboxes are subject pools too, so they go stale the
+        # moment the loaded set changes -- not only when factors are edited.
+        self.refresh_pool_listboxes()
+
     def update_behav_subjects(self):
         """Update subject list in behavioral data tab"""
         # Save current selections
@@ -21916,10 +22752,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def apply_integrity_threshold_to_exclusions(self):
         """
         Evaluate the integrity score of the channels belonging to the *currently
-        selected groups/subjects* on the Visualization tab and add any combination
+        selected subjects* on the Visualization tab and add any combination
         whose overall score is below the user-specified threshold to the Exclusions
         tab.  Existing exclusions are preserved; this only ever *adds* new ones.
         """
+        # See generate_plot: a scoring pass pumps the event loop, so the button
+        # that started it can be clicked again while it runs.
+        if getattr(self, '_integrity_busy', False):
+            self.log_message("Still scoring — ignoring.")
+            return
         # Validate threshold
         try:
             threshold = float(self.integrity_threshold_var.get())
@@ -21938,8 +22779,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not selected_subjects:
             messagebox.showwarning(
                 "No Selection",
-                "Auto-exclude only evaluates the currently selected groups/subjects.\n\n"
-                "Please select one or more groups (or subjects) on the Visualization tab first.")
+                "Auto-exclude only evaluates the currently selected subjects.\n\n"
+                "Please select one or more subjects on the Visualization tab first.")
             return
 
         target_subjects = [s for s in selected_subjects if s in self.processed_data]
@@ -21955,9 +22796,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # auto-exclude — useful when group n is small and a poorer channel is
         # worth keeping.
         candidates = []  # (subject, channel, score, already_excluded)
-        for subject in target_subjects:
+        for subject in self._integrity_progress(target_subjects, 'Auto-exclude'):
             data = self.processed_data[subject]
-            channel_metrics_list = self._extract_signal_integrity_metrics(data)
+            channel_metrics_list = self.signal_integrity_metrics(subject, data)
             if not channel_metrics_list:
                 continue
             for metrics in channel_metrics_list:
@@ -22525,17 +23366,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def toggle_subject_group_mode(self):
         """Toggle between subject and group selection mode in visualization tab"""
         # The two selectors share one slot in the Selection zone, so exactly one
-        # is packed at a time and the other leaves no gap behind.
+        # is packed at a time and the other leaves no gap behind.  Both list
+        # subjects; what differs is what becomes a series -- one per subject, or
+        # one per level of whatever the facet column splits on.
         if self.plot_by_var.get() == "Group":
             self.viz_subject_frame.pack_forget()
             self.viz_group_frame.pack(fill='both', expand=True)
-            self.viz_group_listbox.delete(0, 'end')
-            for group_name in self.groups.keys():
-                self.viz_group_listbox.insert('end', group_name)
+            self.fill_group_listbox(self.viz_group_listbox)
             self.refresh_facet_controls()
+            tip = ("Tip: these subjects are the pool; 'Split series by' below "
+                   "decides how they divide into series. Deselect a subject to "
+                   "drop it without changing its factors.")
         else:
             self.viz_group_frame.pack_forget()
             self.viz_subject_frame.pack(fill='both', expand=True)
+            tip = ("Tip: hold Ctrl to select several. Channels and wavelengths "
+                   "overlay.")
+        if getattr(self, 'viz_info_label', None) is not None:
+            self.viz_info_label.config(text=tip)
 
         # Keep selectors synchronized when mode changes.
         self.update_behavior_list()
@@ -22560,9 +23408,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if self.behav_plot_by_var.get() == "Group":
             self.behav_subject_frame.pack_forget()
             self.behav_group_frame.pack(fill='both', expand=True)
-            self.behav_group_listbox.delete(0, 'end')
-            for group_name in self.groups.keys():
-                self.behav_group_listbox.insert('end', group_name)
+            self.fill_group_listbox(self.behav_group_listbox)
             self.refresh_facet_controls()
         else:
             self.behav_group_frame.pack_forget()
@@ -22691,9 +23537,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def update_bout_analysis_groups(self):
         """Update group list in bout analysis tab"""
-        self.bout_analysis_group_listbox.delete(0, 'end')
-        for group_name in self.groups.keys():
-            self.bout_analysis_group_listbox.insert('end', group_name)
+        self.fill_group_listbox(self.bout_analysis_group_listbox)
     
     def update_bout_analysis_subjects(self):
         """Update subject list in bout analysis tab"""
@@ -22963,7 +23807,41 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         widget.pack(anchor='n', pady=(0, 0))
 
         canvas.draw_idle()
+        self._scroll_plot_zone_to_top(parent)
         return canvas
+
+    def _scroll_plot_zone_to_top(self, widget):
+        """Show the scrolling zone that holds *widget* from its top again.
+
+        A newly generated plot is a new thing to look at and is drawn from the
+        top down, but Tk keeps the viewport's pixel offset across the change of
+        content. After a tall figure — the multi-subject Signal Integrity table
+        runs past 20 inches — the zone is still scrolled a thousand pixels down
+        when a shorter plot replaces it, so the plot renders perfectly into an
+        area nobody is looking at and reads as Generate having done nothing.
+
+        The stale scroll *region* has to be corrected here too. It is normally
+        maintained by make_scrollable's <Configure> handler, but that never
+        fires on this path: the canvas leaves its window item at the old height,
+        so the inner frame is never reconfigured even though its requested size
+        collapsed. bbox('all') does follow the new content, so measure from it.
+        """
+        node = widget
+        while node is not None:
+            parent = getattr(node, 'master', None)
+            # The enclosing scroll viewport, not the plot's own Tk canvas: we
+            # only ever walk upwards, and a figure canvas is never an ancestor.
+            if isinstance(parent, tk.Canvas):
+                try:
+                    if parent.cget('scrollregion'):
+                        bbox = parent.bbox('all')
+                        if bbox:
+                            parent.configure(scrollregion=bbox)
+                        parent.yview_moveto(0.0)
+                except Exception:
+                    pass
+                return
+            node = parent
 
     def _embed_plot_window(self, fig, title, geometry=None):
         """Pop a matplotlib figure out into its own window, embedded in a
@@ -23069,7 +23947,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             pass
         return max(minimum, min(content, cap))
 
-    def _auto_viz_figure_size(self, plot_type, n_subjects):
+    def _auto_viz_figure_size(self, plot_type, n_subjects, subjects=None):
         """Content-aware default figure size for the Visualization tab's 'auto' mode.
 
         Chooses dimensions that suit the plot type and how much data is shown so
@@ -23078,14 +23956,25 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         proportionally. Returns a (width, height) tuple in inches.
         """
         n = max(1, int(n_subjects or 1))
+        subjects = list(subjects) if subjects else None
 
         # Sizes are kept deliberately compact so plots render at a readable
         # scale rather than filling the whole window; the canvas is shown at
         # this natural size (see _embed_plot_canvas).
 
-        # Signal Integrity is a multi-panel dashboard.
+        # Signal Integrity: a multi-panel dashboard for one subject, a table for
+        # several.
         if "Signal Integrity" in plot_type:
-            return (min(13.0, 11.0 + (n - 1) * 0.5), 7.5)
+            if n <= 1:
+                return (min(13.0, 11.0 + (n - 1) * 0.5), 7.5)
+            # The table draws one row per *channel* and lays them out in axes
+            # fractions, so a fixed height silently shrinks the rows until they
+            # overlap into an unreadable smear -- 62 subjects means 124 rows in
+            # 7.5in, about 3 pixels each. Height therefore grows with the rows;
+            # the output zone scrolls, so a tall figure stays reachable.
+            rows = self._integrity_row_estimate(subjects) if subjects else n * 2
+            return (min(13.0, 11.0 + (n - 1) * 0.5),
+                    max(7.5, min(48.0, 1.8 + rows * 0.17)))
 
         # Position Heatmap renders one panel per subject (a true grid).
         # NOTE: "Extracted Bouts" and "Zone Entry Bouts" are deliberately NOT
@@ -23118,6 +24007,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Sensible default.
         return (9.0, 5.0)
+
+    def _integrity_row_estimate(self, subjects):
+        """Rows the multi-subject Signal Integrity table will draw.
+
+        One per photometry channel per subject. Read off the stored channel
+        count rather than by scoring anything, because this decides the figure
+        size and must be cheap -- scoring is the expensive part it is sizing for.
+        """
+        rows = 0
+        for s in subjects or []:
+            d = self.processed_data.get(s)
+            if not isinstance(d, dict):
+                continue
+            if not (d.get('has_470') or d.get('has_570')):
+                continue
+            rows += max(1, int(d.get('num_photometry_channels') or 1))
+        return max(1, rows)
 
     def _viz_bout_channel_rows(self, subjects):
         """How many channel rows the bout trace+heatmap plots will draw (1 or 2).
@@ -23186,10 +24092,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def _get_selected_viz_subjects(self):
         """Return the subjects currently selected on the Visualization tab.
 
-        Honors Group vs Subject mode (in Group mode the members of the selected
-        groups are expanded, de-duplicated, order preserved). Returns an empty
-        list if nothing is selected. Does not show error dialogs — callers that
-        need user feedback handle the empty case themselves.
+        Honors Group vs Subject mode (in Group mode the members of the faceted
+        series are expanded, de-duplicated, order preserved — which drops any
+        subject the pool listbox has deselected). Returns an empty list if
+        nothing is selected. Does not show error dialogs — callers that need
+        user feedback handle the empty case themselves.
         """
         selected_subjects = []
         try:
@@ -23229,12 +24136,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def generate_plot(self):
         """Generate selected plot type"""
+        # A long integrity run pumps the event loop to stay responsive, which
+        # also delivers any Generate clicks queued during it. Re-entering would
+        # start a second scoring pass on top of the first.
+        if getattr(self, '_integrity_busy', False):
+            self.log_message("Still scoring the previous plot — ignoring.")
+            return
         # Get selected subjects or groups
         if self.plot_by_var.get() == "Group":
             # Group mode - get selected groups and their members
             selected_indices = self.viz_group_listbox.curselection()
             if not selected_indices:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             
             selected_groups = self.selected_series('visualization', self.viz_group_listbox)
@@ -23326,7 +24239,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             rows = self._viz_bout_channel_rows(valid_subjects)
             default_w, default_h = 11.0, 4.2 * rows + 0.6
         else:
-            default_w, default_h = self._auto_viz_figure_size(plot_type, size_count)
+            default_w, default_h = self._auto_viz_figure_size(
+                plot_type, size_count, valid_subjects)
         try:
             w_str = self.viz_fig_width_var.get().strip().lower()
             fig_w = float(w_str) if w_str not in ('', 'auto') else default_w
@@ -23440,6 +24354,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      f"See the log for details.",
                      ha='center', va='center', fontsize=11, color='firebrick', wrap=True)
         
+        # _integrity_progress lowers this in its finally, but that only runs when
+        # the generator is closed -- and if a plot raised mid-loop, that is left
+        # to the collector. Clearing it here means a failed plot can never wedge
+        # the button permanently.
+        self._integrity_busy = False
+
         # Store figure and canvas for axis control
         self.current_viz_figure = fig
 
@@ -24578,17 +25498,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Calculate metrics for each subject (now returns list of channel metrics)
         subject_metrics = []
-        for subject in subjects_list:
+        for subject in self._integrity_progress(subjects_list, 'Signal Integrity'):
             if subject not in self.processed_data:
                 continue
-            
+
             data = self.processed_data[subject]
-            channel_metrics_list = self._extract_signal_integrity_metrics(data)
+            channel_metrics_list = self.signal_integrity_metrics(subject, data)
             if channel_metrics_list:
                 # Add each channel as a separate entry
                 for ch_metrics in channel_metrics_list:
                     subject_metrics.append((subject, ch_metrics))
-        
+
         if not subject_metrics:
             ax.text(0.5, 0.5, 'No valid subjects with signal integrity data',
                    ha='center', va='center', fontsize=14, transform=ax.transAxes)
@@ -24741,6 +25661,92 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     fontsize=11, fontweight='bold', y=0.985)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
     
+    def _integrity_progress(self, subjects, label):
+        """Iterate *subjects*, keeping the window alive and the user informed.
+
+        Scoring runs on the Tk thread, so a 62-subject dashboard used to sit
+        there for a minute with Windows painting "Not Responding" over it and no
+        clue that anything was happening.  Pumping the event loop between
+        subjects keeps the window drawn; the cached ones cost nothing, so the
+        pump only really runs on the first pass.
+        """
+        subjects = list(subjects)
+        total = len(subjects)
+        busy = total > 4
+        root = getattr(self, 'root', None)
+        if busy and root is not None:
+            try:
+                root.config(cursor='watch')
+                root.update_idletasks()
+            except Exception:
+                busy = False
+        # update() below dispatches the clicks queued while we were busy, so a
+        # second Generate could land inside the first. The flag makes those
+        # entry points bail rather than start a nested hour of scoring.
+        self._integrity_busy = True
+        try:
+            for i, subject in enumerate(subjects, 1):
+                yield subject
+                if busy and root is not None:
+                    if i % 5 == 0 or i == total:
+                        self.log_message(f"{label}: scored {i}/{total} subject(s)...")
+                    try:
+                        # update(), not update_idletasks(): only draining the
+                        # real event queue stops Windows painting "Not
+                        # Responding" over the window.
+                        root.update()
+                    except Exception:
+                        pass
+        finally:
+            self._integrity_busy = False
+            if busy and root is not None:
+                try:
+                    root.config(cursor='')
+                except Exception:
+                    pass
+
+    def signal_integrity_metrics(self, subject, data=None, sensor=None):
+        """Cached ``_extract_signal_integrity_metrics`` for one subject.
+
+        Scoring a channel costs about a second on a full-length recording, so a
+        62-subject dashboard spends a minute in here and spent it again on every
+        change of selection.  The result depends only on the data dict and the
+        sensor-mode flag, so it is memoised against both: reprocessing replaces
+        the dict and misses the cache, which is exactly when it must.
+        """
+        if data is None:
+            data = self.processed_data.get(subject)
+        if data is None:
+            return None
+        if sensor is None:
+            sensor = bool(getattr(self, 'integrity_sensor_mode_var', None)
+                          and self.integrity_sensor_mode_var.get())
+        sensor = bool(sensor)
+
+        key = (str(subject), id(data), sensor)
+        hit = self._integrity_metrics_cache.get(key)
+        if hit is not None and hit[0] is data:
+            return hit[1]
+
+        metrics = self._extract_signal_integrity_metrics(data, sensor=sensor)
+        self._integrity_metrics_cache[key] = (data, metrics)
+
+        # Entries pin their data dict, so ones for subjects that have since been
+        # unloaded or reprocessed would hold that memory forever. A stale entry
+        # is never *wrong* (the id + identity check sees to that), so pruning is
+        # only about memory and can wait until the cache is clearly oversized.
+        cache = self._integrity_metrics_cache
+        if len(cache) > 4 * max(1, len(self.processed_data)):
+            live = self.processed_data
+            self._integrity_metrics_cache = {
+                k: v for k, v in cache.items() if live.get(k[0]) is v[0]}
+        return metrics
+
+    def invalidate_integrity_caches(self):
+        """Drop every memoised integrity result. Call when the data set changes."""
+        self._integrity_metrics_cache = {}
+        self._integrity_plot_cache = None
+
     def _extract_signal_integrity_metrics(self, data, sensor=None):
         """
         Extract signal integrity metrics for a single subject.
@@ -25306,7 +26312,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 candidates = [b for b in stored_bouts if not str(b).startswith('_')]
             elif boutframes_file and os.path.exists(boutframes_file) and subject:
                 parsed, _ = self._parse_boutframes_dataframe(
-                    pd.read_excel(boutframes_file, sheet_name=subject))
+                    self.read_boutframes_sheet(boutframes_file, subject))
                 candidates = [name for (name, _s, _e) in parsed]
             else:
                 candidates = []
@@ -25331,7 +26337,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ends = np.asarray(ef, dtype=float) if ef is not None else None
                 elif boutframes_file and os.path.exists(boutframes_file) and subject:
                     parsed, _ = self._parse_boutframes_dataframe(
-                        pd.read_excel(boutframes_file, sheet_name=subject))
+                        self.read_boutframes_sheet(boutframes_file, subject))
                     match = next(((s, e) for (nm, s, e) in parsed if nm == behavior), None)
                     if match is None:
                         continue
@@ -25737,10 +26743,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Export signal integrity metrics for all subjects and all channels
                 export_rows = []
                 
-                for subject in valid_subjects:
+                for subject in self._integrity_progress(valid_subjects, 'Integrity export'):
                     data = self.processed_data[subject]
-                    channel_metrics_list = self._extract_signal_integrity_metrics(data)
-                    
+                    channel_metrics_list = self.signal_integrity_metrics(subject, data)
+
                     if not channel_metrics_list:
                         continue
                     
@@ -30091,7 +31097,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if in_group_mode:
             sel = self.bout_analysis_group_listbox.curselection()
             if not sel:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             group_members = {g: list(self._series_members(g)) for g in selected_groups}
@@ -30201,7 +31207,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if self.bout_analysis_by_var.get() == "Group":
             selected_indices = self.bout_analysis_group_listbox.curselection()
             if not selected_indices:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
@@ -32042,7 +33048,7 @@ cat("OK\n")
         if in_group_mode:
             sel = self.bout_analysis_group_listbox.curselection()
             if not sel:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
@@ -34321,7 +35327,7 @@ cat("OK\n")
         if self.bout_analysis_by_var.get() == "Group":
             selected_indices = self.bout_analysis_group_listbox.curselection()
             if not selected_indices:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
@@ -35373,7 +36379,7 @@ cat("OK\n")
         if analysis_mode == "Group":
             selected_indices = self.bout_analysis_group_listbox.curselection()
             if not selected_indices:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
@@ -35596,7 +36602,7 @@ cat("OK\n")
         if analysis_mode == "Group":
             selected_indices = self.bout_analysis_group_listbox.curselection()
             if not selected_indices:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
             selected_subjects = []
@@ -36039,7 +37045,7 @@ cat("OK\n")
         if self.bout_analysis_by_var.get() == "Group":
             selected_indices = self.bout_analysis_group_listbox.curselection()
             if not selected_indices:
-                messagebox.showerror("Error", "Please select at least one group")
+                messagebox.showerror("Error", "Please select at least one subject")
                 return
             
             selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
@@ -37273,7 +38279,7 @@ cat("OK\n")
                 base_subjects.extend(self._series_members(g))
             base_subjects = list(dict.fromkeys(base_subjects))  # dedupe, keep order
             if not base_subjects:
-                messagebox.showerror("Error", "Please select at least one group with members.")
+                messagebox.showerror("Error", "Please select at least one subject.")
                 return
         else:
             selected_groups = []
@@ -38891,6 +39897,11 @@ cat("OK\n")
     # without the 5th+ channel colliding with elapsed/position columns.
     BEH_KIN_FIELDS = ('elapsed', 'velocity', 'dist', 'xc', 'yc')
 
+    # Header a boutframes sheet uses to say which session each row was scored
+    # in.  Anything here is a tag, never a behaviour.  See
+    # resolve_boutframes_sheet().
+    BOUTFRAMES_SESSION_COLUMNS = ('session', 'day')
+
     def _beh_channel_count(self, data):
         """Number of photometry channels packed into beh_synced (cols 6..6+N-1)."""
         n = data.get('num_photometry_channels')
@@ -39195,7 +40206,7 @@ cat("OK\n")
         self.dec_prob_subject_listbox.config(yscrollcommand=_s1.set)
 
         self._dec_prob_grp_container = ttk.Frame(selector)
-        ttk.Label(self._dec_prob_grp_container, text="Group(s):").pack(anchor='w')
+        ttk.Label(self._dec_prob_grp_container, text="Subjects to include:").pack(anchor='w')
         grp_inner = ttk.Frame(self._dec_prob_grp_container)
         grp_inner.pack(fill='both', expand=True)
         self.dec_prob_group_listbox = tk.Listbox(
@@ -39343,15 +40354,7 @@ cat("OK\n")
 
     def update_dec_prob_groups(self):
         """Refresh the group listbox on the Decision Probability tab."""
-        if not hasattr(self, 'dec_prob_group_listbox'):
-            return
-        sel = {self.dec_prob_group_listbox.get(i)
-               for i in self.dec_prob_group_listbox.curselection()}
-        self.dec_prob_group_listbox.delete(0, 'end')
-        for i, gname in enumerate(self.groups.keys()):
-            self.dec_prob_group_listbox.insert('end', gname)
-            if gname in sel:
-                self.dec_prob_group_listbox.selection_set(i)
+        self.fill_group_listbox(getattr(self, 'dec_prob_group_listbox', None))
 
     # ── Settings dialog ───────────────────────────────────────────────────────
 
@@ -39609,7 +40612,7 @@ cat("OK\n")
                 sel_idx = self.dec_prob_group_listbox.curselection()
                 if not sel_idx:
                     messagebox.showwarning("Warning",
-                                           "Please select at least one group.")
+                                           "Please select at least one subject.")
                     return
                 sel_groups = self.selected_series('decision_probability', self.dec_prob_group_listbox)
                 group_subjects = {g: self._series_members(g) for g in sel_groups}
@@ -41176,7 +42179,7 @@ cat("OK\n")
         self.kin_subject_listbox.config(yscrollcommand=_ks.set)
 
         self._kin_grp_container = ttk.Frame(selector)
-        ttk.Label(self._kin_grp_container, text="Group(s):").pack(anchor='w')
+        ttk.Label(self._kin_grp_container, text="Subjects to include:").pack(anchor='w')
         grp_inner = ttk.Frame(self._kin_grp_container)
         grp_inner.pack(fill='both', expand=True)
         self.kin_group_listbox = tk.Listbox(
@@ -41341,15 +42344,7 @@ cat("OK\n")
 
     def update_kin_groups(self):
         """Refresh the Kinematics group listbox."""
-        if not hasattr(self, 'kin_group_listbox'):
-            return
-        sel = {self.kin_group_listbox.get(i)
-               for i in self.kin_group_listbox.curselection()}
-        self.kin_group_listbox.delete(0, 'end')
-        for i, gname in enumerate(self.groups.keys()):
-            self.kin_group_listbox.insert('end', gname)
-            if gname in sel:
-                self.kin_group_listbox.selection_set(i)
+        self.fill_group_listbox(getattr(self, 'kin_group_listbox', None))
 
     def open_kin_graph_settings(self):
         """Dialog to adjust Kinematics graph display: colormaps, heatmap limits,

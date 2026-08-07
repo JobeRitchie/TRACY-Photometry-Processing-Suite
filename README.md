@@ -64,6 +64,52 @@ Version 1.2.2.
 File-name patterns and suffixes are configurable on the Processing tab, so
 existing naming schemes do not need to be renamed.
 
+### Repeated sessions
+
+When the same animal is recorded on several days, encode the session in the
+subject ID — `CAB01_AlcoholFPData.csv`, `CAB01_FentanylFPData.csv`. TRACY then
+splits each ID into animal + session (pattern chosen on the Factors tab), offers
+**Session** and **Animal** as factors on every tab, and keys mixed-model random
+intercepts on the *animal* so repeated days are not treated as independent
+subjects.
+
+The boutframes workbook can keep one worksheet per **animal** and tag each row
+with the session it was scored in:
+
+| Session  | Alcohol\_\_start | Alcohol\_\_end | Water\_\_start | Water\_\_end |
+| -------- | ---------------- | -------------- | -------------- | ------------ |
+| Alcohol  | 156              | 327            |                |              |
+| Water    |                  |                | 1097           | 1168         |
+
+Recording `CAB01_Alcohol` reads sheet `CAB01`, rows where `Session` is
+`Alcohol`. A worksheet named for the recording itself (`CAB01_Alcohol`) still
+takes precedence, and single-session workbooks are unaffected. `Day` is accepted
+as an alias for `Session`.
+
+`tools/combine_sessions.py` converts one folder per session into a combined
+folder plus a merged boutframes workbook:
+
+```
+python tools/combine_sessions.py PARENT --sessions Alcohol Fentanyl WaterSucrose
+```
+
+## Choosing what a plot shows
+
+Every graphing tab has a **Plot by: Subject / Group** switch. Both modes list
+subjects; what differs is what becomes a plotted series.
+
+- **Subject** — one series per selected subject.
+- **Group** — the list is the *pool* of subjects, and the **Split series by**
+  column underneath decides how that pool divides. Left alone it splits on the
+  Group factor and combines the rest, which is one series per group. Set
+  `Session` to *split* instead and you get one series per session; set both and
+  you get the cross-product. Setting a factor to a specific level filters the
+  pool down to it.
+
+Deselecting a subject in Group mode drops it from whichever series it belongs
+to. Nothing on the Factors tab changes, so it is a plot-level exclusion, not an
+edit to the design — reselect it and it comes back.
+
 ## Optional: exact FLMM via R / fastFMM
 
 The FLMM time-course feature ships with two engines:
