@@ -155,6 +155,10 @@ class _Facets:
     get_subject_factors = _G.get_subject_factors
     get_factor_definitions = _G.get_factor_definitions
     facet = _G.facet
+    # facet/facet_series derive the factor model from the whole project rather
+    # than the selected pool, so the derived Session/Animal factors do not
+    # vanish when a tab narrows its selection.
+    _factor_universe = _G._factor_universe
     # The real property, so a test that sets groups exercises the same
     # conversion into Group-factor levels that the app performs.
     groups = _G.groups

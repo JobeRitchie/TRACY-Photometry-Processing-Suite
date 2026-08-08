@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 APP_VERSION_DATE = "August 7, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -286,17 +286,27 @@ def facet_subjects(subject_ids, subject_factors, selections, factor_order=None):
     return labels, split_factors
 
 
-def factor_levels(subject_ids, subject_factors, factor, level_order=None):
+def factor_levels(subject_ids, subject_factors, factor, level_order=None,
+                  include_declared=False):
     """Levels of *factor* present among *subject_ids*, in display order.
 
     Display order is honoured first (it drives series order and colour
     assignment on every plot, so it must not be alphabetical by accident), then
     any remaining levels alphabetically, with FACTOR_UNASSIGNED last.
+
+    ``include_declared`` also returns levels that are in *level_order* but that
+    nobody is at yet.  That is right for the widgets you pick a level *from* --
+    naming the groups before filling them is what create_factor_level is for,
+    and a level that vanished the moment it was declared looks broken -- and
+    wrong for plotting, where it would mint an empty series.  Hence the default.
     """
     present = set()
     for sid in subject_ids:
         levels = subject_factors.get(str(sid)) or {}
         present.add(str(levels.get(factor) or FACTOR_UNASSIGNED))
+
+    if include_declared:
+        present |= {str(lv) for lv in (level_order or []) if str(lv)}
 
     ordered = [lv for lv in (level_order or []) if lv in present]
     rest = sorted(lv for lv in present
@@ -349,8 +359,13 @@ def levels_from_ids(subject_ids, pattern):
             level = match.group(1)
         else:
             level = match.group(0)
+        # Stripped like every hand-entered level (assign_factor_level,
+        # create_factor_level, rename_factor_level all strip). A pattern that
+        # captures a trailing space would otherwise mint 'Hi ' beside 'Hi',
+        # splitting one cohort into two series and halving each n.
+        level = str(level).strip() if level else level
         if level:
-            out[str(sid)] = str(level)
+            out[str(sid)] = level
     return out
 
 
@@ -396,7 +411,9 @@ def legacy_groups_to_factors(groups):
     """
     assignments, order = {}, []
     for gname, members in (groups or {}).items():
-        gname = str(gname)
+        gname = str(gname).strip()   # see levels_from_ids on why every path strips
+        if not gname:
+            continue
         if gname not in order:
             order.append(gname)
         for sid in members or []:
@@ -417,18 +434,23 @@ def legacy_group_overlaps(groups):
     return {sid: names for sid, names in seen.items() if len(names) > 1}
 
 
-def facet_is_inert(selections):
-    """True when *selections* reproduce the plain group fan-out.
+def facet_is_inert(selections, series_factor=GROUP_FACTOR):
+    """True when *selections* reproduce the plain series-factor fan-out.
 
-    "Split Group, combine everything else" is what the app already did before
-    factors existed, so it is the default the controls start in. Recognising it
-    lets the untouched case take the original code path verbatim rather than an
-    equivalent-looking reimplementation -- which matters because the two are
-    not quite equivalent: groups may overlap, and a subject in two groups is
-    drawn in both there but lands in exactly one facet series.
+    "Split the series factor, combine everything else" is what the app already
+    did before factors existed, so it is the default the controls start in.
+    Recognising it lets the untouched case take the original code path verbatim
+    rather than an equivalent-looking reimplementation -- which matters because
+    the two are not quite equivalent: groups may overlap, and a subject in two
+    groups is drawn in both there but lands in exactly one facet series.
+
+    *series_factor* defaults to the built-in Group factor but must be passed
+    when the user has renamed it or nominated another factor to plot as series;
+    hard-coding 'Group' here made every dropdown read as deliberately-combined
+    the moment that happened.
     """
     for factor, choice in (selections or {}).items():
-        expected = FACTOR_SPLIT if factor == 'Group' else FACTOR_COMBINE
+        expected = FACTOR_SPLIT if factor == series_factor else FACTOR_COMBINE
         if choice != expected:
             return False
     return True
@@ -516,10 +538,18 @@ class FacetControls(ttk.Frame):
     # "Split series by" rather than "Facet by": the column sits under a list of
     # subjects and its job is to say how that pool divides into plotted series,
     # which is the one thing a reader needs to know without learning the word.
-    def __init__(self, parent, app, on_change=None, header="Split series by:"):
+    # default_split says what an untouched column means on this tab. It is True
+    # everywhere the tab already drew one series per group, so the column starts
+    # in the state that reproduces that plot. Signal Linkage passes False: it
+    # never had grouping and pooled every selected subject into one analysis, so
+    # splitting the series factor by default would silently change what the tab
+    # computes the first time it is opened.
+    def __init__(self, parent, app, on_change=None, header="Split series by:",
+                 default_split=True):
         super().__init__(parent)
         self.app = app
         self._on_change = on_change
+        self._default_split = bool(default_split)
         self._combos = {}
         self._vars = {}
         self._signature = None
@@ -546,7 +576,12 @@ class FacetControls(ttk.Frame):
         factors = self.app.get_factor_definitions(subjects)
         assignments = self.app.get_subject_factors(subjects)
         order_map = self.app.params.get('factor_level_order') or {}
-        levels = {f: factor_levels(subjects, assignments, f, order_map.get(f))
+        # include_declared: a level named on the Factors tab but not yet filled
+        # still belongs in the column you filter by, or declaring it looks like
+        # it did nothing. It cannot mint an empty series -- facet_series drops
+        # labels with no members.
+        levels = {f: factor_levels(subjects, assignments, f, order_map.get(f),
+                                   include_declared=True)
                   for f in factors}
 
         signature = tuple((f, tuple(levels[f])) for f in factors)
@@ -576,7 +611,16 @@ class FacetControls(ttk.Frame):
             # a level can disappear when assignments change underneath.
             want = previous.get(factor)
             if want not in (combo['values'] or ()):
-                want = FACTOR_SPLIT if factor == 'Group' else FACTOR_COMBINE
+                # The series factor splits by default and everything else
+                # combines. Read it from the app rather than hard-coding
+                # 'Group': renaming that factor, or nominating another with
+                # "Plot as series", otherwise left every dropdown on every tab
+                # defaulting to COMBINE, which collapses each plot to a single
+                # pooled series.
+                want = (FACTOR_SPLIT
+                        if (self._default_split
+                            and factor == self.app.series_factor)
+                        else FACTOR_COMBINE)
             var.set(want)
             combo.pack(side='left', fill='x', expand=True)
             combo.bind('<<ComboboxSelected>>', lambda _e: self._changed())
@@ -1745,6 +1789,12 @@ class FPAnalysisGUI:
         self.use_exclusions_bout = tk.BooleanVar(value=False)
         self.use_exclusions_conn = tk.BooleanVar(value=False)
         self.use_exclusions_dec_prob = tk.BooleanVar(value=False)
+        self.use_exclusions_kin = tk.BooleanVar(value=False)
+        self.use_exclusions_siglink = tk.BooleanVar(value=False)
+        # Named once so saving, loading and resetting cannot drift apart as
+        # tabs are added.
+        self.EXCLUSION_TOGGLES = ('viz', 'behavioral', 'spike', 'bout',
+                                  'conn', 'dec_prob', 'kin', 'siglink')
 
         # Connectivity analysis tunable parameters (edited via Settings dialog)
         self.conn_params = {
@@ -2366,7 +2416,6 @@ class FPAnalysisGUI:
         left.grid(row=0, column=0, sticky='nsew', padx=(self.ui_px(4), self.ui_px(6)),
                   pady=self.ui_px(4))
         left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(0, weight=1)          # the scrolling part absorbs slack
 
         scroll_host = ttk.Frame(left)
         scroll_host.grid(row=0, column=0, sticky='nsew')
@@ -2384,6 +2433,29 @@ class FPAnalysisGUI:
 
         actions = ttk.Frame(left)
         actions.grid(row=1, column=0, sticky='ew', pady=(self.ui_px(4), 0))
+
+        # Keep Actions directly beneath the controls instead of pinned to the
+        # bottom of the column: row 0 asks only for what the controls need and
+        # the slack falls to row 2. When the controls do overflow, row 0 is
+        # capped at what is left and the buttons are still above the fold, so
+        # the v1.9.0 "actions never scroll away" guarantee is unchanged.
+        #
+        # This is not only cosmetic. Pinned to the bottom of a maximised window,
+        # a ttk.Menubutton's menu has no room to drop: Bout Analysis measured
+        # 172 px below the Plot button for a 264 px menu, and Tk answers that by
+        # throwing the menu to the top of the display, far from the button.
+        left.grid_rowconfigure(0, weight=0)
+        left.grid_rowconfigure(2, weight=1)
+        _column_canvas = column._scroll_canvas
+
+        def _fit_controls(_e=None):
+            avail = max(self.ui_px(120),
+                        left.winfo_height() - actions.winfo_reqheight()
+                        - self.ui_px(8))
+            _column_canvas.configure(
+                height=min(column.winfo_reqheight(), avail))
+        column.bind('<Configure>', _fit_controls, add='+')
+        left.bind('<Configure>', _fit_controls, add='+')
 
         output_host = ttk.Frame(container)
         output_host.grid(row=0, column=1, sticky='nsew', pady=self.ui_px(4),
@@ -2494,10 +2566,29 @@ class FPAnalysisGUI:
                 canvas.configure(width=inner.winfo_reqwidth())
             else:
                 # Pin the inner frame to the viewport width so nothing is pushed
-                # horizontally out of view.
-                canvas.itemconfigure(win_id, width=canvas.winfo_width())
+                # horizontally out of view -- and to the viewport HEIGHT while
+                # the content is shorter than it.
+                #
+                # A canvas window item keeps its natural requested height unless
+                # told otherwise, so without this every `expand=True` child is
+                # capped at the content's own request and the zone sits part
+                # empty with a figure clipped inside it. Measured before this
+                # line existed: the Output zone wasted 449-1343 px on all eight
+                # graphing tabs. Content taller than the viewport keeps its own
+                # height and scrolls as before.
+                canvas.itemconfigure(
+                    win_id, width=canvas.winfo_width(),
+                    height=max(inner.winfo_reqheight(), canvas.winfo_height()))
         inner.bind('<Configure>', _sync)
         canvas.bind('<Configure>', _sync)
+        # Let callers that need to size the viewport reach it (make_layout_zones
+        # caps the control column so its Actions row stays under the controls).
+        inner._scroll_canvas = canvas
+        # Once the item height is pinned, swapping the content changes the inner
+        # frame's *requested* size but not its allocated one, so no <Configure>
+        # fires and _sync would never see the new content. Anything that
+        # replaces content calls _scroll_plot_zone_to_top, which re-runs this.
+        canvas._resync_content = _sync
 
         def _wheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
@@ -2760,6 +2851,17 @@ class FPAnalysisGUI:
         # screen. rebuild() returns immediately when nothing changed, so this
         # is cheap enough to hang off every tab switch.
         self.refresh_facet_controls()
+        # _active_facet belongs to whichever tab last plotted, so left in place
+        # it would resolve one tab's series names through another tab's facet
+        # -- plot on Visualization with a subject deselected, then run Spike on
+        # the same group, and that subject silently vanishes. Cleared here, a
+        # stale name falls back to real group membership; every tab that facets
+        # repopulates it before it draws. Every graphing tab now has a column,
+        # but the clear is still what keeps them independent of each other.
+        self._active_facet = None
+        # The selection lists beside those columns are filled from the subject
+        # set and group membership, which refresh_facet_controls does not touch.
+        self._refresh_group_name_lists()
     
     def create_welcome_tab(self):
         """Welcome/Landing page tab"""
@@ -3102,6 +3204,10 @@ class FPAnalysisGUI:
         self.params['session_pattern'] = self.session_pattern_custom_var.get()
         self._animal_map_adopted = None   # let the next map log its verdict again
         self._refresh_identity_preview()
+        # The pattern creates and destroys the derived Session and Animal
+        # factors, so the grid and every facet dropdown are stale the moment it
+        # changes. Without this they self-heal only on the next tab switch.
+        self._refresh_factor_displays()
 
     def _refresh_identity_preview(self):
         """Show the animal → sessions grouping the current pattern produces."""
@@ -4684,8 +4790,11 @@ class FPAnalysisGUI:
 
         order = (self.params.get('factor_level_order') or {}).get(factor) or []
         subjects = sorted(self.processed_data.keys())
+        # include_declared: you cannot assign anyone to a level you just created
+        # if the box you assign it from does not offer it.
         known = [lv for lv in factor_levels(subjects, self.get_subject_factors(subjects),
-                                            factor, order) if lv != FACTOR_UNASSIGNED]
+                                            factor, order, include_declared=True)
+                 if lv != FACTOR_UNASSIGNED]
 
         var = tk.StringVar(value=current if initial is None else initial)
         editor = ttk.Combobox(self.factor_tree, textvariable=var, values=known)
@@ -5074,6 +5183,10 @@ class FPAnalysisGUI:
         self.params.setdefault('factor_level_order', {})[factor] = levels
         self._on_factor_selected()
         self.factor_level_listbox.selection_set(j)
+        # Level order IS series order, so the plots and their dropdowns are
+        # stale until they are told; _on_factor_selected only redraws this list.
+        self.refresh_facet_controls()
+        self._refresh_group_name_lists()
 
     def rename_factor_level(self):
         """Rename a level of a stored factor across all subjects."""
@@ -5161,10 +5274,17 @@ class FPAnalysisGUI:
         leaves everything else alone -- importing a Drug assignment should not
         silently wipe the Group one. Without it the factor set is replaced.
         """
-        incoming = {str(sid): {str(f): str(lv) for f, lv in (levels or {}).items() if lv}
+        # Names and levels are stripped on the way in: an imported .tracy is not
+        # hand-entered, so nothing else would have done it, and 'Hi ' beside
+        # 'Hi' splits one cohort into two series (see levels_from_ids).
+        incoming = {str(sid).strip():
+                    {str(f).strip(): str(lv).strip()
+                     for f, lv in (levels or {}).items()
+                     if lv and str(lv).strip() and str(f).strip()}
                     for sid, levels in (payload.get('subject_factors') or {}).items()}
         names = sorted({f for levels in incoming.values() for f in levels}
-                       | {str(f) for f in (payload.get('factor_definitions') or [])})
+                       | {str(f).strip() for f in (payload.get('factor_definitions') or [])
+                          if str(f).strip()})
 
         if not merge:
             self.params['subject_factors'] = {}
@@ -5182,10 +5302,14 @@ class FPAnalysisGUI:
 
         order_map = self.params.setdefault('factor_level_order', {})
         for name, order in (payload.get('factor_level_order') or {}).items():
-            existing = order_map.setdefault(str(name), [])
+            name = str(name).strip()
+            if not name:
+                continue
+            existing = order_map.setdefault(name, [])
             for level in order or []:
-                if str(level) not in existing:
-                    existing.append(str(level))
+                level = str(level).strip()
+                if level and level not in existing:
+                    existing.append(level)
         return sorted(incoming), names
 
     def save_factors_to_file(self):
@@ -5703,14 +5827,26 @@ class FPAnalysisGUI:
                   foreground='gray', font=('Segoe UI', 8), justify='left',
                   wraplength=self.ui_px(240)).pack(anchor='w')
 
+        # The list holds subjects in both modes. Subject mode plots one series
+        # per row; Group mode treats the same rows as a pool that the facet
+        # column below divides into series -- the split the other graphing tabs
+        # already use. Before this the list showed group NAMES in Group mode,
+        # which made the series factor the only reachable one.
+        self.conn_pool_label = ttk.Label(selection, text="Subject(s):")
+        self.conn_pool_label.pack(anchor='w', pady=(self.ui_px(4), 0))
         lb_outer = ttk.Frame(selection)
-        lb_outer.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+        lb_outer.pack(fill='both', expand=True)
         lb_sb = ttk.Scrollbar(lb_outer, orient='vertical')
         lb_sb.pack(side='right', fill='y')
         self.conn_listbox = tk.Listbox(lb_outer, selectmode='multiple', height=6,
                                        yscrollcommand=lb_sb.set, exportselection=False)
         self.conn_listbox.pack(side='left', fill='both', expand=True)
         lb_sb.config(command=self.conn_listbox.yview)
+
+        # Packed and unpacked by update_conn_listbox: in Subject mode there is
+        # no pool to divide, so the column would only invite a selection that
+        # nothing reads.
+        self.conn_facet_controls = self._make_facet_controls(selection, 'coherence')
 
         # ── Settings ───────────────────────────────────────────────────────
         ch1_row = ttk.Frame(settings)
@@ -5937,19 +6073,34 @@ class FPAnalysisGUI:
                   text="Pre/post window lengths are set in the By Bout tab.",
                   foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=8)
 
-        # Groups listbox (row 3)
-        ttk.Label(grp_tab, text="Groups (Ctrl+click):").grid(
+        # Subject pool + facet column (row 3). The list used to hold group
+        # names, which made the series factor the only one this comparison
+        # could reach; it now holds the subjects being compared and the column
+        # beside it says how they divide into series.
+        ttk.Label(grp_tab, text="Subjects to include:").grid(
             row=3, column=0, sticky='nw', padx=3, pady=3)
-        grp_lb_frame = ttk.Frame(grp_tab)
-        grp_lb_frame.grid(row=3, column=1, columnspan=2, sticky='w', padx=3, pady=3)
+        # List and column share one cell: grp_tab gives column 1 all the slack,
+        # so gridding them into separate columns threw the facet dropdowns to
+        # the far right of the page, a screen away from the list they divide.
+        grp_sel_frame = ttk.Frame(grp_tab)
+        grp_sel_frame.grid(row=3, column=1, sticky='w', padx=3, pady=3)
+        grp_lb_frame = ttk.Frame(grp_sel_frame)
+        grp_lb_frame.pack(side='left', fill='both', expand=True)
         grp_lb_sb = ttk.Scrollbar(grp_lb_frame, orient='vertical')
         grp_lb_sb.pack(side='right', fill='y')
+        # exportselection=False: without it, clicking any other listbox on the
+        # tab clears this selection and the comparison silently falls back to
+        # the whole pool.
         self.grp_comp_listbox = tk.Listbox(grp_lb_frame, selectmode='multiple', height=5,
-                                           yscrollcommand=grp_lb_sb.set, width=28)
+                                           yscrollcommand=grp_lb_sb.set, width=28,
+                                           exportselection=False)
         self.grp_comp_listbox.pack(side='left', fill='both', expand=True)
         grp_lb_sb.config(command=self.grp_comp_listbox.yview)
         # Alias — both backends read from the same widget
         self.beg_groups_listbox = self.grp_comp_listbox
+
+        self._make_facet_controls(grp_sel_frame, 'coherence_groups').pack(
+            side='left', fill='y', padx=(self.ui_px(10), 0))
 
         ttk.Button(grp_tab, text="\u21ba Refresh",
                    command=self._refresh_grp_comp_listbox).grid(
@@ -6006,15 +6157,46 @@ class FPAnalysisGUI:
 
     
     def update_conn_listbox(self):
-        """Update listbox based on analysis mode"""
-        self.conn_listbox.delete(0, 'end')
-        if self.conn_mode_var.get() == 'Subject':
+        """Re-list the subject pool and show or hide the facet column.
+
+        Both modes list subjects. Subject mode draws one series per selected
+        subject; Group mode hands the selection to the facet column, which
+        divides it into series exactly as on the other graphing tabs.
+        """
+        group_mode = self.conn_mode_var.get() != 'Subject'
+        if group_mode:
+            # Pool semantics: an untouched pool means "everything", so preselect.
+            self.fill_group_listbox(self.conn_listbox)
+        else:
+            self.conn_listbox.delete(0, 'end')
             for subject in sorted(self.processed_data.keys()):
                 self.conn_listbox.insert('end', subject)
-        else:  # Group
-            for group in sorted(self.groups.keys()):
-                self.conn_listbox.insert('end', group)
+
+        label = getattr(self, 'conn_pool_label', None)
+        if label is not None:
+            label.config(text="Subjects to include:" if group_mode
+                         else "Subject(s):")
+        facet = getattr(self, 'conn_facet_controls', None)
+        if facet is not None:
+            if group_mode:
+                facet.rebuild()
+                facet.pack(fill='x', pady=(self.ui_px(6), 0))
+            else:
+                facet.pack_forget()
         self._refresh_conn_channels()
+
+    def _conn_selection(self):
+        """``(series_names, group_mode)`` for the Coherence selection zone.
+
+        Group mode returns facet series (which fall back to the plain
+        one-series-per-group fan-out when the column is untouched); Subject
+        mode returns the selected subject ids unchanged.
+        """
+        group_mode = self.conn_mode_var.get() != 'Subject'
+        if group_mode:
+            return self.selected_series('coherence', self.conn_listbox), True
+        return [self.conn_listbox.get(i)
+                for i in self.conn_listbox.curselection()], False
 
     def _all_channel_names(self):
         """Union of detected channel designations across all processed subjects,
@@ -6478,33 +6660,36 @@ class FPAnalysisGUI:
     # ------------------------------------------------------------------ #
 
     def _refresh_grp_comp_listbox(self):
-        """Populate the group comparison listbox from self.groups."""
+        """Re-list the subject pool the By-Group comparisons draw from."""
         if not hasattr(self, 'grp_comp_listbox'):
             return
-        self.grp_comp_listbox.delete(0, 'end')
-        for g in sorted(self.groups.keys()):
-            n = len(self.groups[g])
-            self.grp_comp_listbox.insert('end', f"{g}  (n={n})")
+        self.fill_group_listbox(self.grp_comp_listbox)
+        control = getattr(self, 'facet_controls', {}).get('coherence_groups')
+        if control is not None:
+            control.rebuild()
+
+    def _grp_comp_series(self):
+        """Series the By-Group coherence comparisons should compare.
+
+        Untouched, the facet column splits on the series factor, so this
+        returns the same group names the listbox used to hold -- but narrowed
+        to the subjects still selected in the pool.
+        """
+        return self.selected_series('coherence_groups', self.grp_comp_listbox)
 
     def run_group_coherence_comparison(self):
         """Compute per-subject static coherence for each selected group and store results."""
-        sel = self.grp_comp_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("No Groups",
-                "Select two or more groups from the comparison list.\n"
-                "Click '↺ Refresh Groups' if the list is empty.")
-            return
         if not self.processed_data:
             messagebox.showwarning("No Data", "No processed subjects found.")
             return
 
-        # Parse group names (strip the (n=X) suffix we added)
-        raw_names = [self.grp_comp_listbox.get(i) for i in sel]
-        selected_groups = [n.rsplit('  (n=', 1)[0].strip() for n in raw_names]
+        selected_groups = self._grp_comp_series()
 
         if len(selected_groups) < 2:
-            messagebox.showwarning("Too Few Groups",
-                "Select at least two groups to compare.")
+            messagebox.showwarning("Too Few Series",
+                "This comparison needs at least two series.\n"
+                "Assign subjects to more than one level of the split factor, "
+                "or split on another factor in the column beside the list.")
             return
 
         ch1 = self.conn_channel1_var.get()
@@ -6525,15 +6710,18 @@ class FPAnalysisGUI:
         bands = self._get_active_freq_bands()
 
         self.group_coherence_results = {}
-        total_subjects = sum(len(self._series_members(g)) for g in selected_groups)
+        # Resolve series membership on the main thread: a facet-derived series
+        # ("Fentanyl × pre") is not a key in self.groups, so the worker must be
+        # handed the members rather than looking them up itself.
+        _members = {g: self._series_members(g) for g in selected_groups}
+        total_subjects = sum(len(m) for m in _members.values())
         _pd = self.processed_data
-        _groups = self.groups
         _params = dict(self.conn_params)
 
         def _worker(q):
             done = 0
             for gname in selected_groups:
-                members = _groups.get(gname, [])
+                members = _members.get(gname, [])
                 group_entry = {
                     'group': gname,
                     'ch1': ch1, 'ch2': ch2,
@@ -6608,13 +6796,11 @@ class FPAnalysisGUI:
         category.  Bars show the mean spectral coherence per zone, grouped.
         (In-zone frames are concatenated before the spectral estimate, so treat
         very short zone occupancies with caution.)"""
-        sel = self.grp_comp_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("No Groups",
-                "Select one or more groups from the comparison list.")
+        selected_groups = self._grp_comp_series()
+        if not selected_groups:
+            messagebox.showwarning("No Series",
+                "Select at least one subject in the pool beside the facet column.")
             return
-        raw_names = [self.grp_comp_listbox.get(i) for i in sel]
-        selected_groups = [n.rsplit('  (n=', 1)[0].strip() for n in raw_names]
 
         ch1 = self.conn_channel1_var.get()
         ch2 = self.conn_channel2_var.get()
@@ -7004,13 +7190,12 @@ class FPAnalysisGUI:
         self.log_message(f"BEG behavior list refreshed: {', '.join(behaviors) or 'none found'}")
 
     def _refresh_beg_groups_listbox(self):
-        """Populate the groups listbox for the bout-epoch group comparison panel."""
-        if not hasattr(self, 'beg_groups_listbox'):
-            return
-        self.beg_groups_listbox.delete(0, 'end')
-        for g in sorted(self.groups.keys()):
-            n = len(self.groups[g])
-            self.beg_groups_listbox.insert('end', f"{g}  (n={n})")
+        """Re-list the bout-epoch group comparison pool.
+
+        The two By-Group backends share one widget, so this delegates rather
+        than filling it a second (and differently formatted) way.
+        """
+        self._refresh_grp_comp_listbox()
 
     def run_bout_epoch_group_comparison(self):
         """
@@ -7024,18 +7209,13 @@ class FPAnalysisGUI:
                 "Enter or select a behavior and click ↺ Refresh.")
             return
 
-        sel = self.beg_groups_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("No Groups",
-                "Select at least two groups from the list.")
-            return
-
-        raw_names = [self.beg_groups_listbox.get(i) for i in sel]
-        selected_groups = [n.rsplit('  (n=', 1)[0].strip() for n in raw_names]
+        selected_groups = self._grp_comp_series()
 
         if len(selected_groups) < 2:
-            messagebox.showwarning("Too Few Groups",
-                "Select at least two groups to compare.")
+            messagebox.showwarning("Too Few Series",
+                "This comparison needs at least two series.\n"
+                "Assign subjects to more than one level of the split factor, "
+                "or split on another factor in the column beside the list.")
             return
 
         try:
@@ -7074,20 +7254,21 @@ class FPAnalysisGUI:
         fmax         = self.conn_params['static_fmax']
         bands        = self._get_active_freq_bands()
 
-        total_subjects = sum(
-            len(self._series_members(g)) for g in selected_groups)
+        # Resolve series membership on the main thread -- see the note in
+        # run_group_coherence_comparison; facet series are not self.groups keys.
+        _members = {g: self._series_members(g) for g in selected_groups}
+        total_subjects = sum(len(m) for m in _members.values())
 
         # Storage: { group_name: { subject: {pre_freqs, pre_coh_mean, post_coh_mean,
         #                                     pre_coh_sem, post_coh_sem, n_bouts, ...} } }
         self.beg_results = {}
         _pd     = self.processed_data
-        _groups = self.groups
         _cp     = dict(self.conn_params)
 
         def _worker(q):
             done = 0
             for gname in selected_groups:
-                members = _groups.get(gname, [])
+                members = _members.get(gname, [])
                 group_entry = {}
 
                 for subj in members:
@@ -8340,17 +8521,17 @@ class FPAnalysisGUI:
         boutframes_file = self.boutframes_path_var.get()
         _use_file_fallback = bool(boutframes_file and os.path.exists(boutframes_file))
 
-        selected = self.conn_listbox.curselection()
-        if not selected:
+        # Expand series → subject list, tracking which series each subject is in.
+        # Resolved here, on the main thread, so a facet-derived series name is
+        # already a member list by the time the worker sees it.
+        selected_items, _group_mode = self._conn_selection()
+        if not selected_items:
             messagebox.showwarning("No Selection",
                 "Select at least one subject (or group) from the list above.")
             return
 
-        # Expand groups → subject list, tracking which group each subject belongs to
-        _group_mode = self.conn_mode_var.get() == 'Group'
-        _subject_to_group = {}  # subject -> group_name (empty when not in group mode)
+        _subject_to_group = {}  # subject -> series name (empty when not in group mode)
         if _group_mode:
-            selected_items = [self.conn_listbox.get(i) for i in selected]
             subjects = []
             for gname in selected_items:
                 for s in self._series_members(gname):
@@ -8358,7 +8539,7 @@ class FPAnalysisGUI:
                         _subject_to_group[s] = gname
                         subjects.append(s)
         else:
-            subjects = [self.conn_listbox.get(i) for i in selected]
+            subjects = list(selected_items)
 
         ch1 = self.conn_channel1_var.get()
         ch2 = self.conn_channel2_var.get()
@@ -9129,28 +9310,30 @@ class FPAnalysisGUI:
             return
 
         # ── Gather selection ───────────────────────────────────────────
-        selected = self.conn_listbox.curselection()
-        if not selected:
+        selected_items, group_mode = self._conn_selection()
+        if not selected_items:
             messagebox.showwarning("No Selection",
                                    "Select at least one subject or group "
                                    "from the list.")
             return
 
-        mode = self.conn_mode_var.get()
-        selected_items = [self.conn_listbox.get(i) for i in selected]
         ch1 = self.conn_channel1_var.get()
         ch2 = self.conn_channel2_var.get()
 
-        # Expand groups to subject lists
+        # Expand series to subject lists
         subject_lists = {}   # display_label -> [subject_ids]
-        if mode == 'Subject':
+        if not group_mode:
             for s in selected_items:
                 if s in self.processed_data:
                     subject_lists[s] = [s]
         else:
+            # _series_members, not processed_data[s]['group']: that per-subject
+            # field is a copy taken when the subject was processed, so it went
+            # stale the moment groups were edited and never knew about facets
+            # at all -- this panel was the last site still reading it.
             for g in selected_items:
-                members = [s for s in self.processed_data
-                           if self.processed_data[s].get('group') == g]
+                members = [s for s in self._series_members(g)
+                           if s in self.processed_data]
                 if members:
                     subject_lists[g] = members
 
@@ -10025,7 +10208,12 @@ class FPAnalysisGUI:
         # Plot ▾ — all graph types live behind one dropdown
         # No arrow in the label: a full-width Menubutton already draws its own,
         # and two of them read as a rendering bug.
-        plot_mb = ttk.Menubutton(actions, text="Plot")
+        # direction='right' posts the menu beside the button, into the wide
+        # Output zone, instead of below it. Vertical room runs out first: at
+        # ui_scale 1.5 the Plot menu needs 376 px and the gap to the screen
+        # edge is 375, and Tk answers a menu that will not fit by throwing it
+        # to the top of the display, nowhere near the button the user clicked.
+        plot_mb = ttk.Menubutton(actions, text="Plot", direction='right')
         plot_menu = tk.Menu(plot_mb, tearoff=0)
         plot_menu.add_command(label="Bar Graphs (per metric)",
                               command=self.generate_bout_bar_graphs)
@@ -10053,7 +10241,7 @@ class FPAnalysisGUI:
             fill='x', pady=(self.ui_px(4), 0))
 
         # Export ▾ — both export paths behind one dropdown
-        export_mb = ttk.Menubutton(actions, text="Export")
+        export_mb = ttk.Menubutton(actions, text="Export", direction='right')
         export_menu = tk.Menu(export_mb, tearoff=0)
         export_menu.add_command(label="Metrics Table (Excel)…",
                                 command=self.export_bout_metrics)
@@ -10070,11 +10258,25 @@ class FPAnalysisGUI:
         export_mb.pack(fill='x', pady=(self.ui_px(4), 0))
 
         # ── Output: graph, metrics table, statistics ─────────────────────
-        bout_graph_container = ttk.Frame(output)
-        bout_graph_container.pack(fill='both', expand=True)
+        # Gridded with weights rather than three pack(expand=True) siblings,
+        # which split the pane into equal thirds. The figure is the thing that
+        # needs the pixels here -- these plots stack one subplot per metric, so
+        # six metrics is an 1800 px figure -- while the table and the stats box
+        # read fine at a few rows and scroll for the rest.
+        output.grid_columnconfigure(0, weight=1)
+        output.grid_rowconfigure(0, weight=4)
+        output.grid_rowconfigure(1, weight=1)
+        output.grid_rowconfigure(2, weight=1)
 
+        bout_graph_container = ttk.Frame(output)
+        bout_graph_container.grid(row=0, column=0, sticky='nsew')
+
+        # A floor, not a ceiling: this used to ask for 450 px and, nested inside
+        # the already-scrollable Output zone, could never grow past it -- an
+        # 1800 px figure showed its top 25% with the rest reachable only by
+        # dragging a hairline scrollbar.
         self.bout_histogram_canvas = tk.Canvas(
-            bout_graph_container, height=self.ui_px(450), highlightthickness=0)
+            bout_graph_container, height=self.ui_px(220), highlightthickness=0)
         bout_h_scrollbar = ttk.Scrollbar(
             bout_graph_container, orient="horizontal",
             command=self.bout_histogram_canvas.xview)
@@ -10105,9 +10307,33 @@ class FPAnalysisGUI:
         bout_graph_container.grid_rowconfigure(0, weight=1)
         bout_graph_container.grid_columnconfigure(0, weight=1)
 
+        # This canvas scrolls independently of the Output zone around it, so it
+        # needs its own wheel handler. Without one the zone's bind_all handler
+        # keeps the wheel and the graph strip stays parked on the top panel --
+        # the lower panels of a multi-panel figure were only reachable by
+        # dragging the scrollbar.
+        def _bout_graph_wheel(event):
+            try:
+                self.bout_histogram_canvas.yview_scroll(
+                    int(-1 * (event.delta / 120)), 'units')
+            except tk.TclError:
+                return
+            return 'break'
+
+        def _claim_wheel(_e=None):
+            self.root.bind_all('<MouseWheel>', _bout_graph_wheel)
+
+        def _release_wheel(_e=None):
+            # Hand the wheel back to whatever the tab normally scrolls.
+            self._on_notebook_tab_changed()
+
+        self.bout_histogram_canvas.bind('<Enter>', _claim_wheel)
+        self.bout_histogram_frame.bind('<Enter>', _claim_wheel)
+        self.bout_histogram_canvas.bind('<Leave>', _release_wheel)
+
         results_frame = ttk.LabelFrame(
             output, text="Calculated Metrics (Detailed)", padding=3)
-        results_frame.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+        results_frame.grid(row=1, column=0, sticky='nsew', pady=(self.ui_px(4), 0))
 
         tree_container = ttk.Frame(results_frame)
         tree_container.pack(fill='both', expand=True)
@@ -10135,7 +10361,7 @@ class FPAnalysisGUI:
             label="Copy Column (All Rows)", command=self.copy_metrics_column_from_context)
 
         stats_frame = ttk.LabelFrame(output, text="Statistical Results", padding=3)
-        stats_frame.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+        stats_frame.grid(row=2, column=0, sticky='nsew', pady=(self.ui_px(4), 0))
 
         stats_text_container = ttk.Frame(stats_frame)
         stats_text_container.pack(fill='both', expand=True)
@@ -10175,10 +10401,15 @@ class FPAnalysisGUI:
                         command=self.update_spike_selection_mode).pack(
             side='left', padx=(self.ui_px(6), 0))
 
-        # One listbox for both modes: update_spike_selection_mode refills it, so
-        # there is nothing to show or hide here.
+        # One listbox for both modes, holding subjects in each. Subject mode
+        # reports one row per selected subject; Group mode treats the same rows
+        # as a pool and lets the facet column below divide it into series. The
+        # list used to hold group NAMES in Group mode, which left the series
+        # factor as the only one this tab could reach.
+        self.spike_pool_label = ttk.Label(selection, text="Subject(s):")
+        self.spike_pool_label.pack(anchor='w', pady=(self.ui_px(4), 0))
         list_container = ttk.Frame(selection)
-        list_container.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
+        list_container.pack(fill='both', expand=True)
         scrollbar_list = ttk.Scrollbar(list_container)
         scrollbar_list.pack(side='right', fill='y')
         self.spike_listbox = tk.Listbox(list_container, selectmode='multiple',
@@ -10186,6 +10417,11 @@ class FPAnalysisGUI:
                                         exportselection=False)
         self.spike_listbox.pack(side='left', fill='both', expand=True)
         scrollbar_list.config(command=self.spike_listbox.yview)
+
+        # Packed and unpacked by update_spike_selection_mode: Subject mode has
+        # no pool to divide, so the column would only invite a selection that
+        # nothing reads.
+        self.spike_facet_controls = self._make_facet_controls(selection, 'spike')
 
         # ── Settings ─────────────────────────────────────────────────────────
         warning_bg = tk.Frame(settings, bg='#FFF3CD', bd=1, relief='solid')
@@ -10351,22 +10587,76 @@ class FPAnalysisGUI:
         self._rebuild_spike_channel_checkboxes(sorted_chs)
 
     def update_spike_selection_mode(self):
-        """Update the listbox based on selected mode (Subject or Group), then refresh channels."""
-        self.spike_listbox.delete(0, tk.END)
+        """Re-list the subject pool, show or hide the facet column, then refresh
+        channels.
 
-        if self.spike_mode_var.get() == "Subject":
+        Both modes list subjects. Subject mode reports one row per selected
+        subject; Group mode hands the selection to the facet column, which
+        divides it into series exactly as on the other graphing tabs.
+        """
+        group_mode = self.spike_mode_var.get() != "Subject"
+        if group_mode:
+            # Pool semantics: an untouched pool means "everything", so preselect.
+            self.fill_group_listbox(self.spike_listbox)
+        else:
+            self.spike_listbox.delete(0, tk.END)
             for subject in sorted(self.processed_data.keys()):
                 self.spike_listbox.insert(tk.END, subject)
-        else:  # Group mode
-            for group_name in self.groups.keys():
-                self.spike_listbox.insert(tk.END, group_name)
+
+        label = getattr(self, 'spike_pool_label', None)
+        if label is not None:
+            label.config(text="Subjects to include:" if group_mode
+                         else "Subject(s):")
+        facet = getattr(self, 'spike_facet_controls', None)
+        if facet is not None:
+            if group_mode:
+                facet.rebuild()
+                facet.pack(fill='x', pady=(self.ui_px(6), 0))
+            else:
+                facet.pack_forget()
 
         # Refresh channel checkboxes and preview subject list from loaded data
         if hasattr(self, 'spike_channel_check_frame'):
             self.refresh_spike_channels()
-    
+
+    def _spike_series(self):
+        """``(series_names, group_mode)`` for the Spike selection zone.
+
+        Group mode returns facet series (which fall back to the plain
+        one-series-per-group fan-out when the column is untouched); Subject
+        mode returns the selected subject ids unchanged.
+        """
+        group_mode = self.spike_mode_var.get() != "Subject"
+        if group_mode:
+            return self.selected_series('spike', self.spike_listbox), True
+        return [self.spike_listbox.get(i)
+                for i in self.spike_listbox.curselection()], False
+
+    def _spike_subject_to_series(self):
+        """``{subject: series label}`` for labelling spike rows, plots and exports.
+
+        These sites used to build the map by walking ``self.groups``, which
+        knows nothing about a facet -- so a run split on two factors was
+        plotted and exported back under plain group names, contradicting the
+        run that produced it.
+
+        Subject mode has no series to label with, so it keeps the plain group
+        membership it always used; there the label is decorative.
+        """
+        series, group_mode = self._spike_series()
+        mapping = {}
+        if group_mode:
+            for name in series:
+                for subject in self._series_members(name):
+                    mapping.setdefault(subject, name)
+            return mapping
+        for group_name, members in self.groups.items():
+            for member in members:
+                mapping[member] = group_name
+        return mapping
+
     def _spike_selected_subjects(self):
-        """Subjects implied by the current spike-tab listbox selection (groups
+        """Subjects implied by the current spike-tab listbox selection (series
         expanded to members).  Returns ``None`` when nothing is selected so
         callers fall back to every analyzed subject.
 
@@ -10383,8 +10673,8 @@ class FPAnalysisGUI:
         if self.spike_mode_var.get() == "Subject":
             return {self.spike_listbox.get(i) for i in sel}
         subs = set()
-        for i in sel:
-            subs.update(self._series_members(self.spike_listbox.get(i)))
+        for name in self._spike_series()[0]:
+            subs.update(self._series_members(name))
         return subs
 
     def _spike_results_for_selection(self):
@@ -10399,33 +10689,32 @@ class FPAnalysisGUI:
 
     def run_spike_analysis(self):
         """Run spike analysis on selected subjects/groups"""
-        selected_indices = self.spike_listbox.curselection()
-        if not selected_indices:
+        selected_items, group_mode = self._spike_series()
+        if not selected_items:
             messagebox.showwarning("No Selection", "Please select at least one subject or group")
             return
-        
+
         # Clear previous results
         for item in self.spike_tree.get_children():
             self.spike_tree.delete(item)
-        
+
         self.spike_results = {}
-        
+
         # Determine subjects to analyze
         subjects_to_analyze = []
         subject_to_group = {}
-        
-        if self.spike_mode_var.get() == "Subject":
-            subjects_to_analyze = [self.spike_listbox.get(i) for i in selected_indices]
+
+        if not group_mode:
+            subjects_to_analyze = list(selected_items)
             for subject in subjects_to_analyze:
                 subject_to_group[subject] = "N/A"
-        else:  # Group mode
-            selected_groups = [self.spike_listbox.get(i) for i in selected_indices]
-            for group_name in selected_groups:
+        else:  # Group mode — the series come from the facet column
+            for group_name in selected_items:
                 group_members = self._series_members(group_name)
                 for member in group_members:
                     subject_to_group[member] = group_name
                 subjects_to_analyze.extend(group_members)
-        
+
         if not subjects_to_analyze:
             messagebox.showinfo("No Data", "No subjects found for analysis")
             return
@@ -10437,7 +10726,8 @@ class FPAnalysisGUI:
             return
 
         # Apply exclusions if enabled
-        if self.use_exclusions_spike.get():
+        use_excl = self.use_exclusions_spike.get()
+        if use_excl:
             valid_subjects = set()
             for ch in active_channels:
                 valid_subjects.update(
@@ -10466,6 +10756,9 @@ class FPAnalysisGUI:
                     ch = self.get_channel_name(data, i)
                     if ch not in active_channels:
                         continue
+                    # A channel excluded below must not set the threshold above.
+                    if use_excl and self.is_channel_slot_excluded(subject, i, data):
+                        continue
                     for kind in ('corrected', 'dff', 'zscore'):
                         sig = self.get_channel_signal(data, i, kind=kind)
                         if sig is not None and sig.size > 0:
@@ -10482,7 +10775,8 @@ class FPAnalysisGUI:
             if subject not in self.processed_data:
                 continue
 
-            results = self.analyze_spikes_for_subject(subject, global_mads=global_mads)
+            results = self.analyze_spikes_for_subject(
+                subject, global_mads=global_mads, use_exclusions=use_excl)
             if not results:
                 continue
 
@@ -10631,11 +10925,8 @@ class FPAnalysisGUI:
             # Active channels from dynamic channel selection
             active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
             
-            # Determine subject groups
-            subject_to_group = {}
-            for group_name, members in self.groups.items():
-                for member in members:
-                    subject_to_group[member] = group_name
+            # Facet-aware: in Group mode these are the series the run produced.
+            subject_to_group = self._spike_subject_to_series()
             
             fps = self.get_fps()
             
@@ -10707,6 +10998,21 @@ class FPAnalysisGUI:
             self.log_message(f"Error exporting spike summary: {str(e)}")
 
     
+    def _spike_export_channels(self, subject, active_channels, excluded_channels):
+        """Channel designations to export for one subject, in checkbox order.
+
+        Iterates the channels actually present in ``spike_data`` — which is keyed
+        by each subject's real designation (``G0``, ``R4``, ...) — rather than the
+        literal ``['G0', 'G1']`` these exports used to loop.  On a red-channel or
+        mixed cohort that literal matched neither the stored spike data nor the
+        exclusion keys, so the export came out empty and unfiltered at once.
+        """
+        present = self.spike_data.get(subject) or {}
+        chans = [ch for ch in present
+                 if ch in active_channels and ch not in excluded_channels]
+        return sorted(chans, key=lambda x: (str(x)[0].upper(),
+                                            int(str(x)[1:]) if str(x)[1:].isdigit() else 0))
+
     def _export_spike_time_binned(self, bin_size_sec):
         """Export spike data binned by time intervals, respecting exclusions"""
         # Ask for filename
@@ -10722,16 +11028,13 @@ class FPAnalysisGUI:
             return
         
         try:
-            # Get channel selection options
-            show_g0 = self.spike_show_g0.get()
-            show_g1 = self.spike_show_g1.get()
-            
-            # Determine subject groups
-            subject_to_group = {}
-            for group_name, members in self.groups.items():
-                for member in members:
-                    subject_to_group[member] = group_name
-            
+            # Channel selection comes from the dynamic checkboxes, which are keyed
+            # by each subject's real designation.
+            active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
+
+            # Facet-aware: in Group mode these are the series the run produced.
+            subject_to_group = self._spike_subject_to_series()
+
             fps = self.get_fps()
 
             # Restrict to the current subject/group selection.
@@ -10743,13 +11046,12 @@ class FPAnalysisGUI:
 
             for subject in sel_results.keys():
                 # Apply exclusions if enabled
-                if self.use_exclusions_spike.get():
-                    excluded_channels = self.exclusions.get(subject, [])
-                    # Skip subject if they have all channels excluded
-                    if excluded_channels and show_g0 and show_g1:
-                        if 'G0' in excluded_channels and 'G1' in excluded_channels:
-                            continue
-                
+                excluded_channels = (self.exclusions.get(subject, [])
+                                     if self.use_exclusions_spike.get() else [])
+                # Skip subject if nothing is left to export for them
+                if not self._spike_export_channels(subject, active_channels, excluded_channels):
+                    continue
+
                 if subject not in self.spike_data or subject not in self.processed_data:
                     continue
                 
@@ -10779,14 +11081,9 @@ class FPAnalysisGUI:
 
             for subject in sel_results.keys():
                 # Apply exclusions again
-                if self.use_exclusions_spike.get():
-                    excluded_channels = self.exclusions.get(subject, [])
-                    if excluded_channels and show_g0 and show_g1:
-                        if 'G0' in excluded_channels and 'G1' in excluded_channels:
-                            continue
-                else:
-                    excluded_channels = []
-                
+                excluded_channels = (self.exclusions.get(subject, [])
+                                     if self.use_exclusions_spike.get() else [])
+
                 group_name = subject_to_group.get(subject, "N/A")
                 
                 if subject not in subject_bin_data:
@@ -10797,18 +11094,9 @@ class FPAnalysisGUI:
                 num_bins = bin_info['num_bins']
                 
                 # Process each channel
-                for channel in ['G0', 'G1']:
-                    # Skip excluded channels
-                    if channel in excluded_channels:
-                        continue
-                    
-                    # Skip unselected channels
-                    if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
-                        continue
-                    
-                    if channel not in self.spike_data[subject]:
-                        continue
-                    
+                for channel in self._spike_export_channels(subject, active_channels,
+                                                          excluded_channels):
+
                     spike_times = self.spike_data[subject][channel].get('spike_times', np.array([]))
                     
                     # Create row data
@@ -10850,7 +11138,7 @@ class FPAnalysisGUI:
             messagebox.showinfo("Export Complete", 
                                f"Time-binned data exported to:\n{filepath}\n\n"
                                f"Bin size: {bin_size_sec}s\n"
-                               f"Channels: G0={show_g0}, G1={show_g1}\n"
+                               f"Channels: {', '.join(sorted({r['channel'] for r in rows})) or 'none'}\n"
                                f"Exclusions applied: {self.use_exclusions_spike.get()}")
             
         except Exception as e:
@@ -10873,16 +11161,13 @@ class FPAnalysisGUI:
             return
         
         try:
-            # Get channel selection options
-            show_g0 = self.spike_show_g0.get()
-            show_g1 = self.spike_show_g1.get()
-            
-            # Determine subject groups
-            subject_to_group = {}
-            for group_name, members in self.groups.items():
-                for member in members:
-                    subject_to_group[member] = group_name
-            
+            # Channel selection comes from the dynamic checkboxes, which are keyed
+            # by each subject's real designation.
+            active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
+
+            # Facet-aware: in Group mode these are the series the run produced.
+            subject_to_group = self._spike_subject_to_series()
+
             fps = self.get_fps()
 
             # Restrict to the current subject/group selection.
@@ -10894,12 +11179,11 @@ class FPAnalysisGUI:
 
             for subject in sel_results.keys():
                 # Apply exclusions if enabled
-                if self.use_exclusions_spike.get():
-                    excluded_channels = self.exclusions.get(subject, [])
-                    # Skip subject if they have all channels excluded
-                    if excluded_channels and show_g0 and show_g1:
-                        if 'G0' in excluded_channels and 'G1' in excluded_channels:
-                            continue
+                excluded_channels = (self.exclusions.get(subject, [])
+                                     if self.use_exclusions_spike.get() else [])
+                # Skip subject if nothing is left to export for them
+                if not self._spike_export_channels(subject, active_channels, excluded_channels):
+                    continue
 
                 if subject not in self.spike_data or subject not in self.processed_data:
                     continue
@@ -10967,14 +11251,9 @@ class FPAnalysisGUI:
 
             for subject in sel_results.keys():
                 # Apply exclusions again
-                if self.use_exclusions_spike.get():
-                    excluded_channels = self.exclusions.get(subject, [])
-                    if excluded_channels and show_g0 and show_g1:
-                        if 'G0' in excluded_channels and 'G1' in excluded_channels:
-                            continue
-                else:
-                    excluded_channels = []
-                
+                excluded_channels = (self.exclusions.get(subject, [])
+                                     if self.use_exclusions_spike.get() else [])
+
                 group_name = subject_to_group.get(subject, "N/A")
                 
                 if subject not in subject_zone_data:
@@ -10984,18 +11263,9 @@ class FPAnalysisGUI:
                 zone_classifications = zone_data['zone_classifications']
                 
                 # Process each channel
-                for channel in ['G0', 'G1']:
-                    # Skip excluded channels
-                    if channel in excluded_channels:
-                        continue
-                    
-                    # Skip unselected channels
-                    if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
-                        continue
-                    
-                    if channel not in self.spike_data[subject]:
-                        continue
-                    
+                for channel in self._spike_export_channels(subject, active_channels,
+                                                          excluded_channels):
+
                     spike_indices = self.spike_data[subject][channel].get('spike_indices', np.array([]))
                     
                     # Create row data
@@ -11050,7 +11320,7 @@ class FPAnalysisGUI:
             self.log_message(f"Zone-binned spike data exported to: {filepath}")
             messagebox.showinfo("Export Complete", 
                                f"Zone-binned data exported to:\n{filepath}\n\n"
-                               f"Channels: G0={show_g0}, G1={show_g1}\n"
+                               f"Channels: {', '.join(sorted({r['channel'] for r in rows})) or 'none'}\n"
                                f"Zones: {len(base_zones)}\n"
                                f"Exclusions applied: {self.use_exclusions_spike.get()}")
             
@@ -11113,11 +11383,8 @@ class FPAnalysisGUI:
                      ha='center', va='center', fontsize=13)
             return
 
-        # Build group lookup
-        subject_to_group = {}
-        for group_name, members in self.groups.items():
-            for member in members:
-                subject_to_group[member] = group_name
+        # Facet-aware: in Group mode these are the series the run produced.
+        subject_to_group = self._spike_subject_to_series()
 
         COLORS     = ['#4a90e2', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6', '#1abc9c']
         DOT_COLORS = ['darkblue', 'darkgreen', 'darkred', 'darkorange', 'purple', 'teal']
@@ -11354,10 +11621,7 @@ class FPAnalysisGUI:
         active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
         apply_excl = self.use_exclusions_spike.get()
         group_mode = self.spike_mode_var.get() == "Group"
-        subject_to_group = {}
-        for g, members in self.groups.items():
-            for mm in members:
-                subject_to_group[mm] = g
+        subject_to_group = self._spike_subject_to_series()
 
         phases = ['Pre', 'During', 'Post']
         # group -> phase -> list of per-subject mean rates (per min)
@@ -11540,11 +11804,8 @@ class FPAnalysisGUI:
         sample_zone_data = {z: 0 for z in all_zone_names}
         zone_names = list(aggregate_zones(sample_zone_data).keys())
         
-        # Organize data by subject/group
-        subject_to_group = {}
-        for group_name, members in self.groups.items():
-            for member in members:
-                subject_to_group[member] = group_name
+        # Organize data by subject/series (facet-aware in Group mode)
+        subject_to_group = self._spike_subject_to_series()
         
         # Create subplots
         n_plots = (1 if show_g0 else 0) + (1 if show_g1 else 0)
@@ -11988,6 +12249,53 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Fix — Exclusions did nothing on cohorts not designated G0/G1. Around 25 plot and
+    export sites asked for the literal channel names "G0"/"G1", so on an R4/R5 cohort
+    ticking a box had no effect. Two spike exports were worse and emitted nothing at
+    all; the position-heatmap export read the wrong columns for any channel past the
+    first two. All of these now resolve the subject's real designation.
+  • Fix — Bout metrics could be measured over the neighbouring bout's window. A bout
+    rejected on one channel shifted that channel's traces out of step with the frame
+    lists, so every later bout was measured one window off. Affects whole/offset
+    styles on recordings containing a flat or all-NaN bout. Re-extract to benefit —
+    existing bout stores carry no index map.
+  • Fix — Group-mode coherence never ran. It looked group names up in the per-subject
+    data, found nothing, and stopped with "Channel Not Available" before starting.
+    Power spectra also resolved membership from a copy taken at processing time, so
+    they went stale as soon as groups were edited.
+  • Fix — Exclusions were applied inconsistently across tabs. Behavioral Data had
+    three different definitions of "excluded", so its table, plot and CSV could report
+    three different n; Spike Analysis filtered even with the toggle off, and pooled
+    excluded channels into the threshold the surviving ones were judged against; FLMM
+    pairwise dropped the setting entirely; and group-level Out/Back and bout-length
+    plots applied no filter though their exports did. Single-subject plots stay
+    unfiltered by design — that is how you judge whether an exclusion was right.
+  • Fix — Exclusions carried over into the next project. They were not cleared on New
+    Project, so two projects sharing subject IDs silently inherited each other's, and
+    the Exclusions tab could show checkboxes belonging to a project you had closed.
+  • New — "Split series by" on Coherence, Spike Analysis and Signal Linkage. All three
+    now list the subject pool with a facet column beside it, as the other five tabs
+    do. Spike results and exports are labelled by the split rather than by plain group
+    names. Signal Linkage, which had no grouping at all, computes each series
+    separately — permutation null included — and starts fully combined, so an existing
+    workflow is unchanged until you split it.
+  • New — Exclusions on Kinematics and Signal Linkage. Kinematics reads the Behavioral
+    Data channel, since it is computed from tracked position; Signal Linkage reads the
+    photometry channel it is analysing. Every "Apply exclusions" toggle now persists
+    with the project instead of resetting on load.
+  • Fix — Factor levels differing only in whitespace ("Hi " and "Hi") split a cohort
+    into two series and halved each n. Level names are now trimmed everywhere they can
+    be set, including imported factor sets. Facet selections no longer leak from one
+    tab to another, and derived Session/Animal factors stay available when a tab
+    narrows its selection.
+  • Change — Layout. Control columns no longer leave a screen of dead space below the
+    settings, so Actions sits under the controls rather than pinned to the bottom of a
+    tall display. Bout Analysis gives the graph the room instead of splitting the pane
+    three ways, and its Plot menus open sideways — at some display scales they missed
+    fitting below by a pixel and Tk threw them to the top of the screen.
+
+Version 1.11.0  •  August 7, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Factors replace Groups. A project is now described by as many factors as it
     needs — Group, Sex, Session, Treatment, Dose — each with its own levels, edited on
@@ -13043,6 +13351,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.refresh_projects_list()  # Refresh the list
         self.processed_data = {}
         self.reset_factors()  # A new project starts with no groups or factors
+        # Exclusions are keyed by subject ID, and two projects routinely reuse
+        # the same IDs, so a leftover set would silently exclude channels of
+        # subjects the user has never looked at. Same hazard reset_factors
+        # documents for factor assignments.
+        self.exclusions = {}
+        self.reset_exclusion_toggles()
+        if hasattr(self, 'exclusion_vars'):
+            self.refresh_exclusions_list()
 
         # Clear all behavior dropdowns so stale behaviors from the prior project
         # don't appear in the new project's UI.
@@ -13107,6 +13423,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # by an older TRACY, and so the loader has something to migrate.
             'groups': self.groups,
             'exclusions': self.exclusions,  # Save exclusion information
+            # Which tabs were applying them. Without this the exclusions
+            # reload but every tab's checkbox comes back off, so nothing
+            # is actually filtered and the project looks like it lost them.
+            'exclusion_toggles': self.exclusion_toggle_state(),
             'bout_offsets': self.bout_offsets,  # Save offset bout definitions
             'per_subject_boutframe_shifts': self.per_subject_boutframe_shifts,
             'fpdata_path': self.fpdata_path_var.get(),
@@ -13130,6 +13450,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'project_name': self.current_project,
             'groups': self.groups,
             'exclusions': self.exclusions,  # Include exclusion information
+            'exclusion_toggles': self.exclusion_toggle_state(),
             'parameters': self.params,
             'zones': self.zones,  # Include zone definitions
             'per_subject_boutframe_shifts': self.per_subject_boutframe_shifts,
@@ -13742,6 +14063,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.log_message(f"  Loaded {total_exclusions} channel exclusions for {len(self.exclusions)} subjects")
             else:
                 self.log_message(f"  No exclusions found in project config")
+            self.apply_exclusion_toggle_state(config.get('exclusion_toggles'))
+            # refresh_exclusions_list ran only at tab-build and from the manual
+            # refresh button, so the tab kept showing the previous project's
+            # checkboxes -- and select/deselect-all then iterated those stale
+            # vars rather than this project's.
+            if hasattr(self, 'exclusion_vars'):
+                self.refresh_exclusions_list()
             
             # Load file paths
             if 'fpdata_path' in config:
@@ -15223,7 +15551,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         order = []
         for gname, subjects in (mapping or {}).items():
-            gname = str(gname)
+            gname = str(gname).strip()   # see levels_from_ids on why every path strips
+            if not gname:
+                continue
             if gname not in order:
                 order.append(gname)
             for sid in subjects or []:
@@ -15322,10 +15652,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._legacy_group_notice = None
         messagebox.showwarning("Groups Are Now Factors", notice)
 
+    def _factor_universe(self, subject_ids=()):
+        """Every subject the factor model should be derived from.
+
+        The model must not depend on which subjects a tab happens to have
+        selected. Session and Animal are *derived* factors: whether Animal
+        exists at all turns on some animal owning more than one recording, so
+        deriving them from a narrowed pool can delete them outright -- a level
+        filter on Session then matched nobody and drew an empty plot, and a
+        split on it collapsed to a single 'All' series, while the facet
+        dropdowns (built from the full project) still offered the levels.
+        """
+        universe = set(str(s) for s in self.processed_data.keys())
+        universe.update(str(s) for s in subject_ids)
+        return sorted(universe)
+
     def facet(self, subject_ids, selections):
         """Series labels for *subject_ids* under *selections*. See facet_subjects."""
-        return facet_subjects(subject_ids, self.get_subject_factors(subject_ids),
-                              selections, self.get_factor_definitions(subject_ids))
+        universe = self._factor_universe(subject_ids)
+        return facet_subjects(subject_ids, self.get_subject_factors(universe),
+                              selections, self.get_factor_definitions(universe))
 
     def facet_series(self, subject_pool, selections):
         """``[(series_label, [subject_id, ...])]`` for *subject_pool*, in plot order.
@@ -15334,11 +15680,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         colour or a legend entry.
         """
         labels, split_factors = self.facet(subject_pool, selections)
-        assignments = self.get_subject_factors(subject_pool)
+        # Same universe as the labels above, or a narrowed pool would be
+        # ordered against a factor model it was not labelled with. Series that
+        # end up with no members are dropped below, so taking levels from the
+        # whole project only affects their order, not which ones appear.
+        assignments = self.get_subject_factors(self._factor_universe(subject_pool))
         order_map = self.params.get('factor_level_order') or {}
         wanted = facet_series_order(
             split_factors,
-            {f: factor_levels(subject_pool, assignments, f, order_map.get(f))
+            {f: factor_levels(self._factor_universe(subject_pool), assignments,
+                              f, order_map.get(f))
              for f in split_factors})
 
         members = {}
@@ -15410,6 +15761,59 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         control.rebuild()
         return control
 
+    def exclusion_toggle_state(self):
+        """``{tab: bool}`` for the per-tab "Apply exclusions" checkboxes."""
+        state = {}
+        for name in getattr(self, 'EXCLUSION_TOGGLES', ()):
+            var = getattr(self, f'use_exclusions_{name}', None)
+            if var is not None:
+                try:
+                    state[name] = bool(var.get())
+                except Exception:
+                    pass
+        return state
+
+    def apply_exclusion_toggle_state(self, state):
+        """Restore the checkboxes saved by exclusion_toggle_state.
+
+        A project that recorded no toggles (saved by an older TRACY, or with
+        none ticked) resets them all off rather than inheriting the previous
+        project's.
+        """
+        state = state or {}
+        for name in getattr(self, 'EXCLUSION_TOGGLES', ()):
+            var = getattr(self, f'use_exclusions_{name}', None)
+            if var is not None:
+                try:
+                    var.set(bool(state.get(name, False)))
+                except Exception:
+                    pass
+
+    def reset_exclusion_toggles(self):
+        """Turn every "Apply exclusions" checkbox off (new project)."""
+        self.apply_exclusion_toggle_state(None)
+
+    def _refresh_factor_displays(self):
+        """Rebuild everything that shows the factor model: the Factors grid, the
+        facet columns, and the tabs that list group names.
+
+        The three used to be refreshed ad hoc, so an edit that changed the model
+        without going through update_groups_ui -- reordering a level, or a
+        session-pattern change that creates or destroys the derived Session and
+        Animal factors -- left one or more of them stale until the next tab
+        switch happened to heal it.
+        """
+        for name in ('refresh_factors_display', 'refresh_facet_controls',
+                     '_refresh_group_name_lists'):
+            fn = getattr(self, name, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                # A tab that has not been built yet is not an error here.
+                self.log_message(f"{name} refresh skipped: {exc}")
+
     def refresh_facet_controls(self):
         """Re-derive every tab's facet column after factors or groups change."""
         for control in getattr(self, 'facet_controls', {}).values():
@@ -15417,6 +15821,28 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 control.rebuild()
             except Exception as exc:
                 self.log_message(f"Facet control refresh skipped: {exc}")
+
+    def _refresh_group_name_lists(self):
+        """Rebuild the Coherence and Spike selection lists.
+
+        These held group NAMES until P10 gave both tabs a facet column; they
+        now hold the subject pool, and the name survives because three call
+        sites and two tests refer to it. ``refresh_facet_controls`` rebuilds
+        the columns themselves, but not the lists beside them, which were
+        otherwise rebuilt only on project load, on re-processing, or from a
+        manual refresh button -- so assigning subjects to a group on the
+        Factors tab left them as they stood when the project opened.
+        """
+        for name in ('update_conn_listbox', '_refresh_grp_comp_listbox',
+                     'update_spike_selection_mode'):
+            fn = getattr(self, name, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                # A tab that has not been built yet is not an error here.
+                self.log_message(f"{name} refresh skipped: {exc}")
 
     # ======================== Pooled Z-Scoring ========================
 
@@ -15725,7 +16151,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         }
     
     def analyze_spikes_for_subject(self, subject_id, global_mad_g0=None, global_mad_g1=None,
-                                   global_mads=None):
+                                   global_mads=None, use_exclusions=None):
         """Perform spike analysis for a specific subject using the dynamic channel system.
 
         Args:
@@ -15733,10 +16159,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             global_mads:     dict {ch_name: mad} for whole-dataset mode (preferred)
             global_mad_g0:   Legacy per-G0 MAD (used when global_mads is None)
             global_mad_g1:   Legacy per-G1 MAD (used when global_mads is None)
+            use_exclusions:  Honour the Exclusions checkboxes.  ``None`` reads the
+                             tab's "Apply exclusions" toggle, which is the point:
+                             this used to filter unconditionally, so turning the
+                             toggle off still dropped excluded channels here even
+                             though every other spike site respected it.
 
         Returns:
             Dict {ch_name: spike_result_dict} or None if no data / channels found.
         """
+        if use_exclusions is None:
+            var = getattr(self, 'use_exclusions_spike', None)
+            use_exclusions = bool(var.get()) if var is not None else False
         if subject_id not in self.processed_data:
             return None
 
@@ -15759,8 +16193,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for ch_idx in range(n_channels):
             ch_name = self.get_channel_name(data, ch_idx)
 
-            # Skip excluded channels
-            if self.is_subject_channel_excluded(subject_id, ch_name):
+            # Skip excluded channels.  Resolve the key per subject: get_channel_name
+            # answers 'Ch2' for an undesignated header, but the Exclusions tab
+            # labels that same checkbox 'G2'.
+            if use_exclusions and self.is_channel_slot_excluded(subject_id, ch_idx, data):
+                self.log_message(
+                    f"  {subject_id}: skipping channel {ch_name} (excluded)")
                 continue
 
             # Get signal: corrected → dff → zscore
@@ -18902,7 +19340,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if self.use_exclusions_behavioral.get():
                 original_count = len(selected_subjects)
                 # Filter subjects based on behavioral data exclusions
-                selected_subjects = [s for s in selected_subjects if not self.is_subject_channel_excluded(s, 'Behavior')]
+                selected_subjects = [s for s in selected_subjects
+                                     if not self.is_behavior_excluded(s, use_exclusions=True)]
                 if not selected_subjects:
                     messagebox.showwarning("All Excluded", "All selected subjects have behavioral data excluded")
                     return
@@ -19200,12 +19639,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def _display_behavioral_results(self):
         """Display behavioral results in treeview"""
-        if not self.behavioral_results:
+        results = self.included_behavioral_results()
+        if not results:
             return
-        
+
         # Get all unique column names across all results
         all_columns = set()
-        for result in self.behavioral_results:
+        for result in results:
             all_columns.update(result.keys())
         
         # Sort columns: Subject, Group (if exists), Time_Bin first, then alphabetically
@@ -19230,7 +19670,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.behav_tree.column(col, width=120)
         
         # Insert data (use 0 for missing numeric values)
-        for result in self.behavioral_results:
+        for result in results:
             values = []
             for col in columns:
                 if col in result:
@@ -19258,26 +19698,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not filename:
             return
         
-        # Filter results based on exclusions if enabled
-        results_to_export = self.behavioral_results
-        if self.use_exclusions_behavioral.get():
-            # For behavioral metrics, we conservatively exclude subjects that have all channels excluded
-            exclusions = self.exclusions
-            filtered_results = []
-            for result in self.behavioral_results:
-                subject = result.get('Subject')
-                excluded_channels = exclusions.get(subject, [])
-                # Only exclude if subject has no non-excluded channels
-                if not excluded_channels:
-                    filtered_results.append(result)
-            
-            if not filtered_results:
-                messagebox.showwarning("All Excluded", 
-                                      "All results have been excluded based on your exclusion settings.")
-                return
-            
-            results_to_export = filtered_results
-        
+        # Filter results on the one behavioral rule (see included_behavioral_results).
+        results_to_export = self.included_behavioral_results()
+        if not results_to_export:
+            messagebox.showwarning("All Excluded",
+                                  "All results have been excluded based on your exclusion settings.")
+            return
+
         # Check if time bins are used
         use_bins = self.use_time_bins.get()
         
@@ -19377,7 +19804,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Get available metrics (exclude Subject and Time_Bin)
         all_metrics = set()
-        for result in self.behavioral_results:
+        for result in self.included_behavioral_results():
             all_metrics.update(result.keys())
         all_metrics.discard('Subject')
         all_metrics.discard('Time_Bin')
@@ -19462,7 +19889,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # Group mode with bins - one line per group
                         group_data = {}
                         
-                        for result in self.behavioral_results:
+                        for result in self.included_behavioral_results():
                             subj = result.get('Subject', 'Unknown')
                             time_bin = result.get('Time_Bin', '')
                             value = result.get(metric, 0)
@@ -19510,7 +19937,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     else:
                         # Subject mode with bins - one line per subject
                         subjects = {}
-                        for result in self.behavioral_results:
+                        for result in self.included_behavioral_results():
                             subj = result.get('Subject', 'Unknown')
                             time_bin = result.get('Time_Bin', '')
                             value = result.get(metric, 0)
@@ -19541,7 +19968,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # Group mode without bins - bar graph with individual points
                         group_data = {}
                         
-                        for result in self.behavioral_results:
+                        for result in self.included_behavioral_results():
                             subj = result.get('Subject', 'Unknown')
                             value = result.get(metric, 0)
                             
@@ -19579,8 +20006,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         
                     else:
                         # Subject mode without bins
-                        values = [result.get(metric, 0) for result in self.behavioral_results]
-                        subjects_list = [result.get('Subject', 'Unknown') for result in self.behavioral_results]
+                        values = [result.get(metric, 0) for result in self.included_behavioral_results()]
+                        subjects_list = [result.get('Subject', 'Unknown') for result in self.included_behavioral_results()]
                         
                         if plot_type == 'histogram':
                             # Histogram
@@ -19680,7 +20107,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
                 
                 # Collect data from pre-calculated metrics
-                for result in self.behavioral_results:
+                for result in self.included_behavioral_results():
                     subject = result.get('Subject', 'Unknown')
                     
                     # Check if this subject should be included
@@ -19854,7 +20281,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
                 
                 # Collect data from pre-calculated metrics
-                for result in self.behavioral_results:
+                for result in self.included_behavioral_results():
                     subject = result.get('Subject', 'Unknown')
                     
                     # Check if this subject should be included
@@ -20844,6 +21271,38 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return None
         return phot_cols[idx]
 
+    def _original_bout_index(self, entry, channel, bout_idx, n_frames):
+        """Map a *channel trace-list* index back to its row in onset_frames.
+
+        A bout is rejected per channel (all-NaN, or `_is_valid_bout` failing),
+        so a channel's trace list can be shorter than -- and no longer parallel
+        to -- onset_frames/end_frames, and the two can differ between channels
+        of the same subject. Extraction records the surviving bout numbers in
+        ``_kept_indices``; this resolves through them.
+
+        Returns ``None`` when the mapping cannot be trusted, so the caller falls
+        back to the onset-aligned slice rather than reading some other bout's
+        window. That includes bout stores extracted before ``_kept_indices``
+        existed *and* showing a length mismatch: the skew is detectable but not
+        recoverable, and those projects need a re-extract to use whole/offset
+        styles safely.
+        """
+        if bout_idx is None or bout_idx < 0:
+            return None
+        kept = entry.get('_kept_indices') if isinstance(entry, dict) else None
+        seq = kept.get(str(channel)) if isinstance(kept, dict) else None
+        if seq is not None:
+            if not (0 <= bout_idx < len(seq)):
+                return None
+            idx = int(seq[bout_idx])
+            return idx if 0 <= idx < n_frames else None
+
+        # Legacy store: direct indexing is sound only if nothing was dropped.
+        traces = entry.get(str(channel)) if isinstance(entry, dict) else None
+        if isinstance(traces, list) and len(traces) != n_frames:
+            return None
+        return bout_idx if bout_idx < n_frames else None
+
     def _bout_analysis_segment(self, subject, behavior, channel, bout_idx, stored_bout,
                                window_start_frame, window_end_frame):
         """Return the 1-D signal array to compute a bout metric over, honoring the
@@ -20886,10 +21345,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ends = bouts_beh.get('end_frames')
         beh_synced = data.get('beh_synced')
         if (ends is None or starts is None or beh_synced is None
-                or len(starts) != len(ends) or bout_idx >= len(starts)):
+                or len(starts) != len(ends)):
             return _onset_slice()
-        start_f = starts[bout_idx]
-        end_f = ends[bout_idx]
+        # bout_idx indexes the CHANNEL'S trace list, which skips bouts rejected
+        # as all-NaN or invalid; onset_frames/end_frames keep every bout. Map
+        # across before indexing, or every bout after the first rejection is
+        # measured over its neighbour's window.
+        frame_idx = self._original_bout_index(bouts_beh, channel, bout_idx,
+                                              len(starts))
+        if frame_idx is None:
+            return _onset_slice()
+        start_f = starts[frame_idx]
+        end_f = ends[frame_idx]
         if end_f is None or (isinstance(end_f, float) and np.isnan(end_f)):
             return _onset_slice()
 
@@ -21010,9 +21477,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                 # Prepare per-channel containers
                 behavior_bouts = {f'Ch{ch}': [] for ch in range(num_channels)}
+                # A bout can be rejected on one channel and kept on another, so a
+                # channel's trace list is NOT parallel to `frames`. Record which
+                # original bout each kept trace came from, or every consumer that
+                # pairs a trace with onset_frames[i]/end_frames[i] silently reads
+                # the wrong bout's window from the first rejection onwards.
+                behavior_kept = {f'Ch{ch}': [] for ch in range(num_channels)}
 
                 # Visualization/extraction is always aligned to the bout START frame.
-                for frame in frames:
+                for bout_i, frame in enumerate(frames):
                     start_idx = max(0, frame - prebout)
                     end_idx = min(len(beh_synced), frame + postbout)
 
@@ -21027,6 +21500,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             # Validate bout quality
                             if self._is_valid_bout(bout_ch):
                                 behavior_bouts[f'Ch{ch}'].append(bout_ch)
+                                behavior_kept[f'Ch{ch}'].append(bout_i)
                             else:
                                 self.log_message(f"    Warning: Skipping invalid bout at frame {frame} for {behavior} (constant or zero variance) on Ch{ch}")
 
@@ -21034,17 +21508,28 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # index-based consumers like visualization) and its real designation
                 # (G0/G1/R4/…) so name-based consumers work for any channel count.
                 behavior_entry = {}
+                kept_indices = {}
                 for ch in range(num_channels):
                     behavior_entry[f'Ch{ch}'] = behavior_bouts.get(f'Ch{ch}', [])
+                    kept_indices[f'Ch{ch}'] = behavior_kept.get(f'Ch{ch}', [])
                 for ch in range(num_channels):
                     real = self.get_channel_name(subject_data, ch)
                     if real not in behavior_entry:
                         behavior_entry[real] = behavior_entry[f'Ch{ch}']
+                        kept_indices[real] = kept_indices[f'Ch{ch}']
                 # Keep explicit G0/G1 aliases for backward compatibility.
                 if num_channels >= 1:
                     behavior_entry.setdefault('G0', behavior_entry.get('Ch0', []))
+                    kept_indices.setdefault('G0', kept_indices.get('Ch0', []))
                 if num_channels >= 2:
                     behavior_entry.setdefault('G1', behavior_entry.get('Ch1', []))
+                    kept_indices.setdefault('G1', kept_indices.get('Ch1', []))
+                # Keyed the same way as the trace lists, so a consumer holding a
+                # channel key can map its trace index back to the original bout.
+                # Underscore-prefixed because it is metadata, not signal:
+                # _rescale_bout_store recurses into plain dict values and would
+                # otherwise multiply these indices by the z-score scale factor.
+                behavior_entry['_kept_indices'] = kept_indices
 
                 # Store onset (start) frames so other analyses can use them without
                 # re-reading the boutframes Excel file.  Also store end frames and
@@ -21096,7 +21581,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             continue
                         # Extract bouts for offset frames
                         offset_bouts = {f'Ch{ch}': [] for ch in range(num_channels)}
-                        for frame in shifted_frames:
+                        offset_kept = {f'Ch{ch}': [] for ch in range(num_channels)}
+                        for bout_i, frame in enumerate(shifted_frames):
                             start_idx = max(0, frame - prebout)
                             end_idx = min(len(beh_synced), frame + postbout)
                             for ch, col_idx in enumerate(phot_cols):
@@ -21107,17 +21593,25 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                             bout_ch, frame, start_idx, prebout, baseline_frames)
                                     if self._is_valid_bout(bout_ch):
                                         offset_bouts[f'Ch{ch}'].append(bout_ch)
+                                        offset_kept[f'Ch{ch}'].append(bout_i)
                         offset_entry = {}
+                        offset_indices = {}
                         for ch in range(num_channels):
                             offset_entry[f'Ch{ch}'] = offset_bouts.get(f'Ch{ch}', [])
+                            offset_indices[f'Ch{ch}'] = offset_kept.get(f'Ch{ch}', [])
                         for ch in range(num_channels):
                             real = self.get_channel_name(subject_data, ch)
                             if real not in offset_entry:
                                 offset_entry[real] = offset_entry[f'Ch{ch}']
+                                offset_indices[real] = offset_indices[f'Ch{ch}']
                         if num_channels >= 1:
                             offset_entry.setdefault('G0', offset_entry.get('Ch0', []))
+                            offset_indices.setdefault('G0', offset_indices.get('Ch0', []))
                         if num_channels >= 2:
                             offset_entry.setdefault('G1', offset_entry.get('Ch1', []))
+                            offset_indices.setdefault('G1', offset_indices.get('Ch1', []))
+                        # Same skew as the base extraction above -- see _kept_indices there.
+                        offset_entry['_kept_indices'] = offset_indices
                         offset_entry['onset_frames'] = shifted_frames.tolist()
                         if shifted_ends is not None:
                             offset_entry['end_frames'] = shifted_ends.tolist()
@@ -22571,6 +23065,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Group is a factor, so editing groups changes the facet columns' levels.
         self.refresh_facet_controls()
         self.refresh_pool_listboxes()
+        # Coherence and Spike fill their pools per selection mode rather than
+        # through fill_group_listbox, so they need telling separately.
+        self._refresh_group_name_lists()
 
     # ======================== Configuration Presets ========================
     
@@ -23069,37 +23566,98 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def get_included_subjects_for_channel(self, subjects, channel):
         """Filter subject list to only include those not excluded for given channel"""
         return [s for s in subjects if not self.is_subject_channel_excluded(s, channel)]
-    
-    def filter_subjects_by_exclusions(self, subjects, channels=None, use_exclusions=False):
+
+    def channel_exclusion_key(self, subject, ch_index, data=None):
+        """Exclusion key for one subject's channel *slot index* (0-based).
+
+        The Exclusions tab keys every checkbox by the subject's real channel
+        designation (``G0``, ``G1``, ``R2``, ``R4``...), but the plotting and
+        export code works in positional slots, because the bout/entry stores are
+        keyed ``Ch0``/``Ch1`` with ``G0``/``G1`` kept only as positional aliases.
+        Those call sites used to ask about the literal ``'G0'``/``'G1'``, so on a
+        recording designated ``R4``/``R5`` the lookup could never match and the
+        excluded trace was still drawn.  Resolving the slot per subject here also
+        fixes mixed cohorts, where subject A is ``G0``/``G1`` and subject B is
+        ``R4``/``R5``.
+
+        Subjects whose channels carry no G/R designation resolve to positional
+        ``Ch#`` names; those fall back to ``G0``/``G1``, which is what the tab
+        labels their checkboxes and what this code asked for before.
         """
-        Filter subjects based on exclusion settings.
-        
-        Args:
-            subjects: List of subject IDs to filter
-            channels: List of channel names (e.g., ['G0', 'G1']). If None, no channel-specific filtering
-            use_exclusions: Boolean flag whether to apply exclusions
-        
-        Returns:
-            If channels is None: List of subjects
-            If channels is provided: Dictionary mapping channel -> list of valid subjects for that channel
+        if data is None:
+            data = self.processed_data.get(subject) or {}
+        name = str(self.get_channel_name(data, ch_index))
+        if re.match(r'^[GR]\d+$', name):
+            return name
+        return f'G{ch_index}'
+
+    def channel_slot_index(self, channel, default=0):
+        """Slot index behind a ``Ch{n}`` key (or a plain int); ``default`` if unparseable."""
+        if isinstance(channel, int):
+            return channel
+        m = re.match(r'^Ch(\d+)$', str(channel))
+        return int(m.group(1)) if m else default
+
+    def is_channel_slot_excluded(self, subject, ch_index, data=None):
+        """True when the subject's channel at slot ``ch_index`` is excluded."""
+        return self.is_subject_channel_excluded(
+            subject, self.channel_exclusion_key(subject, ch_index, data))
+
+    def get_included_subjects_for_slot(self, subjects, ch_index):
+        """Filter subjects by exclusion on a channel slot index.
+
+        Unlike :meth:`get_included_subjects_for_channel`, each subject is tested
+        against its own channel designation rather than one shared literal.
         """
-        if not use_exclusions:
-            if channels is None:
-                return subjects
-            else:
-                return {ch: subjects for ch in channels}
-        
-        if channels is None:
-            # Return all subjects that are not completely excluded (have at least one valid channel)
+        return [s for s in subjects if not self.is_channel_slot_excluded(s, ch_index)]
+
+    def included_subjects_for_slot_key(self, subjects, ch_key):
+        """Filter subjects by the slot named by a ``Ch{n}`` bout key.
+
+        ``_viz_bout_channel_slots`` returns ``(key, label)`` pairs whose label is
+        read off the *first* subject that has data.  Filtering on that shared
+        label mis-filtered a mixed cohort; filtering on the key's slot index
+        resolves each subject's own designation.  ``None`` means the slot is
+        unused, so nothing is filtered out.
+        """
+        if ch_key is None:
             return subjects
-        
-        # Return per-channel subject lists
-        filtered = {}
-        for channel in channels:
-            filtered[channel] = self.get_included_subjects_for_channel(subjects, channel)
-        
-        return filtered
-    
+        return self.get_included_subjects_for_slot(subjects, self.channel_slot_index(ch_key))
+
+    BEHAVIOR_EXCLUSION_KEY = 'Behavior'
+
+    def is_behavior_excluded(self, subject, use_exclusions=None):
+        """True when *subject*'s behavioral data is excluded.
+
+        Behavioral metrics are not per-photometry-channel, so the Exclusions tab
+        gives them one pseudo-channel checkbox.  This is the single definition
+        of "excluded" for the Behavioral Data tab: the table, the plots and the
+        CSV each used to apply a different one, so they could disagree about n.
+        In particular the export dropped any subject with *any* non-empty
+        exclusion list, so ticking an unrelated photometry channel silently
+        deleted that animal's behavioral row.
+        """
+        if use_exclusions is None:
+            var = getattr(self, 'use_exclusions_behavioral', None)
+            use_exclusions = bool(var.get()) if var is not None else False
+        if not use_exclusions:
+            return False
+        return self.is_subject_channel_excluded(subject, self.BEHAVIOR_EXCLUSION_KEY)
+
+    def included_behavioral_results(self, results=None, use_exclusions=None):
+        """`behavioral_results` rows whose subject is not excluded.
+
+        Applied at every read site rather than only when the metrics are
+        computed, because the toggle can be flipped after a calculation and the
+        stored rows would otherwise keep the old answer.
+        """
+        if results is None:
+            results = getattr(self, 'behavioral_results', None) or []
+        if not self.exclusions:
+            return list(results)
+        return [r for r in results
+                if not self.is_behavior_excluded(r.get('Subject'), use_exclusions)]
+
     # ======================== End Exclusions Management ========================
     
     def update_bin_entry_state(self):
@@ -23834,6 +24392,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if isinstance(parent, tk.Canvas):
                 try:
                     if parent.cget('scrollregion'):
+                        # Re-fit the content to the viewport first: the window
+                        # item's height is pinned, so the new plot's requested
+                        # size raised no <Configure> and make_scrollable has not
+                        # seen it yet. Measuring before this ran gave the *old*
+                        # plot's extent.
+                        resync = getattr(parent, '_resync_content', None)
+                        if callable(resync):
+                            resync()
                         bbox = parent.bbox('all')
                         if bbox:
                             parent.configure(scrollregion=bbox)
@@ -26609,7 +27175,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if self.resolve_channel_wavelength(data, ch) != int(wavelength):
                         continue
                     # Skip excluded channels
-                    if apply_excl and self.is_subject_channel_excluded(subject, ch_name):
+                    if apply_excl and self.is_channel_slot_excluded(subject, ch, data):
                         continue
 
                     signal = zscore[:, 2 + ch]
@@ -26826,9 +27392,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
             # ── Position Heatmap: export averaged 2D matrix (Prism-friendly) ──────────
             if "Position Heatmap" in plot_type:
+                # The selector names a positional slot; photometry z-scores start at
+                # column 6.  A hardcoded four-entry map used to send Ch4+ back to
+                # Ch0's column and to a fabricated 'G0' exclusion key.
                 channel_str = self.channel_var.get()
-                channel_col_map = {'Ch0': (6, 'G0'), 'Ch1': (7, 'G1'), 'Ch2': (8, 'G2'), 'Ch3': (9, 'R0')}
-                col_idx, channel_name = channel_col_map.get(channel_str, (6, 'G0'))
+                ch_index = self.channel_slot_index(channel_str)
+                col_idx = 6 + ch_index
 
                 try:
                     bin_size = float(self.spatial_bin_var.get())
@@ -26861,7 +27430,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         subj_data = self.processed_data.get(subj)
                         if subj_data is None or 'beh_synced' not in subj_data:
                             continue
-                        if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subj, channel_name):
+                        if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subj, ch_index, subj_data):
                             continue
                         beh_synced = subj_data['beh_synced']
                         if beh_synced.shape[1] <= col_idx:
@@ -26948,16 +27517,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if not isinstance(behavior_entry, dict):
                             continue
                         
-                        # Process each channel separately (G0 and G1)
-                        for ch_key in ['G0', 'G1']:
+                        # Process each channel separately (G0 and G1).  The key is
+                        # positional — the store aliases Ch0/Ch1 as G0/G1 — so the
+                        # exclusion lookup goes through the slot index, which
+                        # resolves to this subject's own designation.
+                        for ch_slot, ch_key in enumerate(['G0', 'G1']):
                             # Check if channel should be exported
                             if ch_key == 'G0' and not show_g0:
                                 continue
                             if ch_key == 'G1' and not show_g1:
                                 continue
-                            
+
                             # Check if this channel is excluded for this subject
-                            if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, ch_key):
+                            if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
                                 continue
                             
                             # Get bouts for this channel
@@ -27024,11 +27596,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     category_data = self._aggregate_zones_by_category(zone_data, maze_type_export)
 
                     # Create row data with categories as columns (horizontal format)
-                    for channel in ['G0', 'G1']:
+                    for ch_slot, channel in enumerate(['G0', 'G1']):
                         if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
                             continue
-                        # Skip excluded channels
-                        if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, channel):
+                        # Skip excluded channels (slot resolves to this subject's designation)
+                        if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
                             continue
 
                         row_data = {
@@ -27063,13 +27635,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         
                         dist_data = data[axis_key]
                         
-                        for channel in ['G0', 'G1']:
+                        for ch_slot, channel in enumerate(['G0', 'G1']):
                             if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
                                 continue
-                            # Skip excluded channels
-                            if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, channel):
+                            # Skip excluded channels (slot resolves to this subject's designation)
+                            if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
                                 continue
-                            
+
                             row_data = {
                                 'subject': subject,
                                 'axis': axis_name,
@@ -27098,14 +27670,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         out_dict = {'subject': [subject], 'movement': ['Out']}
                         
                         # Only include G0 if it's selected and not excluded
-                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G0')):
+                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)):
                             out_dict['G0_mean'] = [outback['out'].get('G0_mean', np.nan)]
                             out_dict['G0_sem'] = [outback['out'].get('G0_sem', np.nan)]
                             out_dict['G0_std'] = [outback['out'].get('G0_std', np.nan)]
                             out_dict['G0_n'] = [outback['out'].get('G0_n', 0)]
                         
                         # Only include G1 if it's selected and not excluded
-                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G1')):
+                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)):
                             out_dict['G1_mean'] = [outback['out'].get('G1_mean', np.nan)]
                             out_dict['G1_sem'] = [outback['out'].get('G1_sem', np.nan)]
                             out_dict['G1_std'] = [outback['out'].get('G1_std', np.nan)]
@@ -27123,14 +27695,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         back_dict = {'subject': [subject], 'movement': ['Back']}
                         
                         # Only include G0 if it's selected and not excluded
-                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G0')):
+                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)):
                             back_dict['G0_mean'] = [outback['back'].get('G0_mean', np.nan)]
                             back_dict['G0_sem'] = [outback['back'].get('G0_sem', np.nan)]
                             back_dict['G0_std'] = [outback['back'].get('G0_std', np.nan)]
                             back_dict['G0_n'] = [outback['back'].get('G0_n', 0)]
                         
                         # Only include G1 if it's selected and not excluded
-                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G1')):
+                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)):
                             back_dict['G1_mean'] = [outback['back'].get('G1_mean', np.nan)]
                             back_dict['G1_sem'] = [outback['back'].get('G1_sem', np.nan)]
                             back_dict['G1_std'] = [outback['back'].get('G1_std', np.nan)]
@@ -27162,10 +27734,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     bins = np.arange(0, maze_width + bin_size, bin_size)
                     
                     # Process each channel
-                    for channel, col_idx in [('G0', 6), ('G1', 7)]:
+                    for ch_slot, (channel, col_idx) in enumerate([('G0', 6), ('G1', 7)]):
                         if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
                             continue
-                        if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, channel):
+                        # Slot resolves to this subject's own designation
+                        if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
                             continue
                         if beh_synced.shape[1] <= col_idx:
                             continue
@@ -27240,7 +27813,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # Export each zone's bouts (should be 'open_arm')
                     for zone_name, zone_bouts in bout_type_data.items():
                         # G0 bouts
-                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G0')) and zone_bouts.get('G0'):
+                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)) and zone_bouts.get('G0'):
                             # Realign to current window before export.
                             g0_bouts = self._entry_channel_bouts(zone_bouts, 'G0', max_bouts)
 
@@ -27264,7 +27837,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     subject_bouts[col_name] = bout
                         
                         # G1 bouts
-                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, 'G1')) and zone_bouts.get('G1'):
+                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)) and zone_bouts.get('G1'):
                             g1_bouts = self._entry_channel_bouts(zone_bouts, 'G1', max_bouts)
 
                             if average_within_subject and len(g1_bouts) > 0:
@@ -27319,7 +27892,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if self.resolve_channel_wavelength(data, ch) != int(wavelength):
                             continue
                         ch_name = self.get_channel_name(data, ch)
-                        if self.use_exclusions_viz.get() and self.is_subject_channel_excluded(subject, ch_name):
+                        if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch, data):
                             continue
                         sig_col = 2 + ch * per
                         if sig_col >= dataset.shape[1]:
@@ -27649,15 +28222,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except ValueError:
             bin_size = self.params['spatial_bin_size']
         
-        # Apply exclusions if enabled
-        # Map channel selector to channel name (Ch0->G0, Ch1->G1 or R0, etc)
-        # For heatmaps, we typically use G0 (470nm) which is usually Ch0
-        # This is a simplified mapping - assumes Ch0=G0, Ch1=G1
-        channel_name_map = {'Ch0': 'G0', 'Ch1': 'G1', 'Ch2': 'G2', 'Ch3': 'R0'}
-        channel_name = channel_name_map.get(channel, 'G0')
-        
+        # Apply exclusions if enabled.  The selector names a positional slot
+        # (Ch0, Ch1, ...); resolve it to each subject's own designation rather
+        # than a fabricated map, which invented Ch3 -> 'R0' and silently sent
+        # every slot past Ch3 to 'G0'.
+        ch_index = self.channel_slot_index(channel)
+
         if self.use_exclusions_viz.get():
-            subjects = self.get_included_subjects_for_channel(subjects, channel_name)
+            subjects = self.get_included_subjects_for_slot(subjects, ch_index)
         
         # Check how many subjects have position data
         valid_subjects = []
@@ -27820,18 +28392,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except ValueError:
             vmax = 2
         
-        # Map channel selector to channel name for exclusions
-        channel_name_map = {'Ch0': 'G0', 'Ch1': 'G1', 'Ch2': 'G2', 'Ch3': 'R0'}
-        channel_name = channel_name_map.get(channel, 'G0')
-        
+        # The channel selector names a positional slot (Ch0, Ch1, ...); resolve
+        # it per subject to the designation the Exclusions tab keys by.
+        ch_index = self.channel_slot_index(channel)
+
         # Collect group data
         group_data = {}
         for group_name in group_names:
             subjects = self._series_members(group_name)
-            
+
             # Apply exclusions if enabled
             if self.use_exclusions_viz.get():
-                subjects = self.get_included_subjects_for_channel(subjects, channel_name)
+                subjects = self.get_included_subjects_for_slot(subjects, ch_index)
             
             valid_subjects = []
             all_H_sum = np.zeros((len(bins)-1, len(bins)-1))
@@ -27950,9 +28522,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Apply exclusions if enabled
         if self.use_exclusions_viz.get():
-            if self.is_subject_channel_excluded(subject_name, 'G0'):
+            if self.is_channel_slot_excluded(subject_name, 0, data):
                 show_g0 = False
-            if self.is_subject_channel_excluded(subject_name, 'G1'):
+            if self.is_channel_slot_excluded(subject_name, 1, data):
                 show_g1 = False
         
         # Use .get() — single-channel subjects only have a 'G0' key (no 'G1'),
@@ -28077,9 +28649,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Apply exclusions if enabled
         if self.use_exclusions_viz.get():
-            if self.is_subject_channel_excluded(subject_name, 'G0'):
+            if self.is_channel_slot_excluded(subject_name, 0, data):
                 show_g0 = False
-            if self.is_subject_channel_excluded(subject_name, 'G1'):
+            if self.is_channel_slot_excluded(subject_name, 1, data):
                 show_g1 = False
 
         # A single-channel subject has no G1 — never draw a phantom second bar.
@@ -28303,9 +28875,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Apply exclusions if enabled
         if self.use_exclusions_viz.get():
-            if self.is_subject_channel_excluded(subject_name, 'G0'):
+            if self.is_channel_slot_excluded(subject_name, 0, data):
                 show_g0 = False
-            if self.is_subject_channel_excluded(subject_name, 'G1'):
+            if self.is_channel_slot_excluded(subject_name, 1, data):
                 show_g1 = False
 
         # A single-channel subject has no G1 — don't plot a phantom second trace.
@@ -28380,9 +28952,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         show_g1 = self.show_g1.get()
 
         if self.use_exclusions_viz.get():
-            if self.is_subject_channel_excluded(subject_name, 'G0'):
+            if self.is_channel_slot_excluded(subject_name, 0, data):
                 show_g0 = False
-            if self.is_subject_channel_excluded(subject_name, 'G1'):
+            if self.is_channel_slot_excluded(subject_name, 1, data):
                 show_g1 = False
 
         # A single-channel subject has no G1 — don't plot a phantom second trace.
@@ -28443,8 +29015,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
+            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
+            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
 
         all_eucl_data = {}
         for subject in subjects:
@@ -28521,8 +29093,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if self.use_exclusions_viz.get():
             for group_name in group_names:
                 subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G0')
-                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G1')
+                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 0)
+                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 1)
         else:
             for group_name in group_names:
                 subjects = self._series_members(group_name)
@@ -28622,8 +29194,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
+            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
+            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
         
         # Get display settings
         show_g0 = self.show_g0.get()
@@ -28812,8 +29384,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             subjects_for_g0 = subjects
             subjects_for_g1 = subjects
             if self.use_exclusions_viz.get():
-                subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-                subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
+                subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
+                subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
 
             g0_bouts = []
             g1_bouts = []
@@ -28980,8 +29552,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
+            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
+            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
         
         # Collect category-aggregated data for each subject
         subject_category_data = {}
@@ -29106,8 +29678,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if self.use_exclusions_viz.get():
             for group_name in group_names:
                 subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G0')
-                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G1')
+                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 0)
+                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 1)
         else:
             for group_name in group_names:
                 subjects = self._series_members(group_name)
@@ -29324,8 +29896,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, 'G0')
-            subjects_for_g1 = self.get_included_subjects_for_channel(subjects, 'G1')
+            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
+            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
 
         # Collect all distance data
         all_x_data = {}
@@ -29499,8 +30071,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if self.use_exclusions_viz.get():
             for group_name in group_names:
                 subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G0')
-                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_channel(subjects, 'G1')
+                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 0)
+                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 1)
         else:
             for group_name in group_names:
                 subjects = self._series_members(group_name)
@@ -29747,27 +30319,35 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         back_g0_values = []
         back_g1_values = []
         
+        apply_excl = self.use_exclusions_viz.get()
+
         for subject in subjects:
             data = self.processed_data[subject]
             if 'outback' not in data or not data['outback']:
                 continue
-            
+
+            # Honour exclusions per channel slot.  This aggregate view used to
+            # apply none at all while export_plot_data filtered the same Out/Back
+            # store, so the graph and the CSV reported different n.
+            keep_g0 = not (apply_excl and self.is_channel_slot_excluded(subject, 0, data))
+            keep_g1 = not (apply_excl and self.is_channel_slot_excluded(subject, 1, data))
+
             outback_data = data['outback']
-            
+
             # Out data
             if 'out' in outback_data and outback_data['out'].get('G0_n', 0) > 0:
-                if 'G0_mean' in outback_data['out'] and not np.isnan(outback_data['out']['G0_mean']):
+                if keep_g0 and 'G0_mean' in outback_data['out'] and not np.isnan(outback_data['out']['G0_mean']):
                     out_g0_values.append(outback_data['out']['G0_mean'])
-                if 'G1_mean' in outback_data['out'] and not np.isnan(outback_data['out']['G1_mean']):
+                if keep_g1 and 'G1_mean' in outback_data['out'] and not np.isnan(outback_data['out']['G1_mean']):
                     out_g1_values.append(outback_data['out']['G1_mean'])
-            
+
             # Back data
             if 'back' in outback_data and outback_data['back'].get('G0_n', 0) > 0:
-                if 'G0_mean' in outback_data['back'] and not np.isnan(outback_data['back']['G0_mean']):
+                if keep_g0 and 'G0_mean' in outback_data['back'] and not np.isnan(outback_data['back']['G0_mean']):
                     back_g0_values.append(outback_data['back']['G0_mean'])
-                if 'G1_mean' in outback_data['back'] and not np.isnan(outback_data['back']['G1_mean']):
+                if keep_g1 and 'G1_mean' in outback_data['back'] and not np.isnan(outback_data['back']['G1_mean']):
                     back_g1_values.append(outback_data['back']['G1_mean'])
-        
+
         if not (out_g0_values or back_g0_values):
             fig.text(0.5, 0.5, 'No Out/Back movement data available for selected subjects',
                     ha='center', va='center', fontsize=14)
@@ -29849,6 +30429,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 [s for g in group_names for s in self._series_members(g)]):
             show_g1 = False
 
+        apply_excl = self.use_exclusions_viz.get()
+
         # Collect data for each group
         group_data = {}
         for group_name in group_names:
@@ -29857,27 +30439,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             out_g1 = []
             back_g0 = []
             back_g1 = []
-            
+
             for subject in subjects:
                 if subject not in self.processed_data:
                     continue
                 data = self.processed_data[subject]
                 if 'outback' not in data or not data['outback']:
                     continue
-                
+
+                # Honour exclusions per channel slot, matching export_plot_data
+                # (this comparison used to apply none, so the per-group n on the
+                # graph disagreed with the CSV).
+                keep_g0 = not (apply_excl and self.is_channel_slot_excluded(subject, 0, data))
+                keep_g1 = not (apply_excl and self.is_channel_slot_excluded(subject, 1, data))
+
                 outback = data['outback']
                 if 'out' in outback and outback['out'].get('G0_n', 0) > 0:
-                    if not np.isnan(outback['out'].get('G0_mean', np.nan)):
+                    if keep_g0 and not np.isnan(outback['out'].get('G0_mean', np.nan)):
                         out_g0.append(outback['out']['G0_mean'])
-                    if not np.isnan(outback['out'].get('G1_mean', np.nan)):
+                    if keep_g1 and not np.isnan(outback['out'].get('G1_mean', np.nan)):
                         out_g1.append(outback['out']['G1_mean'])
-                
+
                 if 'back' in outback and outback['back'].get('G0_n', 0) > 0:
-                    if not np.isnan(outback['back'].get('G0_mean', np.nan)):
+                    if keep_g0 and not np.isnan(outback['back'].get('G0_mean', np.nan)):
                         back_g0.append(outback['back']['G0_mean'])
-                    if not np.isnan(outback['back'].get('G1_mean', np.nan)):
+                    if keep_g1 and not np.isnan(outback['back'].get('G1_mean', np.nan)):
                         back_g1.append(outback['back']['G1_mean'])
-            
+
             group_data[group_name] = {
                 'out_g0': out_g0, 'out_g1': out_g1,
                 'back_g0': back_g0, 'back_g1': back_g1
@@ -30046,9 +30634,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             subjects_for_g0 = subjects
             subjects_for_g1 = subjects
             if self.use_exclusions_viz.get():
-                subjects_for_g0 = self.get_included_subjects_for_channel(subjects, label_a)
-                subjects_for_g1 = (self.get_included_subjects_for_channel(subjects, label_b)
-                                   if key_b is not None else subjects)
+                subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
+                subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
             
             # We'll process all subjects and track which channels are valid
             for subject in subjects:
@@ -30321,9 +30908,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, label_a)
-            subjects_for_g1 = (self.get_included_subjects_for_channel(subjects, label_b)
-                               if key_b is not None else subjects)
+            subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
+            subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
 
         # Collect bouts from all subjects
         all_g0_bouts = []
@@ -30552,9 +31138,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         show_g1 = key_b is not None
         if self.use_exclusions_viz.get():
             if show_g0:
-                show_g0 = subject in self.get_included_subjects_for_channel([subject], label_a)
+                show_g0 = not self.is_channel_slot_excluded(subject, self.channel_slot_index(key_a))
             if show_g1:
-                show_g1 = subject in self.get_included_subjects_for_channel([subject], label_b)
+                show_g1 = not self.is_channel_slot_excluded(subject, self.channel_slot_index(key_b))
 
         # Realign to current window so the onset marker matches the traces even
         # if pre/post changed since extraction.
@@ -30704,9 +31290,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = subjects
         subjects_for_g1 = subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(subjects, label_a)
-            subjects_for_g1 = (self.get_included_subjects_for_channel(subjects, label_b)
-                               if key_b is not None else subjects)
+            subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
+            subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
 
         # Collect bouts from all subjects organized by bout number
         g0_bouts_by_number = {}  # {bout_num: [traces]}
@@ -30893,9 +31478,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subjects_for_g0 = all_subjects
         subjects_for_g1 = all_subjects
         if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_channel(all_subjects, label_a)
-            subjects_for_g1 = (self.get_included_subjects_for_channel(all_subjects, label_b)
-                               if key_b is not None else all_subjects)
+            subjects_for_g0 = self.included_subjects_for_slot_key(all_subjects, key_a)
+            subjects_for_g1 = self.included_subjects_for_slot_key(all_subjects, key_b)
         
         # Collect bouts organized by group and bout number: {group: {bout_num: [traces]}}
         g0_data_by_group = {group: {} for group in selected_groups}
@@ -31784,13 +32368,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 np.array(fac_list, dtype=object), L)
 
     def _collect_flmm_across_channels(self, subjects, behavior, channels,
-                                      max_bouts=_MAX_BOUTS_UNSET):
+                                      max_bouts=_MAX_BOUTS_UNSET,
+                                      use_exclusions=False):
         """Collect ONE behavior's bouts across several channels, tagging each bout
         with its channel (the factor). Used by the same-behavior-across-channels
         pairwise mode. Returns (Z, subjects, channel_factor, L) or None.
 
         ``max_bouts`` defaults to reading the Tk entry; a worker thread must pass
-        the already-resolved limit instead (Tk vars are not thread-safe)."""
+        the already-resolved limit instead (Tk vars are not thread-safe).
+
+        ``use_exclusions`` is applied per (subject, channel) pair rather than by
+        pre-filtering the subject list: the channel *is* the factor here, so
+        dropping a subject outright would remove it from every level."""
         if max_bouts is _MAX_BOUTS_UNSET:
             max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         traces, subj_list, chan_list = [], [], []
@@ -31800,6 +32389,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 continue
             entry = data['bouts'][behavior]
             for channel in channels:
+                if use_exclusions and self.is_subject_channel_excluded(subject, channel):
+                    continue
                 bouts_data = entry.get(channel, [])
                 if not bouts_data:
                     alt = 'G0' if channel == 'Ch0' else 'G1' if channel == 'Ch1' else None
@@ -33158,7 +33749,8 @@ cat("OK\n")
             # Every behavior vs every other, FDR-corrected (Python FUI, no R).
             self._run_flmm_pairwise(selected_subjects, sel_channels[0],
                                     available_behaviors,
-                                    default_channels=sel_channels)
+                                    default_channels=sel_channels,
+                                    use_exclusions=use_exclusions)
             return
 
         comp_behaviors = comp_label = ref_b = None
@@ -33860,11 +34452,17 @@ cat("OK\n")
         return result['value']
 
     def _run_flmm_pairwise(self, subjects_sel, default_channel, all_behaviors,
-                           default_channels=None):
+                           default_channels=None, use_exclusions=False):
         """Entry point for pairwise behavior comparison. Opens the behavior/channel/
         mode popup, then runs the (potentially long) computation in a background
         thread behind a detailed progress window so the GUI stays responsive.
-        Python FUI engine (no R needed)."""
+        Python FUI engine (no R needed).
+
+        ``use_exclusions`` is threaded through from plot_timecourse_flmm the same
+        way the factor and single-coefficient branches do it -- this branch used
+        to drop it on the floor, so the Apply-exclusions toggle silently did
+        nothing on the pairwise panels while it worked on every other FLMM view.
+        """
         channels = self._all_channel_names()
         choice = self._flmm_pairwise_dialog(
             all_behaviors, channels, all_behaviors, default_channel,
@@ -33882,10 +34480,12 @@ cat("OK\n")
         def worker(q):
             if mode == 'within':
                 store, warn = self._compute_pairwise_within(
-                    subjects_sel, behaviors, sel_channels, max_bouts, q)
+                    subjects_sel, behaviors, sel_channels, max_bouts, q,
+                    use_exclusions=use_exclusions)
             else:
                 store, warn = self._compute_pairwise_across_channels(
-                    subjects_sel, behaviors, sel_channels, max_bouts, q)
+                    subjects_sel, behaviors, sel_channels, max_bouts, q,
+                    use_exclusions=use_exclusions)
             holder['store'], holder['warn'] = store, warn
 
         def on_done():
@@ -33919,7 +34519,7 @@ cat("OK\n")
         return _p
 
     def _compute_pairwise_within(self, subjects_sel, behaviors, channels,
-                                 max_bouts, q):
+                                 max_bouts, q, use_exclusions=False):
         """Worker: within-channel behavior × behavior matrix, one per channel.
         Returns (store, warn); runs off the main thread, reporting via ``q``."""
         logq = lambda m: q.put(('log', m))
@@ -33932,8 +34532,12 @@ cat("OK\n")
             q.put(('status', f"Channel {channel}  ({ci + 1}/{C})"))
             q.put(('detail', "collecting bouts…"))
             q.put(('progress', base))
+            # Per channel, as _compute_flmm_timecourse_panel does: a subject
+            # excluded on G1 still belongs in the G0 panel.
+            subjects_ch = (self.get_included_subjects_for_channel(subjects_sel, channel)
+                           if use_exclusions else subjects_sel)
             collected = self._collect_flmm_factor(
-                subjects_sel, behaviors, channel, max_bouts=max_bouts)
+                subjects_ch, behaviors, channel, max_bouts=max_bouts)
             if collected is None:
                 continue
             Z, subjects, factor, L = collected
@@ -33983,7 +34587,7 @@ cat("OK\n")
         return store, None
 
     def _compute_pairwise_across_channels(self, subjects_sel, behaviors, channels,
-                                          max_bouts, q):
+                                          max_bouts, q, use_exclusions=False):
         """Worker: same-behavior-across-channels. For each behavior fit
         Y~channel+(1|subj) and test every channel pair with the sup-t functional
         Wald test; FDR is applied jointly across the whole (behavior × channel-pair)
@@ -34002,7 +34606,8 @@ cat("OK\n")
             q.put(('detail', "collecting bouts…"))
             q.put(('progress', base))
             collected = self._collect_flmm_across_channels(
-                subjects_sel, beh, channels, max_bouts=max_bouts)
+                subjects_sel, beh, channels, max_bouts=max_bouts,
+                use_exclusions=use_exclusions)
             if collected is None:
                 continue
             Z, subjects, factor, L = collected
@@ -35142,27 +35747,6 @@ cat("OK\n")
 
     # ======================== Bout Analysis Methods ========================
     
-    def _apply_exclusions(self, subjects, channel):
-        """Filter subjects based on exclusions for a specific channel
-        
-        Args:
-            subjects: List of subject IDs
-            channel: Channel identifier (e.g., 'G0', 'G1')
-            
-        Returns:
-            list: Filtered list of subjects excluding those marked for this channel
-        """
-        if not self.exclusions:
-            return subjects
-        
-        filtered_subjects = []
-        for subject in subjects:
-            excluded_channels = self.exclusions.get(subject, [])
-            if channel not in excluded_channels:
-                filtered_subjects.append(subject)
-        
-        return filtered_subjects
-    
     def _create_export_metadata(self, export_type='bout'):
         """Create metadata dictionary for export documentation
         
@@ -36249,8 +36833,13 @@ cat("OK\n")
             if use_channel is not None:
                 channels = [use_channel]
             else:
+                # Pooled across subjects: honour exclusions per channel slot so the
+                # pooled n agrees with the other multi views.  The single-subject
+                # caller names its channel explicitly and stays unfiltered by design.
+                apply_excl = self.use_exclusions_viz.get()
                 channels = [self.get_channel_name(data, i)
-                            for i in self.get_selected_viz_channels(data)]
+                            for i in self.get_selected_viz_channels(data)
+                            if not (apply_excl and self.is_channel_slot_excluded(subject, i, data))]
             for ch in channels:
                 bouts, status = self._iter_length_binned_bouts(data, behavior, ch, max_bouts)
                 if status == 'no_end':
@@ -38305,6 +38894,9 @@ cat("OK\n")
         average_ws       = self.bout_average_within_subject.get()
         apply_exclusions = self.use_exclusions_bout.get()
         max_bouts        = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        # Bout stores alias slots 0/1 as 'G0'/'G1', so these keys read the right
+        # traces on any cohort — but the exclusion lookup must go through the slot
+        # index, which resolves to each subject's own designation.
         channels         = ['G0', 'G1']
 
         # ── Compute every combo up front (so we never write an empty file) ─
@@ -38326,10 +38918,10 @@ cat("OK\n")
         combo_summary = []   # (behavior, channel, n_rows, n_bouts)
 
         for behavior in behaviors:
-            for channel in channels:
+            for ch_slot, channel in enumerate(channels):
                 subs = base_subjects
                 if apply_exclusions:
-                    subs = self.get_included_subjects_for_channel(base_subjects, channel)
+                    subs = self.get_included_subjects_for_slot(base_subjects, ch_slot)
                 if not subs:
                     continue
 
@@ -39584,8 +40176,8 @@ cat("OK\n")
                 "the Input Setup tab), then return here.")
             return
 
-        selected = self.conn_listbox.curselection()
-        if not selected:
+        selected_items, group_mode = self._conn_selection()
+        if not selected_items:
             self.update_conn_listbox()
             messagebox.showwarning(
                 "No Selection",
@@ -39593,7 +40185,6 @@ cat("OK\n")
                 "If the list is empty, make sure data has been processed first.")
             return
 
-        selected_items = [self.conn_listbox.get(i) for i in selected]
         ch1 = self.conn_channel1_var.get()
         ch2 = self.conn_channel2_var.get()
 
@@ -39601,10 +40192,24 @@ cat("OK\n")
             messagebox.showwarning("Invalid", "Please select two different channels")
             return
 
-        missing_ch2 = [subj for subj in selected_items
-                       if subj in self.processed_data
-                       and self._get_channel_signal(self.processed_data[subj], ch2) is None]
-        if len(missing_ch2) == len([s for s in selected_items if s in self.processed_data]):
+        # Resolved here, on the main thread: a facet-derived series name is not
+        # a key in self.groups, so the worker cannot look it up itself.
+        group_members = ({g: self._series_members(g) for g in selected_items}
+                         if group_mode else None)
+
+        # The channel check has to run over subjects. It used to run over
+        # selected_items, so in Group mode it compared a group name against
+        # processed_data, both counts came out 0, and every group-mode run
+        # aborted with "Channel Not Available" before reaching the worker.
+        check_subjects = (
+            [s for members in group_members.values() for s in members]
+            if group_mode else list(selected_items))
+        present = [s for s in check_subjects if s in self.processed_data]
+        missing_ch2 = [subj for subj in present
+                       if self._get_channel_signal(self.processed_data[subj], ch2) is None]
+        # "and present": with nothing to check the counts are equal at zero,
+        # which is the false positive this guard used to fire on.
+        if present and len(missing_ch2) == len(present):
             messagebox.showwarning(
                 "Channel Not Available",
                 f"Channel '{ch2}' was not found in any selected subject.\n\n"
@@ -39627,10 +40232,8 @@ cat("OK\n")
         self.log_message(f"Starting connectivity analysis ({analysis_mode} mode)…")
 
         # Count subjects so the status label is informative
-        if analysis_mode == 'Subject':
-            total = len(selected_items)
-        else:
-            total = sum(len(self._series_members(g)) for g in selected_items)
+        total = (sum(len(m) for m in group_members.values()) if group_mode
+                 else len(selected_items))
 
         # ── Heavy computation runs in a background thread ────────────────
         def _worker(q):
@@ -39640,14 +40243,14 @@ cat("OK\n")
             def _status(msg):
                 q.put(('status', msg))
 
-            if analysis_mode == 'Subject':
+            if not group_mode:
                 self._run_subject_connectivity(
                     selected_items, ch1, ch2, analysis_types, params,
                     progress_q=q, total=total)
             else:
                 self._run_group_connectivity(
                     selected_items, ch1, ch2, analysis_types, params,
-                    progress_q=q, total=total)
+                    progress_q=q, total=total, members=group_members)
 
         def _on_done():
             n_done = len(self.connectivity_results)
@@ -39772,8 +40375,13 @@ cat("OK\n")
             done += 1
 
     def _run_group_connectivity(self, groups, ch1, ch2, analysis_types, params,
-                                progress_q=None, total=None):
-        """Run connectivity analysis per group, storing full spectral traces for comparison plots"""
+                                progress_q=None, total=None, members=None):
+        """Run connectivity analysis per group, storing full spectral traces for comparison plots
+
+        ``members`` maps each series name to its subjects, resolved by the
+        caller on the main thread.  Without it the names are treated as plain
+        group names, which is only correct when no facet is active.
+        """
         def _emit(kind, msg):
             if progress_q is not None:
                 progress_q.put((kind, msg))
@@ -39783,10 +40391,12 @@ cat("OK\n")
         use_excl = self.use_exclusions_conn.get()
         subj_done = 0
         for group_name in groups:
-            if group_name not in self.groups:
+            if members is not None:
+                group_subjects = members.get(group_name, [])
+            else:
+                group_subjects = self._series_members(group_name)
+            if not group_subjects:
                 continue
-
-            group_subjects = self.groups[group_name]
             group_results = {
                 'group': group_name,
                 'ch1': ch1, 'ch2': ch2,
@@ -41407,7 +42017,9 @@ cat("OK\n")
 
         # State vars
         self.sig_link_channel_var = tk.StringVar(value="G0")
-        self.sig_link_by_var = tk.StringVar(value="Subject")
+        # sig_link_by_var (a Subject/Group mode toggle) lived here unread: the
+        # tab had no grouping to toggle. The facet column supplies it now, so
+        # the variable is gone rather than left as a second, dead way to say it.
         self.sig_link_sg_win_var = tk.StringVar(value="11")
         self.sig_link_sg_poly_var = tk.StringVar(value="3")
         self.sig_link_search_var = tk.StringVar(value="1.0")
@@ -41462,6 +42074,14 @@ cat("OK\n")
                    command=lambda: self.sig_link_subject_listbox.selection_clear(
                        0, 'end')).pack(side='left', padx=(self.ui_px(4), 0))
 
+        # default_split=False: this tab pooled every selected subject into one
+        # analysis and had no grouping at all, so an untouched column has to
+        # keep doing that. Split a factor and the whole analysis -- table, plot
+        # and readout -- is computed once per series instead.
+        self._make_facet_controls(selection, 'signal_linkage',
+                                  default_split=False).pack(
+            fill='x', pady=(self.ui_px(6), 0))
+
         ttk.Label(selection, text="Behavior(s):").pack(
             anchor='w', pady=(self.ui_px(6), 0))
         _bf = ttk.Frame(selection)
@@ -41500,6 +42120,10 @@ cat("OK\n")
         _mk_row(settings, "Response (s)", self.sig_link_resp_var, hint="post-onset")
         _mk_row(settings, "Reliability ± (s)", self.sig_link_relia_var)
         _mk_row(settings, "Permutations", self.sig_link_nperm_var, hint="null model")
+
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_siglink).pack(
+            anchor='w', pady=(self.ui_px(6), 0))
 
         # ── Actions ──────────────────────────────────────────────────────
         ttk.Button(actions, text="▶  Run Linkage Analysis",
@@ -41575,6 +42199,31 @@ cat("OK\n")
         for i, b in enumerate(behs):
             if not prev_b or b in prev_b:
                 self.sig_link_behavior_listbox.selection_set(i)
+        # Factor levels move independently of the subject list.
+        control = getattr(self, 'facet_controls', {}).get('signal_linkage')
+        if control is not None:
+            control.rebuild()
+
+    def _sig_link_series(self, subjects):
+        """``[(series_label, [subject, ...])]`` for the Signal Linkage pool.
+
+        Unlike the other tabs this does *not* fall back to splitting the series
+        factor when the column reports nothing: with no factors defined at all
+        the tab must still run the single pooled analysis it always ran, and
+        the historical fallback would relabel that lone series '(unassigned)'.
+        An all-combined column yields exactly one series called 'All'.
+        """
+        control = getattr(self, 'facet_controls', {}).get('signal_linkage')
+        selections = control.selections() if control is not None else {}
+        pool, seen = [], set()
+        for sid in subjects:
+            sid = str(sid)
+            if sid not in seen:
+                seen.add(sid)
+                pool.append(sid)
+        series = self.facet_series(pool, selections)
+        self._active_facet = {label: members for label, members in series}
+        return series
 
     def _sig_channel_index(self, data, ch_name):
         """Map a channel designation (e.g. 'G0') to its integer index for this
@@ -41603,8 +42252,33 @@ cat("OK\n")
         if not subs:
             messagebox.showwarning("Signal Linkage", "Select at least one subject.")
             return
+        if self.use_exclusions_siglink.get():
+            # One named photometry channel drives the whole analysis, so the
+            # exclusion is a straight per-channel filter on the subject list.
+            kept = self.get_included_subjects_for_channel(subs, channel)
+            n_dropped = len(subs) - len(kept)
+            if not kept:
+                messagebox.showwarning(
+                    "Signal Linkage",
+                    f"Every selected subject is excluded on channel {channel}.")
+                return
+            if n_dropped:
+                self.log_message(
+                    f"Signal Linkage: excluded {n_dropped} subject(s) on {channel}")
+            subs = kept
         if not behs:
             messagebox.showwarning("Signal Linkage", "Select at least one behavior.")
+            return
+
+        # Exclusions are applied above, so the pool that reaches the facet is
+        # already the analysable one and no series can be built from subjects
+        # this channel excludes.
+        series = self._sig_link_series(subs)
+        series = [(label, members) for label, members in series if members]
+        if not series:
+            messagebox.showwarning(
+                "Signal Linkage",
+                "The facet column leaves no subject in any series.")
             return
 
         def _f(var, default, lo=None, hi=None, integer=False):
@@ -41633,14 +42307,60 @@ cat("OK\n")
         self.sig_link_status_var.set("Running…")
 
         def _worker(q):
-            self._sig_linkage_results = self._compute_signal_linkage(
-                q, subs, channel, behs, cfg)
+            self._sig_linkage_results = self._compute_signal_linkage_series(
+                q, series, channel, behs, cfg)
 
         self._run_with_progress(
             "Signal Linkage Analysis", _worker,
             on_done_fn=self._render_signal_linkage_results,
             cancelable=False,
             subtitle="Peri-onset dF/dt + permutation locking test")
+
+    def _compute_signal_linkage_series(self, q, series, channel, behaviors, cfg):
+        """Run the whole peri-onset analysis once per series.
+
+        Each series is an independent analysis over its own subjects -- the
+        permutation null included -- because pooling and then splitting only at
+        display time would compare each series against the other's baseline.
+
+        ``order`` is global so every series' table and every panel of the figure
+        lists behaviors in the same order; it ranks by the mean Linkage Index
+        across the series that produced one.
+        """
+        panels, all_subjects, seen = [], [], set()
+        for i, (label, members) in enumerate(series):
+            q.put(('status', f"Series '{label}'  ({i + 1}/{len(series)})"))
+            one = self._compute_signal_linkage(q, list(members), channel,
+                                               behaviors, cfg)
+            panels.append((label, {
+                'results': one['results'],
+                'order': one['order'],
+                'subjects': one['subjects'],
+                'skipped': one['skipped'],
+            }))
+            for s in one['subjects']:
+                if s not in seen:
+                    seen.add(s)
+                    all_subjects.append(s)
+
+        scores = {}
+        for _label, panel in panels:
+            for beh, m in panel['results'].items():
+                scores.setdefault(beh, []).append(m['linkage_index'])
+        order = sorted(scores, key=lambda b: float(np.mean(scores[b])),
+                       reverse=True)
+        # Skipped only counts when *no* series could measure it; otherwise the
+        # behavior is reported, just with a gap in one series.
+        skipped = [b for b in dict.fromkeys(
+            b for _l, p in panels for b in p['skipped']) if b not in scores]
+
+        prebout = int(self.params.get('preboutframes', 150))
+        postbout = int(self.params.get('postboutframes', 150))
+        return {
+            'series': panels, 'order': order, 'cfg': cfg, 'channel': channel,
+            'subjects': all_subjects, 'prebout': prebout,
+            'total': prebout + postbout, 'skipped': skipped,
+        }
 
     def _fill_nan_1d(self, a):
         """Linear-interpolate NaNs in a 1D array (for edge-padded mean traces).
@@ -41873,7 +42593,7 @@ cat("OK\n")
         for w in self.sig_link_plot_frame.winfo_children():
             w.destroy()
 
-        if not res or not res['results']:
+        if not res or not res.get('order'):
             ttk.Label(self.sig_link_readout_frame,
                       text="No bouts found for the selected behaviors/subjects.",
                       foreground='#a00').pack(anchor='w')
@@ -41893,18 +42613,37 @@ cat("OK\n")
                       text=f"Could not render figure: {e}",
                       foreground='#a00').pack(anchor='w')
 
+    @staticmethod
+    def _sig_link_panels(res):
+        """``[(series_label, panel)]`` -- the one shape every renderer reads."""
+        return list(res.get('series') or [])
+
+    @staticmethod
+    def _sig_link_is_split(res):
+        """True when the facet column produced more than one series.
+
+        The single-series case is the tab's whole history, so it keeps the
+        layout it had: no Series column, no legend, verdict-coloured bars.
+        """
+        return len(res.get('series') or []) > 1
+
     def _sig_link_build_readout(self, res):
         """Plain-language summary of the most/least linked behaviors."""
-        results, order, cfg = res['results'], res['order'], res['cfg']
+        panels, order, cfg = self._sig_link_panels(res), res['order'], res['cfg']
+        split = self._sig_link_is_split(res)
         n_sub = len(res['subjects'])
-        total_bouts = sum(results[b]['n'] for b in order)
+        total_bouts = sum(m['n'] for _l, p in panels for m in p['results'].values())
         header = (f"Channel {res['channel']}  ·  {n_sub} subject(s)  ·  "
                   f"{len(order)} behavior(s)  ·  {total_bouts} bouts  ·  "
                   f"{cfg['n_perm']} permutations")
+        if split:
+            header += f"  ·  {len(panels)} series"
         ttk.Label(self.sig_link_readout_frame, text=header,
                   font=('Segoe UI', 9, 'bold')).pack(anchor='w')
 
-        txt = tk.Text(self.sig_link_readout_frame, height=8, wrap='word',
+        txt = tk.Text(self.sig_link_readout_frame,
+                      height=8 if not split else min(20, 3 + 5 * len(panels)),
+                      wrap='word',
                       relief='flat', font=('Segoe UI', 9),
                       background=self.sig_link_readout_frame.winfo_toplevel(
                       ).cget('background'))
@@ -41912,6 +42651,8 @@ cat("OK\n")
         for tag, color in self.SIG_LINK_COLORS.items():
             txt.tag_configure(tag, foreground=color, font=('Segoe UI', 9, 'bold'))
         txt.tag_configure('metric', foreground='#555')
+        txt.tag_configure('series', foreground='#111',
+                          font=('Segoe UI', 9, 'bold'))
 
         def _line(m):
             lat = m['peak_lat']
@@ -41926,85 +42667,106 @@ cat("OK\n")
                        f"at {lat:+.2f}s — {lead}; r={m['reliability']:.2f}, "
                        f"{pstr})\n", 'metric')
 
-        tight = [results[b] for b in order
-                 if results[b]['verdict'] == 'Tightly linked']
-        popv = [results[b] for b in order
-                if results[b]['verdict'] == 'Population-linked (variable)']
-        none = [results[b] for b in order
-                if results[b]['verdict'] == 'Not linked']
-
-        if tight:
-            txt.insert('end', "Tightly linked "
-                              "(significant & consistent across bouts):\n",
-                       'Tightly linked')
-            for m in tight:
-                _line(m)
-        if popv:
-            txt.insert('end', "Population-linked but variable "
-                              "(significant mean transient, low bout-to-bout "
-                              "consistency):\n", 'Population-linked (variable)')
-            for m in popv:
-                _line(m)
-        if none:
-            names = ", ".join(m['behavior'] for m in none)
-            txt.insert('end', "Not linked: ", 'Not linked')
-            txt.insert('end', f"{names}\n", 'metric')
-        if res.get('skipped'):
-            txt.insert('end',
-                       f"Skipped (no bouts): {', '.join(res['skipped'])}\n",
-                       'metric')
+        for label, panel in panels:
+            results = panel['results']
+            if split:
+                txt.insert('end', f"{label}  ({len(panel['subjects'])} subject(s))\n",
+                           'series')
+            present = [b for b in order if b in results]
+            for verdict, heading in (
+                    ('Tightly linked',
+                     "Tightly linked (significant & consistent across bouts):\n"),
+                    ('Population-linked (variable)',
+                     "Population-linked but variable (significant mean "
+                     "transient, low bout-to-bout consistency):\n")):
+                rows = [results[b] for b in present
+                        if results[b]['verdict'] == verdict]
+                if rows:
+                    txt.insert('end', heading, verdict)
+                    for m in rows:
+                        _line(m)
+            none = [results[b] for b in present
+                    if results[b]['verdict'] == 'Not linked']
+            if none:
+                txt.insert('end', "Not linked: ", 'Not linked')
+                txt.insert('end',
+                           f"{', '.join(m['behavior'] for m in none)}\n", 'metric')
+            if panel['skipped']:
+                txt.insert('end',
+                           f"Skipped (no bouts): {', '.join(panel['skipped'])}\n",
+                           'metric')
         txt.configure(state='disabled')
 
     def _sig_link_build_table(self, res):
-        results, order = res['results'], res['order']
-        cols = ('Behavior', 'n', 'Linkage', 'Verdict', 'Δ z',
-                'dF/dt z/s', 'Latency s', 'Reliab. r', 'Lock Z', 'p')
+        panels, order = self._sig_link_panels(res), res['order']
+        split = self._sig_link_is_split(res)
+        # The Series column only appears when there is a split to report, so a
+        # single-series run reads exactly as it did before the column existed.
+        cols = (('Series',) if split else ()) + (
+            'Behavior', 'n', 'Linkage', 'Verdict', 'Δ z',
+            'dF/dt z/s', 'Latency s', 'Reliab. r', 'Lock Z', 'p')
+        n_rows = sum(len(p['results']) for _l, p in panels)
         wrap = ttk.Frame(self.sig_link_table_frame)
         wrap.pack(fill='x')
         tree = ttk.Treeview(wrap, columns=cols, show='headings',
-                            height=min(12, max(3, len(order))))
-        widths = {'Behavior': 110, 'n': 45, 'Linkage': 65, 'Verdict': 170,
-                  'Δ z': 60, 'dF/dt z/s': 70, 'Latency s': 70,
+                            height=min(14, max(3, n_rows)))
+        widths = {'Series': 130, 'Behavior': 110, 'n': 45, 'Linkage': 65,
+                  'Verdict': 170, 'Δ z': 60, 'dF/dt z/s': 70, 'Latency s': 70,
                   'Reliab. r': 70, 'Lock Z': 60, 'p': 70}
         for c in cols:
             tree.heading(c, text=c)
             tree.column(c, width=widths.get(c, 70),
-                        anchor='center' if c not in ('Behavior', 'Verdict')
-                        else 'w', stretch=False)
+                        anchor='center'
+                        if c not in ('Series', 'Behavior', 'Verdict') else 'w',
+                        stretch=False)
         for tag, color in self.SIG_LINK_COLORS.items():
             tree.tag_configure(tag.replace(' ', '_').replace('(', '').replace(
                 ')', ''), foreground=color)
-        for b in order:
-            m = results[b]
-            pstr = ("<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
-                    else f"{m['p']:.3f}" if np.isfinite(m['p']) else "n/a")
-            zstr = f"{m['z']:.1f}" if np.isfinite(m['z']) else "n/a"
-            rstr = f"{m['reliability']:.2f}" if np.isfinite(
-                m['reliability']) else "n/a"
-            tag = m['verdict'].replace(' ', '_').replace(
-                '(', '').replace(')', '')
-            tree.insert('', 'end', values=(
-                b, m['n'], f"{m['linkage_index']:.0f}", m['verdict'],
-                f"{m['delta']:+.2f}", f"{m['peak_rate']:+.2f}",
-                f"{m['peak_lat']:+.2f}", rstr, zstr, pstr), tags=(tag,))
+        for label, panel in panels:
+            results = panel['results']
+            for b in order:
+                m = results.get(b)
+                if m is None:
+                    continue
+                pstr = ("<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
+                        else f"{m['p']:.3f}" if np.isfinite(m['p']) else "n/a")
+                zstr = f"{m['z']:.1f}" if np.isfinite(m['z']) else "n/a"
+                rstr = f"{m['reliability']:.2f}" if np.isfinite(
+                    m['reliability']) else "n/a"
+                tag = m['verdict'].replace(' ', '_').replace(
+                    '(', '').replace(')', '')
+                row = (b, m['n'], f"{m['linkage_index']:.0f}", m['verdict'],
+                       f"{m['delta']:+.2f}", f"{m['peak_rate']:+.2f}",
+                       f"{m['peak_lat']:+.2f}", rstr, zstr, pstr)
+                tree.insert('', 'end',
+                            values=((label,) + row) if split else row,
+                            tags=(tag,))
         tree.pack(side='left', fill='x', expand=True)
         self._sig_link_tree = tree
 
     def _copy_signal_linkage_table(self):
         res = getattr(self, '_sig_linkage_results', None)
-        if not res or not res.get('results'):
+        if not res or not res.get('order'):
             messagebox.showinfo("Signal Linkage", "Run an analysis first.")
             return
-        cols = ['Behavior', 'n', 'LinkageIndex', 'Verdict', 'Delta_z',
-                'dFdt_z_per_s', 'Latency_s', 'Reliability_r', 'LockZ', 'p']
+        panels = self._sig_link_panels(res)
+        split = self._sig_link_is_split(res)
+        cols = (['Series'] if split else []) + [
+            'Behavior', 'n', 'LinkageIndex', 'Verdict', 'Delta_z',
+            'dFdt_z_per_s', 'Latency_s', 'Reliability_r', 'LockZ', 'p']
         lines = ['\t'.join(cols)]
-        for b in res['order']:
-            m = res['results'][b]
-            lines.append('\t'.join(str(x) for x in [
-                b, m['n'], f"{m['linkage_index']:.1f}", m['verdict'],
-                f"{m['delta']:.4f}", f"{m['peak_rate']:.4f}",
-                f"{m['peak_lat']:.4f}", f"{m['reliability']:.4f}",
-                f"{m['z']:.4f}", f"{m['p']:.5f}"]))
+        for label, panel in panels:
+            for b in res['order']:
+                m = panel['results'].get(b)
+                if m is None:
+                    continue
+                row = [b, m['n'], f"{m['linkage_index']:.1f}", m['verdict'],
+                       f"{m['delta']:.4f}", f"{m['peak_rate']:.4f}",
+                       f"{m['peak_lat']:.4f}", f"{m['reliability']:.4f}",
+                       f"{m['z']:.4f}", f"{m['p']:.5f}"]
+                if split:
+                    row = [label] + row
+                lines.append('\t'.join(str(x) for x in row))
         payload = '\n'.join(lines)
         self.root.clipboard_clear()
         self.root.clipboard_append(payload)
@@ -42014,7 +42776,8 @@ cat("OK\n")
         """Clean multi-panel figure: a comparison bar of Linkage Index across
         behaviors, plus per-behavior peri-onset traces with the dF/dt peak and
         response window marked."""
-        results, order, cfg = res['results'], res['order'], res['cfg']
+        panels, order, cfg = self._sig_link_panels(res), res['order'], res['cfg']
+        split = self._sig_link_is_split(res)
         prebout, total = res['prebout'], res['total']
         fps = cfg['fps']
         t = (np.arange(total) - prebout) / fps
@@ -42022,69 +42785,111 @@ cat("OK\n")
         ncol = min(3, max(1, len(show)))
         nrow = int(np.ceil(len(show) / ncol))
 
+        # One colour per series, so a series keeps the same colour in the
+        # summary bar and in every trace panel.
+        _palette = plt.cm.tab10(np.linspace(0, 0.9, max(len(panels), 1)))
+        series_colors = {label: _palette[i]
+                         for i, (label, _p) in enumerate(panels)}
+
         fig = plt.figure(figsize=(4.1 * ncol, 2.3 + 2.5 * nrow),
                          constrained_layout=True)
         gs = fig.add_gridspec(nrow + 1, ncol, height_ratios=[1.25] + [1] * nrow)
 
         # ── Summary bar: Linkage Index across all behaviors ──────────────
+        # Single series keeps the verdict-coloured bar this tab always drew;
+        # a split fans each behavior into one bar per series instead, because
+        # comparing the series is the whole point of having split them.
         axb = fig.add_subplot(gs[0, :])
         bnames = order[::-1]  # so highest ends on top
-        vals = [results[b]['linkage_index'] for b in bnames]
-        colors = [self.SIG_LINK_COLORS[results[b]['verdict']] for b in bnames]
         ypos = np.arange(len(bnames))
-        axb.barh(ypos, vals, color=colors, edgecolor='white', height=0.7)
+        height = 0.7 / max(1, len(panels)) if split else 0.7
+        for si, (label, panel) in enumerate(panels):
+            results = panel['results']
+            vals = [results[b]['linkage_index'] if b in results else 0.0
+                    for b in bnames]
+            if split:
+                offset = (si - (len(panels) - 1) / 2.0) * height
+                colors = series_colors[label]
+            else:
+                offset = 0.0
+                colors = [self.SIG_LINK_COLORS[results[b]['verdict']]
+                          for b in bnames]
+            axb.barh(ypos + offset, vals, color=colors, edgecolor='white',
+                     height=height, label=label if split else None)
+            for yp, b in zip(ypos, bnames):
+                m = results.get(b)
+                if m is None:
+                    continue
+                axb.text(min(98, m['linkage_index'] + 1.5), yp + offset,
+                         f"{m['linkage_index']:.0f}", va='center', ha='left',
+                         fontsize=7 if split else 8, color='#333')
         axb.set_yticks(ypos)
         axb.set_yticklabels(bnames, fontsize=9)
         axb.set_xlim(0, 100)
         axb.set_xlabel("Linkage Index  (0–100)", fontsize=9)
         axb.set_title("Onset ⇄ signal coupling strength by behavior",
                       fontsize=11, fontweight='bold', pad=8)
-        for yp, b in zip(ypos, bnames):
-            m = results[b]
-            axb.text(min(98, m['linkage_index'] + 1.5), yp,
-                     f"{m['linkage_index']:.0f}", va='center', ha='left',
-                     fontsize=8, color='#333')
         axb.grid(axis='x', alpha=0.25)
         for sp in ('top', 'right'):
             axb.spines[sp].set_visible(False)
-        # legend
-        from matplotlib.patches import Patch
-        handles = [Patch(facecolor=c, label=k)
-                   for k, c in self.SIG_LINK_COLORS.items()]
-        axb.legend(handles=handles, loc='lower right', fontsize=7,
-                   frameon=False, ncol=1)
+        # legend: series when split, verdict key otherwise
+        if split:
+            axb.legend(loc='lower right', fontsize=7, frameon=False, ncol=1)
+        else:
+            from matplotlib.patches import Patch
+            handles = [Patch(facecolor=c, label=k)
+                       for k, c in self.SIG_LINK_COLORS.items()]
+            axb.legend(handles=handles, loc='lower right', fontsize=7,
+                       frameon=False, ncol=1)
 
         # ── Per-behavior peri-onset panels ───────────────────────────────
         trace_c = '#2b6cb0'
         deriv_c = '#c05621'
         resp_w = cfg['resp_s']
         for i, beh in enumerate(show):
-            m = results[beh]
             ax = fig.add_subplot(gs[1 + i // ncol, i % ncol])
-            mean_tr = m['mean_tr']
-            sem = m['sem']
             ax.axhline(0, color='#ccc', lw=0.8, zorder=0)
             ax.axvspan(0, resp_w, color=trace_c, alpha=0.06, zorder=0)
-            ax.plot(t, mean_tr, color=trace_c, lw=1.8, zorder=3)
-            ax.fill_between(t, mean_tr - sem, mean_tr + sem, color=trace_c,
-                            alpha=0.2, zorder=2, linewidth=0)
             ax.axvline(0, color='k', ls='--', lw=1, zorder=1)
-            # dF/dt peak marker
-            ax.axvline(m['peak_lat'], color=deriv_c, ls=':', lw=1.4, zorder=1)
-            # verdict-colored title
-            vc = self.SIG_LINK_COLORS[m['verdict']]
-            ax.set_title(f"{beh}   (n={m['n']})", fontsize=10, color=vc,
-                         fontweight='bold')
-            pstr = ("p<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
-                    else f"p={m['p']:.3f}" if np.isfinite(m['p']) else "p=n/a")
-            ann = (f"Δ {m['delta']:+.2f} z\n"
-                   f"peak {m['peak_rate']:+.2f} z/s\n"
-                   f"lat {m['peak_lat']:+.2f} s\n"
-                   f"r {m['reliability']:.2f}   {pstr}")
-            ax.text(0.03, 0.97, ann, transform=ax.transAxes, va='top',
-                    ha='left', fontsize=7.5, color='#333',
-                    bbox=dict(boxstyle='round,pad=0.3', fc='white',
-                              ec=vc, alpha=0.85, lw=1.0))
+
+            drawn = []
+            for label, panel in panels:
+                m = panel['results'].get(beh)
+                if m is None:
+                    continue
+                drawn.append((label, m))
+                color = series_colors[label] if split else trace_c
+                mean_tr, sem = m['mean_tr'], m['sem']
+                ax.plot(t, mean_tr, color=color, lw=1.8, zorder=3,
+                        label=f"{label} (n={m['n']})" if split else None)
+                ax.fill_between(t, mean_tr - sem, mean_tr + sem, color=color,
+                                alpha=0.2, zorder=2, linewidth=0)
+                ax.axvline(m['peak_lat'], color=color if split else deriv_c,
+                           ls=':', lw=1.4, zorder=1)
+            if not drawn:
+                continue
+
+            if split:
+                # The per-series metrics live in the legend; stacking one
+                # annotation box per series would cover the traces.
+                ax.set_title(beh, fontsize=10, fontweight='bold')
+                ax.legend(fontsize=6.5, frameon=False, loc='upper left')
+            else:
+                m = drawn[0][1]
+                vc = self.SIG_LINK_COLORS[m['verdict']]
+                ax.set_title(f"{beh}   (n={m['n']})", fontsize=10, color=vc,
+                             fontweight='bold')
+                pstr = ("p<0.001" if np.isfinite(m['p']) and m['p'] < 0.001
+                        else f"p={m['p']:.3f}" if np.isfinite(m['p'])
+                        else "p=n/a")
+                ann = (f"Δ {m['delta']:+.2f} z\n"
+                       f"peak {m['peak_rate']:+.2f} z/s\n"
+                       f"lat {m['peak_lat']:+.2f} s\n"
+                       f"r {m['reliability']:.2f}   {pstr}")
+                ax.text(0.03, 0.97, ann, transform=ax.transAxes, va='top',
+                        ha='left', fontsize=7.5, color='#333',
+                        bbox=dict(boxstyle='round,pad=0.3', fc='white',
+                                  ec=vc, alpha=0.85, lw=1.0))
             if i // ncol == nrow - 1:
                 ax.set_xlabel("time from onset (s)", fontsize=8)
             if i % ncol == 0:
@@ -42266,6 +43071,18 @@ cat("OK\n")
                   wraplength=self.ui_px(260)).grid(row=0, column=0, columnspan=2,
                                                    sticky='w')
 
+        excl = cluster('exclusions')
+        ttk.Checkbutton(excl, text="Apply exclusions",
+                        variable=self.use_exclusions_kin).grid(
+            row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(excl,
+                  text="Kinematics comes from the tracked position, so this "
+                       "reads the Behavioral Data checkbox on the Exclusions "
+                       "tab, not a photometry channel.",
+                  foreground='gray', font=('TkDefaultFont', 7), justify='left',
+                  wraplength=self.ui_px(260)).grid(row=1, column=0, columnspan=2,
+                                                   sticky='w')
+
         extras = cluster('extras')
         ttk.Button(extras, text="⚙  Graph Settings…",
                    command=self.open_kin_graph_settings).grid(
@@ -42276,7 +43093,7 @@ cat("OK\n")
 
         self.register_option_clusters(
             'kinematics', self.kin_analysis_var, clusters, KIN_OPTIONS_BY_PLOT,
-            always=('signal', 'timing', 'note', 'extras'))
+            always=('signal', 'timing', 'note', 'exclusions', 'extras'))
 
         # ── Actions ────────────────────────────────────────────────────────
         ttk.Button(actions, text="Run", command=self.run_kinematics).pack(fill='x')
@@ -42753,7 +43570,18 @@ cat("OK\n")
         return lags, np.array(rs)
 
     def _kin_selected_subjects(self):
-        """Return (mode, list-of-(subject, group_label)) from the active selector."""
+        """Return (mode, list-of-(subject, group_label)) from the active selector.
+
+        Kinematics is computed from the tracked position, not from a photometry
+        channel, so "Apply exclusions" here means the Exclusions tab's Behavioral
+        Data checkbox -- the same key the Behavioral Data tab uses.
+        """
+        if self.use_exclusions_kin.get():
+            drop = lambda s: self.is_subject_channel_excluded(
+                s, self.BEHAVIOR_EXCLUSION_KEY)
+        else:
+            drop = lambda s: False
+
         if self.kin_by_var.get() == "Group":
             idxs = self.kin_group_listbox.curselection()
             groups = self.selected_series('kinematics', self.kin_group_listbox)
@@ -42762,14 +43590,16 @@ cat("OK\n")
             for g in groups:
                 for s in self._series_members(g):
                     if s in self.processed_data and s not in seen and \
-                            self.processed_data[s].get('has_position', False):
+                            self.processed_data[s].get('has_position', False) and \
+                            not drop(s):
                         pairs.append((s, g))
                         seen.add(s)
             return "Group", pairs
         else:
             idxs = self.kin_subject_listbox.curselection()
             subs = [self.kin_subject_listbox.get(i) for i in idxs]
-            return "Subject", [(s, self.processed_data[s].get('group', '')) for s in subs]
+            return "Subject", [(s, self.processed_data[s].get('group', ''))
+                               for s in subs if not drop(s)]
 
     def _kin_collect(self, pairs, ch_index, settings):
         """Compute per-subject kinematics for each (subject, group) pair.

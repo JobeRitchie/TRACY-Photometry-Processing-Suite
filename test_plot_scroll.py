@@ -48,24 +48,9 @@ class _Scroller:
     colors = {'bg_light': '#ffffff'}
 
 
-@pytest.fixture(scope='module')
-def tk_root():
-    """One interpreter for the module.
-
-    Creating and tearing down a Tk() per test fails intermittently on Windows,
-    and the resulting TclError is indistinguishable from having no display --
-    so it would silently skip real failures rather than report them.
-    """
-    try:
-        r = tk.Tk()
-    except tk.TclError:                      # genuinely no display
-        pytest.skip('no Tk display available')
-    r.withdraw()
-    yield r
-    try:
-        r.destroy()
-    except tk.TclError:
-        pass
+# ``tk_root`` is session-scoped and lives in conftest.py -- a Tk interpreter may
+# only be created once per process, and a per-module one made this module skip
+# whenever it ran after another module that had built (and destroyed) its own.
 
 
 @pytest.fixture
