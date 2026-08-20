@@ -14,6 +14,7 @@ import types
 
 import numpy as np
 import pytest
+import tkinter as tk
 
 import fp_analysis_gui as G
 
@@ -25,6 +26,34 @@ def _app():
                   'boutframe_processing_style': 'whole'}
     app.processed_data = {}
     return app
+
+
+def test_bout_analysis_has_visible_settings_button():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = G.FPAnalysisGUI(root)
+        nb = app.data_notebook
+        texts = []
+
+        def walk(widget):
+            try:
+                txt = widget.cget('text')
+                if txt:
+                    texts.append(txt)
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                walk(child)
+
+        for i in range(nb.index('end')):
+            if nb.tab(i, 'text') == 'Bout Analysis':
+                walk(nb.nametowidget(nb.tabs()[i]))
+                break
+
+        assert any('Settings' in text for text in texts)
+    finally:
+        root.destroy()
 
 
 # --------------------------------------------------------------------------

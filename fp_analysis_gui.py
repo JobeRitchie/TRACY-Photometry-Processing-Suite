@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.12.0"
-APP_VERSION_DATE = "August 7, 2026"
+APP_VERSION = "1.13.0"
+APP_VERSION_DATE = "August 20, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -1656,8 +1656,12 @@ class FPAnalysisGUI:
             # with.
             'series_factor': GROUP_FACTOR,
             'boutframes_video_fps': 30,  # Frame rate of source video used to create boutframes
-            'auto_scale_boutframes': False,  # Auto-scale boutframe numbers to photometry FPS
-            'precut_correct_boutframes': True,  # Subtract precut/n_led_states offset from boutframes to align with post-precut FP data
+            # Boutframes are video frames; signals are indexed in photometry
+            # samples.  This is a unit conversion, not a preference, so it is on
+            # by default — with it off, indices are stretched by
+            # video_fps/photometry_fps and late bouts fall off the recording.
+            'auto_scale_boutframes': True,
+            'precut_correct_boutframes': True,  # Shift boutframes onto the analysed signal's origin (recording start + precut trim)
             'boutframe_manual_shift': 0,  # Manual frame shift applied after scaling (positive = shift forward, negative = shift backward)
             # How rows in a raw TTL file (timestamp,value — no header) map to bouts:
             #   'pairs_start'    = onset/offset pairs; keep onsets only (rows 0,2,4…) → start-only bouts [LEGACY DEFAULT]
@@ -1736,7 +1740,14 @@ class FPAnalysisGUI:
             'bout_overlay_line_thickness': 1.2,
             # Optional per-behavior colors: {behavior_name: '#rrggbb'}.  Empty ->
             # automatic tab10 palette.  Set via the "Bout Overlay Style…" dialog.
-            'bout_overlay_colors': {}
+            'bout_overlay_colors': {},
+            # Time-zero marker on every peri-event graph (Visualization tab).
+            # Historically a 2 pt red dashed line on traces and a 2 pt yellow one
+            # on the heatmaps, which dominated the data it was annotating; a thin
+            # grey line is the default now and both are user-configurable via
+            # Advanced Graph Settings.
+            'zero_line_color': '#808080',
+            'zero_line_width': 0.8,
         }
         
         # Zone definitions (stored as rectangles: x_min, x_max, y_min, y_max in cm)
@@ -1764,7 +1775,7 @@ class FPAnalysisGUI:
         # Detected photometry frame rate (populated automatically during processing)
         self.detected_photometry_fps = None
         self._mixed_fps_warned = False  # log the mixed-rate warning only once per session
-        self.auto_scale_boutframes_var = tk.BooleanVar(value=False)
+        self.auto_scale_boutframes_var = tk.BooleanVar(value=True)
         self.precut_correct_boutframes_var = tk.BooleanVar(value=True)
         self.boutframes_video_fps_var = tk.StringVar(value='30')
         self.boutframe_manual_shift_var = tk.StringVar(value='0')
@@ -5770,6 +5781,18 @@ class FPAnalysisGUI:
         self.trace_linewidth_var = tk.StringVar(value="0.3")
         self.trace_alpha_var = tk.StringVar(value="0.3")
 
+        # Time-zero marker style. Backed by params so it round-trips through a
+        # project save/load like the rest of the graph settings.
+        self.zero_line_color_var = tk.StringVar(
+            value=str(self.params.get('zero_line_color', '#808080')))
+        self.zero_line_width_var = tk.StringVar(
+            value=str(self.params.get('zero_line_width', 0.8)))
+        # The "Pick" button doubles as the colour preview; it only exists while
+        # the settings window is open, so the trace is registered once here.
+        self.zero_line_swatch = None
+        self.zero_line_color_var.trace_add(
+            'write', lambda *_: self._update_zero_line_swatch())
+
         # Store current canvas and figure for axis updates
         self.current_viz_canvas = None
         self.current_viz_figure = None
@@ -7963,28 +7986,7 @@ class FPAnalysisGUI:
                             if bcol:
                                 raw_f = (pd.to_numeric(df_b[bcol], errors='coerce')
                                          .dropna().to_numpy(dtype=float))
-                                _sc = 1.0
-                                if self.params.get('auto_scale_boutframes', False):
-                                    _vf = float(self.params.get('boutframes_video_fps', 30))
-                                    _pf = data.get('photometry_fps',
-                                                   getattr(self, 'detected_photometry_fps', None))
-                                    if _pf and _vf > 0 and abs(_pf - _vf) > 0.1:
-                                        _sc = _pf / _vf
-                                if _sc != 1.0:
-                                    raw_f = np.round(raw_f * _sc)
-                                raw_f = raw_f.astype(int)
-                                _ms = int(self.params.get('boutframe_manual_shift', 0))
-                                if _ms:
-                                    raw_f += _ms
-                                _ps = self._get_per_subject_shift(subject)
-                                if _ps:
-                                    raw_f += _ps
-                                if self.params.get('precut_correct_boutframes', True):
-                                    _pc = int(self.params.get('precut', 0))
-                                    _nl = int(data.get('n_led_states', 1))
-                                    _off = _pc // max(1, _nl)
-                                    if _off > 0:
-                                        raw_f = raw_f - _off
+                                raw_f = self._transform_boutframe_values(raw_f, subject, as_int=True)
                                 _excl = int(self.params.get('exclude_frames_before', 0))
                                 onset_frames = raw_f[raw_f >= _excl].tolist()
                         except Exception:
@@ -8617,31 +8619,9 @@ class FPAnalysisGUI:
                             continue
                     raw_frames = (pd.to_numeric(df_bouts[behavior_col], errors='coerce')
                                   .dropna().to_numpy(dtype=float))
-                    # Apply the same corrections as extract_bouts so alignment
-                    # matches what is used in the bout analysis tab.
-                    _scale = 1.0
-                    if self.params.get('auto_scale_boutframes', False):
-                        _vfps  = float(self.params.get('boutframes_video_fps', 30))
-                        _pfps  = data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
-                        if _pfps is not None and _vfps > 0 and abs(_pfps - _vfps) > 0.1:
-                            _scale = _pfps / _vfps
-                    if _scale != 1.0:
-                        raw_frames = np.round(raw_frames * _scale)
-                    raw_frames = raw_frames.astype(int)
-                    _manual = int(self.params.get('boutframe_manual_shift', 0))
-                    if _manual != 0:
-                        raw_frames = raw_frames + _manual
-                    _ps = self._get_per_subject_shift(subject)
-                    if _ps != 0:
-                        raw_frames = raw_frames + _ps
-                    if self.params.get('precut_correct_boutframes', True):
-                        _precut  = int(self.params.get('precut', 0))
-                        _n_led   = int(data.get('n_led_states', 1))
-                        _offset  = _precut // max(1, _n_led)
-                        if _offset > 0:
-                            raw_frames = raw_frames - _offset
-                            q.put(('log',
-                                   f"  {subject}: fallback boutframe precut correction −{_offset} frames"))
+                    # Same conversion as extract_bouts so alignment matches what
+                    # is used in the bout analysis tab.
+                    raw_frames = self._transform_boutframe_values(raw_frames, subject, as_int=True)
                     _excl = int(self.params.get('exclude_frames_before', 0))
                     raw_frames = raw_frames[raw_frames >= _excl]
                     onset_frames = raw_frames.tolist()
@@ -9103,31 +9083,8 @@ class FPAnalysisGUI:
                         if bcol:
                             raw_f = (pd.to_numeric(df_b[bcol], errors='coerce')
                                      .dropna().to_numpy(dtype=float))
-                            # Apply same corrections as extract_bouts
-                            _sc = 1.0
-                            if self.params.get('auto_scale_boutframes', False):
-                                _vf = float(self.params.get('boutframes_video_fps', 30))
-                                _pf = data.get('photometry_fps',
-                                               getattr(self, 'detected_photometry_fps', None))
-                                if _pf is not None and _vf > 0 and abs(_pf - _vf) > 0.1:
-                                    _sc = _pf / _vf
-                            if _sc != 1.0:
-                                raw_f = np.round(raw_f * _sc)
-                            raw_f = raw_f.astype(int)
-                            _ms = int(self.params.get('boutframe_manual_shift', 0))
-                            if _ms:
-                                raw_f = raw_f + _ms
-                            _ps = self._get_per_subject_shift(subject)
-                            if _ps:
-                                raw_f = raw_f + _ps
-                            if self.params.get('precut_correct_boutframes', True):
-                                _pc  = int(self.params.get('precut', 0))
-                                _nl  = int(data.get('n_led_states', 1))
-                                _off = _pc // max(1, _nl)
-                                if _off > 0:
-                                    raw_f = raw_f - _off
-                                    self.log_message(
-                                        f"  Epoch spectrogram: fallback precut correction −{_off} for {subject}")
+                            # Same conversion as extract_bouts
+                            raw_f = self._transform_boutframe_values(raw_f, subject, as_int=True)
                             _excl = int(self.params.get('exclude_frames_before', 0))
                             onset_frames = raw_f[raw_f >= _excl].tolist()
                     except Exception as exc:
@@ -10178,11 +10135,6 @@ class FPAnalysisGUI:
         ttk.Separator(settings, orient='horizontal').pack(
             fill='x', pady=self.ui_px(6))
 
-        ttk.Checkbutton(settings, text="Apply exclusions",
-                        variable=self.use_exclusions_bout).pack(anchor='w')
-        ttk.Checkbutton(settings, text="Average bouts within subject",
-                        variable=self.bout_average_within_subject).pack(anchor='w')
-
         max_row = ttk.Frame(settings)
         max_row.pack(fill='x', pady=(self.ui_px(4), 0))
         ttk.Label(max_row, text="Max bouts/subject:").pack(side='left')
@@ -10197,13 +10149,20 @@ class FPAnalysisGUI:
         ttk.Entry(binx_row, textvariable=self.bout_first_last_x_var, width=7).pack(
             side='right')
 
-        ttk.Button(settings, text="⚙  Metrics & Window Settings…",
-                   command=self._open_bout_settings).pack(
-            fill='x', pady=(self.ui_px(8), 0))
+        ttk.Checkbutton(settings, text="Apply exclusions",
+                        variable=self.use_exclusions_bout).pack(anchor='w')
+        ttk.Checkbutton(settings, text="Average bouts within subject",
+                        variable=self.bout_average_within_subject).pack(anchor='w')
+
+        # Keep the more advanced settings dialog within easy reach in the
+        # sticky actions row, but leave the common limiter controls visible in
+        # the main settings panel where users expect them.
 
         # ── Actions ──────────────────────────────────────────────────────
         ttk.Button(actions, text="Calculate Metrics",
                    command=self.calculate_bout_metrics).pack(fill='x')
+        ttk.Button(actions, text="⚙ Settings…",
+                   command=self._open_bout_settings).pack(fill='x', pady=(self.ui_px(4), 0))
 
         # Plot ▾ — all graph types live behind one dropdown
         # No arrow in the label: a full-width Menubutton already draws its own,
@@ -12250,6 +12209,64 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix — Bout markers sat in the wrong place whenever the photometry recording started
+    after the video. The correction subtracted only the precut trim (precut ÷ LED
+    states), so any delay between the camera rolling and the recording starting was
+    left in — 4200 frames, 210 s, on one ASR session. It now reads the acquisition
+    clock of the first retained sample, which covers the delay and the trim together.
+    Re-extract to benefit.
+  • Fix — Boutframe scaling is on by default. Boutframes are numbered in video frames
+    and the signals are indexed in photometry samples, so this is a unit conversion,
+    not a preference: with it off every index was stretched by video_fps ÷ photometry
+    _fps, an error that grows with time until late bouts fall past the end of the
+    recording and are dropped without a word. Rounding now happens once at the end
+    rather than at each step.
+  • Fix — A sync marker counted as an LED channel. Startup rows in state 7 inflated
+    n_led_states, which mis-scaled the boutframe correction and trimmed the interleave
+    to the wrong multiple; states above 4 are ignored now, as the deinterleave already
+    did. The boutframe preview table also runs the real transform, so the "Scaled
+    Frame" column can no longer disagree with what extraction uses.
+  • Fix — Behavior frames outside the photometry recording were filled with the nearest
+    sample. Nearest-neighbour matching has no notion of "out of range", so a session
+    whose FP started late carried thousands of copies of one value that read as a flat
+    but genuine trace — and bouts scored there were extracted from signal that was
+    never recorded. Those rows stay blank now, the processing log says how many, and
+    the Bouts Overlay shades the uncovered stretch. Projects processed before this
+    recompute coverage when they are plotted, so no reprocess is needed to see it.
+  • Fix — Bout overlay markers drifted from the trace they annotate. The signal was
+    plotted against the behavior file's own frame column while the markers were row
+    indices, which agree only when that column is 0, 1, 2… — a 1-based or gap-
+    containing column shifted every marker. Onsets and ends are also saved with the
+    project now, so the overlay marks where the traces were actually cut rather than
+    re-deriving positions from the boutframes workbook and the current settings, and
+    it still draws when that workbook sits on a drive that is not mounted.
+  • Fix — 570-only subjects were reported as having 470 data. The wavelength flags
+    treated the legacy combined arrays as evidence of green, so a red-only recording
+    was offered a channel it does not have. Channel names also fall back to the
+    computed designation map instead of "Ch0"/"Ch1", and the Visualization channel
+    list counts channels the same way the rest of the app does.
+  • Fix — Exports labelled channels G0/G1 whatever the cohort's designations were.
+    Out/Back, zone averages, distance averages, zone bouts and bout exports now carry
+    each subject's real channel name in the column headers and channel column.
+  • New — Time-zero line style (Advanced Graph Settings). The onset/entry marker was a
+    2 pt red dashed line on traces and a 2 pt yellow one on heatmaps, heavy enough to
+    dominate the data it was annotating. One setting now covers every peri-event graph,
+    traces and heatmaps alike — a thin grey line by default, any colour name or hex
+    value, and width 0 to hide it altogether. It saves and loads with the project.
+  • Change — Bout Analysis controls. Max bouts/subject and the first/last-X limiter sit
+    with the other settings, "Settings…" moved into the sticky actions row where it
+    stays reachable, and switching between the subject and group selectors re-measures
+    the panel so the settings below it are not clipped out of view in a short window.
+  • Fix — The in-app updater failed on a PC with no git identity configured. It ran
+    "git pull", which needs a committer identity for the merge it may make and treats
+    git's background repack — which Windows antivirus and sync clients routinely block
+    from renaming a pack file — as a failure of the update itself. It now fetches and
+    fast-forwards with that maintenance disabled, carries its own identity, checks that
+    the app folder really landed on the downloaded commit before restarting, and
+    explains a "Permission denied" as the file-locking problem it is.
+
+Version 1.12.0  •  August 7, 2026
+────────────────────────────────────────────────────────────────────────────────
   • Fix — Exclusions did nothing on cohorts not designated G0/G1. Around 25 plot and
     export sites asked for the literal channel names "G0"/"G1", so on an R4/R5 cohort
     ticking a box had no effect. Two spike exports were worse and emitted nothing at
@@ -12876,6 +12893,9 @@ Version 1.0.0
         cmap = data.get('channel_name_map')
         if isinstance(cmap, dict) and ch in cmap:
             return cmap[ch]
+        default = self.compute_default_channel_map(data, self.get_num_channels(data))
+        if ch in default:
+            return default[ch]
         return f'Ch{ch}'
 
     def compute_default_channel_map(self, data, n_channels):
@@ -13781,12 +13801,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # CSVs below only carry the raw arrays, not their onset index).
                     bout_windows = {}
                     for behavior, bout_data in data['bouts'].items():
-                        if isinstance(bout_data, dict) and '_prebout' in bout_data:
-                            bout_windows[behavior] = {
-                                'prebout': int(bout_data.get('_prebout')),
-                                'postbout': int(bout_data.get('_postbout',
-                                                 self.params.get('postboutframes', 90))),
-                            }
+                        if not isinstance(bout_data, dict):
+                            continue
+                        entry = {}
+                        if '_prebout' in bout_data:
+                            entry['prebout'] = int(bout_data.get('_prebout'))
+                            entry['postbout'] = int(bout_data.get('_postbout',
+                                                    self.params.get('postboutframes', 90)))
+                        # Persist the onsets too. Without them a reloaded project
+                        # has to re-derive bout positions from the boutframes
+                        # workbook and the *current* transform settings, so the
+                        # Bouts Overlay drifts away from the traces it is drawn
+                        # beside the moment the precut/shift/fps settings change
+                        # after extraction -- and shows nothing at all when the
+                        # workbook lives on a drive that is not mounted.
+                        onsets = bout_data.get('onset_frames')
+                        if onsets is not None:
+                            entry['onset_frames'] = [
+                                None if o is None or (isinstance(o, float) and np.isnan(o))
+                                else float(o) for o in onsets]
+                        ends = bout_data.get('end_frames')
+                        if ends is not None:
+                            entry['end_frames'] = [
+                                None if e is None or (isinstance(e, float) and np.isnan(e))
+                                else float(e) for e in ends]
+                        if entry:
+                            bout_windows[behavior] = entry
                     if bout_windows:
                         with open(os.path.join(bout_dir, '_bout_windows.json'), 'w') as f:
                             json.dump(bout_windows, f, indent=2)
@@ -13990,6 +14030,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.timestamp_suffix_var.set(self.params.get('timestamp_suffix', '0.csv'))
             if hasattr(self, 'boutframe_manual_shift_var'):
                 self.boutframe_manual_shift_var.set(str(self.params.get('boutframe_manual_shift', 0)))
+            if hasattr(self, 'zero_line_color_var'):
+                self._refresh_zero_line_widgets()
             if hasattr(self, 'boutframe_processing_style_var'):
                 self.boutframe_processing_style_var.set(self.params.get('boutframe_processing_style', 'onset'))
             if hasattr(self, 'ttl_format_var'):
@@ -14362,10 +14404,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 behavior, chname = m.group(1), m.group(2)
                                 if behavior not in bouts:
                                     bouts[behavior] = {}
-                                    _w = bout_windows.get(behavior)
-                                    if _w:
-                                        bouts[behavior]['_prebout'] = int(_w.get('prebout'))
-                                        bouts[behavior]['_postbout'] = int(_w.get('postbout'))
+                                    _w = bout_windows.get(behavior) or {}
+                                    if _w.get('prebout') is not None:
+                                        bouts[behavior]['_prebout'] = int(_w['prebout'])
+                                        bouts[behavior]['_postbout'] = int(
+                                            _w.get('postbout',
+                                                   self.params.get('postboutframes', 90)))
+                                    # Restore the onsets the traces were cut at,
+                                    # so the Bouts Overlay marks those rather
+                                    # than re-deriving positions from the
+                                    # boutframes workbook and today's settings.
+                                    if _w.get('onset_frames') is not None:
+                                        bouts[behavior]['onset_frames'] = [
+                                            np.nan if o is None else float(o)
+                                            for o in _w['onset_frames']]
+                                    if _w.get('end_frames') is not None:
+                                        bouts[behavior]['end_frames'] = [
+                                            np.nan if e is None else float(e)
+                                            for e in _w['end_frames']]
+                                        _on = bouts[behavior].get('onset_frames')
+                                        if _on is not None and len(_on) == len(_w['end_frames']):
+                                            bouts[behavior]['durations'] = [
+                                                e - s for s, e in
+                                                zip(_on, bouts[behavior]['end_frames'])]
                                 df_ch = pd.read_csv(os.path.join(bout_dir, file))
                                 traces = []
                                 for _, row in df_ch.iterrows():
@@ -14614,28 +14675,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             except Exception as e:
                                 self.log_message(f"    Warning: Could not regenerate outback: {str(e)}")
 
-                        # Infer wavelength flags if not set (for backward compatibility)
-                        # Set based on what actually loaded successfully, not just what metadata claims
-                        if 'has_470' not in subject_data:
-                            subject_data['has_470'] = ('zscore_470' in subject_data or 
-                                                      'data_470' in subject_data or 
-                                                      'dff_470' in subject_data or
-                                                      'zscore' in subject_data)
-                        if 'has_570' not in subject_data:
-                            subject_data['has_570'] = ('zscore_570' in subject_data or 
-                                                      'data_570' in subject_data or 
-                                                      'dff_570' in subject_data)
-                        
-                        # Always set based on actual loaded data to avoid metadata mismatch
-                        subject_data['has_470'] = ('zscore_470' in subject_data or 
-                                                  'data_470' in subject_data or 
-                                                  'dff_470' in subject_data or
-                                                  'zscore' in subject_data or
-                                                  'data' in subject_data or
-                                                  'dff' in subject_data)
-                        subject_data['has_570'] = ('zscore_570' in subject_data or 
-                                                  'data_570' in subject_data or 
-                                                  'dff_570' in subject_data)
+                        # Infer wavelength flags based on explicitly loaded 470/570 matrices.
+                        # Generic /combined arrays (data, zscore, dff, corrected) are only
+                        # used to infer a missing wavelength when the opposite explicit
+                        # wavelength matrix is absent. This avoids misclassifying 570-only
+                        # subjects as having green data just because the legacy primary
+                        # arrays were present.
+                        explicit_has_470 = any(k in subject_data for k in (
+                            'zscore_470', 'data_470', 'dff_470', 'corrected_470'))
+                        explicit_has_570 = any(k in subject_data for k in (
+                            'zscore_570', 'data_570', 'dff_570', 'corrected_570'))
+                        generic_present = any(k in subject_data for k in (
+                            'zscore', 'data', 'dff', 'corrected'))
+
+                        subject_data['has_470'] = explicit_has_470 or (generic_present and not explicit_has_570)
+                        subject_data['has_570'] = explicit_has_570 or (generic_present and not explicit_has_470)
                         
                         # Only add subject if it has essential photometry trace data
                         # (not just bout data or behavioral data)
@@ -17268,8 +17322,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         else:
             fp_raw = fp_raw[precut:, :]
         
-        # Determine number of channels
-        n_channels = len(np.unique(fp_raw[:, 2]))
+        # Determine number of channels.  Sync markers (state 7, typically a
+        # single startup row) are not LED channels: counting them inflates
+        # n_led_states, which then mis-scales the `precut // n_led_states`
+        # boutframe correction and trims the interleave to the wrong multiple.
+        # Same `<= 4` rule the deinterleave below applies.
+        _led_states = fp_raw[:, 2]
+        n_channels = len(np.unique(_led_states[_led_states <= 4]))
         result['n_led_states'] = n_channels  # Store for boutframe precut correction
         
         # Ensure equal number of frames per channel
@@ -18148,6 +18207,34 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         frame_col = np.arange(len(ts_col), dtype=float)
         return np.column_stack([frame_col, ts_col])
 
+    @staticmethod
+    def _sync_match_tolerance(fp_ts, beh_ts):
+        """How far a behavior frame may sit from an FP sample and still match.
+
+        Derived from the two recordings' own sampling intervals rather than a
+        fixed constant, because the pair can be anything from 15 Hz photometry
+        against a 30 fps camera to a 1 Hz behavioural score. Two sample periods
+        of the coarser of the two absorbs jitter and a whole dropped sample
+        while still being far smaller than the gaps this is meant to catch.
+        Falls back to a permissive value when either interval is unusable, so
+        an odd timestamp column can never mask out a whole session.
+        """
+        def _step(ts):
+            ts = np.asarray(ts, dtype=float)
+            ts = ts[np.isfinite(ts)]
+            if ts.size < 2:
+                return None
+            d = np.diff(ts)
+            d = d[np.isfinite(d) & (d > 0)]
+            if d.size == 0:
+                return None
+            return float(np.median(d))
+
+        steps = [s for s in (_step(fp_ts), _step(beh_ts)) if s]
+        if not steps:
+            return float('inf')     # cannot tell -- keep the old behaviour
+        return 2.0 * max(steps)
+
     def synchronize_behavior(self, zscore_data, beh_raw, has_position=False):
         """Synchronize behavior timestamps with photometry data
         
@@ -18262,22 +18349,50 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 "FP signal could not be aligned to behavior for this subject."
             )
 
+        # Nearest-neighbour matching has no notion of "out of range": for a
+        # behavior frame recorded before the photometry started (or after it
+        # stopped) argmin still returns the first/last FP sample, so the whole
+        # uncovered stretch was filled with one repeated value that reads as a
+        # flat but real trace. That is not a small edge effect -- the precut
+        # alone leaves every subject with `precut / n_led_states` fabricated
+        # frames, and a session whose FP recording started late can carry
+        # thousands (GRAB_NE_ASR/1F_post: 4200 frames, 210 s). Bout markers
+        # drawn over that region look misaligned with the signal, and bouts
+        # extracted from it are invented. Anything further than one matching
+        # tolerance from a real sample stays NaN instead.
+        match_tol = self._sync_match_tolerance(fp_ts_ref, beh_ts_ref)
+
         # For each behavior timestamp, find closest photometry timestamp
+        n_uncovered = 0
         for i in range(len(beh_raw)):
             beh_ts = beh_ts_ref[i]
             if np.isnan(beh_ts):
                 continue
-            
+
             # Find closest match
             idx = np.argmin(np.abs(fp_ts_ref - beh_ts))
-            
+            if abs(float(fp_ts_ref[idx]) - float(beh_ts)) > match_tol:
+                n_uncovered += 1
+                continue        # no photometry sample here -- leave NaN
+
             # Store matched values for each available channel
             for ch_idx, fp_channel in enumerate(fp_channels):
                 if 6 + ch_idx < kin_base:  # Channels occupy cols 6 .. 6+N-1
                     beh_synced[i, 6 + ch_idx] = fp_channel[idx]
 
             beh_synced[i, kin_base] = fp_elapsed[idx]  # Elapsed time (after channels)
-        
+
+        if n_uncovered:
+            pct = 100.0 * n_uncovered / max(1, len(beh_raw))
+            msg = (f"    {n_uncovered} of {len(beh_raw)} behavior frame(s) ({pct:.1f}%) "
+                   f"fall outside the photometry recording (no FP sample within "
+                   f"{match_tol:.3g}); left blank rather than filled with the "
+                   f"nearest edge sample.")
+            if pct >= 1.0:
+                msg += (" Bouts scored in that stretch have no signal behind them — "
+                        "check that the FP and behavior files cover the same session.")
+            self.log_message(msg)
+
         # Sanity check: warn if the vast majority of frames still map to the same FP index
         # (can happen if relative matching also fails, e.g. completely different session lengths)
         matched_indices = []
@@ -21058,9 +21173,53 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 behaviors.append((str(c), start_arr, None))
         return behaviors, has_end_any
 
+    def _photometry_start_offset_samples(self, subject_id):
+        """Samples between video time zero and the first analysed photometry sample.
+
+        Boutframes are numbered from the start of the *video*, but the signal
+        arrays start at the first photometry sample that survived processing.
+        Two things separate those origins: the recording often starts seconds
+        into the video, and ``precut`` raw rows are trimmed during processing.
+        Reading the timestamp of the first retained raw row covers both at once.
+
+        The legacy ``precut // n_led_states`` estimate covered only the trim, so
+        it under-corrected by the whole recording delay whenever the photometry
+        did not start rolling with the camera.
+        """
+        subject_data = self.processed_data.get(subject_id, {})
+        fs = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
+        precut = max(0, int(self.params.get('precut', 0)))
+        raw = subject_data.get('raw')
+
+        if fs and float(fs) > 0 and raw is not None:
+            try:
+                arr = np.asarray(raw)
+                if arr.ndim == 2 and arr.shape[1] >= 2 and arr.shape[0] > precut:
+                    # Column 1 is an absolute acquisition clock, not a
+                    # recording-relative one: Bonsai's SystemTimestamp counts
+                    # from system boot, so row 0 is already tens of thousands of
+                    # seconds in.  The delay we want is the time elapsed between
+                    # the first raw row and the first retained one, so subtract
+                    # row 0 the same way calculate_dff does with ts1.
+                    t0 = float(arr[precut, 1]) - float(arr[0, 1])
+                    if np.isfinite(t0) and t0 >= 0:
+                        return int(round(t0 * float(fs)))
+            except Exception:
+                pass
+
+        nl = int(subject_data.get('n_led_states', 1) or 1)
+        return max(0, precut // max(1, nl))
+
     def _transform_boutframe_values(self, frames, subject_id, as_int=True):
-        """Apply FPS scaling, manual shift, per-subject shift, and precut correction
-        to a boutframe array (same order/logic used for start frames historically).
+        """Convert video-frame bout numbers into photometry sample indices.
+
+        Boutframes arrive numbered in video frames at ``boutframes_video_fps``;
+        the signal arrays are indexed in photometry samples at the recording's
+        own rate, and their sample zero is not video time zero.  Both a rate
+        conversion and a start offset are therefore required.  Skipping the rate
+        conversion stretches every index by ``video_fps / photometry_fps`` — an
+        error that grows with time and pushes late bouts past the end of the
+        recording, where the extraction loops drop them silently.
 
         Used for both start and end frames so they stay consistent.  When
         *as_int* is False the result is rounded but kept as float so NaN (a
@@ -21071,14 +21230,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return frames.astype(int) if as_int else frames
         subject_data = self.processed_data.get(subject_id, {})
 
-        # FPS scaling
-        if self.params.get('auto_scale_boutframes', False):
+        # Video frames -> photometry samples.  Rounding is deferred to the end so
+        # the rate conversion and the start offset do not each cost half a sample.
+        if self.params.get('auto_scale_boutframes', True):
             vfps = float(self.params.get('boutframes_video_fps', 30))
             pfps = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
-            if pfps and vfps > 0 and abs(pfps - vfps) > 0.1:
-                frames = np.round(frames * (pfps / vfps))
+            if pfps and vfps > 0 and abs(float(pfps) - vfps) > 0.1:
+                frames = frames * (float(pfps) / vfps)
 
-        # Manual + per-subject shift
+        # Manual + per-subject shift, both in photometry samples.
         ms = int(self.params.get('boutframe_manual_shift', 0))
         if ms:
             frames = frames + ms
@@ -21086,17 +21246,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if ps:
             frames = frames + ps
 
-        # Precut correction
+        # Recording start: signal sample 0 is not video frame 0.
         if self.params.get('precut_correct_boutframes', True):
-            pc = int(self.params.get('precut', 0))
-            nl = int(subject_data.get('n_led_states', 1))
-            off = pc // max(1, nl)
-            if off > 0:
+            off = self._photometry_start_offset_samples(subject_id)
+            if off:
                 frames = frames - off
 
+        frames = np.round(frames)
         if as_int:
             return frames.astype(int)
-        return np.round(frames)
+        return frames
 
     def _inverse_transform_boutframe_values(self, frames, subject_id, as_int=True):
         """Inverse of :meth:`_transform_boutframe_values`.
@@ -21112,12 +21271,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return frames.astype(int) if as_int else frames
         subject_data = self.processed_data.get(subject_id, {})
 
-        # Undo precut correction (forward subtracted the offset)
+        # Undo the recording-start offset (forward subtracted it)
         if self.params.get('precut_correct_boutframes', True):
-            pc = int(self.params.get('precut', 0))
-            nl = int(subject_data.get('n_led_states', 1))
-            off = pc // max(1, nl)
-            if off > 0:
+            off = self._photometry_start_offset_samples(subject_id)
+            if off:
                 frames = frames + off
 
         # Undo per-subject + manual shift
@@ -21128,12 +21285,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if ms:
             frames = frames - ms
 
-        # Undo FPS scaling
-        if self.params.get('auto_scale_boutframes', False):
+        # Undo the sample-rate conversion
+        if self.params.get('auto_scale_boutframes', True):
             vfps = float(self.params.get('boutframes_video_fps', 30))
             pfps = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
-            if pfps and vfps > 0 and abs(pfps - vfps) > 0.1:
-                frames = frames * (vfps / pfps)
+            if pfps and vfps > 0 and abs(float(pfps) - vfps) > 0.1:
+                frames = frames * (vfps / float(pfps))
 
         if as_int:
             return np.round(frames).astype(int)
@@ -21453,15 +21610,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if raw_end is not None:
                     end_frames = self._transform_boutframe_values(raw_end, subject_id, as_int=False)
 
-                # Log precut correction once per behavior (transform already applied it)
+                # Log the start offset once per behavior (transform already applied it)
                 if self.params.get('precut_correct_boutframes', True):
-                    _precut = int(self.params.get('precut', 0))
-                    _n_led = int(subject_data.get('n_led_states', 1))
-                    _precut_offset = _precut // max(1, _n_led)
-                    if _precut_offset > 0:
+                    _start_offset = self._photometry_start_offset_samples(subject_id)
+                    if _start_offset > 0:
+                        _fs = subject_data.get('photometry_fps') or 0
+                        _secs = f" ({_start_offset / _fs:.1f} s)" if _fs else ""
                         self.log_message(
-                            f"    Precut boutframe correction: -{_precut_offset} frames "
-                            f"(precut={_precut} raw rows \u00f7 {_n_led} LED states) for {behavior}")
+                            f"    Recording-start boutframe correction: -{_start_offset} samples"
+                            f"{_secs} for {behavior}")
 
                 # Filter frames based on exclude_frames_before (keep start/end paired)
                 _keep = frames >= exclude_before
@@ -22898,7 +23055,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if photo_fps_subj is not None:
             photo_fps = photo_fps_subj
 
-        scale_enabled = self.params.get('auto_scale_boutframes', False)
+        scale_enabled = self.params.get('auto_scale_boutframes', True)
         if scale_enabled and photo_fps is not None and video_fps > 0 and abs(photo_fps - video_fps) > 0.1:
             scale_factor = photo_fps / video_fps
         else:
@@ -22917,17 +23074,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.preview_info_label.config(text=f"Error: {e}", foreground='red')
             return
 
-        scaled_frames = np.round(raw_frames * scale_factor).astype(int) if scale_factor != 1.0 else raw_frames.astype(int)
+        # Preview exactly what extraction will use, start offset included, so the
+        # "Scaled Frame" column cannot disagree with the analysis.
+        scaled_frames = self._transform_boutframe_values(raw_frames, subject, as_int=True)
 
-        # Apply manual boutframe shift
+        # Read back the shifts the transform applied so the info label can report
+        # them; the transform folds them in, it does not return them.
         _manual_shift = int(self.params.get('boutframe_manual_shift', 0))
-        if _manual_shift != 0:
-            scaled_frames = scaled_frames + _manual_shift
-
-        # Apply per-subject boutframe shift
-        _per_subj_shift = self._get_per_subject_shift(subject)
-        if _per_subj_shift != 0:
-            scaled_frames = scaled_frames + _per_subj_shift
+        _per_subj_shift = int(self._get_per_subject_shift(subject))
 
         # ── Populate table ────────────────────────────────────────────
         for raw, scaled in zip(raw_frames.astype(int), scaled_frames):
@@ -24092,6 +24246,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         else:
             self._bout_grp_container.pack_forget()
             self._bout_subj_container.pack(fill='both', expand=True)
+
+        # Switching between subject and group selector layouts changes the
+        # required height of the left-side selection column. Re-measure the
+        # scroll viewport here so the lower settings panel is not clipped out of
+        # view in compact windows.
+        if hasattr(self, 'root'):
+            self.root.update_idletasks()
+        node = self._bout_sel_frame
+        while node is not None and not hasattr(node, '_scroll_canvas'):
+            node = getattr(node, 'master', None)
+        canvas = getattr(node, '_scroll_canvas', None)
+        if canvas is not None and hasattr(canvas, '_resync_content'):
+            canvas._resync_content()
     
     def update_bout_analysis_groups(self):
         """Update group list in bout analysis tab"""
@@ -25108,6 +25275,115 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return mean_width, trace_width, trace_alpha
 
+    # ── Time-zero marker ────────────────────────────────────────────────
+    # Every peri-event graph draws a dashed line at t=0 (bout onset / zone
+    # entry). Colour and weight come from one setting so the trace panels and
+    # their heatmaps cannot drift apart, and so a user who wants the marker out
+    # of the way of the data can turn it down once instead of per plot.
+    ZERO_LINE_DEFAULT_COLOR = '#808080'
+    ZERO_LINE_DEFAULT_WIDTH = 0.8
+
+    def get_zero_line_style(self):
+        """Return ``(color, linewidth)`` for the time-zero marker.
+
+        Reads the Advanced Graph Settings widgets when they exist, else the
+        stored params, so headless callers and tests get the same answer.
+        """
+        color = None
+        var = getattr(self, 'zero_line_color_var', None)
+        if var is not None:
+            try:
+                color = str(var.get()).strip()
+            except Exception:
+                color = None
+        if not color:
+            color = str(self.params.get('zero_line_color',
+                                        self.ZERO_LINE_DEFAULT_COLOR) or '').strip()
+        if not color or not mcolors.is_color_like(color):
+            color = self.ZERO_LINE_DEFAULT_COLOR
+
+        raw = None
+        var = getattr(self, 'zero_line_width_var', None)
+        if var is not None:
+            try:
+                raw = var.get()
+            except Exception:
+                raw = None
+        if raw in (None, ''):
+            raw = self.params.get('zero_line_width', self.ZERO_LINE_DEFAULT_WIDTH)
+        try:
+            width = float(raw)
+        except (TypeError, ValueError):
+            width = self.ZERO_LINE_DEFAULT_WIDTH
+        # 0 is a legitimate "hide it" request; the upper bound keeps a typo from
+        # painting the whole panel.
+        width = max(0.0, min(10.0, width))
+        # Write the validated pair back so a project save carries the setting
+        # without the Advanced Graph Settings window having to be open (and so a
+        # typed-in value that failed validation cannot be saved).
+        self.params['zero_line_color'] = color
+        self.params['zero_line_width'] = width
+        return color, width
+
+    def _refresh_zero_line_widgets(self):
+        """Push params back into the settings widgets (called on project load)."""
+        if hasattr(self, 'zero_line_color_var'):
+            self.zero_line_color_var.set(
+                str(self.params.get('zero_line_color', self.ZERO_LINE_DEFAULT_COLOR)))
+        if hasattr(self, 'zero_line_width_var'):
+            self.zero_line_width_var.set(
+                str(self.params.get('zero_line_width', self.ZERO_LINE_DEFAULT_WIDTH)))
+        self._update_zero_line_swatch()
+
+    def _update_zero_line_swatch(self):
+        """Tint the colour preview button next to the time-zero colour entry."""
+        btn = getattr(self, 'zero_line_swatch', None)
+        if btn is None:
+            return
+        try:
+            if not btn.winfo_exists():
+                return
+            color = str(self.zero_line_color_var.get()).strip()
+            btn.config(background=color if mcolors.is_color_like(color)
+                       else self.ZERO_LINE_DEFAULT_COLOR)
+        except Exception:
+            pass
+
+    def pick_zero_line_color(self):
+        """Colour picker for the time-zero marker."""
+        current = str(self.zero_line_color_var.get()).strip() or self.ZERO_LINE_DEFAULT_COLOR
+        if not mcolors.is_color_like(current):
+            current = self.ZERO_LINE_DEFAULT_COLOR
+        try:
+            initial = mcolors.to_hex(current)
+        except ValueError:
+            initial = self.ZERO_LINE_DEFAULT_COLOR
+        _rgb, hex_col = colorchooser.askcolor(
+            color=initial, title="Time-Zero Line Colour",
+            parent=getattr(self, 'graph_settings_window', None) or self.root)
+        if hex_col:
+            self.zero_line_color_var.set(hex_col)
+            self._update_zero_line_swatch()
+
+    def draw_zero_line(self, ax, x=0.0, label=None, **kwargs):
+        """Draw the configured dashed time-zero marker on *ax*.
+
+        A width of 0 hides the marker entirely (and takes its legend entry with
+        it). Any keyword overrides matplotlib accepts are passed through.
+        """
+        color, width = self.get_zero_line_style()
+        if width <= 0:
+            return None
+        # 2.5 keeps the marker above the traces (2) and any SEM shading (1) --
+        # where the red line it replaces sat by drawing order -- and above the
+        # heatmap images (0), without covering annotations.
+        opts = dict(color=color, linestyle='--', linewidth=width,
+                    alpha=0.9, zorder=2.5)
+        if label:
+            opts['label'] = label
+        opts.update(kwargs)
+        return ax.axvline(x, **opts)
+
     def _get_rolling_window_frames(self):
         """Visualization-time smoothing is disabled (handled in processing)."""
         return 1
@@ -25242,6 +25518,30 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         command=self._toggle_gridlines).grid(
             row=1, column=0, columnspan=3, sticky='w', padx=5, pady=(6, 3))
 
+        # Time-zero marker: the dashed line every peri-event graph draws at the
+        # bout onset / zone entry, on the trace panels and their heatmaps alike.
+        zero_frame = ttk.LabelFrame(main, text="Time-Zero Line  (bout onset / entry marker)",
+                                    padding=8)
+        zero_frame.pack(fill='x', pady=(0, 8))
+        ttk.Label(zero_frame, text="Line Width:").grid(row=0, column=0, sticky='w', padx=5, pady=3)
+        ttk.Entry(zero_frame, textvariable=self.zero_line_width_var, width=10).grid(
+            row=0, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(zero_frame, text="Color:").grid(row=0, column=2, sticky='w', padx=15, pady=3)
+        zero_color_entry = ttk.Entry(zero_frame, textvariable=self.zero_line_color_var, width=10)
+        zero_color_entry.grid(row=0, column=3, padx=5, pady=3, sticky='w')
+        self.zero_line_swatch = tk.Button(zero_frame, text="Pick", width=5,
+                                          command=self.pick_zero_line_color)
+        self.zero_line_swatch.grid(row=0, column=4, padx=5, pady=3, sticky='w')
+        self._update_zero_line_swatch()
+        ttk.Label(zero_frame,
+                  text='Applies to every peri-event graph (Extracted Bouts, Zone Entry Bouts, '
+                       'Compare Across Bouts, Bout Length Bins), traces and heatmaps alike. '
+                       'A name ("grey", "red") or a hex value both work; set the width to 0 to '
+                       'hide the marker.',
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(560), justify='left').grid(
+            row=1, column=0, columnspan=5, sticky='w', padx=5, pady=(2, 0))
+
         heatmap_frame = ttk.LabelFrame(main, text="Heatmap Styling", padding=8)
         heatmap_frame.pack(fill='x', pady=(0, 8))
         ttk.Label(heatmap_frame, text="Color Min:").grid(row=0, column=0, sticky='w', padx=5, pady=3)
@@ -25291,6 +25591,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.heatmap_color_low_entry = self.heatmap_color_low_btn = None
             self.heatmap_color_mid_entry = self.heatmap_color_mid_btn = None
             self.heatmap_color_high_entry = self.heatmap_color_high_btn = None
+            self.zero_line_swatch = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _clear_custom_color_refs)
 
@@ -25399,6 +25700,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             try:
                 self.get_trace_styling()
                 self.get_heatmap_range()
+                # Validates and commits to params, then mirrors the accepted
+                # value back so a rejected entry does not silently stick around.
+                self.get_zero_line_style()
+                self._refresh_zero_line_widgets()
                 self._update_zone_overlay_button_label()
                 if self.current_viz_figure is not None:
                     self.generate_plot()
@@ -25465,18 +25770,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.viz_channel_vars = []
 
         data = self.processed_data.get(subject, {})
-        num_channels = 0
-        # Prefer corrected/zscore arrays to determine channel count
-        for key in ('zscore_470', 'zscore_570', 'corrected_470', 'corrected_570', 'dff_470', 'dff_570', 'data_470', 'data_570'):
-            if key in data:
-                arr = data[key]
-                if arr is not None and arr.shape[1] > 2:
-                    if key.startswith('data_'):
-                        # raw data: signals and isosbestic pairs -> count pairs
-                        num_channels = (arr.shape[1] - 2) // 2
-                    else:
-                        num_channels = arr.shape[1] - 2
-                    break
+        num_channels = self.get_num_channels(data)
+        if num_channels <= 0:
+            # Fall back to explicit names if available
+            channel_names = data.get('channel_names') or data.get('channel_name_map')
+            if isinstance(channel_names, list):
+                num_channels = len(channel_names)
+            elif isinstance(channel_names, dict):
+                num_channels = len(channel_names)
 
         if num_channels <= 0:
             # Fallback to two-channel legacy
@@ -26829,6 +27130,50 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Button(btn_row, text="Reset colors", command=_reset_colors).pack(side='left', padx=4)
         ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='left', padx=4)
 
+    @staticmethod
+    def _contiguous_runs(mask):
+        """Yield ``(first, last)`` inclusive index pairs for each True run."""
+        mask = np.asarray(mask, dtype=bool)
+        if mask.size == 0 or not mask.any():
+            return []
+        edges = np.flatnonzero(np.diff(np.concatenate(([False], mask, [False]))))
+        return [(int(a), int(b) - 1) for a, b in zip(edges[::2], edges[1::2])]
+
+    def _photometry_coverage_mask(self, data, beh):
+        """Boolean mask of the beh_synced rows the photometry recording covers.
+
+        Projects processed before the sync gained a matching tolerance have the
+        uncovered rows filled with a repeated copy of the nearest edge sample,
+        which draws as a flat but plausible trace. Recomputing coverage from the
+        FP timestamps lets a graph hide that without the user having to
+        reprocess. Returns ``None`` when coverage cannot be established -- no
+        FP timestamps, no behavior timestamps, or the two clocks not sharing an
+        epoch (the relative-matching path, where the comparison is meaningless).
+        """
+        z = data.get('zscore')
+        if not isinstance(z, np.ndarray) or z.ndim != 2 or z.shape[1] < 2 or len(z) < 2:
+            return None
+        if not isinstance(beh, np.ndarray) or beh.ndim != 2 or beh.shape[1] < 2:
+            return None
+
+        fp_ts = np.asarray(z[:, 1], dtype=float)
+        beh_ts = np.asarray(beh[:, 1], dtype=float)
+        if not np.isfinite(fp_ts).any() or not np.isfinite(beh_ts).any():
+            return None
+
+        fp_lo, fp_hi = np.nanmin(fp_ts), np.nanmax(fp_ts)
+        beh_lo, beh_hi = np.nanmin(beh_ts), np.nanmax(beh_ts)
+        span = max(fp_hi, beh_hi) - min(fp_lo, beh_lo)
+        overlap = min(fp_hi, beh_hi) - max(fp_lo, beh_lo)
+        if span <= 0 or overlap / span < 0.01:
+            return None         # different clocks -- sync matched on elapsed time
+
+        tol = self._sync_match_tolerance(fp_ts, beh_ts)
+        if not np.isfinite(tol):
+            return None
+        covered = (beh_ts >= fp_lo - tol) & (beh_ts <= fp_hi + tol)
+        return covered if covered.any() else None
+
     def plot_bouts_overlay(self, fig, data, subject):
         """Plot z-scored signal with bout markers"""
         if 'beh_synced' not in data:
@@ -26852,17 +27197,49 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # bout highlights line up across channels).
         n_plots = len(phot_cols)
         n_frames = beh.shape[0]
+        # Bout frames are ROW indices into beh_synced -- that is the space
+        # _transform_boutframe_values produces and the space extract_bouts
+        # slices with. Plotting the signal against beh[:, 0] (the behavior
+        # file's own frame *value*) only happens to agree when that column is
+        # 0, 1, 2, ...; a 1-based or gap-containing frame column silently
+        # shifted every marker away from the sample it belongs to. Use the row
+        # index so the markers and the trace share one coordinate system.
+        x_frames = np.arange(n_frames)
+        # Rows the photometry recording never covered are blanked rather than
+        # drawn, so a bout scored there is visibly sitting over no signal
+        # instead of over a fabricated flat line (see
+        # _photometry_coverage_mask). A no-op once the subject has been
+        # reprocessed, since the sync now leaves those rows NaN itself.
+        covered = self._photometry_coverage_mask(data, beh)
+        n_blanked = int(np.count_nonzero(~covered)) if covered is not None else 0
+
         axes = []
         for i, col_idx in enumerate(phot_cols):
             ax = fig.add_subplot(n_plots, 1, i + 1, sharex=axes[0] if axes else None)
-            signal = self._apply_visualizer_smoothing(beh[:, col_idx])
-            ax.plot(beh[:, 0], signal, linewidth=0.6, color='#2b2b2b', zorder=3)
+            signal = np.asarray(
+                self._apply_visualizer_smoothing(beh[:, col_idx]), dtype=float)
+            if n_blanked:
+                signal = np.where(covered, signal, np.nan)
+            ax.plot(x_frames, signal, linewidth=0.6, color='#2b2b2b', zorder=3)
             ax.set_title(f'Ch{sel_chs[i]} z-scored signal with bout highlights')
             ax.set_ylabel('Z-score')
             ax.axhline(0, color='k', linestyle='--', alpha=0.3, zorder=1)
             ax.grid(True, alpha=0.3)
             axes.append(ax)
         axes[-1].set_xlabel('Frame')
+
+        if n_blanked:
+            # Shaded quietly, with no caption. Every subject carries a short
+            # uncovered head from the precut (~50 frames), which is normal and
+            # expected -- annotating it read as a data-loss warning and alarmed
+            # users over nothing. The shading alone is enough to show that the
+            # region holds no signal, and stays proportionate when the gap is a
+            # real one (a late-starting FP recording spanning thousands of
+            # frames) rather than the routine precut.
+            for ax in axes:
+                for lo, hi in self._contiguous_runs(~covered):
+                    ax.axvspan(lo - 0.5, hi + 0.5, facecolor='#d9d9d9',
+                               alpha=0.45, linewidth=0, zorder=0)
 
         # Build behavior -> list of (start, end_or_None) spans.  Prefer the
         # scaled onset/end frames stored on processed_data; fall back to parsing
@@ -27077,7 +27454,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax_trace.plot(time_axis, mean_bout, linewidth=2, label='Mean')
                 ax_trace.fill_between(time_axis, mean_bout - sem_bout, mean_bout + sem_bout, alpha=0.3, label='SEM')
 
-            ax_trace.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
+            self.draw_zero_line(ax_trace, label='Bout Onset')
             ax_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax_trace.set_xlabel('Time from bout onset (s)')
             ax_trace.set_ylabel(f'Ch{ch} Z-score')
@@ -27100,7 +27477,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 im = ax_heat.imshow(heatmap_data, aspect='auto', cmap=cmap,
                                     extent=[time_axis[0], time_axis[-1], len(bouts), 0],
                                     vmin=vmin, vmax=vmax, interpolation='nearest')
-                ax_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+                self.draw_zero_line(ax_heat)
                 ax_heat.set_xlabel('Time from bout onset (s)')
                 ax_heat.set_ylabel('Bout #')
                 ax_heat.set_title(f'Ch{ch} Heatmap')
@@ -27517,15 +27894,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if not isinstance(behavior_entry, dict):
                             continue
                         
-                        # Process each channel separately (G0 and G1).  The key is
-                        # positional — the store aliases Ch0/Ch1 as G0/G1 — so the
-                        # exclusion lookup goes through the slot index, which
-                        # resolves to this subject's own designation.
+                        # Process each channel separately. The store may use legacy
+                        # G0/G1 aliases for positional data, but we export the real
+                        # channel name assigned to that slot for clarity.
                         for ch_slot, ch_key in enumerate(['G0', 'G1']):
-                            # Check if channel should be exported
-                            if ch_key == 'G0' and not show_g0:
+                            actual_channel_name = self.get_channel_name(data, ch_slot)
+
+                            # Check if this channel should be exported
+                            if ch_slot == 0 and not show_g0:
                                 continue
-                            if ch_key == 'G1' and not show_g1:
+                            if ch_slot == 1 and not show_g1:
                                 continue
 
                             # Check if this channel is excluded for this subject
@@ -27582,8 +27960,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     subject_behavior_channel_bouts[col_name] = np.asarray(bout)
                             
                             if subject_behavior_channel_bouts:
-                                # Tag with behavior name AND channel for separation
-                                all_data.append({'behavior': behavior_name, 'channel': ch_key, 'bouts': subject_behavior_channel_bouts})
+                                # Tag with behavior name AND the actual channel designation.
+                                all_data.append({'behavior': behavior_name, 'channel': actual_channel_name, 'bouts': subject_behavior_channel_bouts})
                     continue  # Skip the wavelength loop for bouts
                 elif "Zone Averages" in plot_type or "Zone average" in plot_type:
                     # Export zone averages data - horizontal format with zone categories as columns
@@ -27597,6 +27975,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                     # Create row data with categories as columns (horizontal format)
                     for ch_slot, channel in enumerate(['G0', 'G1']):
+                        channel_label = self.get_channel_name(data, ch_slot)
                         if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
                             continue
                         # Skip excluded channels (slot resolves to this subject's designation)
@@ -27605,7 +27984,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                         row_data = {
                             'subject': subject,
-                            'channel': channel
+                            'channel': channel_label
                         }
 
                         if subject_to_group:
@@ -27632,10 +28011,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     for axis_name, axis_key in [('X', 'distance_averages_x'), ('Y', 'distance_averages_y')]:
                         if axis_key not in data:
                             continue
-                        
+
                         dist_data = data[axis_key]
-                        
+
                         for ch_slot, channel in enumerate(['G0', 'G1']):
+                            channel_label = self.get_channel_name(data, ch_slot)
                             if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
                                 continue
                             # Skip excluded channels (slot resolves to this subject's designation)
@@ -27645,17 +28025,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             row_data = {
                                 'subject': subject,
                                 'axis': axis_name,
-                                'channel': channel
+                                'channel': channel_label
                             }
-                            
+
                             if subject_to_group:
                                 row_data['group'] = subject_to_group.get(subject, 'Unknown')
-                            
+
                             # Add each distance as a column
                             for distance, metrics in sorted(dist_data.items()):
                                 mean_val = metrics.get(f'{channel}_mean', float('nan'))
                                 row_data[f'dist_{int(distance)}cm_mean'] = mean_val
-                            
+
                             all_data.append(pd.DataFrame([row_data]))
                     continue  # Skip the wavelength loop for distance data
                 elif "Out/Back" in plot_type:
@@ -27664,24 +28044,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         continue
                     
                     outback = data['outback']
+                    actual_channel_name_0 = self.get_channel_name(data, 0)
+                    actual_channel_name_1 = self.get_channel_name(data, 1)
                     
                     # Out movement
                     if 'out' in outback and outback['out'].get('G0_n', 0) > 0:
                         out_dict = {'subject': [subject], 'movement': ['Out']}
                         
-                        # Only include G0 if it's selected and not excluded
+                        # Only include channel slot 0 if it's selected and not excluded
                         if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)):
-                            out_dict['G0_mean'] = [outback['out'].get('G0_mean', np.nan)]
-                            out_dict['G0_sem'] = [outback['out'].get('G0_sem', np.nan)]
-                            out_dict['G0_std'] = [outback['out'].get('G0_std', np.nan)]
-                            out_dict['G0_n'] = [outback['out'].get('G0_n', 0)]
+                            out_dict[f'{actual_channel_name_0}_mean'] = [outback['out'].get('G0_mean', np.nan)]
+                            out_dict[f'{actual_channel_name_0}_sem'] = [outback['out'].get('G0_sem', np.nan)]
+                            out_dict[f'{actual_channel_name_0}_std'] = [outback['out'].get('G0_std', np.nan)]
+                            out_dict[f'{actual_channel_name_0}_n'] = [outback['out'].get('G0_n', 0)]
                         
-                        # Only include G1 if it's selected and not excluded
+                        # Only include channel slot 1 if it's selected and not excluded
                         if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)):
-                            out_dict['G1_mean'] = [outback['out'].get('G1_mean', np.nan)]
-                            out_dict['G1_sem'] = [outback['out'].get('G1_sem', np.nan)]
-                            out_dict['G1_std'] = [outback['out'].get('G1_std', np.nan)]
-                            out_dict['G1_n'] = [outback['out'].get('G1_n', 0)]
+                            out_dict[f'{actual_channel_name_1}_mean'] = [outback['out'].get('G1_mean', np.nan)]
+                            out_dict[f'{actual_channel_name_1}_sem'] = [outback['out'].get('G1_sem', np.nan)]
+                            out_dict[f'{actual_channel_name_1}_std'] = [outback['out'].get('G1_std', np.nan)]
+                            out_dict[f'{actual_channel_name_1}_n'] = [outback['out'].get('G1_n', 0)]
                         
                         # Skip this movement if no channels are available
                         if len(out_dict) > 2:  # More than just 'subject' and 'movement'
@@ -27694,19 +28076,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if 'back' in outback and outback['back'].get('G0_n', 0) > 0:
                         back_dict = {'subject': [subject], 'movement': ['Back']}
                         
-                        # Only include G0 if it's selected and not excluded
+                        # Only include channel slot 0 if it's selected and not excluded
                         if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)):
-                            back_dict['G0_mean'] = [outback['back'].get('G0_mean', np.nan)]
-                            back_dict['G0_sem'] = [outback['back'].get('G0_sem', np.nan)]
-                            back_dict['G0_std'] = [outback['back'].get('G0_std', np.nan)]
-                            back_dict['G0_n'] = [outback['back'].get('G0_n', 0)]
+                            back_dict[f'{actual_channel_name_0}_mean'] = [outback['back'].get('G0_mean', np.nan)]
+                            back_dict[f'{actual_channel_name_0}_sem'] = [outback['back'].get('G0_sem', np.nan)]
+                            back_dict[f'{actual_channel_name_0}_std'] = [outback['back'].get('G0_std', np.nan)]
+                            back_dict[f'{actual_channel_name_0}_n'] = [outback['back'].get('G0_n', 0)]
                         
-                        # Only include G1 if it's selected and not excluded
+                        # Only include channel slot 1 if it's selected and not excluded
                         if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)):
-                            back_dict['G1_mean'] = [outback['back'].get('G1_mean', np.nan)]
-                            back_dict['G1_sem'] = [outback['back'].get('G1_sem', np.nan)]
-                            back_dict['G1_std'] = [outback['back'].get('G1_std', np.nan)]
-                            back_dict['G1_n'] = [outback['back'].get('G1_n', 0)]
+                            back_dict[f'{actual_channel_name_1}_mean'] = [outback['back'].get('G1_mean', np.nan)]
+                            back_dict[f'{actual_channel_name_1}_sem'] = [outback['back'].get('G1_sem', np.nan)]
+                            back_dict[f'{actual_channel_name_1}_std'] = [outback['back'].get('G1_std', np.nan)]
+                            back_dict[f'{actual_channel_name_1}_n'] = [outback['back'].get('G1_n', 0)]
                         
                         # Skip this movement if no channels are available
                         if len(back_dict) > 2:  # More than just 'subject' and 'movement'
@@ -27809,6 +28191,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     
                     # Collect all bouts for this subject in wide format
                     subject_bouts = {}
+                    actual_channel_name_0 = self.get_channel_name(data, 0)
+                    actual_channel_name_1 = self.get_channel_name(data, 1)
                     
                     # Export each zone's bouts (should be 'open_arm')
                     for zone_name, zone_bouts in bout_type_data.items():
@@ -27824,14 +28208,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 for i, bout in enumerate(g0_bouts):
                                     bout_matrix[i, :len(bout)] = bout
                                 subject_avg = np.nanmean(bout_matrix, axis=0)
-                                col_name = f"{subject}_G0_avg"
+                                col_name = f"{subject}_{actual_channel_name_0}_avg"
                                 if subject_to_group:
                                     col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                 subject_bouts[col_name] = subject_avg
                             else:
                                 # Export individual bouts
                                 for bout_idx, bout in enumerate(g0_bouts):
-                                    col_name = f"{subject}_G0_bout{bout_idx + 1}"
+                                    col_name = f"{subject}_{actual_channel_name_0}_bout{bout_idx + 1}"
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                     subject_bouts[col_name] = bout
@@ -27847,14 +28231,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 for i, bout in enumerate(g1_bouts):
                                     bout_matrix[i, :len(bout)] = bout
                                 subject_avg = np.nanmean(bout_matrix, axis=0)
-                                col_name = f"{subject}_G1_avg"
+                                col_name = f"{subject}_{actual_channel_name_1}_avg"
                                 if subject_to_group:
                                     col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                 subject_bouts[col_name] = subject_avg
                             else:
                                 # Export individual bouts
                                 for bout_idx, bout in enumerate(g1_bouts):
-                                    col_name = f"{subject}_G1_bout{bout_idx + 1}"
+                                    col_name = f"{subject}_{actual_channel_name_1}_bout{bout_idx + 1}"
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                     subject_bouts[col_name] = bout
@@ -28567,7 +28951,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.plot(time_axis, mean_trace, 'b', linewidth=mean_width, label='Mean')
             ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                            alpha=0.3, color='b', label='SEM')
-            ax.axvline(0, color='r', linestyle='--', linewidth=2, label='Entry')
+            self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {entry_label.lower()} (s)')
             ax.set_ylabel('G0 Z-score')
@@ -28584,7 +28968,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
                                extent=[time_axis[0], time_axis[-1], len(g0_bouts), 0],
                                vmin=vmin, vmax=vmax, interpolation='nearest')
-            ax_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {entry_label.lower()} (s)')
             ax_heat.set_ylabel('Entry #')
             ax_heat.set_title('G0 Heatmap')
@@ -28612,7 +28996,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.plot(time_axis, mean_trace, 'g', linewidth=mean_width, label='Mean')
             ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                            alpha=0.3, color='g', label='SEM')
-            ax.axvline(0, color='r', linestyle='--', linewidth=2, label='Entry')
+            self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {entry_label.lower()} (s)')
             ax.set_ylabel('G1 Z-score')
@@ -28629,7 +29013,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
                                extent=[time_axis[0], time_axis[-1], len(g1_bouts), 0],
                                vmin=vmin, vmax=vmax, interpolation='nearest')
-            ax_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {entry_label.lower()} (s)')
             ax_heat.set_ylabel('Entry #')
             ax_heat.set_title('G1 Heatmap')
@@ -29286,7 +29670,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.plot(time_axis, mean_trace, 'b', linewidth=mean_width, label='Mean')
             ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                            alpha=0.3, color='b', label='SEM')
-            ax.axvline(0, color='r', linestyle='--', linewidth=2, label='Entry')
+            self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
             ax.set_ylabel('G0 Z-score')
@@ -29305,7 +29689,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
                                extent=[time_axis[0], time_axis[-1], len(all_g0_bouts), 0],
                                vmin=vmin, vmax=vmax, interpolation='nearest')
-            ax_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
             ax_heat.set_ylabel('Bout/Subject #' if average_within_subject else 'Bout #')
             ax_heat.set_title('G0 Heatmap')
@@ -29329,7 +29713,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.plot(time_axis, mean_trace, 'g', linewidth=mean_width, label='Mean')
             ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                            alpha=0.3, color='g', label='SEM')
-            ax.axvline(0, color='r', linestyle='--', linewidth=2, label='Entry')
+            self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
             ax.set_ylabel('G1 Z-score')
@@ -29348,7 +29732,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
                                extent=[time_axis[0], time_axis[-1], len(all_g1_bouts), 0],
                                vmin=vmin, vmax=vmax, interpolation='nearest')
-            ax_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
             ax_heat.set_ylabel('Bout/Subject #' if average_within_subject else 'Bout #')
             ax_heat.set_title('G1 Heatmap')
@@ -29473,7 +29857,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                                 alpha=0.3, color=color)
 
-            ax.axvline(0, color='r', linestyle='--', linewidth=2, label='Entry')
+            self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
             ax.set_ylabel('G0 Z-score')
@@ -29505,7 +29889,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                                 alpha=0.3, color=color)
 
-            ax.axvline(0, color='r', linestyle='--', linewidth=2, label='Entry')
+            self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
             ax.set_ylabel('G1 Z-score')
@@ -30773,7 +31157,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax1_trace.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                                alpha=0.2, color=color)
             
-            ax1_trace.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
+            self.draw_zero_line(ax1_trace, label='Bout Onset')
             ax1_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1_trace.set_xlabel('Time from bout onset (s)')
             ax1_trace.set_ylabel(f'{label_a} Z-score')
@@ -30800,7 +31184,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     im = ax1_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
                                         extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
                                         vmin=vmin, vmax=vmax, interpolation='nearest')
-                    ax1_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+                    self.draw_zero_line(ax1_heat)
                     ax1_heat.set_xlabel('Time from bout onset (s)')
                     ax1_heat.set_ylabel('Subject (by group)')
                     ax1_heat.set_title(f'{label_a} Heatmap' if average_within_subject
@@ -30843,7 +31227,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax2_trace.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                                alpha=0.2, color=color)
             
-            ax2_trace.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
+            self.draw_zero_line(ax2_trace, label='Bout Onset')
             ax2_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2_trace.set_xlabel('Time from bout onset (s)')
             ax2_trace.set_ylabel(f'{label_b} Z-score')
@@ -30870,7 +31254,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     im = ax2_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
                                         extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
                                         vmin=vmin, vmax=vmax, interpolation='nearest')
-                    ax2_heat.axvline(0, color='yellow', linestyle='--', linewidth=2)
+                    self.draw_zero_line(ax2_heat)
                     ax2_heat.set_xlabel('Time from bout onset (s)')
                     ax2_heat.set_ylabel('Subject (by group)')
                     ax2_heat.set_title(f'{label_b} Heatmap' if average_within_subject
@@ -31023,7 +31407,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     padded[:len(bout)] = bout
                     ax1.plot(time_axis, padded, color='b', alpha=0.4, linewidth=0.8)
             
-            ax1.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
+            self.draw_zero_line(ax1, label='Bout Onset')
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
             ax1.set_ylabel(f'{label_a} Z-score')
@@ -31048,7 +31432,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             im = ax3.imshow(heatmap_data, aspect='auto', cmap=cmap, 
                           extent=[time_axis[0], time_axis[-1], len(all_g0_bouts), 0],
                           vmin=vmin, vmax=vmax, interpolation='nearest')
-            ax3.axvline(0, color='yellow', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax3)
             ax3.set_xlabel('Time from bout onset (s)')
             ax3.set_ylabel(heatmap_ylabel)
             ax3.set_title(f'{label_a} Heatmap{heatmap_title_suffix}')
@@ -31081,7 +31465,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     padded[:len(bout)] = bout
                     ax2.plot(time_axis, padded, color='g', alpha=0.4, linewidth=0.8)
             
-            ax2.axvline(0, color='r', linestyle='--', linewidth=2, label='Bout Onset')
+            self.draw_zero_line(ax2, label='Bout Onset')
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
             ax2.set_ylabel(f'{label_b} Z-score')
@@ -31106,7 +31490,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             im = ax4.imshow(heatmap_data, aspect='auto', cmap=cmap,
                           extent=[time_axis[0], time_axis[-1], len(all_g1_bouts), 0],
                           vmin=vmin, vmax=vmax, interpolation='nearest')
-            ax4.axvline(0, color='yellow', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax4)
             ax4.set_xlabel('Time from bout onset (s)')
             ax4.set_ylabel(heatmap_ylabel)
             ax4.set_title(f'{label_b} Heatmap{heatmap_title_suffix}')
@@ -31228,7 +31612,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 title = f'{label_a}: {subject} - {behavior}\n(Bout #{selected_bout} only)'
                 ax1.legend(loc='best', fontsize=8)
 
-            ax1.axvline(0, color='r', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax1)
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
             ax1.set_ylabel(f'{label_a} Z-score')
@@ -31265,7 +31649,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 title = f'{label_b}: {subject} - {behavior}\n(Bout #{selected_bout} only)'
                 ax2.legend(loc='best', fontsize=8)
 
-            ax2.axvline(0, color='r', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax2)
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
             ax2.set_ylabel(f'{label_b} Z-score')
@@ -31392,7 +31776,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     label = f'Bout #{bout_num} (n={len(bouts)})' if i == 0 else None
                     ax1.plot(time_axis, padded, color=color, alpha=0.6, linewidth=1.2, label=label)
             
-            ax1.axvline(0, color='r', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax1)
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
             ax1.set_ylabel(f'{label_a} Z-score')
@@ -31434,7 +31818,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     label = f'Bout #{bout_num} (n={len(bouts)})' if i == 0 else None
                     ax2.plot(time_axis, padded, color=color, alpha=0.6, linewidth=1.2, label=label)
             
-            ax2.axvline(0, color='r', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax2)
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
             ax2.set_ylabel(f'{label_b} Z-score')
@@ -31606,7 +31990,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         ax1.plot(time_axis, padded, color=base_color, linestyle=line_style,
                                alpha=0.6, linewidth=1.2, label=label)
             
-            ax1.axvline(0, color='r', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax1)
             ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax1.set_xlabel('Time from bout onset (s)')
             ax1.set_ylabel(f'{label_a} Z-score')
@@ -31654,7 +32038,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         ax2.plot(time_axis, padded, color=base_color, linestyle=line_style,
                                alpha=0.6, linewidth=1.2, label=label)
             
-            ax2.axvline(0, color='r', linestyle='--', linewidth=2)
+            self.draw_zero_line(ax2)
             ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax2.set_xlabel('Time from bout onset (s)')
             ax2.set_ylabel(f'{label_b} Z-score')
@@ -31765,7 +32149,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             label=f'{ch} (n={len(traces)})')
                     ax.fill_between(time_axis, mean - sem, mean + sem, color=color, alpha=0.2)
                     any_line = True
-                ax.axvline(0, color='r', linestyle='--', linewidth=1.5)
+                self.draw_zero_line(ax)
                 ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
                 ax.set_ylabel('Z-score', fontsize=10)
                 ax.set_title(f'{group_name}: {behavior} — channel comparison', fontsize=10,
@@ -36883,7 +37267,7 @@ cat("OK\n")
                             color=color, alpha=0.18)
             plotted = True
         if plotted:
-            ax.axvline(0, color='r', linestyle='--', linewidth=1.5)
+            self.draw_zero_line(ax)
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel('Time from bout onset (s)')
             ax.set_ylabel('Z-score')
@@ -39290,6 +39674,25 @@ cat("OK\n")
                 "(repo is on a share owned by another account).")
         return ok
 
+    # Config overrides applied to every git call the updater makes.
+    #
+    #  - gc/maintenance: on Windows, git's post-fetch "geometric repack" often
+    #    fails to rename the new pack file because antivirus or a sync client
+    #    still holds a handle on it ("renaming pack to ...idx failed: Permission
+    #    denied"). The fetch itself succeeded, but the failed maintenance task
+    #    makes git exit non-zero and took the whole update down with it.
+    #  - user.name/user.email: a machine that has never configured a git
+    #    identity cannot create a commit, so any merge git decides to make
+    #    aborts with "Committer identity unknown". The steps above avoid merges,
+    #    but an identity costs nothing and removes the failure mode entirely.
+    GIT_UPDATE_CONFIG = [
+        '-c', 'gc.auto=0',
+        '-c', 'maintenance.auto=false',
+        '-c', 'fetch.writeCommitGraph=false',
+        '-c', 'user.name=TRACY Updater',
+        '-c', 'user.email=tracy-updater@localhost',
+    ]
+
     def check_for_updates(self):
         """Fetch remote git metadata and check whether local branch is behind."""
         import subprocess
@@ -39313,7 +39716,7 @@ cat("OK\n")
 
                 # Fetch latest metadata from remote (non-destructive)
                 subprocess.run(
-                    ['git', 'fetch', 'origin'],
+                    ['git'] + self.GIT_UPDATE_CONFIG + ['fetch', 'origin'],
                     cwd=repo_dir,
                     capture_output=True,
                     timeout=20,
@@ -39451,7 +39854,7 @@ cat("OK\n")
                 Returns (returncode, captured_output_text)."""
                 lines = []
                 proc = subprocess.Popen(
-                    ['git'] + args, cwd=repo_dir,
+                    ['git'] + self.GIT_UPDATE_CONFIG + args, cwd=repo_dir,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, creationflags=SUBPROCESS_NO_WINDOW)
                 for ln in proc.stdout:
@@ -39462,25 +39865,69 @@ cat("OK\n")
                 proc.wait()
                 return proc.returncode, ''.join(lines)
 
-            rc, out = _run_git(['pull', 'origin', 'main'])
+            def _rev_parse(ref):
+                """Resolve a ref to a commit hash, or None if it doesn't exist."""
+                try:
+                    r = subprocess.run(
+                        ['git', 'rev-parse', '--verify', '--quiet',
+                         ref + '^{commit}'],
+                        cwd=repo_dir, capture_output=True, text=True, timeout=15,
+                        creationflags=SUBPROCESS_NO_WINDOW)
+                    return r.stdout.strip() if r.returncode == 0 else None
+                except Exception:
+                    return None
 
-            # A pull commonly fails because local or untracked files in the app
-            # folder would be overwritten (e.g. a user's own copy of files now
-            # tracked in the repo, like assets/). Set those changes aside in a
-            # RECOVERABLE git stash and retry once, so the update applies without
-            # the user needing the command line.
+            # Fetch and fast-forward as two steps rather than one 'git pull'.
+            # git's exit code for a fetch also covers its background repack,
+            # which fails on some Windows machines even though every object
+            # arrived, so judge the fetch by whether FETCH_HEAD actually points
+            # at a commit rather than by the return code.
+            fetch_rc, out = _run_git(['fetch', 'origin', 'main'])
+            target = _rev_parse('FETCH_HEAD')
+
             stashed = False
-            if rc != 0:
-                self.system_text.insert(
-                    'end', "\nPull failed — setting local changes aside "
-                           "(recoverable git stash) and retrying...\n")
-                self.system_text.see('end')
-                self.root.update()
-                stash_rc, _ = _run_git(
-                    ['stash', 'push', '--include-untracked',
-                     '-m', 'TRACY auto-update stash'])
-                stashed = (stash_rc == 0)
-                rc, out = _run_git(['pull', 'origin', 'main'])
+            if target is None:
+                rc = fetch_rc or 1
+            else:
+                rc, out = _run_git(['merge', '--ff-only', 'FETCH_HEAD'])
+
+                # A fast-forward commonly fails because local or untracked files
+                # in the app folder would be overwritten (e.g. a user's own copy
+                # of files now tracked in the repo, like assets/). Set those
+                # changes aside in a RECOVERABLE git stash and retry once, so the
+                # update applies without the user needing the command line.
+                if rc != 0:
+                    self.system_text.insert(
+                        'end', "\nUpdate blocked by local changes — setting them "
+                               "aside (recoverable git stash) and retrying...\n")
+                    self.system_text.see('end')
+                    self.root.update()
+                    stash_rc, _ = _run_git(
+                        ['stash', 'push', '--include-untracked',
+                         '-m', 'TRACY auto-update stash'])
+                    stashed = (stash_rc == 0)
+                    rc, out = _run_git(['merge', '--ff-only', 'FETCH_HEAD'])
+
+                # Still stuck: local history has diverged from the remote (a
+                # commit made inside the app folder). Uncommitted work is safe in
+                # the stash above, so move the branch onto the fetched commit.
+                if rc != 0:
+                    self.system_text.insert(
+                        'end', "\nLocal copy has diverged from GitHub — resetting "
+                               "it to the downloaded version...\n")
+                    self.system_text.see('end')
+                    self.root.update()
+                    rc, out = _run_git(['reset', '--hard', 'FETCH_HEAD'])
+
+            # Confirm we really landed on the downloaded commit. If the fetch
+            # only half-succeeded (objects blocked by antivirus, a locked pack
+            # file), FETCH_HEAD can still point at an older fetch and the merge
+            # then reports "Already up to date" with exit code 0 - a silent
+            # non-update. Never restart the app on that.
+            if rc == 0 and target is not None and _rev_parse('HEAD') != target:
+                rc = 1
+                out += ("\nThe downloaded files did not replace the installed "
+                        "ones - the app folder still holds the old version.\n")
 
             if rc == 0:
                 self.system_text.insert('end', "\n" + "=" * 60 + "\n")
@@ -39505,6 +39952,16 @@ cat("OK\n")
             else:
                 self.system_text.insert('end', "\n✗ Update failed. See output above.\n")
                 tail = '\n'.join(out.strip().splitlines()[-12:]) or "(no output)"
+                # 'Permission denied' in git's output is Windows file locking,
+                # not a git problem: another copy of the app, antivirus, or a
+                # folder that OneDrive/Dropbox syncs while git rewrites it.
+                hint = ""
+                if 'permission denied' in out.lower():
+                    hint = (
+                        "\n\nTip: something on this PC is holding files in the app "
+                        "folder open. Close any other copies of Tracy, then try "
+                        "again. If it keeps happening, move the app folder out of "
+                        "OneDrive/Dropbox or add it to your antivirus exclusions.")
                 messagebox.showerror(
                     "Update Failed",
                     "The update could not be installed and the app was NOT changed.\n\n"
@@ -39513,6 +39970,7 @@ cat("OK\n")
                     "You can update manually by running 'git pull origin main' in the "
                     "application folder, or re-download the latest version from GitHub. "
                     "Full details are in the Installation Log on this tab."
+                    + hint
                 )
 
         except FileNotFoundError:

@@ -567,6 +567,68 @@ class TestBoutWindowExtraction:
             "Marker should shift to index 3 (= prebout - shift) with +2 shift"
 
 
+
+# ---------------------------------------------------------------------------
+# _photometry_start_offset_samples against a real acquisition clock.
+#
+# The simulated helper above models the legacy `precut // n_led_states` rule and
+# so cannot see how the real method reads the raw timestamp column.  Bonsai
+# writes SystemTimestamp as an absolute clock counting from system boot, so row 0
+# is already tens of thousands of seconds in; taking that value directly makes
+# the offset dwarf the whole recording and pushes every bout out of range.
+# ---------------------------------------------------------------------------
+
+class TestStartOffsetUsesRelativeTimestamp:
+
+    @staticmethod
+    def _app(raw, fs=19.9349, precut=1200, n_led_states=2):
+        import fp_analysis_gui as G
+        app = object.__new__(G.FPAnalysisGUI)
+        app.params = {'precut': precut}
+        app.processed_data = {'S1': {'raw': raw, 'photometry_fps': fs,
+                                     'n_led_states': n_led_states}}
+        app.detected_photometry_fps = fs
+        return app
+
+    @staticmethod
+    def _raw(t_start, n=38732, raw_fs=39.87):
+        """A 2-LED raw block whose column 1 starts at *t_start* seconds."""
+        ts = t_start + np.arange(n) / raw_fs
+        led = np.where(np.arange(n) % 2 == 0, 1, 2)
+        return np.column_stack([np.arange(n), ts, led,
+                                np.zeros(n), np.zeros(n), np.zeros(n)])
+
+    def test_boot_clock_offset_matches_recording_relative_offset(self):
+        """A clock starting at boot must give the same answer as one at zero."""
+        at_zero = self._app(self._raw(0.0))
+        at_boot = self._app(self._raw(48592.0334))   # observed in real FPData
+        assert at_boot._photometry_start_offset_samples('S1') ==                at_zero._photometry_start_offset_samples('S1')
+
+    def test_offset_agrees_with_legacy_precut_rule(self):
+        """With photometry rolling from record, precut // n_led_states holds."""
+        app = self._app(self._raw(48592.0334))
+        assert app._photometry_start_offset_samples('S1') ==                pytest.approx(1200 // 2, abs=3)
+
+    def test_offset_stays_inside_the_recording(self):
+        app = self._app(self._raw(48592.0334))
+        off = app._photometry_start_offset_samples('S1')
+        n_per_channel = (38732 - 1200) // 2
+        assert 0 <= off < n_per_channel,             f"offset {off} outside a {n_per_channel}-sample trace"
+
+    def test_bouts_land_in_range_through_full_transform(self):
+        app = self._app(self._raw(48592.0334))
+        app.params.update({'auto_scale_boutframes': True,
+                           'boutframes_video_fps': 30.0,
+                           'precut_correct_boutframes': True,
+                           'boutframe_manual_shift': 0})
+        app.per_subject_boutframe_shifts = {}
+        frames = np.array([1600, 3316, 4927, 9203, 15065], dtype=float)
+        idx = app._transform_boutframe_values(frames, 'S1', as_int=True)
+        expected = np.round(frames / 30.0 * 19.9349 - 1200 // 2).astype(int)
+        assert np.max(np.abs(idx - expected)) <= 2
+        assert (idx >= 0).all()
+
+
 if __name__ == "__main__":
     # Run with: python test_precut_boutframe_correction.py
     import pytest as _pytest
