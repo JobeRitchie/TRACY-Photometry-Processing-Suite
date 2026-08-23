@@ -205,3 +205,74 @@ def test_toggle_off_produces_a_row_for_every_channel():
     app.run_spike_analysis()
     assert {(r[0], r[2]) for r in app.spike_tree.rows} == {
         ('S1', 'G0'), ('S1', 'G1'), ('S2', 'G0'), ('S2', 'G1')}
+
+
+# --------------------------------------------------------------------------- #
+#  zone analysis                                                               #
+# --------------------------------------------------------------------------- #
+#  "Analyze Spikes by Zone" re-detected transients straight off the z-score
+#  columns and never looked at the Exclusions tab, so a channel the results
+#  table and both exports had already dropped was still drawn per zone.
+
+def _zone_app(exclusions, use_exclusions, channel_names=('G0', 'G1')):
+    """A shell whose subject has position data and two z-scored channels."""
+    app = object.__new__(G.FPAnalysisGUI)
+    n = 60
+    beh = np.zeros((n, 4), dtype=float)
+    beh[:, 2] = 1.0          # x
+    beh[:, 3] = 1.0          # y
+    zscore = np.zeros((n, 4), dtype=float)
+    zscore[:, 2] = 1.0
+    zscore[:, 3] = 1.0
+    data = {
+        'beh_synced': beh,
+        'has_position': True,
+        'zscore_470': zscore,
+        'channel_names': list(channel_names) if channel_names else None,
+    }
+    app.processed_data = {'S1': data}
+    app.exclusions = {'S1': list(exclusions)}
+    app.use_exclusions_spike = _Var(use_exclusions)
+    app.zones = {'centre': {'category': 'centre'}}
+    app.classify_zone = lambda x, y: 'centre'
+    app.get_fps = lambda *a, **k: 30.0
+    app.get_channel_name = lambda d, i: (
+        d['channel_names'][i] if d.get('channel_names') else f'Ch{i}')
+    app.detect_spikes = lambda sig, fps, global_mad=None: {
+        'total_spikes': 2, 'spike_indices': [5, 25]}
+    return app
+
+
+def test_zone_toggle_off_keeps_an_excluded_channel():
+    app = _zone_app(exclusions=['G0'], use_exclusions=False)
+    assert set(app.analyze_spikes_by_zone('S1')) == {'G0', 'G1'}
+
+
+def test_zone_toggle_on_drops_an_excluded_channel():
+    app = _zone_app(exclusions=['G0'], use_exclusions=True)
+    assert set(app.analyze_spikes_by_zone('S1')) == {'G1'}
+
+
+def test_zone_explicit_use_exclusions_overrides_the_toggle():
+    app = _zone_app(exclusions=['G1'], use_exclusions=False)
+    assert set(app.analyze_spikes_by_zone('S1', use_exclusions=True)) == {'G0'}
+    app = _zone_app(exclusions=['G1'], use_exclusions=True)
+    assert set(app.analyze_spikes_by_zone('S1', use_exclusions=False)) == {'G0', 'G1'}
+
+
+def test_zone_red_designation_is_excluded_by_its_real_name():
+    """Results stay keyed by slot (G0/G1) -- the filter asks by designation."""
+    app = _zone_app(exclusions=['R5'], use_exclusions=True,
+                    channel_names=('R4', 'R5'))
+    assert set(app.analyze_spikes_by_zone('S1')) == {'G0'}
+
+
+def test_zone_all_channels_excluded_returns_nothing():
+    app = _zone_app(exclusions=['G0', 'G1'], use_exclusions=True)
+    assert app.analyze_spikes_by_zone('S1') is None
+
+
+def test_zone_no_toggle_attribute_means_no_filtering():
+    app = _zone_app(exclusions=['G0'], use_exclusions=True)
+    del app.use_exclusions_spike
+    assert set(app.analyze_spikes_by_zone('S1')) == {'G0', 'G1'}

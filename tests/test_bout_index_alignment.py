@@ -106,7 +106,13 @@ def test_legacy_store_with_a_detectable_skew_refuses_to_guess():
 
 # --------------------------------------------------------------------------
 # _bout_analysis_segment reads the right window
+#
+# The window is passed in SECONDS; with no processed rate anywhere these apps
+# fall back to 30 Hz, so 4/30 s is the four-sample window these tests want.
 # --------------------------------------------------------------------------
+
+FOUR_SAMPLES_SEC = 4 / 30.0
+TWO_SAMPLES_SEC = 2 / 30.0
 
 def _subject_with_a_rejected_bout():
     """3 bouts at frames 10/20/30; bout 1 (frame 20) rejected on G0.
@@ -140,7 +146,7 @@ def test_whole_style_reads_the_bout_the_trace_belongs_to():
     stored = np.zeros(4)
 
     # Trace 1 is bout 2 -> frames 30..34, i.e. ramp values 30..33.
-    seg = app._bout_analysis_segment('S1', 'Sniff', 'G0', 1, stored, 0, 4)
+    seg = app._bout_analysis_segment('S1', 'Sniff', 'G0', 1, stored, 0, FOUR_SAMPLES_SEC)
     assert seg is not None
     assert seg[0] == pytest.approx(30.0), (
         f"read the wrong bout's window: starts at {seg[0]}, expected 30")
@@ -150,7 +156,7 @@ def test_whole_style_reads_the_bout_the_trace_belongs_to():
 def test_first_trace_is_unaffected():
     app = _app()
     app.processed_data = {'S1': _subject_with_a_rejected_bout()}
-    seg = app._bout_analysis_segment('S1', 'Sniff', 'G0', 0, np.zeros(4), 0, 4)
+    seg = app._bout_analysis_segment('S1', 'Sniff', 'G0', 0, np.zeros(4), 0, FOUR_SAMPLES_SEC)
     assert seg[0] == pytest.approx(10.0)
 
 
@@ -161,7 +167,7 @@ def test_legacy_skewed_store_falls_back_to_the_onset_slice():
     del data['bouts']['Sniff']['_kept_indices']      # pre-fix project
     app.processed_data = {'S1': data}
     stored = np.arange(4, dtype=float) + 100.0       # recognisable onset trace
-    seg = app._bout_analysis_segment('S1', 'Sniff', 'G0', 1, stored, 0, 2)
+    seg = app._bout_analysis_segment('S1', 'Sniff', 'G0', 1, stored, 0, TWO_SAMPLES_SEC)
     # Came from the stored onset-aligned trace, not from beh_synced.
     assert seg is not None
     assert seg[0] >= 100.0

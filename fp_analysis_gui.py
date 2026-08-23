@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.14.0"
-APP_VERSION_DATE = "August 22, 2026"
+APP_VERSION = "1.15.0"
+APP_VERSION_DATE = "August 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -1642,6 +1642,14 @@ class FPAnalysisGUI:
             'preboutframes': 90,
             'postboutframes': 90,
             'maxlengthframe': 20000000,
+            # Bout Analysis metric window, in SECONDS relative to the bout onset
+            # (or the bout end, in offset style).  Negative = before, positive =
+            # after.  In seconds for the same reason the bout window above is: a
+            # frame count is a different duration at every sampling rate.  It
+            # becomes samples at the rate of whichever axis is being sliced --
+            # see analysis_window_samples().
+            'analysis_window_start_sec': 0.0,
+            'analysis_window_end_sec': 5.0,
             'precut': 100,
             # NOTE: there is deliberately no 'fps' parameter.  The sampling rate is
             # a property of the recording, measured from the timestamps during
@@ -10067,8 +10075,13 @@ class FPAnalysisGUI:
         self.metric_t_half               = tk.BooleanVar(value=False)
         self.metric_auc                  = tk.BooleanVar(value=False)
         self.metric_auc_mode             = tk.StringVar(value="both")
-        self.frames_before_var           = tk.StringVar(value="0")
-        self.frames_after_var            = tk.StringVar(value="150")
+        # Metric window in SECONDS relative to the bout onset, like the
+        # pre/post bout window it sits inside; converted to samples per axis by
+        # analysis_window_samples().
+        self.window_start_sec_var        = tk.StringVar(
+            value=f"{float(self.params.get('analysis_window_start_sec', 0.0)):g}")
+        self.window_end_sec_var          = tk.StringVar(
+            value=f"{float(self.params.get('analysis_window_end_sec', 5.0)):g}")
         self.bout_ymin_var               = tk.StringVar(value="auto")
         self.bout_ymax_var               = tk.StringVar(value="auto")
         self.bout_first_vs_last_data     = {}
@@ -10467,11 +10480,18 @@ class FPAnalysisGUI:
         self.spike_channel_check_frame.pack(fill='x')
         self._rebuild_spike_channel_checkboxes(['G0', 'G1'])
 
-        ttk.Checkbutton(settings, text="Apply exclusions",
-                        variable=self.use_exclusions_spike).pack(
-            anchor='w', pady=(self.ui_px(6), 0))
-
         # ── Actions ──────────────────────────────────────────────────────────
+        # "Apply exclusions" lives with the buttons it governs, not in Detection
+        # Settings.  This tab's settings column is the tallest in the app -- the
+        # warning box, five hinted parameters, the MAD mode and the channel list
+        # push the toggle roughly 400 px below the fold on a 900 px window, so in
+        # Settings it was reachable only by scrolling and read as missing.  The
+        # Actions zone is pinned outside the scroll region (see make_layout_zones),
+        # so here it is always on screen.
+        ttk.Checkbutton(actions, text="Apply exclusions (Exclusions tab)",
+                        variable=self.use_exclusions_spike).pack(
+            anchor='w', pady=(0, self.ui_px(4)))
+
         for text, command in (
                 ("Run Spike Analysis", self.run_spike_analysis),
                 ("Visualize Spike Data", self.visualize_spike_data),
@@ -11715,9 +11735,26 @@ class FPAnalysisGUI:
             return
         
         # Analyze spikes by zone for each subject
+        use_excl = self.use_exclusions_spike.get()
+        if use_excl:
+            # A subject excluded on every slot this tab can plot has nothing
+            # left to show, so drop it before the per-subject pass.
+            kept = [s for s in subjects_with_position
+                    if not all(self.is_channel_slot_excluded(
+                        s, i, self.processed_data.get(s))
+                        for i in range(max(1, self.get_num_channels(
+                            self.processed_data.get(s, {})))))]
+            if not kept:
+                messagebox.showwarning(
+                    "All Excluded",
+                    "Every selected subject is excluded on all of its channels.")
+                return
+            subjects_with_position = kept
+
         self.spike_zone_results = {}
         for subject in subjects_with_position:
-            zone_results = self.analyze_spikes_by_zone(subject)
+            zone_results = self.analyze_spikes_by_zone(
+                subject, use_exclusions=use_excl)
             if zone_results:
                 self.spike_zone_results[subject] = zone_results
         
@@ -12223,6 +12260,40 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Change — The Bout Analysis window is set in seconds, like every other bout setting.
+    "Window Start Frame" / "Window End Frame" were sample counts, so the span the
+    metrics were computed over meant a different duration on every rig — 150 samples
+    is 5.0 s at 30 Hz but 7.5 s at 20 Hz — and one number could not describe the same
+    window for a cohort recorded on two of them. The dialog now asks for "Window start
+    (s)" and "Window end (s)", shows the sample equivalent underneath as you type, and
+    each consumer converts at the rate of the data it is about to slice: the shared
+    analysis axis for stored bout traces, the subject's own recording for the
+    whole-bout and offset-aligned styles. The window is also saved with the project
+    now instead of resetting on every launch. Its default, 0 to 5 s, is the old
+    default at the usual 30 Hz.
+  • Fix — Bouts whose window ran past the start or end of the recording were kept as
+    short traces and NaN-padded back to full length downstream. That drew a blank tail
+    on the heatmap row and dropped the subject out of the group mean part-way along the
+    x-axis. Such bouts are now excluded at extraction, with a count in the log, and any
+    NaN inside a window — a sync gap, a channel that stops early — rejects that trace
+    instead of being averaged over. Projects saved before this drop the short rows on
+    load, so no re-extraction is needed.
+  • Fix — "Analyze Spikes by Zone" ignored the Exclusions tab. A channel the spike
+    results table and both exports had already dropped was still detected and plotted
+    per zone. It now honours the same "Apply exclusions" toggle, asking about the
+    channel SLOT so a cohort designated R4/R5 is matched as well as G0/G1, and says so
+    when a subject is excluded on every channel rather than emptying it silently.
+  • Fix — Reopening a project made whole-bout and offset-aligned metrics fall back to
+    the onset window. Bouts are dropped per channel during extraction, so a channel's
+    trace list is not parallel to the onset/end frames; the map between them was built
+    at extraction but never saved. It is now written with the project and kept in step
+    with any rows dropped on load.
+  • Change — "Apply exclusions" on the Spike Analysis tab moved next to the buttons it
+    governs. That tab's settings column is the tallest in the app, which pushed the
+    toggle roughly 400 px below the fold on a 900 px window, where it read as missing.
+
+Version 1.14.0  •  August 22, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — The bout window is set in seconds, not samples. A sample count is a
     different duration on every rig, so cohorts recorded at different rates could not
@@ -13878,6 +13949,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             entry['end_frames'] = [
                                 None if e is None or (isinstance(e, float) and np.isnan(e))
                                 else float(e) for e in ends]
+                        # Persist which original bout each surviving trace came
+                        # from. Bouts are dropped per channel (edge-clipped window,
+                        # NaN, zero variance), so without this a reloaded project
+                        # can only detect the skew, not undo it, and every
+                        # whole/offset-style metric falls back to the onset slice.
+                        kept = bout_data.get('_kept_indices')
+                        if isinstance(kept, dict) and kept:
+                            entry['kept_indices'] = {
+                                str(k): [int(i) for i in v]
+                                for k, v in kept.items() if v is not None}
                         if entry:
                             bout_windows[behavior] = entry
                     if bout_windows:
@@ -14070,6 +14151,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.params['preboutseconds'] = None
                 self.params['postboutseconds'] = None
             self._migrate_bout_window_to_seconds()
+            self._sync_analysis_window_vars()
             
             # Load zones if available
             if 'zones' in config:
@@ -14480,6 +14562,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         bouts[behavior]['onset_frames'] = [
                                             np.nan if o is None else float(o)
                                             for o in _w['onset_frames']]
+                                    if _w.get('kept_indices'):
+                                        bouts[behavior]['_kept_indices'] = {
+                                            str(k): [int(i) for i in v]
+                                            for k, v in _w['kept_indices'].items()}
                                     if _w.get('end_frames') is not None:
                                         bouts[behavior]['end_frames'] = [
                                             np.nan if e is None else float(e)
@@ -14490,12 +14576,34 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                                 e - s for s, e in
                                                 zip(_on, bouts[behavior]['end_frames'])]
                                 df_ch = pd.read_csv(os.path.join(bout_dir, file))
+                                # Rows saved before edge-clipped bouts were
+                                # excluded at extraction are shorter than the
+                                # window they were cut with. Drop them here too,
+                                # so an existing project stops drawing blank
+                                # heatmap tails without needing a re-extract.
+                                _full = None
+                                if bouts[behavior].get('_prebout') is not None:
+                                    _full = (int(bouts[behavior]['_prebout'])
+                                             + int(bouts[behavior]['_postbout']))
                                 traces = []
-                                for _, row in df_ch.iterrows():
+                                _rows_kept = []
+                                for _row_i, (_, row) in enumerate(df_ch.iterrows()):
                                     bout = row.dropna().values
-                                    if len(bout) > 0:
-                                        traces.append(bout)
+                                    if len(bout) == 0:
+                                        continue
+                                    if _full is not None and len(bout) < _full:
+                                        continue
+                                    traces.append(bout)
+                                    _rows_kept.append(_row_i)
                                 bouts[behavior][chname] = traces
+                                # Keep the trace -> onset_frames mapping in step
+                                # with the rows just dropped.
+                                _kept_map = bouts[behavior].get('_kept_indices')
+                                if isinstance(_kept_map, dict) and chname in _kept_map:
+                                    _seq = _kept_map[chname]
+                                    if len(_rows_kept) != len(_seq):
+                                        _kept_map[chname] = [_seq[i] for i in _rows_kept
+                                                             if i < len(_seq)]
 
                             # Rebuild positional Ch{idx} + legacy G0/G1 aliases so
                             # index-based consumers (visualization) keep working.
@@ -15293,6 +15401,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         self.params[key] = value_str
                 
                 self._sync_bout_window_frames()
+                self._sync_analysis_window_vars()
                 self.update_param_labels()
                 # Update UI elements that display parameters
                 self.time_bin_var.set(str(self.params['time_bin_size']))
@@ -15529,6 +15638,52 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         base_sec = float(self.params.get('baseline_seconds', 0.0) or 0.0)
         base = int(round(base_sec * fs)) if base_sec > 0 else pre // 2
         return pre, post, max(1, min(base, pre))
+
+    def analysis_window_seconds(self):
+        """The Bout Analysis metric window as ``(start, end)`` seconds.
+
+        Read from the two entry boxes in the Bout Analysis settings dialog and
+        mirrored into params so it is saved with the project.  Raises
+        ValueError, with a message fit for a dialog, when the entries do not
+        parse or the window is empty.
+        """
+        try:
+            start = float(self.window_start_sec_var.get())
+            end = float(self.window_end_sec_var.get())
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("Invalid analysis window: enter seconds "
+                             "(negative = before the bout, positive = after).")
+        if end <= start:
+            raise ValueError("Window end (s) must be greater than window start (s).")
+        self.params['analysis_window_start_sec'] = start
+        self.params['analysis_window_end_sec'] = end
+        return start, end
+
+    def _sync_analysis_window_vars(self):
+        """Push the stored analysis window back into its entry boxes.
+
+        The boxes are the source of truth while the Bout Analysis tab is in use,
+        so anything that writes params behind them — opening a project, the
+        parameter editor — has to refresh them or its value is discarded on the
+        next read.
+        """
+        if not hasattr(self, 'window_start_sec_var'):
+            return
+        self.window_start_sec_var.set(
+            f"{float(self.params.get('analysis_window_start_sec', 0.0)):g}")
+        self.window_end_sec_var.set(
+            f"{float(self.params.get('analysis_window_end_sec', 5.0)):g}")
+
+    def analysis_window_samples(self, subject=None):
+        """``(start, end)`` sample offsets for the Bout Analysis metric window.
+
+        Converted at the rate of whatever axis the caller is about to slice:
+        pass a subject when indexing that subject's own recording, omit it for
+        the shared analysis axis the stored bout traces are resampled onto.
+        """
+        start_sec, end_sec = self.analysis_window_seconds()
+        fs = self.get_fps(subject) if subject is not None else self.analysis_fps()
+        return int(round(start_sec * fs)), int(round(end_sec * fs))
 
     def _sync_bout_window_frames(self):
         """Refresh the derived frame-denominated params from the seconds.
@@ -16415,15 +16570,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return results if results else None
     
-    def analyze_spikes_by_zone(self, subject_id):
+    def analyze_spikes_by_zone(self, subject_id, use_exclusions=None):
         """Analyze spike frequency by behavioral zone
         
         Args:
-            subject_id: Subject identifier
+            subject_id:     Subject identifier
+            use_exclusions: Honour the Exclusions checkboxes.  ``None`` reads the
+                            Spike Analysis tab's "Apply exclusions" toggle.  This
+                            path used to ignore exclusions entirely, so an
+                            excluded channel that the results table and the
+                            exports both dropped was still plotted by zone.
             
         Returns:
             Dictionary with spike rates per zone for each channel
         """
+        if use_exclusions is None:
+            var = getattr(self, 'use_exclusions_spike', None)
+            use_exclusions = bool(var.get()) if var is not None else False
         if subject_id not in self.processed_data:
             return None
         
@@ -16454,8 +16617,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         results = {}
         
-        # Analyze G0 channel
-        if zscore_data.shape[1] > 2:
+        # Analyze G0 channel.  Ask about the slot, not the literal 'G0': a
+        # recording designated R4/R5 keys its exclusion checkbox by that name.
+        if (zscore_data.shape[1] > 2 and
+                not (use_exclusions and
+                     self.is_channel_slot_excluded(subject_id, 0, data))):
             g0_signal = zscore_data[:, 2]
             g0_spikes = self.detect_spikes(g0_signal, fps)
             
@@ -16503,7 +16669,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 results['G0'] = zone_spike_rates
         
         # Analyze G1 channel if available
-        if zscore_data.shape[1] > 3:
+        if (zscore_data.shape[1] > 3 and
+                not (use_exclusions and
+                     self.is_channel_slot_excluded(subject_id, 1, data))):
             g1_signal = zscore_data[:, 3]
             g1_spikes = self.detect_spikes(g1_signal, fps)
             
@@ -21685,9 +21853,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return bout_idx if bout_idx < n_frames else None
 
     def _bout_analysis_segment(self, subject, behavior, channel, bout_idx, stored_bout,
-                               window_start_frame, window_end_frame):
+                               window_start_sec, window_end_sec):
         """Return the 1-D signal array to compute a bout metric over, honoring the
         current start/end processing style.
+
+        The window is given in SECONDS and becomes samples here, at the rate of
+        whichever axis is actually being sliced: the shared analysis axis for the
+        stored onset-aligned trace, the subject's own recording for the
+        beh_synced slices that 'whole' and 'offset' read.
 
           'onset'  : slice the stored onset-aligned segment [onset+ws : onset+we]
                      (legacy behavior; always used when no end frames exist).
@@ -21704,13 +21877,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # onset index above is valid even when this bout was extracted with a
         # different pre/post (identity when the windows already match).
         _entry = self.processed_data.get(subject, {}).get('bouts', {}).get(behavior, {})
+        axis_fs = float(self.analysis_fps())
         onset_bout = self._realign_bout_trace(
             stored_bout, self._entry_prebout(_entry),
-            src_fs=self._entry_fs(_entry), dst_fs=float(self.analysis_fps()))
+            src_fs=self._entry_fs(_entry), dst_fs=axis_fs)
 
         def _onset_slice():
-            a = max(0, onset_idx + window_start_frame)
-            b = min(len(onset_bout), onset_idx + window_end_frame)
+            a = max(0, onset_idx + int(round(window_start_sec * axis_fs)))
+            b = min(len(onset_bout), onset_idx + int(round(window_end_sec * axis_fs)))
             if b <= a:
                 return None
             return onset_bout[a:b]
@@ -21749,11 +21923,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         start_f = int(round(start_f))
         end_f = int(round(end_f))
+        # beh_synced is in this subject's own samples, so the window converts at
+        # this subject's rate rather than the shared axis rate.
+        subj_fs = float(self.get_fps(subject))
         if style == 'whole':
             a, b = start_f, end_f
         else:  # offset
-            a = end_f + window_start_frame
-            b = end_f + window_end_frame
+            a = end_f + int(round(window_start_sec * subj_fs))
+            b = end_f + int(round(window_end_sec * subj_fs))
         a = max(0, a)
         b = min(beh_synced.shape[0], b)
         if b <= a:
@@ -21765,7 +21942,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Baseline-correct against the pre-bout window before the START frame so
         # metrics stay referenced to the same baseline regardless of style.
         if self.params.get('baseline_correct_bouts', False):
-            bf = int(self.params.get('baseline_frames', 45))
+            bf = self.bout_window_samples(subject)[2]
             bstart = max(0, start_f - bf)
             if bstart < start_f:
                 base = np.asarray(beh_synced[bstart:start_f, col], dtype=float)
@@ -21869,14 +22046,27 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 behavior_kept = {f'Ch{ch}': [] for ch in range(num_channels)}
 
                 # Visualization/extraction is always aligned to the bout START frame.
+                # A bout whose pre/post window runs past either edge of the
+                # recording used to be clipped to what fitted; the short trace was
+                # then NaN-padded back to full length downstream, which shows up as
+                # a blank tail on that heatmap row and drops the subject out of the
+                # group mean part-way along the x-axis. Exclude it instead, the way
+                # extract_entry_bouts already does.
+                _n_edge = 0
                 for bout_i, frame in enumerate(frames):
-                    start_idx = max(0, frame - prebout)
-                    end_idx = min(len(beh_synced), frame + postbout)
+                    start_idx = frame - prebout
+                    end_idx = frame + postbout
+                    if start_idx < 0 or end_idx > len(beh_synced):
+                        _n_edge += 1
+                        continue
 
                     # Extract bout data for each photometry column detected
                     for ch, col_idx in enumerate(phot_cols):
                         bout_ch = beh_synced[start_idx:end_idx, col_idx]
-                        if not np.all(np.isnan(bout_ch)):
+                        # Any NaN inside the window (a sync gap, a channel that
+                        # stops early) leaves a hole that averaging would silently
+                        # paper over, so reject the whole trace, not just all-NaN.
+                        if not np.any(np.isnan(bout_ch)):
                             # Apply baseline correction if enabled
                             if baseline_correct:
                                 bout_ch = self.apply_baseline_correction(bout_ch, frame, start_idx, prebout, baseline_frames)
@@ -21887,6 +22077,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 behavior_kept[f'Ch{ch}'].append(bout_i)
                             else:
                                 self.log_message(f"    Warning: Skipping invalid bout at frame {frame} for {behavior} (constant or zero variance) on Ch{ch}")
+
+                if _n_edge > 0:
+                    self.log_message(
+                        f"    Excluded {_n_edge} {behavior} bout(s) whose window ran past "
+                        f"the recording edge (incomplete pre/post data)")
 
                 # Store each channel under both its positional Ch{n} key (used by
                 # index-based consumers like visualization) and its real designation
@@ -21969,12 +22164,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # Extract bouts for offset frames
                         offset_bouts = {f'Ch{ch}': [] for ch in range(num_channels)}
                         offset_kept = {f'Ch{ch}': [] for ch in range(num_channels)}
+                        # Same edge rule as the base extraction above.
                         for bout_i, frame in enumerate(shifted_frames):
-                            start_idx = max(0, frame - prebout)
-                            end_idx = min(len(beh_synced), frame + postbout)
+                            start_idx = frame - prebout
+                            end_idx = frame + postbout
+                            if start_idx < 0 or end_idx > len(beh_synced):
+                                continue
                             for ch, col_idx in enumerate(phot_cols):
                                 bout_ch = beh_synced[start_idx:end_idx, col_idx]
-                                if not np.all(np.isnan(bout_ch)):
+                                if not np.any(np.isnan(bout_ch)):
                                     if baseline_correct:
                                         bout_ch = self.apply_baseline_correction(
                                             bout_ch, frame, start_idx, prebout, baseline_frames)
@@ -24475,12 +24673,34 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         wf.pack(fill='x', padx=12, pady=5)
         win_row = ttk.Frame(wf)
         win_row.pack(fill='x')
-        ttk.Label(win_row, text="Window Start Frame:").pack(side='left', padx=(0, 5))
-        ttk.Entry(win_row, textvariable=self.frames_before_var, width=10).pack(side='left', padx=(0, 15))
-        ttk.Label(win_row, text="Window End Frame:").pack(side='left', padx=(0, 5))
-        ttk.Entry(win_row, textvariable=self.frames_after_var, width=10).pack(side='left')
-        ttk.Label(wf, text="(frames relative to bout onset; negative=before, positive=after)",
+        ttk.Label(win_row, text="Window start (s):").pack(side='left', padx=(0, 5))
+        start_entry = ttk.Entry(win_row, textvariable=self.window_start_sec_var, width=10)
+        start_entry.pack(side='left', padx=(0, 15))
+        ttk.Label(win_row, text="Window end (s):").pack(side='left', padx=(0, 5))
+        end_entry = ttk.Entry(win_row, textvariable=self.window_end_sec_var, width=10)
+        end_entry.pack(side='left')
+        ttk.Label(wf, text="(seconds relative to bout onset; negative=before, positive=after)",
                   foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 0))
+        # Seconds are the setting, but the sample count is what a reader used to
+        # typing frames needs in order to recognise the window they had.  Bound
+        # to the entries rather than traced on the variables, which would keep
+        # firing at this label long after the dialog is gone.
+        win_hint = ttk.Label(wf, text="", foreground='gray', font=('Segoe UI', 8))
+        win_hint.pack(anchor='w')
+
+        def _refresh_win_hint(_e=None):
+            try:
+                a, b = self.analysis_window_samples()
+            except ValueError:
+                win_hint.config(text="")
+                return
+            win_hint.config(
+                text=f"= samples {a} to {b} at {self.analysis_fps():g} Hz")
+
+        for _e in (start_entry, end_entry):
+            _e.bind('<KeyRelease>', _refresh_win_hint)
+            _e.bind('<FocusOut>', _refresh_win_hint)
+        _refresh_win_hint()
 
         # ── Start/End Processing Style ───────────────────────────────────
         sf = ttk.LabelFrame(dlg, text="Start/End Processing Style", padding=8)
@@ -32511,16 +32731,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Get analysis window
         try:
-            window_start_frame = int(self.frames_before_var.get())
-            window_end_frame = int(self.frames_after_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid window start/end frame values")
-            return
-        if window_end_frame <= window_start_frame:
-            messagebox.showerror(
-                "Error",
-                "Window End Frame must be greater than Window Start Frame."
-            )
+            window_start_sec, window_end_sec = self.analysis_window_seconds()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
         
         # Collect bout data organized by bout number
@@ -32597,7 +32810,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Get the analysis array honoring the start/end processing style
                 window_data = self._bout_analysis_segment(
                     subject, behavior, channel, bout_num - 1, bout,
-                    window_start_frame, window_end_frame)
+                    window_start_sec, window_end_sec)
                 if window_data is None or len(window_data) == 0:
                     continue
 
@@ -36635,14 +36848,9 @@ cat("OK\n")
         
         # Get analysis window
         try:
-            window_start_frame = int(self.frames_before_var.get())
-            window_end_frame = int(self.frames_after_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid window start/end frame values")
-            return
-        
-        if window_end_frame <= window_start_frame:
-            messagebox.showerror("Error", "Window end frame must be greater than window start frame")
+            window_start_sec, window_end_sec = self.analysis_window_seconds()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
         
         # Get which metrics to calculate
@@ -36778,7 +36986,7 @@ cat("OK\n")
                 # when end frames are unavailable.
                 post_bout_data = self._bout_analysis_segment(
                     subject, behavior, channel, bout_idx, bout,
-                    window_start_frame, window_end_frame)
+                    window_start_sec, window_end_sec)
                 if post_bout_data is None or len(post_bout_data) == 0:
                     continue
                 
@@ -37681,13 +37889,9 @@ cat("OK\n")
                 return
 
         try:
-            window_start_frame = int(self.frames_before_var.get())
-            window_end_frame = int(self.frames_after_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid window start/end frame values")
-            return
-        if window_end_frame <= window_start_frame:
-            messagebox.showerror("Error", "Window end frame must be greater than window start frame")
+            win_start_samples, win_end_samples = self.analysis_window_samples()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
 
         bins = self._get_bout_length_bins()
@@ -37726,8 +37930,8 @@ cat("OK\n")
                 bidx = self._assign_length_bin(dur_sec, bins)
                 if bidx is None:
                     continue
-                ws = max(0, prebout + window_start_frame)
-                we = min(len(trace), prebout + window_end_frame)
+                ws = max(0, prebout + win_start_samples)
+                we = min(len(trace), prebout + win_end_samples)
                 if we <= ws:
                     continue
                 wd = trace[ws:we]
@@ -37904,13 +38108,9 @@ cat("OK\n")
                 return
 
         try:
-            window_start_frame = int(self.frames_before_var.get())
-            window_end_frame   = int(self.frames_after_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid window start/end frame values")
-            return
-        if window_end_frame <= window_start_frame:
-            messagebox.showerror("Error", "Window end frame must be greater than window start frame")
+            win_start_samples, win_end_samples = self.analysis_window_samples()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
 
         fps      = self.get_fps()
@@ -37953,8 +38153,8 @@ cat("OK\n")
             for bout_idx, bout in enumerate(bouts_data):
                 bin_idx = bout_idx // bin_size  # 0, 1, 2, ...
                 onset   = pre_frames
-                ws = max(0, onset + window_start_frame)
-                we = min(len(bout), onset + window_end_frame)
+                ws = max(0, onset + win_start_samples)
+                we = min(len(bout), onset + win_end_samples)
                 if we <= ws:
                     continue
                 wd = bout[ws:we]
@@ -38354,14 +38554,9 @@ cat("OK\n")
                 return
         
         try:
-            window_start_frame = int(self.frames_before_var.get())
-            window_end_frame = int(self.frames_after_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid window start/end frame values")
-            return
-        
-        if window_end_frame <= window_start_frame:
-            messagebox.showerror("Error", "Window end frame must be greater than window start frame")
+            window_start_sec, window_end_sec = self.analysis_window_seconds()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
         
         # Get which metrics to calculate
@@ -38461,7 +38656,7 @@ cat("OK\n")
                     # bout's true index within the subject's bout list)
                     post_bout_data = self._bout_analysis_segment(
                         subject, behavior, channel, base_idx + j, bout,
-                        window_start_frame, window_end_frame)
+                        window_start_sec, window_end_sec)
                     if post_bout_data is None or len(post_bout_data) == 0:
                         continue
                     
@@ -39349,8 +39544,8 @@ cat("OK\n")
                     ('Average Within Subject', 'Yes' if average_ws else 'No'),
                     ('Exclusions Applied',     'Yes' if apply_exclusions else 'No'),
                     ('Metrics Calculated',     metrics_selected),
-                    ('Window Start Frame',     self.frames_before_var.get()),
-                    ('Window End Frame',       self.frames_after_var.get()),
+                    ('Window Start (s)',       self.window_start_sec_var.get()),
+                    ('Window End (s)',         self.window_end_sec_var.get()),
                 ]
 
                 # Excluded subjects note
@@ -39394,7 +39589,7 @@ cat("OK\n")
             messagebox.showerror("Error", f"Failed to export metrics:\n{str(e)}")
 
     def _compute_bout_metrics_for(self, behavior, channel, selected_subjects,
-                                  subject_to_group, window_start_frame, window_end_frame,
+                                  subject_to_group, window_start_sec, window_end_sec,
                                   metric_specs, max_bouts, auc_mode):
         """Headless bout-metric computation for one (behavior, channel).
 
@@ -39435,7 +39630,7 @@ cat("OK\n")
                     continue
                 seg = self._bout_analysis_segment(
                     subject, behavior, channel, bout_idx, bout,
-                    window_start_frame, window_end_frame)
+                    window_start_sec, window_end_sec)
                 if seg is None or len(seg) == 0:
                     continue
 
@@ -39535,13 +39730,9 @@ cat("OK\n")
 
         # ── Analysis window ───────────────────────────────────────────────
         try:
-            window_start_frame = int(self.frames_before_var.get())
-            window_end_frame   = int(self.frames_after_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid window start/end frame values.")
-            return
-        if window_end_frame <= window_start_frame:
-            messagebox.showerror("Error", "Window end frame must be greater than start frame.")
+            window_start_sec, window_end_sec = self.analysis_window_seconds()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
 
         # ── Subject/group selection (current UI) ──────────────────────────
@@ -39613,7 +39804,7 @@ cat("OK\n")
 
                 by_subject, rows, columns, total_bouts = self._compute_bout_metrics_for(
                     behavior, channel, subs, subject_to_group,
-                    window_start_frame, window_end_frame,
+                    window_start_sec, window_end_sec,
                     metric_specs, max_bouts, auc_mode)
                 if total_bouts == 0:
                     continue
@@ -39689,8 +39880,8 @@ cat("OK\n")
                     ('Average Within Subject',   'Yes' if average_ws else 'No'),
                     ('Exclusions Applied',       'Yes' if apply_exclusions else 'No'),
                     ('Metrics Calculated',       metrics_selected),
-                    ('Window Start Frame',       self.frames_before_var.get()),
-                    ('Window End Frame',         self.frames_after_var.get()),
+                    ('Window Start (s)',         self.window_start_sec_var.get()),
+                    ('Window End (s)',           self.window_end_sec_var.get()),
                 ]
                 if apply_exclusions and getattr(self, 'exclusions', None):
                     excl_parts = [
