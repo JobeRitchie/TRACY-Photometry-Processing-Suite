@@ -12,7 +12,8 @@ import importlib.util
 import os
 import sys
 
-_GUI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fp_analysis_gui.py')
+_GUI_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fp_analysis_gui.py')
 
 
 def _load_gui_module():

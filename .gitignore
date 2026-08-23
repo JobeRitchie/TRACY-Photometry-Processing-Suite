@@ -13,3 +13,6 @@ Validation Tests
 flmm_validation
 # Windows Explorer folder settings
 desktop.ini
+
+# Development-only scripts and handoff notes (not part of the shipped app)
+dev/

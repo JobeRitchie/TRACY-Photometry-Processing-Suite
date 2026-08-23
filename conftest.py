@@ -9,6 +9,11 @@ silently *skipped* its tests instead of reporting. Six real test_plot_scroll
 tests were skipping in every full-suite run for exactly that reason.
 
 Tests take a ``Toplevel`` off this root; they must not destroy the root itself.
+
+This file stays at the repository root rather than moving into ``tests/`` with
+them: pytest prepends a conftest's own directory to ``sys.path``, and that is
+what lets the suite's plain ``import fp_analysis_gui`` resolve. Move it down a
+level and seventeen modules stop importing.
 """
 
 import pytest

@@ -19,7 +19,8 @@ import sys
 import numpy as np
 import pytest
 
-_GUI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fp_analysis_gui.py')
+_GUI_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fp_analysis_gui.py')
 
 
 def _load_gui_module():

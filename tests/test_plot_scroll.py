@@ -24,7 +24,8 @@ import pytest
 tk = pytest.importorskip('tkinter')
 _ttk = pytest.importorskip('tkinter.ttk')
 
-_GUI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fp_analysis_gui.py')
+_GUI_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fp_analysis_gui.py')
 
 
 def _load_gui_module():
