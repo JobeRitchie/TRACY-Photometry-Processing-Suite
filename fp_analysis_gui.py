@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 APP_VERSION_DATE = "August 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -680,6 +680,12 @@ class ZoneEditor:
         action_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         ttk.Button(action_frame, text="Save & Apply", style='Compact.TButton',
                    command=self.save_zones).pack(fill=tk.X, pady=1)
+        # Saving alone only changes the zone definitions; already-processed
+        # subjects keep the position results derived from the OLD zones until
+        # something recomputes them. This runs that recompute in place, so the
+        # cohort does not have to be reprocessed from the source files.
+        ttk.Button(action_frame, text="Save & Recalculate", style='Compact.TButton',
+                   command=self.save_and_recalculate).pack(fill=tk.X, pady=1)
         ttk.Button(action_frame, text="Cancel", style='Compact.TButton',
                    command=self.parent.destroy).pack(fill=tk.X, pady=1)
         ttk.Button(action_frame, text="Analysis Settings...", style='Compact.TButton',
@@ -1207,15 +1213,42 @@ class ZoneEditor:
         """Handle mouse release"""
         self.drag_corner = None
     
-    def save_zones(self):
+    def save_zones(self, notify=True, close=True):
         """Save zones back to main application"""
         # Apply any pending maze width change
         self._apply_maze_width()
         self.main_app.zones = {k: v.copy() for k, v in self.zones.items()}
         self.main_app.params['maze_width_cm'] = self.maze_width
         self.main_app.params['maze_type'] = self.template_var.get()
-        messagebox.showinfo("Success", "Zones saved successfully!")
-        self.parent.destroy()
+        if notify:
+            messagebox.showinfo("Success", "Zones saved successfully!")
+        if close:
+            self.parent.destroy()
+
+    def save_and_recalculate(self):
+        """Save the zone settings, then re-derive every position-dependent
+        result for the already-processed subjects from their stored position
+        track. Avoids a full reprocess just to try different zone boundaries."""
+        n_position = sum(1 for d in self.main_app.processed_data.values()
+                         if d.get('has_position', False))
+        if n_position and not messagebox.askyesno(
+                "Save & Recalculate",
+                f"Save these zone settings and recalculate position analyses for "
+                f"{n_position} processed subject(s)?\n\n"
+                f"Zone entries, entry-aligned bouts, zone averages, distance "
+                f"averages and Out/Back stats will be recomputed from the stored "
+                f"position track. Signal processing and behaviour bouts are not "
+                f"affected.",
+                parent=self.parent):
+            return
+
+        self.save_zones(notify=False, close=False)
+        parent_win = self.parent
+        try:
+            parent_win.destroy()
+        except Exception:
+            pass
+        self.main_app.apply_zone_changes_and_recalculate()
 
     def open_analysis_settings(self):
         """Open the Analysis Settings popup window."""
@@ -1641,7 +1674,13 @@ class FPAnalysisGUI:
             # _sync_bout_window_frames() whenever the seconds or the rates change.
             'preboutframes': 90,
             'postboutframes': 90,
-            'maxlengthframe': 20000000,
+            # Longest stretch of a recording to analyse, in SECONDS measured
+            # from the first sample kept after the precut.  Seconds rather than
+            # raw rows because a row count is a different duration at every
+            # sampling rate (and at every LED-state count), so a cohort split
+            # across rigs would be trimmed to different lengths.  0 = no cap,
+            # which is what the old frame cap amounted to in practice.
+            'maxlengthseconds': 0.0,
             # Bout Analysis metric window, in SECONDS relative to the bout onset
             # (or the bout end, in offset style).  Negative = before, positive =
             # after.  In seconds for the same reason the bout window above is: a
@@ -1736,8 +1775,14 @@ class FPAnalysisGUI:
             # File naming patterns (for batch processing)
             'fpdata_pattern': 'FPData',  # Pattern to identify FPData files
             'fpdata_suffix': '0.csv',  # Suffix after subject ID for FPData files
-            'timestamp_pattern': 'ComputerTS|AnimalPosition',  # Pattern(s) for timestamp files (use | for alternatives)
+            'timestamp_pattern': 'ABELposition|ComputerTS|AnimalPosition',  # Pattern(s) for timestamp files (use | for alternatives)
             'timestamp_suffix': '0.csv',  # Suffix after subject ID for timestamp files
+            # ABEL position files ({SubjectID}ABELposition.csv, written by ABEL's
+            # Export tab) are position files with no acquisition clock in them --
+            # they are numbered in video frames.  Detected like any other timestamp
+            # file, then aligned by frame instead (see synchronize_abel_position).
+            'abel_position_pattern': 'ABELposition',
+            'abel_position_enabled': True,
             # Spike/transient detection parameters for GCaMP fiber photometry
             'spike_threshold_mad': 2.5,  # MAD-based threshold (2.0–3.0 MADs)
             'spike_min_width': 2,        # Minimum event width in frames (~67ms at 30fps; fast GCaMP8)
@@ -2160,6 +2205,11 @@ class FPAnalysisGUI:
         settings_menu.add_command(label="Processing Parameters", command=self.edit_parameters)
         settings_menu.add_separator()
         settings_menu.add_command(label="Zone Editor", command=self.open_zone_editor)
+        # Same recompute the Zone Editor's "Save & Recalculate" runs, reachable
+        # on its own after a change made elsewhere (e.g. the Y-calibration
+        # method in Analysis Settings).
+        settings_menu.add_command(label="Recalculate Position Analyses",
+                                  command=self.apply_zone_changes_and_recalculate)
         settings_menu.add_separator()
 
         # Interface density. Auto-picked from the screen height at startup, but
@@ -3486,7 +3536,8 @@ class FPAnalysisGUI:
         ttk.Label(naming_frame, text="Timestamp Pattern:").grid(row=2, column=0, sticky='w', padx=5, pady=2)
         self.timestamp_pattern_var = tk.StringVar(value=self.params['timestamp_pattern'])
         ttk.Entry(naming_frame, textvariable=self.timestamp_pattern_var, width=25).grid(row=2, column=1, sticky='w', padx=5, pady=2)
-        ttk.Label(naming_frame, text="(use | for alternatives)", foreground='gray', font=('Segoe UI', 8)).grid(row=2, column=2, sticky='w', padx=5)
+        ttk.Label(naming_frame, text="(use | for alternatives; 'ABELposition' is always searched)",
+                  foreground='gray', font=('Segoe UI', 8)).grid(row=2, column=2, sticky='w', padx=5)
         
         ttk.Label(naming_frame, text="Timestamp Suffix:").grid(row=3, column=0, sticky='w', padx=5, pady=2)
         self.timestamp_suffix_var = tk.StringVar(value=self.params['timestamp_suffix'])
@@ -12121,6 +12172,16 @@ photometry data columns. LedState codes: 1 = 415 nm, 2 = 470 nm, 4 = 570 nm,
 Columns: frame number, computer timestamp, and optionally X / Y position (kept
 for zone, heatmap and kinematics analyses). Processing also runs without this.
 
+2b. ABEL position  (optional, exported by ABEL's Export tab):
+> {SubjectID}ABELposition.csv
+Columns: frame, timestamp, X, Y -- where 'frame' is the VIDEO frame number and
+'timestamp' is video elapsed seconds, because ABEL never sees the photometry
+rig's computer clock. TRACY recognises the 'ABELposition' marker in the filename
+and aligns the track by video frame, using the same conversion it applies to
+boutframes, so an ABEL position file and an ABEL boutframes workbook from the
+same project land on the signal together. Set 'Boutframes video FPS' to your
+camera's rate; TRACY warns if the file disagrees with it.
+
 3. Boutframes  (optional):
 > boutframes.xlsx
 One worksheet per subject (worksheet name = SubjectID); each column is a
@@ -12227,8 +12288,10 @@ Info group:
 """),
             ("Tips & Troubleshooting", """
 Common issues:
-✗ 'No timestamp file found' — make sure a ComputerTS or AnimalPosition file
-  exists, or proceed without behavior data.
+✗ 'No timestamp file found' — make sure a ComputerTS, AnimalPosition or
+  ABELposition file exists, or proceed without behavior data.
+✗ ABEL position track looks stretched — 'Boutframes video FPS' does not match
+  the camera; the processing log reports the rate the file implies.
 ✗ 'File not found' — confirm the file naming matches your Processing-tab patterns.
 ✗ 'No boutframes sheet' — the worksheet name must equal the SubjectID exactly.
 ✗ 'Biexponential fit failed' — signal may be noisy; TRACY falls back to a
@@ -12260,6 +12323,50 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Position tracks exported by ABEL are read directly. Drop
+    {{SubjectID}}ABELposition.csv beside the FPData file and TRACY finds it like any
+    other position file. It cannot be synchronised like one: ABEL never sees the
+    photometry rig's computer clock, so its timestamps are video-relative, and the
+    generic path would have fallen back to aligning both recordings from t=0 —
+    swallowing the precut and any camera/photometry start delay without a word.
+    ABEL files are instead aligned by VIDEO FRAME, through the identical transform
+    boutframes already use, so an ABEL position track and an ABEL boutframes workbook
+    from the same project land on the signal together and one shift setting fixes
+    both. X/Y are resampled onto the photometry sample grid; samples outside the
+    tracked video range stay blank rather than repeating an edge value, and the log
+    reports how many. If the file's own timestamps imply a different frame rate than
+    "Boutframes video FPS", the log names both numbers and the stretch factor rather
+    than silently trusting either.
+  • New — Zone changes can be applied without reprocessing. The Zone Editor has a
+    "Save & Recalculate" button, and Settings > Recalculate Position Analyses runs the
+    same thing on its own after a change made elsewhere. Saving zones alone only
+    edited the definitions — already-processed subjects kept the results derived from
+    the OLD zones until something recomputed them, which meant a full reprocess from
+    the source files just to try a different boundary. Zone entries, entry-aligned
+    bouts, zone averages, distance-from-centre averages and the Out/Back stats are now
+    re-derived in place from the stored position track and saved with the project.
+    Signal processing and behaviour bouts are untouched, because none of them depend
+    on where the zones are.
+  • Change — Processing stores the uncalibrated pixel track next to each subject
+    ({{SubjectID}}_position_px.csv). Calibration rewrites the X/Y columns from pixels to
+    centimetres in place, so without this snapshot the origin and scale the zones are
+    really defined against were gone, and a changed maze width or Y-calibration method
+    could not be re-applied to processed data. Projects saved by an earlier version
+    have no snapshot: their zone results still recalculate, but a calibration change
+    needs a full reprocess, and those subjects are named in the summary instead of
+    being quietly rescaled.
+  • Change — The maximum recording length is set in SECONDS, not raw rows. The old
+    cap counted deinterleaved frames and doubled them on the assumption of a two-state
+    interleave, so one number meant a different duration at every sampling rate and
+    LED configuration — it could trim a fast rig hard while never firing on a slow one,
+    and a cohort split across rigs was cut to different lengths. The cap is now read
+    straight off the raw timestamp column, measured from the first sample kept after
+    the precut, and rows are cut at the first sample past it so the interleave stays
+    contiguous. 0 means no cap, which is what the old default amounted to in practice.
+    Projects saved with the old frame cap are converted at their own rate on load.
+
+Version 1.15.0  •  August 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Change — The Bout Analysis window is set in seconds, like every other bout setting.
     "Window Start Frame" / "Window End Frame" were sample counts, so the span the
@@ -13280,7 +13387,7 @@ Version 1.0.0
                 
                 # Try to find corresponding timestamp file using configured patterns
                 folder = os.path.dirname(filename)
-                timestamp_patterns = [p.strip().lower() for p in self.params.get('timestamp_pattern', 'ComputerTS|AnimalPosition').split('|')]
+                timestamp_patterns = self._timestamp_patterns()
                 timestamp_suffix = self.params.get('timestamp_suffix', '0.csv')
                 
                 for pattern in timestamp_patterns:
@@ -13868,6 +13975,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # Save behavior CSV
                     df_beh = pd.DataFrame(data['beh_synced'], columns=col_names[:n_cols])
                     df_beh.to_csv(beh_file, index=False)
+
+                    # Save the raw pixel coordinates alongside it (own file, so the
+                    # behavior CSV's column count still implies the channel count).
+                    # These are what "Save & Recalculate" re-calibrates from when the
+                    # maze width or Y-calibration method changes.
+                    px = data.get('position_px')
+                    if isinstance(px, np.ndarray) and px.ndim == 2 and px.shape[1] >= 2:
+                        px_file = os.path.join(project_path, 'processed',
+                                               f'{subject}_position_px.csv')
+                        pd.DataFrame(px[:, :2], columns=['X_px', 'Y_px']).to_csv(
+                            px_file, index=False)
                     
                     # Save derived behavioral metrics as JSON (fast)
                     if ('zone_averages' in data or 'distance_averages_x' in data or
@@ -14151,6 +14269,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.params['preboutseconds'] = None
                 self.params['postboutseconds'] = None
             self._migrate_bout_window_to_seconds()
+            self._migrate_maxlength_to_seconds(loaded_params)
             self._sync_analysis_window_vars()
             
             # Load zones if available
@@ -14521,6 +14640,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         self.log_message(f"    Warning: {subject} behavior file missing X_cm or Y_cm columns")
                             except Exception as e:
                                 self.log_message(f"    Warning: Could not load behavior data: {str(e)}")
+
+                        # Uncalibrated pixel track, if this project was saved by a
+                        # version that stores it. Absent for older projects, which
+                        # then can only recalculate zone geometry, not calibration.
+                        px_file = os.path.join(processed_dir, f'{subject}_position_px.csv')
+                        if os.path.exists(px_file):
+                            try:
+                                df_px = pd.read_csv(px_file)
+                                if {'X_px', 'Y_px'}.issubset(df_px.columns):
+                                    subject_data['position_px'] = df_px[
+                                        ['X_px', 'Y_px']].to_numpy(dtype=float)
+                            except Exception as e:
+                                self.log_message(f"    Warning: Could not load pixel position data: {str(e)}")
                         
                         # Load bout data if exists
                         bout_dir = os.path.join(processed_dir, 'bouts', subject)
@@ -15698,6 +15830,31 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.params['baseline_frames'] = base
         return pre, post, base
 
+    def _migrate_maxlength_to_seconds(self, loaded_params):
+        """Adopt a project saved when the recording cap was a raw-row count.
+
+        The old 'maxlengthframe' counted deinterleaved frames per channel and
+        was doubled on the assumption of a two-state interleave, so the duration
+        it stood for depended on the rate and LED configuration of whatever rig
+        the project was recorded on.  Convert at that project's own rate.  The
+        historic default was far larger than any real recording, so it converts
+        to 'no cap' rather than a nominal century-long limit.
+        """
+        if 'maxlengthseconds' in loaded_params or 'maxlengthframe' not in loaded_params:
+            return
+        try:
+            frames = float(loaded_params['maxlengthframe'])
+        except (TypeError, ValueError):
+            return
+        if frames >= 1e6:
+            self.params['maxlengthseconds'] = 0.0
+            return
+        fs = self.analysis_fps() or self.FPS_FALLBACK
+        self.params['maxlengthseconds'] = round(frames / fs, 3) if fs > 0 else 0.0
+        self.log_message(
+            f"  Recording length cap migrated to seconds at {fs:.3f} Hz: "
+            f"{self.params['maxlengthseconds']:g} s")
+
     def _migrate_bout_window_to_seconds(self):
         """Adopt a project saved before the window was specified in seconds.
 
@@ -16857,7 +17014,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Get file naming patterns
         fpdata_pattern = self.params['fpdata_pattern'].lower()
         fpdata_suffix = self.params['fpdata_suffix']
-        timestamp_patterns = [p.strip().lower() for p in self.params['timestamp_pattern'].split('|')]
+        timestamp_patterns = self._timestamp_patterns()
         timestamp_suffix = self.params['timestamp_suffix']
         
         # Find all FPData files using the pattern
@@ -17369,6 +17526,82 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return stem[:-(len(suffix[:-4] if suffix_lower.endswith('.csv') else suffix))].rstrip('_- ')
         return stem
     
+    # ---- ABEL position files ---- #
+
+    def _timestamp_patterns(self):
+        """Timestamp/position file patterns to search, ABEL position files first.
+
+        The ABEL marker is prepended even when a project was saved before ABEL
+        export existed, so opening an old project still picks up an
+        ``{SubjectID}ABELposition.csv`` dropped into the data folder.  It goes
+        first because a folder holding both an acquisition AnimalPosition file
+        and an ABEL one should use the ABEL track: that is the one numbered in
+        the same video frames as the boutframes ABEL exported beside it.
+        """
+        raw = str(self.params.get('timestamp_pattern', 'ComputerTS|AnimalPosition'))
+        patterns = [p.strip().lower() for p in raw.split('|') if p.strip()]
+        abel = str(self.params.get('abel_position_pattern', 'ABELposition')).strip().lower()
+        if abel and self.params.get('abel_position_enabled', True):
+            patterns = [abel] + [p for p in patterns if p != abel]
+        return patterns
+
+    def is_abel_position_file(self, path):
+        """True if *path* is a position file exported by ABEL.
+
+        Detection is by filename marker, matching how ABEL names the export
+        (``{SubjectID}ABELposition.csv``).  The distinction matters because these
+        files are numbered in video frames and carry video time, not the
+        acquisition computer clock the photometry shares, so they need the
+        dedicated alignment path in :meth:`synchronize_abel_position`.
+        """
+        if not path or not self.params.get('abel_position_enabled', True):
+            return False
+        marker = str(self.params.get('abel_position_pattern', 'ABELposition')).strip().lower()
+        return bool(marker) and marker in os.path.basename(str(path)).lower()
+
+    def _read_abel_position_file(self, path):
+        """Parse an ABEL position CSV into ``(frames, x, y, file_fps)``.
+
+        Expected columns: ``frame`` (0-based video frame), ``timestamp`` (video
+        elapsed seconds), ``X`` and ``Y`` (pixels).  Names are matched
+        case-insensitively, with a positional fallback so a hand-edited header
+        cannot silently shift the coordinates into the wrong role.
+
+        ``file_fps`` is recovered from the timestamp column and used only to
+        cross-check the configured video frame rate -- the actual alignment goes
+        through the frame numbers, so a missing timestamp column is survivable.
+        """
+        df = pd.read_csv(path)
+        cols = {str(c).strip().lower(): c for c in df.columns}
+
+        def _col(name, fallback_idx):
+            c = cols.get(name)
+            if c is None and fallback_idx < df.shape[1]:
+                c = df.columns[fallback_idx]
+            if c is None:
+                return None
+            return pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=float)
+
+        frames = _col('frame', 0)
+        ts = _col('timestamp', 1)
+        x = _col('x', 2)
+        y = _col('y', 3)
+        if frames is None or x is None or y is None:
+            raise ValueError(
+                f"ABEL position file needs frame/X/Y columns; found {list(df.columns)}")
+        if not np.isfinite(frames).any():
+            frames = np.arange(len(df), dtype=float)
+
+        file_fps = None
+        if ts is not None and np.isfinite(ts).sum() > 2:
+            d = np.diff(ts[np.isfinite(ts)])
+            d = d[np.isfinite(d) & (d > 0)]
+            if d.size:
+                med = float(np.median(d))
+                if med > 0:
+                    file_fps = 1.0 / med
+        return frames, x, y, file_fps
+
     def process_fp_data(self, subject_id, fpdata_file, computerts_file=None):
         """
         Process fiber photometry data for a single subject
@@ -17507,22 +17740,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Load behavior/position data if provided
         beh_raw = None
         has_position = False
+        abel_position = None  # (frames, x, y, file_fps) once an ABEL file is read
         if computerts_file and os.path.exists(computerts_file):
             self.log_message(f"  Loading behavior/position data...")
             self.root.update_idletasks()  # Allow GUI to update
             try:
-                # First, detect if file has a text header or starts with numeric data
-                first_row = pd.read_csv(computerts_file, nrows=1, header=None)
-                has_text_header = False
-                for val in first_row.iloc[0].tolist():
-                    try:
-                        float(val)
-                    except (ValueError, TypeError):
-                        has_text_header = True
-                        break
+                # ABEL position files have a known layout and no acquisition
+                # clock to sniff for, so they bypass the header/content
+                # classification entirely.  has_text_header stays None to mark
+                # "already parsed" for the branches below.
+                has_text_header = None
+                if self.is_abel_position_file(computerts_file):
+                    _af, _ax, _ay, _afps = self._read_abel_position_file(computerts_file)
+                    abel_position = (_af, _ax, _ay, _afps)
+                    beh_raw = np.column_stack(
+                        [_af, _af / float(_afps or 30.0), _ax, _ay])
+                    has_position = bool(np.isfinite(_ax).any() and np.isfinite(_ay).any())
+                    _fps_note = f", {_afps:.2f} fps" if _afps else ""
+                    self.log_message(
+                        f"  ABEL position file detected ({len(_af)} video frames{_fps_note}). "
+                        f"It carries video time rather than the acquisition clock, so it is "
+                        f"aligned by video frame -- the same way boutframes are.")
+                    if not has_position:
+                        self.log_message(
+                            "    Warning: ABEL position file has no finite X/Y values.")
+                        if hasattr(self, 'processing_summary'):
+                            self.processing_summary['no_position_data'].append(subject_id)
+                else:
+                    # First, detect if file has a text header or starts with numeric data
+                    first_row = pd.read_csv(computerts_file, nrows=1, header=None)
+                    has_text_header = False
+                    for val in first_row.iloc[0].tolist():
+                        try:
+                            float(val)
+                        except (ValueError, TypeError):
+                            has_text_header = True
+                            break
 
                 # Load with or without header
-                if has_text_header:
+                if has_text_header is None:
+                    pass  # ABEL file, already parsed above
+                elif has_text_header:
                     df_beh = pd.read_csv(computerts_file, header=0)
                     cols = list(df_beh.columns)
                     cols_lower = [str(c).lower() for c in cols]
@@ -17624,6 +17882,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.log_message("  Continuing with photometry-only processing for this subject")
                 beh_raw = None
                 has_position = False
+                abel_position = None
                 if hasattr(self, 'processing_summary') and subject_id not in self.processing_summary['missing_behavior']:
                     self.processing_summary['missing_behavior'].append(subject_id)
         
@@ -17633,15 +17892,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Store first timestamp
         ts1 = fp_raw[0, 1]
         
-        # Trim data
+        # Trim data.  The length cap is a DURATION, read straight off the raw
+        # timestamp column (seconds), so it means the same thing at every
+        # sampling rate and needs no rate estimate of its own -- unlike the old
+        # row-count cap, which trimmed a fast rig hard and never fired on a slow
+        # one.  Rows are cut at the first sample past the cap so the interleave
+        # stays contiguous.
         precut = self.params['precut']
-        maxlength = self.params['maxlengthframe'] * 2
-        
-        num_rows = len(fp_raw)
-        if num_rows >= maxlength:
-            fp_raw = fp_raw[precut:maxlength, :]
-        else:
-            fp_raw = fp_raw[precut:, :]
+        fp_raw = fp_raw[precut:, :]
+
+        max_seconds = float(self.params.get('maxlengthseconds', 0.0) or 0.0)
+        if max_seconds > 0 and len(fp_raw) > 0:
+            elapsed = fp_raw[:, 1] - fp_raw[0, 1]
+            if np.all(np.isfinite(elapsed)) and elapsed[-1] > 0:
+                over = np.flatnonzero(elapsed > max_seconds)
+                if len(over):
+                    n_before = len(fp_raw)
+                    fp_raw = fp_raw[:over[0], :]
+                    self.log_message(
+                        f"  Trimmed to the first {max_seconds:g} s "
+                        f"({len(fp_raw)} of {n_before} raw rows)")
+            else:
+                self.log_message(
+                    "  Max recording length not applied: raw timestamps are unusable")
         
         # Determine number of channels.  Sync markers (state 7, typically a
         # single startup row) are not LED channels: counting them inflates
@@ -17896,13 +18169,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Synchronize with behavior if data is available, or create synthetic timeline
         if beh_raw is not None:
-            self.log_message(f"  Synchronizing with behavior data...")
-            beh_synced = self.synchronize_behavior(result['zscore'], beh_raw, has_position)
+            if abel_position is not None:
+                # The frame -> sample transform reads photometry_fps, n_led_states
+                # and raw from self.processed_data, which is only assigned after
+                # this function returns.  Seed it now, exactly as the boutframe
+                # extraction below does, so the track is not aligned with the
+                # wrong n_led=1 / unknown-fps defaults.
+                self.log_message(f"  Aligning ABEL position track to the signal...")
+                _seed = self.processed_data.get(subject_id, {})
+                _seed['raw'] = result.get('raw', _seed.get('raw'))
+                _seed['photometry_fps'] = result.get(
+                    'photometry_fps', _seed.get('photometry_fps'))
+                _seed['n_led_states'] = result.get('n_led_states', _seed.get('n_led_states', 1))
+                _seed['num_photometry_channels'] = result.get(
+                    'num_photometry_channels', _seed.get('num_photometry_channels'))
+                self.processed_data[subject_id] = _seed
+
+                _af, _ax, _ay, _afps = abel_position
+                beh_synced, has_position = self.synchronize_abel_position(
+                    subject_id, result['zscore'], _af, _ax, _ay, file_fps=_afps)
+            else:
+                self.log_message(f"  Synchronizing with behavior data...")
+                beh_synced = self.synchronize_behavior(result['zscore'], beh_raw, has_position)
             result['beh_synced'] = beh_synced
             result['has_position'] = has_position
             
             # Process position data if available
             if has_position:
+                # Snapshot the UNCALIBRATED pixel coordinates, row-aligned to
+                # beh_synced, before process_position_data rewrites cols 2/3 in
+                # place with centimetres. Without this the pixel origin and scale
+                # are gone, so a later maze-width or Y-calibration change could
+                # not be re-applied without re-reading the position file.
+                # See recalculate_position_analyses().
+                result['position_px'] = np.column_stack(
+                    [beh_synced[:, 2], beh_synced[:, 3]]).astype(float).copy()
+
                 self.log_message(f"  Processing position data (calibration, velocity, distance)...")
                 beh_synced = self.process_position_data(
                     beh_synced, n_channels=result.get('num_photometry_channels'),
@@ -18803,7 +19105,92 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return beh_synced
     
-    def process_position_data(self, beh_synced, n_channels=None, fps=None):
+    def synchronize_abel_position(self, subject_id, zscore_data, frames, x_vals, y_vals,
+                                  file_fps=None):
+        """Build ``beh_synced`` from an ABEL position track (no shared clock).
+
+        An acquisition AnimalPosition file shares the photometry rig's computer
+        clock, so :meth:`synchronize_behavior` can match the two by timestamp.
+        ABEL never sees that clock -- it only knows video frames -- so the times
+        in an ABEL file are video-relative and would send the generic path down
+        its relative-elapsed fallback, which aligns both recordings from t=0 and
+        so silently swallows the precut and any camera/photometry start delay.
+
+        This maps the track through exactly the transform
+        :meth:`_transform_boutframe_values` applies to boutframes: video frames
+        -> photometry samples, including the FPS conversion, the manual and
+        per-subject shifts and the recording-start correction.  The ABEL bouts
+        and the ABEL position track therefore land on the signal in the same
+        place by construction, and a shift entered to fix one fixes the other.
+
+        The result is built on the *photometry sample grid* -- one row per
+        sample, column 1 the real FP timestamp -- rather than on the camera's
+        frame grid, because that is what the rest of the pipeline assumes:
+        :meth:`extract_bouts` slices ``beh_synced`` with photometry sample
+        indices, and :meth:`process_position_data` differentiates it at the
+        photometry rate.  X/Y are interpolated onto that grid; samples whose
+        video frame falls outside the tracked range stay NaN rather than
+        repeating an edge value.
+
+        Returns ``(beh_synced, has_position)``.
+        """
+        n_samples = len(zscore_data)
+        n_ch = zscore_data.shape[1] - 2
+        kin_base = self._beh_kin_base(n_ch)
+        beh = np.full((n_samples, self._beh_width(n_ch)), np.nan)
+
+        beh[:, 0] = np.arange(n_samples, dtype=float)
+        beh[:, 1] = zscore_data[:, 1]           # real FP clock -- shared by construction
+        for ch in range(n_ch):
+            beh[:, 6 + ch] = zscore_data[:, 2 + ch]
+        beh[:, kin_base] = zscore_data[:, 0]    # elapsed time (minutes)
+
+        # Frame-rate sanity check: the frame -> sample conversion uses the
+        # configured video FPS, so a file recorded at a different rate would be
+        # stretched by a factor that grows with time.  Report the disagreement
+        # rather than silently trusting either number.
+        vfps = float(self.params.get('boutframes_video_fps', 30) or 30)
+        if file_fps and abs(file_fps - vfps) > 0.5:
+            self.log_message(
+                f"    Warning: ABEL position file implies {file_fps:.2f} fps but "
+                f"'Boutframes video FPS' is {vfps:.2f}. The position track AND the "
+                f"boutframes are being stretched by {file_fps / vfps:.3f}x -- correct "
+                f"that setting if {file_fps:.2f} is the true video rate.")
+
+        # Photometry sample index -> video frame: the inverse of the boutframe
+        # transform, which is what keeps the two exports locked together.
+        vid_frames = self._inverse_transform_boutframe_values(
+            np.arange(n_samples), subject_id, as_int=False)
+
+        order = np.argsort(frames, kind='stable')
+        f_sorted = np.asarray(frames, dtype=float)[order]
+        x_sorted = np.asarray(x_vals, dtype=float)[order]
+        y_sorted = np.asarray(y_vals, dtype=float)[order]
+
+        covered = (vid_frames >= f_sorted[0]) & (vid_frames <= f_sorted[-1])
+        if covered.any():
+            beh[covered, 2] = np.interp(vid_frames[covered], f_sorted, x_sorted)
+            beh[covered, 3] = np.interp(vid_frames[covered], f_sorted, y_sorted)
+
+        offset = (self._photometry_start_offset_samples(subject_id)
+                  if self.params.get('precut_correct_boutframes', True) else 0)
+        self.log_message(
+            f"    Sync mode: ABEL POSITION (video frames -> photometry samples, the same "
+            f"transform boutframes use). Recording-start offset {offset} sample(s); "
+            f"{len(f_sorted)} video frames resampled onto {n_samples} photometry samples.")
+
+        n_out = int((~covered).sum())
+        if n_out:
+            self.log_message(
+                f"    {n_out} of {n_samples} photometry sample(s) "
+                f"({100.0 * n_out / max(1, n_samples):.1f}%) fall outside the tracked video "
+                f"range and have no position; left blank rather than edge-filled.")
+
+        has_position = bool(np.isfinite(beh[:, 2]).any() and np.isfinite(beh[:, 3]).any())
+        return beh, has_position
+
+    def process_position_data(self, beh_synced, n_channels=None, fps=None,
+                              position_px=None, calibrate=True):
         """Process position data (X, Y coordinates) if present
 
         Performs:
@@ -18816,6 +19203,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             beh_synced: Synchronized behavior array with X, Y in columns 2, 3
             n_channels: Number of photometry channels (cols 6..6+N-1). The
                 kinematics block is written at 6+N onward.
+            position_px: Optional (n, 2) array of the ORIGINAL pixel coordinates,
+                row-aligned to beh_synced. Calibration overwrites cols 2/3 in
+                place, so re-running this on an already-processed array would
+                otherwise treat centimetres as pixels. Pass the snapshot taken
+                during processing to re-calibrate from the true source values.
+            calibrate: When False, cols 2/3 are left exactly as they are and only
+                velocity / distance / distance-from-centre are recomputed. Used
+                when no pixel snapshot exists, so stale centimetres are reused
+                rather than silently rescaled.
 
         Returns:
             Updated beh_synced array with the kinematics block at 6+N:
@@ -18834,7 +19230,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # 1. Calibrate position data (convert pixels to cm)
         maze_width = self.params['maze_width_cm']
-        
+
+        if position_px is not None:
+            px = np.asarray(position_px, dtype=float)
+            if px.ndim == 2 and px.shape[0] == beh_synced.shape[0] and px.shape[1] >= 2:
+                beh_synced[:, 2] = px[:, 0]
+                beh_synced[:, 3] = px[:, 1]
+            else:
+                self.log_message(
+                    f"    Pixel snapshot ignored — shape {px.shape} does not match "
+                    f"{beh_synced.shape[0]} behavior rows; calibrating from the "
+                    f"existing coordinates instead.")
+
         x_coords = beh_synced[:, 2]
         y_coords = beh_synced[:, 3]
         
@@ -18849,7 +19256,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # np.min(valid_y) ("zero-size array to reduction operation minimum").
         # Skip calibration in that case so the photometry signal still processes.
         x_range = (np.max(valid_x) - np.min(valid_x)) if len(valid_x) > 0 else 0.0
-        if len(valid_x) > 0 and len(valid_y) > 0 and x_range > 0:
+        if not calibrate:
+            self.log_message(
+                "    Position calibration skipped by request — reusing the existing "
+                "centimetre coordinates; velocity/distance recomputed.")
+        elif len(valid_x) > 0 and len(valid_y) > 0 and x_range > 0:
             # Calculate conversion ratio
             x_min = np.min(valid_x)
             x_max = np.max(valid_x)
@@ -23809,6 +24220,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.params['preboutseconds'] = None
                     self.params['postboutseconds'] = None
                 self._migrate_bout_window_to_seconds()
+                self._migrate_maxlength_to_seconds(loaded_params)
             
             # Load zones
             if 'zones' in config:
@@ -25992,6 +26404,213 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             except Exception as exc:
                 self.log_message(f"  Zone-entry recompute failed for {subject}: {exc}")
         return updated
+
+    def recalculate_position_analyses(self, subjects=None, progress=None):
+        """Re-derive every position-dependent result from the stored position
+        track, using the CURRENT zone definitions, maze width and calibration
+        method -- without re-reading the source files or re-running the signal
+        pipeline.
+
+        This is what "Save & Recalculate" in the Zone Editor runs. Everything it
+        recomputes is a pure function of (position track + zones + params):
+
+          * calibration of X/Y into cm, velocity, distance, distance-from-centre
+          * zone-entry detection and the entry-aligned photometry bouts
+          * per-zone photometry averages
+          * distance-from-centre averages (X, Y, Euclidean)
+          * open-arm Out/Back movement stats
+
+        Signal processing (dF/F, z-scoring), behaviour bouts and boutframes are
+        untouched, because none of them depend on where the zones are.
+
+        Calibration can only be redone for subjects that carry a pixel snapshot
+        (``position_px``), written during processing and saved with the project.
+        Subjects processed by an older version keep their existing centimetre
+        coordinates: their zone results are still recomputed, but a changed maze
+        width or Y-calibration method cannot be applied to them, and they are
+        reported back as needing a full reprocess.
+
+        Args:
+            subjects: Optional iterable of subject IDs; defaults to all processed.
+            progress: Optional callable(done, total, subject) for UI feedback.
+
+        Returns:
+            dict with 'updated', 'recalibrated', 'no_pixels' (list of subject IDs)
+            and 'failed' (list of (subject, message)).
+        """
+        targets = [s for s in (subjects if subjects is not None
+                               else list(self.processed_data.keys()))
+                   if s in self.processed_data]
+
+        summary = {'updated': 0, 'recalibrated': 0, 'no_pixels': [], 'failed': []}
+        total = len(targets)
+
+        for idx, subject in enumerate(targets):
+            data = self.processed_data[subject]
+            beh = data.get('beh_synced')
+            if beh is None or not data.get('has_position', False):
+                continue  # photometry-only subject -- nothing position-dependent
+
+            if progress is not None:
+                try:
+                    progress(idx, total, subject)
+                except Exception:
+                    pass
+
+            try:
+                self.log_message(f"  Recalculating position analyses for {subject}...")
+                n_ch = data.get('num_photometry_channels')
+                fps = data.get('photometry_fps')
+
+                px = data.get('position_px')
+                have_px = (isinstance(px, np.ndarray) and px.ndim == 2
+                           and px.shape[0] == beh.shape[0] and px.shape[1] >= 2)
+                if not have_px:
+                    summary['no_pixels'].append(subject)
+                    if px is not None:
+                        self.log_message(
+                            f"    Stored pixel track does not line up with "
+                            f"{beh.shape[0]} behavior rows -- keeping the existing "
+                            f"centimetre coordinates.")
+
+                # Work on a copy so a failure part-way through cannot leave the
+                # subject with half-rewritten kinematics.
+                work = beh.copy()
+                work = self.process_position_data(
+                    work, n_channels=n_ch, fps=fps,
+                    position_px=(px if have_px else None),
+                    calibrate=have_px)
+
+                work, entry_frames = self.detect_zone_entries(work, fps=fps)
+
+                zones = []
+                for i in range(len(work)):
+                    x, y = work[i, 2], work[i, 3]
+                    zones.append('unknown' if (np.isnan(x) or np.isnan(y))
+                                 else self.classify_zone(x, y))
+
+                zone_averages = self.calculate_zone_averages(work, zones, n_channels=n_ch)
+                x_avg, y_avg, eucl_avg = self.calculate_distance_based_averages(
+                    work, n_channels=n_ch)
+                outback = self.calculate_outback_movements(
+                    work, zones, n_channels=n_ch, fps=fps)
+                entry_bouts = self.extract_entry_bouts(
+                    work, entry_frames, num_photometry_channels=n_ch, fps=fps)
+
+                # Commit only once every stage above has succeeded.
+                data['beh_synced'] = work
+                data['entry_frames'] = entry_frames
+                data['entry_bouts'] = entry_bouts
+                data['zone_averages'] = zone_averages
+                data['distance_averages_x'] = x_avg
+                data['distance_averages_y'] = y_avg
+                data['distance_averages_euclidean'] = eucl_avg
+                if outback:
+                    data['outback'] = outback
+
+                summary['updated'] += 1
+                if have_px:
+                    summary['recalibrated'] += 1
+            except Exception as exc:
+                summary['failed'].append((subject, str(exc)))
+                self.log_message(f"    Recalculation FAILED for {subject}: {exc}")
+
+        if progress is not None:
+            try:
+                progress(total, total, '')
+            except Exception:
+                pass
+
+        return summary
+
+    def apply_zone_changes_and_recalculate(self, parent=None):
+        """Run recalculate_position_analyses() over the cohort with a progress
+        window, refresh the dependent UI, persist the result, and report back.
+
+        Returns the summary dict, or None if there was nothing to do.
+        """
+        owner = parent or self.root
+        position_subjects = [s for s, d in self.processed_data.items()
+                             if d.get('has_position', False)
+                             and d.get('beh_synced') is not None]
+        if not position_subjects:
+            messagebox.showinfo(
+                "Nothing to Recalculate",
+                "No processed subject has position data, so there is nothing for "
+                "the zone settings to affect.",
+                parent=owner)
+            return None
+
+        win = tk.Toplevel(owner)
+        win.title("Recalculating Position Analyses")
+        self.fit_toplevel(win, 420, 130)
+        win.transient(owner)
+        win.grab_set()
+        lbl = ttk.Label(win, text="Starting...", padding=10)
+        lbl.pack()
+        bar = ttk.Progressbar(win, length=360, mode='determinate',
+                              maximum=max(1, len(position_subjects)))
+        bar.pack(padx=20, pady=(0, 12))
+        win.update_idletasks()
+
+        def _progress(done, total, subject):
+            bar['value'] = done
+            lbl.config(text=(f"{subject}  ({done + 1} of {total})" if subject
+                             else "Finishing..."))
+            win.update()
+
+        try:
+            summary = self.recalculate_position_analyses(
+                subjects=position_subjects, progress=_progress)
+        finally:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        # Zone changes can add or remove entry types, so the Visualization
+        # controls that list them are rebuilt before anything redraws.
+        try:
+            self.update_behavior_list()
+        except Exception:
+            pass
+        try:
+            if self.current_viz_figure is not None:
+                self.generate_plot()
+        except Exception:
+            pass
+
+        # Persist, so the recalculated results survive a reload the same way a
+        # reprocess does.
+        if summary['updated'] and self.current_project:
+            try:
+                self.save_project(quiet=True, show_completion=False,
+                                  subjects=position_subjects)
+            except Exception as exc:
+                self.log_message(f"  Warning: could not save recalculated data: {exc}")
+
+        lines = [f"Recalculated {summary['updated']} subject(s) with position data.",
+                 f"Re-calibrated from the original pixel track: {summary['recalibrated']}."]
+        if summary['no_pixels']:
+            names = ', '.join(summary['no_pixels'][:8])
+            more = ('' if len(summary['no_pixels']) <= 8
+                    else f" (+{len(summary['no_pixels']) - 8} more)")
+            lines.append(
+                f"\nNo stored pixel track for: {names}{more}.\n"
+                f"Their zone results were updated, but a changed maze width or "
+                f"Y-calibration method needs a full reprocess to take effect.")
+        if summary['failed']:
+            lines.append("\nFailed: " + ', '.join(s for s, _ in summary['failed']) +
+                         "\nSee the processing log for details.")
+
+        self.log_message(
+            f"Zone recalculation complete: {summary['updated']} subject(s) updated, "
+            f"{summary['recalibrated']} re-calibrated, "
+            f"{len(summary['no_pixels'])} without a pixel track, "
+            f"{len(summary['failed'])} failed.")
+
+        messagebox.showinfo("Recalculation Complete", '\n'.join(lines), parent=owner)
+        return summary
 
     def open_graph_settings_window(self):
         """Open an advanced graph settings window for visualization controls."""
