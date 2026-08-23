@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.13.0"
-APP_VERSION_DATE = "August 20, 2026"
+APP_VERSION = "1.14.0"
+APP_VERSION_DATE = "August 22, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -1627,8 +1627,20 @@ class FPAnalysisGUI:
 
         # Default parameters
         self.params = {
-            'preboutframes': 90,  # 3 seconds at 30fps
-            'postboutframes': 90,  # 3 seconds at 30fps
+            # The bout window is specified in SECONDS, because a sample count
+            # means a different duration at every sampling rate and cohorts
+            # recorded on different rigs land in the same project.  Each
+            # subject's window is converted to samples at that subject's own
+            # rate when its bouts are extracted, and the stored traces are
+            # resampled onto one shared time axis when they are read back — so
+            # recordings at different rates can be analysed together.
+            'preboutseconds': 3.0,
+            'postboutseconds': 3.0,
+            # Derived from the seconds above at analysis_fps(); kept in params so
+            # the many frame-denominated callers keep working, and refreshed by
+            # _sync_bout_window_frames() whenever the seconds or the rates change.
+            'preboutframes': 90,
+            'postboutframes': 90,
             'maxlengthframe': 20000000,
             'precut': 100,
             # NOTE: there is deliberately no 'fps' parameter.  The sampling rate is
@@ -1689,7 +1701,9 @@ class FPAnalysisGUI:
             'spatial_bin_size': 2,  # cm for heatmap binning
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
-            'baseline_frames': 45,  # Number of prebout frames to use for baseline (default: half of preboutframes)
+            # Baseline window, also in seconds; 0 means "half the pre-bout window".
+            'baseline_seconds': 0.0,
+            'baseline_frames': 45,  # derived from baseline_seconds — see _sync_bout_window_frames
             # How much of a decay must be visible before Tau/t½ report a value.
             # 'strict'     — a full time constant (1-1/e) must be observed; fewest
             #                values, least extrapolation.
@@ -3522,10 +3536,11 @@ class FPAnalysisGUI:
         
         baseline_params_frame = ttk.Frame(channel_frame)
         baseline_params_frame.pack(anchor='w', pady=5, padx=20)
-        ttk.Label(baseline_params_frame, text="Baseline frames:").pack(side='left', padx=(0, 5))
-        self.baseline_frames_var = tk.StringVar(value=str(self.params['baseline_frames']))
+        ttk.Label(baseline_params_frame, text="Baseline seconds:").pack(side='left', padx=(0, 5))
+        self.baseline_frames_var = tk.StringVar(
+            value=f"{float(self.params.get('baseline_seconds', 0.0) or 0.0):g}")
         ttk.Entry(baseline_params_frame, textvariable=self.baseline_frames_var, width=8).pack(side='left', padx=(0, 5))
-        ttk.Label(baseline_params_frame, text="(frames before bout onset to average)", 
+        ttk.Label(baseline_params_frame, text="(seconds before bout onset to average; 0 = half the pre-bout window)",
                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
 
         # ── Signal smoothing (final processing step) ──────────────────
@@ -12209,6 +12224,44 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — The bout window is set in seconds, not samples. A sample count is a
+    different duration on every rig, so cohorts recorded at different rates could not
+    be analysed together: 200 samples is 10.0 s at 19.94 Hz but 6.7 s at 29.99 Hz, and
+    every trace was drawn on one rate's axis, which stretched the faster rig's data by
+    1.5x and smeared the combined average. Each subject's window is now converted to
+    samples at that subject's OWN rate when its bouts are extracted, and stored traces
+    are resampled onto one shared time axis when they are read back, so peaks from
+    both rigs land at the same time. Set "Pre-bout seconds", "Post-bout seconds" and
+    "Baseline seconds"; the old frame counts still exist but are derived, recomputed
+    for you and hidden from the parameter dialog. Projects saved before this keep the
+    window the duration it always had — the seconds are rebuilt from the stored frames
+    at that project's own rate rather than adopting this build's default.
+  • Fix — Processing could freeze on the first subject with no error and no timeout.
+    The photobleaching fit ran on unnormalised signal while the solver's step sizes and
+    convergence tolerances are absolute, so a rig reporting raw detector counts (~1e4
+    rather than ~1) failed the strict fit and fell into a retry whose bounds were
+    infinite — a search that never converged. The fit now runs in normalised units, so
+    it behaves the same whether a rig reports counts, volts or dF/F; the retry's search
+    region is finite; and the evaluation budget is capped against signal length, so a
+    fit always returns rather than running indefinitely. Reaching a cap falls back to a
+    linear detrend and says so, instead of hanging.
+  • Fix — Signals that brighten over a session were silently linear-detrended. The
+    biexponential's initial guess was never checked against its own bounds, so a rising
+    signal produced a guess the fitter rejected outright, and because the caller
+    catches every error the whole channel quietly lost its bleaching correction. The
+    guess is now clipped into the bounds and the channel is fitted properly. The
+    fallback warning also names the actual cause rather than just "fit failed".
+  • Fix — "Mixed Bout Windows" warned about windows that were in fact identical.
+    Durations were compared exactly, so sub-sample differences between subjects
+    recorded at slightly different rates (14.995 s vs 15.001 s) read as distinct
+    windows. The comparison now allows a per-subject tolerance of one sample.
+  • Fix — Pre/post bout durations were reported against the wrong rate in mixed-rate
+    projects. Traces are stored on the shared analysis axis, but the plot labels read
+    the modal subject rate, so a 15 s window displayed as ~22 s. Both now use the
+    shared axis rate.
+
+Version 1.13.0  •  August 20, 2026
+────────────────────────────────────────────────────────────────────────────────
   • Fix — Bout markers sat in the wrong place whenever the photometry recording started
     after the video. The correction subtracted only the precut trim (precut ÷ LED
     states), so any delay between the camera rolling and the recording starting was
@@ -14009,6 +14062,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for key, value in loaded_params.items():
                 if key in self.params:
                     self.params[key] = value
+            # Pre-seconds projects carry only the frame counts; rebuild the
+            # seconds from them so the window keeps the duration it had rather
+            # than adopting this build's default.  See
+            # _migrate_bout_window_to_seconds.
+            if 'preboutseconds' not in loaded_params and 'preboutframes' in loaded_params:
+                self.params['preboutseconds'] = None
+                self.params['postboutseconds'] = None
+            self._migrate_bout_window_to_seconds()
             
             # Load zones if available
             if 'zones' in config:
@@ -14052,7 +14113,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if hasattr(self, 'baseline_correct_bouts'):
                 self.baseline_correct_bouts.set(bool(self.params.get('baseline_correct_bouts', True)))
             if hasattr(self, 'baseline_frames_var'):
-                self.baseline_frames_var.set(str(self.params.get('baseline_frames', 45)))
+                self.baseline_frames_var.set(
+                    f"{float(self.params.get('baseline_seconds', 0.0) or 0.0):g}")
 
             # Boutframes FPS-scaling UI vars (same load-side sync so these
             # checkboxes don't revert to their build-time defaults on reopen).
@@ -15185,13 +15247,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
+        # Derived from the seconds settings at each subject's own rate, so
+        # showing them as editable boxes would invite an edit that the next
+        # sync silently discards.
+        derived = {'preboutframes', 'postboutframes', 'baseline_frames'}
+
         entries = {}
         i = 0
         for key, value in self.params.items():
             # Skip structured params (dict/list) — e.g. bout_overlay_colors.
             # They are edited via their own dialogs, not as free text, and
             # str()'ing a dict here would break the numeric parser on Save.
-            if isinstance(value, (dict, list)):
+            if isinstance(value, (dict, list)) or key in derived:
                 continue
             ttk.Label(scrollable_frame, text=f"{key}:").grid(row=i, column=0, sticky='w', padx=10, pady=5)
             var = tk.StringVar(value=str(value))
@@ -15225,6 +15292,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # None-valued parameter are stored verbatim.
                         self.params[key] = value_str
                 
+                self._sync_bout_window_frames()
                 self.update_param_labels()
                 # Update UI elements that display parameters
                 self.time_bin_var.set(str(self.params['time_bin_size']))
@@ -15244,7 +15312,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if hasattr(self, 'baseline_correct_bouts'):
                     self.baseline_correct_bouts.set(self.params['baseline_correct_bouts'])
                 if hasattr(self, 'baseline_frames_var'):
-                    self.baseline_frames_var.set(str(self.params['baseline_frames']))
+                    self.baseline_frames_var.set(
+                        f"{float(self.params.get('baseline_seconds', 0.0) or 0.0):g}")
                 if hasattr(self, 'processing_rolling_avg_enabled'):
                     self.processing_rolling_avg_enabled.set(self.params['processing_rolling_avg_enabled'])
                 if hasattr(self, 'processing_smoothing_method'):
@@ -15292,12 +15361,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Sync UI variables to params dictionary before processing"""
         # Update baseline correction settings
         self.params['baseline_correct_bouts'] = self.baseline_correct_bouts.get()
+        # The baseline box is in seconds, like the bout window it sits inside;
+        # 0 (or unparseable) means "half the pre-bout window".
         try:
-            self.params['baseline_frames'] = int(self.baseline_frames_var.get())
+            self.params['baseline_seconds'] = max(0.0, float(self.baseline_frames_var.get()))
         except ValueError:
-            # If invalid, use default (half of preboutframes)
-            self.params['baseline_frames'] = self.params['preboutframes'] // 2
-            self.baseline_frames_var.set(str(self.params['baseline_frames']))
+            self.params['baseline_seconds'] = 0.0
+        self._sync_bout_window_frames()
+        self.baseline_frames_var.set(f"{self.params['baseline_seconds']:g}")
 
         # Update processing-time smoothing settings
         self.params['processing_rolling_avg_enabled'] = self.processing_rolling_avg_enabled.get()
@@ -15405,16 +15476,90 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if rates:
             from collections import Counter
             counts = Counter(rates)
+            # The shared axis rate, NOT the most common one: group-level callers
+            # turn a sample index into a time, and the samples they are holding
+            # were resampled onto this rate by _realign_bouts.  Returning the
+            # modal rate instead labels a 450-sample 15 s window as 22.6 s.
+            # Computed here rather than via analysis_fps() so that the rate logic
+            # stays usable by callers that borrow this method off the class.
+            shared = float(max(rates))
             if len(counts) > 1 and not self._mixed_fps_warned:
                 self._mixed_fps_warned = True
                 self.log_message(
-                    "  Warning: subjects were recorded at different sampling rates "
+                    "  Note: subjects were recorded at different sampling rates "
                     f"({', '.join(f'{r:g} Hz x{n}' for r, n in sorted(counts.items()))}). "
-                    f"Group analyses use {counts.most_common(1)[0][0]:g} Hz; frame-denominated "
-                    "windows span different durations for the other subjects.")
-            return float(counts.most_common(1)[0][0])
+                    "The bout window is set in seconds and stored traces are resampled "
+                    f"onto a shared {shared:g} Hz axis, so these can be "
+                    "analysed together. Any other frame-denominated setting (spike width, "
+                    "smoothing window) still means a different duration per rate.")
+            return shared
 
         return float(getattr(self, 'detected_photometry_fps', None) or self.FPS_FALLBACK)
+
+    # ======================== Bout Window (seconds <-> samples) ========================
+
+    def analysis_fps(self):
+        """Rate of the shared time axis every stored bout trace is resampled onto.
+
+        The *highest* rate among the processed subjects, so that combining
+        cohorts never throws away samples a faster recording actually has;
+        slower subjects are interpolated up, which adds no information but also
+        loses none.  With one rate in the project this is just that rate and
+        nothing is resampled.
+        """
+        rates = [float(d['photometry_fps'])
+                 for d in getattr(self, 'processed_data', {}).values()
+                 if isinstance(d, dict) and d.get('photometry_fps')]
+        # Must not fall back to get_fps(): that delegates here for the no-subject
+        # case, and the two would call each other forever.
+        return max(rates) if rates else float(
+            getattr(self, 'detected_photometry_fps', None) or self.FPS_FALLBACK)
+
+    def bout_window_samples(self, subject=None):
+        """``(prebout, postbout, baseline)`` in samples for *subject*.
+
+        The window is stored in seconds; this is the only place it becomes a
+        sample count.  Pass a subject (id or processed entry) whenever the
+        caller is extracting from that subject's own array — its rate is what
+        the indices must be in.  Omit it for the shared analysis axis.
+        """
+        fs = self.get_fps(subject) if subject is not None else self.analysis_fps()
+        pre = max(1, int(round(float(self.params.get('preboutseconds', 3.0)) * fs)))
+        post = max(1, int(round(float(self.params.get('postboutseconds', 3.0)) * fs)))
+        base_sec = float(self.params.get('baseline_seconds', 0.0) or 0.0)
+        base = int(round(base_sec * fs)) if base_sec > 0 else pre // 2
+        return pre, post, max(1, min(base, pre))
+
+    def _sync_bout_window_frames(self):
+        """Refresh the derived frame-denominated params from the seconds.
+
+        Many callers read ``params['preboutframes']`` directly and mean "the
+        shared plotting axis", so those stay in params rather than being chased
+        through the whole file — they are just no longer what the user sets.
+        """
+        pre, post, base = self.bout_window_samples()
+        self.params['preboutframes'] = pre
+        self.params['postboutframes'] = post
+        self.params['baseline_frames'] = base
+        return pre, post, base
+
+    def _migrate_bout_window_to_seconds(self):
+        """Adopt a project saved before the window was specified in seconds.
+
+        Such a project has frames but no seconds; convert once, at the rate that
+        project was analysed with, so its windows keep the duration they had.
+        """
+        p = self.params
+        if p.get('preboutseconds') is None or p.get('postboutseconds') is None:
+            fs = self.analysis_fps() or self.FPS_FALLBACK
+            p['preboutseconds'] = round(float(p.get('preboutframes', 90)) / fs, 4)
+            p['postboutseconds'] = round(float(p.get('postboutframes', 90)) / fs, 4)
+            bf = p.get('baseline_frames')
+            p['baseline_seconds'] = round(float(bf) / fs, 4) if bf else 0.0
+            self.log_message(
+                f"  Bout window migrated to seconds at {fs:.3f} Hz: "
+                f"{p['preboutseconds']:g} s pre / {p['postboutseconds']:g} s post")
+        return self._sync_bout_window_frames()
 
     # ======================== Animal / Session Identity ========================
 
@@ -16657,7 +16802,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.log_message(_tb.format_exc())
 
             self.root.update_idletasks()  # Allow GUI to update after each subject
-    
+
+        # The subjects' rates are only known now, so the shared plotting axis
+        # that the seconds settings imply can finally be sized.
+        pre, post, base = self._sync_bout_window_frames()
+        self.log_message(
+            f"  Bout window: {self.params['preboutseconds']:g} s pre / "
+            f"{self.params['postboutseconds']:g} s post → {pre}/{post} samples "
+            f"on a {self.analysis_fps():g} Hz shared axis (baseline {base} samples)")
+
     def _format_subject_processing_detail(self, subject_id):
         """Human-readable one-liner describing what was produced for a
         successfully processed subject (channels, wavelengths, frames/duration,
@@ -17956,36 +18109,78 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 dff[:, i + 2] = 100 * (signal - fitted) / fitted
             except Exception as e:
                 # If fitting fails, use linear detrend as fallback
-                self.log_message(f"    Warning: Biexponential fit failed for signal {i}, using linear detrend")
+                self.log_message(f"    Warning: Biexponential fit failed for signal {i} "
+                                 f"({type(e).__name__}: {e}), using linear detrend")
                 coeffs = np.polyfit(time_for_fit, signal, 1)
                 fitted = np.polyval(coeffs, time_for_fit)
                 dff[:, i + 2] = 100 * (signal - fitted) / fitted
         
         return dff
     
+    # Work caps for fit_biexponential.  A fit costs roughly nfev * len(signal)
+    # residual evaluations, measured at ~4e7 evaluated-samples/s, so capping
+    # nfev alone still lets a long recording run for minutes.  FIT_MAX_WORK
+    # bounds the product instead: ~5 s for the strict attempt, plus up to ~2 s
+    # if the retry also runs, so ~7 s per channel worst case (measured 7.4 s
+    # over 288 real channel-fits).  For reference, real recordings converge in
+    # ~350 evaluations and the slowest over the whole NSF dataset was 7,871 --
+    # so a 19,000-sample recording gets 10,526 and keeps comfortable headroom.
+    # Hitting a cap is not a failure: it raises, which sends the caller to its
+    # linear detrend with a logged reason, instead of freezing the GUI as an
+    # unbounded search did.
+    FIT_MAX_NFEV = 20000
+    FIT_RETRY_MAX_NFEV = 4000
+    FIT_MAX_WORK = 200_000_000
+
+    @classmethod
+    def _fit_nfev_cap(cls, n_samples, ceiling):
+        """Evaluation budget for a signal of this length."""
+        n = max(1, int(n_samples))
+        return int(max(2000, min(ceiling, cls.FIT_MAX_WORK // n)))
+
     def fit_biexponential(self, x, y):
         """
         Fit biexponential decay to signal with offset
         Matches MATLAB: fit(x, y, 'exp2', 'Normalize', 'on')
         Model: y = a*exp(-b*x) + c*exp(-d*x) + offset
         Improved with better initial guesses and constraints
+
+        Raises ValueError if no usable fit can be produced, so callers fall back
+        to a linear detrend rather than dividing by a bad baseline.
         """
         def biexp(x, a, b, c, d, offset):
             return a * np.exp(-b * x) + c * np.exp(-d * x) + offset
-        
+
         # Normalize x to [0, 1] range (matches MATLAB 'Normalize' option)
         x_min = x.min()
         x_max = x.max()
         x_norm = (x - x_min) / (x_max - x_min) if x_max > x_min else x
-        
+
+        y = np.asarray(y, dtype=float)
+        if not np.all(np.isfinite(y)):
+            raise ValueError("signal contains non-finite samples")
+
+        # Fit in a normalised y as well.  The model is linear in a, c and
+        # offset, so shifting y by y_min and dividing by its range maps the
+        # solution exactly -- (a/s, b, c/s, d, (offset-y_min)/s) describes the
+        # same curve -- and the bounds below carry over unchanged because they
+        # were already expressed as multiples of y_range.  What this does change
+        # is conditioning: curve_fit's step sizes and convergence tolerances are
+        # absolute, so on raw detector counts (~1e4) the solver can wander for
+        # tens of thousands of iterations without converging.  That reached the
+        # user as a frozen GUI rather than an error, because the retry below
+        # used to be unbounded.  Normalising makes the fit behave the same way
+        # whether the rig reports counts, volts or dF/F.
+        y_min = float(np.min(y))
+        y_range = float(np.max(y) - y_min)
+        scale = y_range if y_range > 0 else 1.0
+        y_norm = (y - y_min) / scale
+
         # Improved initial guess based on the data characteristics
-        y_start = np.mean(y[:min(10, len(y))])  # Average of first few points
-        y_end = np.mean(y[-min(10, len(y)):])   # Average of last few points
-        y_min = np.min(y)
-        y_max = np.max(y)
-        y_range = y_max - y_min
+        y_start = np.mean(y_norm[:min(10, len(y_norm))])  # Average of first few points
+        y_end = np.mean(y_norm[-min(10, len(y_norm)):])   # Average of last few points
         decay_amount = y_start - y_end
-        
+
         # Initial parameters: [a, b, c, d, offset]
         # Two exponentials: fast decay (b~5) and slow decay (d~0.5)
         # Total initial amplitude should equal the decay amount
@@ -17996,29 +18191,58 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             0.3,                  # d: slow rate
             y_end                 # offset: settle to end value
         ]
-        
+
         # Set bounds to ensure reasonable parameter values
-        # Allow fast rate up to 50, slow rate up to 10
+        # Allow fast rate up to 50, slow rate up to 10.  In normalised units
+        # y_range is 1, so the amplitude ceiling of y_range*2 becomes 2.
         bounds = (
             [0, 0.1, 0, 0.01, -np.inf],          # Lower bounds
-            [y_range * 2, 50, y_range * 2, 10, np.inf]  # Upper bounds
+            [2.0, 50, 2.0, 10, np.inf]           # Upper bounds
         )
-        
+
+        # A signal that rises overall gives a negative decay_amount, which puts
+        # p0 outside the a >= 0 bound and makes curve_fit raise before it fits
+        # anything.  Clip instead: the constrained fit then settles on a nearly
+        # flat baseline, which is the right answer for a signal that does not
+        # bleach, and matches what the linear fallback would have produced.
+        p0 = [float(np.clip(v, lo, hi))
+              for v, lo, hi in zip(p0, bounds[0], bounds[1])]
+
         # Fit with increased iterations and better tolerance
         try:
-            popt, _ = curve_fit(biexp, x_norm, y, p0=p0, bounds=bounds, 
-                              maxfev=20000, ftol=1e-10, xtol=1e-10)
+            popt, _ = curve_fit(biexp, x_norm, y_norm, p0=p0, bounds=bounds,
+                              maxfev=self._fit_nfev_cap(len(y_norm), self.FIT_MAX_NFEV),
+                              ftol=1e-10, xtol=1e-10)
         except RuntimeError:
-            # If strict fit fails, try with relaxed bounds
+            # If strict fit fails, try with relaxed bounds.  Every bound stays
+            # finite so the search region remains compact -- an unbounded retry
+            # is what used to hang -- and the evaluation cap guarantees this
+            # returns or raises rather than running indefinitely.
             bounds_relaxed = (
-                [0, 0.001, 0, 0.001, -np.inf],
-                [np.inf, 100, np.inf, 50, np.inf]
+                [0, 0.001, 0, 0.001, -10.0],
+                [10.0, 100, 10.0, 50, 10.0]
             )
-            popt, _ = curve_fit(biexp, x_norm, y, p0=p0, bounds=bounds_relaxed, 
-                              maxfev=20000)
-        
+            p0_relaxed = [float(np.clip(v, lo, hi))
+                          for v, lo, hi in zip(p0, bounds_relaxed[0], bounds_relaxed[1])]
+            popt, _ = curve_fit(biexp, x_norm, y_norm, p0=p0_relaxed,
+                              bounds=bounds_relaxed,
+                              maxfev=self._fit_nfev_cap(len(y_norm),
+                                                        self.FIT_RETRY_MAX_NFEV))
+
+        # Undo the y normalisation
+        fitted = biexp(x_norm, *popt) * scale + y_min
+
+        # Callers divide by this curve to get dF/F, so a baseline that is
+        # non-finite or crosses zero would silently produce absurd values.
+        # Raising sends them to their linear fallback instead.
+        if not np.all(np.isfinite(fitted)):
+            raise ValueError("biexponential fit produced non-finite values")
+        if np.min(fitted) <= 0 < np.min(y):
+            raise ValueError("biexponential baseline crosses zero; "
+                             "unusable as a dF/F denominator")
+
         # Return fitted values
-        return biexp(x_norm, *popt)
+        return fitted
     
     def motion_correction(self, dff, subtract_iso=True):
         """
@@ -21480,7 +21704,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # onset index above is valid even when this bout was extracted with a
         # different pre/post (identity when the windows already match).
         _entry = self.processed_data.get(subject, {}).get('bouts', {}).get(behavior, {})
-        onset_bout = self._realign_bout_trace(stored_bout, self._entry_prebout(_entry))
+        onset_bout = self._realign_bout_trace(
+            stored_bout, self._entry_prebout(_entry),
+            src_fs=self._entry_fs(_entry), dst_fs=float(self.analysis_fps()))
 
         def _onset_slice():
             a = max(0, onset_idx + window_start_frame)
@@ -21556,11 +21782,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             df = self.read_boutframes_sheet(boutframes_file, subject_id)
             
             bout_data = {}
-            prebout = self.params['preboutframes']
-            postbout = self.params['postboutframes']
+            # Sample counts for THIS subject's rate: the indices below address
+            # its own array, so a shared frame count would be the wrong duration
+            # for every subject not recorded at the analysis rate.
+            prebout, postbout, baseline_frames = self.bout_window_samples(subject_id)
             exclude_before = self.params['exclude_frames_before']
             baseline_correct = self.params['baseline_correct_bouts']
-            baseline_frames = self.params['baseline_frames']
 
             # ── Boutframes FPS scaling ──
             # If the checkbox is enabled, re-map all boutframe numbers from the
@@ -21708,6 +21935,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # silently assume the live param applies to every subject.
                 behavior_entry['_prebout'] = int(prebout)
                 behavior_entry['_postbout'] = int(postbout)
+                # The rate these samples are spaced at, so a trace from a rig
+                # that ran at a different rate can be put on the shared axis.
+                behavior_entry['_fs'] = float(self.get_fps(subject_id))
 
                 bout_data[behavior] = behavior_entry
 
@@ -21779,6 +22009,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             offset_entry['durations'] = None
                         offset_entry['_prebout'] = int(prebout)
                         offset_entry['_postbout'] = int(postbout)
+                        offset_entry['_fs'] = float(self.get_fps(subject_id))
                         offset_name = f"{src_behavior}_{suffix}"
                         bout_data[offset_name] = offset_entry
                         self.log_message(
@@ -21810,23 +22041,57 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 return int(v)
         return int(self.params.get('preboutframes', 90))
 
-    def _realign_bout_trace(self, trace, src_prebout, dst_prebout=None, dst_total=None):
-        """Reposition one trace so its onset (at src_prebout) sits at dst_prebout
-        on an axis of length dst_total, NaN-padding/cropping as needed."""
+    def _entry_fs(self, entry):
+        """Sampling rate a bout entry's traces are spaced at.
+
+        Entries stored before the window was specified in seconds carry no rate;
+        those projects were single-rate by necessity, so the analysis rate is the
+        right assumption and resampling below becomes a no-op.
+        """
+        if isinstance(entry, dict):
+            v = entry.get('_fs')
+            if v:
+                return float(v)
+        return float(self.analysis_fps())
+
+    def _realign_bout_trace(self, trace, src_prebout, dst_prebout=None, dst_total=None,
+                            src_fs=None, dst_fs=None):
+        """Put one trace on the shared axis: resample by rate, then position.
+
+        *src_fs* is the rate the trace was sampled at.  When it differs from the
+        axis rate the trace is first resampled onto the axis's sample spacing
+        about its own onset — without that, a 30 Hz recording drawn on a 20 Hz
+        axis is stretched by 1.5x and its peak lands at the wrong time.  The
+        onset is the anchor, so pre and post both keep their duration.
+        """
         if dst_prebout is None:
             dst_prebout = int(self.params.get('preboutframes', 90))
         if dst_total is None:
             dst_total = dst_prebout + int(self.params.get('postboutframes', 90))
         tr = np.asarray(trace, dtype=float)
+        src_prebout = int(src_prebout)
+
+        if src_fs and dst_fs and abs(float(src_fs) - float(dst_fs)) > 1e-6 and len(tr) > 1:
+            # Times of the stored samples relative to onset, and of the axis's.
+            t_src = (np.arange(len(tr)) - src_prebout) / float(src_fs)
+            t_dst = (np.arange(dst_total) - dst_prebout) / float(dst_fs)
+            good = np.isfinite(tr)
+            if good.sum() < 2:
+                return np.full(dst_total, np.nan)
+            out = np.interp(t_dst, t_src[good], tr[good], left=np.nan, right=np.nan)
+            # np.interp cannot extrapolate; mark anything outside the stored span.
+            out[(t_dst < t_src[good][0]) | (t_dst > t_src[good][-1])] = np.nan
+            return out
+
         out = np.full(dst_total, np.nan)
-        shift = dst_prebout - int(src_prebout)  # source idx s -> dst idx s + shift
+        shift = dst_prebout - src_prebout  # source idx s -> dst idx s + shift
         dst_lo = max(0, shift)
         dst_hi = min(dst_total, shift + len(tr))
         if dst_hi > dst_lo:
             out[dst_lo:dst_hi] = tr[dst_lo - shift:dst_hi - shift]
         return out
 
-    def _realign_bouts(self, traces, src_prebout):
+    def _realign_bouts(self, traces, src_prebout, src_fs=None):
         """Realign a list of stored traces onto the current window.  A no-op in
         the common case where the stored window already matches the live params
         (identity within floating tolerance), so it is safe to call everywhere."""
@@ -21834,10 +22099,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return []
         dst_prebout = int(self.params.get('preboutframes', 90))
         dst_total = dst_prebout + int(self.params.get('postboutframes', 90))
+        dst_fs = float(self.analysis_fps())
+        same_rate = not src_fs or abs(float(src_fs) - dst_fs) <= 1e-6
         # Fast path: window already matches what the plotters expect.
-        if int(src_prebout) == dst_prebout and all(len(t) == dst_total for t in traces):
+        if same_rate and int(src_prebout) == dst_prebout and all(len(t) == dst_total for t in traces):
             return list(traces)
-        return [self._realign_bout_trace(t, src_prebout, dst_prebout, dst_total)
+        return [self._realign_bout_trace(t, src_prebout, dst_prebout, dst_total,
+                                         src_fs=src_fs, dst_fs=dst_fs)
                 for t in traces]
 
     def _entry_channel_bouts(self, entry, channel_key, max_bouts=None):
@@ -21851,7 +22119,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return []
         if max_bouts is not None:
             bouts = bouts[:max_bouts]
-        return self._realign_bouts(bouts, self._entry_prebout(entry))
+        return self._realign_bouts(bouts, self._entry_prebout(entry), self._entry_fs(entry))
 
     def _stored_bout_trace_length(self, data):
         """Length (in frames) of a subject's stored bout traces, or None.
@@ -21889,30 +22157,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         onto the current axis, so they silently show truncated / blank regions —
         the classic "zero data" symptom of a partial reprocess.  Logged every
         time; the modal popup is shown only when the situation changes so it
-        doesn't nag on every plot."""
-        cur_total = (int(self.params.get('preboutframes', 90))
-                     + int(self.params.get('postboutframes', 90)))
-        lengths = {}  # trace length -> [subjects]
+        doesn't nag on every plot.
+
+        Windows are compared as DURATIONS, not sample counts: subjects recorded
+        at different rates hold a different number of samples for the same
+        window, and that difference is handled by resampling, not a problem to
+        warn about."""
+        cur_total = round(float(self.params.get('preboutseconds', 3.0))
+                          + float(self.params.get('postboutseconds', 3.0)), 3)
+        lengths = {}  # window duration (s) -> [subjects]
         for s in subjects:
             L = self._stored_bout_trace_length(self.processed_data.get(s, {}))
-            if L is not None:
-                lengths.setdefault(L, []).append(s)
+            if L is None:
+                continue
+            fs = float(self.get_fps(s)) or 1.0
+            # A window is only a *different* window if it differs by more than
+            # the rounding that converting seconds to whole samples costs.  Rigs
+            # that disagree in the third decimal of their rate (19.932 vs 19.940)
+            # land a sample apart on a 15 s window -- that is the same window,
+            # and reporting it as four windows sends people re-extracting to fix
+            # nothing.  Two samples of slack covers pre and post each rounding.
+            tol = max(2.0 / fs, 0.02)
+            if abs(L / fs - cur_total) <= tol:
+                continue
+            lengths.setdefault(round(L / fs, 2), []).append(s)
 
         if not lengths:
-            return  # no stored bouts to compare
-
-        distinct = sorted(lengths)
-        # Consistent iff a single window that matches the current settings.
-        if len(distinct) == 1 and distinct[0] == cur_total:
+            # Every subject is at the current window, to within rounding.
             self._mixed_window_warn_sig = None
             return
 
-        short = [s for L in distinct if L < cur_total for s in lengths[L]]
-        lines = [f"{L} frames: {', '.join(lengths[L])}" for L in distinct]
+        distinct = sorted(lengths)
+        lines = [f"{L:g} s: {', '.join(lengths[L])}" for L in distinct]
         msg = (
-            "The selected subjects' bouts were not all extracted with the "
-            "current pre/post window (prebout + postbout = "
-            f"{cur_total} frames).\n\n"
+            "These subjects' bouts were extracted with a different pre/post "
+            "window than the current one (prebout + postbout = "
+            f"{cur_total:g} s).\n\n"
             "Windows found:\n  " + "\n  ".join(lines) + "\n\n"
             "Subjects with a shorter window appear truncated (blank) at the "
             "edges of the plot, and mixed windows can misalign the average. "
@@ -21942,11 +22222,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             Dictionary with zone-entry aligned photometry traces
         """
         entry_bout_data = {}
-        prebout = self.params['preboutframes']
-        postbout = self.params['postboutframes']
         baseline_correct = self.params['baseline_correct_bouts']
-        baseline_frames = self.params['baseline_frames']
         fps = fps if fps is not None else self.get_fps()
+        # Window in samples at the rate these entry frames are indexed with.
+        pre_s = float(self.params.get('preboutseconds', 3.0))
+        post_s = float(self.params.get('postboutseconds', 3.0))
+        base_s = float(self.params.get('baseline_seconds', 0.0) or 0.0)
+        prebout = max(1, int(round(pre_s * fps)))
+        postbout = max(1, int(round(post_s * fps)))
+        baseline_frames = (int(round(base_s * fps)) if base_s > 0 else prebout // 2)
+        baseline_frames = max(1, min(baseline_frames, prebout))
         
         # Detect available photometry columns (columns 6+ contain per-channel z-scores).
         # Use stored channel count when available to avoid counting non-photometry columns.
@@ -22009,6 +22294,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 packed['G1'] = packed.get('Ch1', [])
                 packed['_prebout'] = int(prebout)
                 packed['_postbout'] = int(postbout)
+                packed['_fs'] = float(fps)
 
                 entry_bout_data[entry_type][display_name] = packed
                 # Count only the per-channel trace lists (Ch0..ChN); packed also
@@ -23315,6 +23601,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 for key, value in loaded_params.items():
                     if key in self.params:
                         self.params[key] = value
+                # A project saved before the bout window was specified in
+                # seconds carries only the frame counts.  Clear the seconds so
+                # _migrate_bout_window_to_seconds rebuilds them from those
+                # frames at that project's rate — keeping the window the
+                # duration it has always been, rather than silently adopting
+                # this build's 3 s default.
+                if 'preboutseconds' not in loaded_params and 'preboutframes' in loaded_params:
+                    self.params['preboutseconds'] = None
+                    self.params['postboutseconds'] = None
+                self._migrate_bout_window_to_seconds()
             
             # Load zones
             if 'zones' in config:
@@ -27925,7 +28221,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             # Realign to the current window so exported bouts share
                             # a common onset even across mixed extraction windows.
                             bouts_list = self._realign_bouts(
-                                list(bouts_list), self._entry_prebout(behavior_entry))
+                                list(bouts_list), self._entry_prebout(behavior_entry),
+                                self._entry_fs(behavior_entry))
                             
                             # Collect bouts for this subject-behavior-channel
                             subject_behavior_channel_bouts = {}
@@ -32633,7 +32930,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Realign to current window so subjects/bouts extracted with different
             # pre/post stack on a common onset (otherwise the min-length truncation
             # below silently drops samples and mis-aligns the time course).
-            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
+            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
+                                                self._entry_fs(entry))
             grp = subject_to_group.get(subject)
             for order, bout in enumerate(bouts_data, 1):
                 arr = np.asarray(bout, dtype=float)
@@ -32689,7 +32987,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             bouts_data = entry.get(alt, [])
                     if max_bouts is not None:
                         bouts_data = bouts_data[:max_bouts]
-                    bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
+                    bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
+                                                self._entry_fs(entry))
                     for bout in bouts_data:
                         arr = np.asarray(bout, dtype=float)
                         if arr.size == 0 or not np.any(np.isfinite(arr)):
@@ -32734,7 +33033,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         bouts_data = entry.get(alt, [])
                 if max_bouts is not None:
                     bouts_data = bouts_data[:max_bouts]
-                bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
+                bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
+                                                self._entry_fs(entry))
                 for bout in bouts_data:
                     arr = np.asarray(bout, dtype=float)
                     if arr.size == 0 or not np.any(np.isfinite(arr)):
@@ -32782,7 +33082,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         bouts_data = entry.get(alt, [])
                 if max_bouts is not None:
                     bouts_data = bouts_data[:max_bouts]
-                bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
+                bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
+                                                self._entry_fs(entry))
                 for bout in bouts_data:
                     arr = np.asarray(bout, dtype=float)
                     if arr.size == 0 or not np.any(np.isfinite(arr)):
@@ -37644,7 +37945,8 @@ cat("OK\n")
                 bouts_data = bouts_data[:max_bouts]
             # Realign so the onset index below is valid even if this subject's
             # bouts were extracted with a different pre/post window.
-            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry))
+            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
+                                                self._entry_fs(entry))
 
             # Assign each bout to a bin (0-based)
             bin_accum = {}  # {bin_idx: {metric: [values]}}

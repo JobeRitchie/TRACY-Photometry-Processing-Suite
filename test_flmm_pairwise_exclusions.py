@@ -60,7 +60,7 @@ def _app(exclusions, subjects=('S1', 'S2'), channels=('G0', 'G1'),
     app.params = {'preboutframes': 4}
     app.get_fps = lambda *a, **k: 30.0
     app.log_message = lambda *a, **k: None
-    app._realign_bouts = lambda bouts, prebout: bouts
+    app._realign_bouts = lambda bouts, prebout, src_fs=None: bouts
     app._entry_prebout = lambda entry: entry.get('_prebout', 4)
     return app
 
