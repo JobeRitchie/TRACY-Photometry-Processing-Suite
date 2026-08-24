@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.16.0"
-APP_VERSION_DATE = "August 23, 2026"
+APP_VERSION = "1.17.0"
+APP_VERSION_DATE = "August 24, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -1690,6 +1690,19 @@ class FPAnalysisGUI:
             'analysis_window_start_sec': 0.0,
             'analysis_window_end_sec': 5.0,
             'precut': 100,
+            # Per-subject session bounds, in VIDEO frames -- the same numbering
+            # boutframes arrive in, because that is what an experimenter reads
+            # off the video.  A recording routinely starts before the animal is
+            # in the apparatus and ends after it is lifted out, and those two
+            # stretches are tracking artefacts, not data: the position track
+            # wanders outside the arena and drags the pixel->cm calibration
+            # (which is fitted to the observed X range) with it, so the whole
+            # session is squashed into a sub-rectangle of the real one.
+            # {subject_id: {'start': int, 'end': int}}; 0 at either end means
+            # "no bound".  Applied to the raw rows before 'maxlengthseconds', so
+            # a 600 s cap is 600 s of real session.
+            'session_bounds_frames': {},
+            'session_bounds_enabled': True,
             # NOTE: there is deliberately no 'fps' parameter.  The sampling rate is
             # a property of the recording, measured from the timestamps during
             # processing and stored per subject as 'photometry_fps'; read it via
@@ -1844,6 +1857,7 @@ class FPAnalysisGUI:
         self._mixed_fps_warned = False  # log the mixed-rate warning only once per session
         self.auto_scale_boutframes_var = tk.BooleanVar(value=True)
         self.precut_correct_boutframes_var = tk.BooleanVar(value=True)
+        self.session_bounds_enabled_var = tk.BooleanVar(value=True)
         self.boutframes_video_fps_var = tk.StringVar(value='30')
         self.boutframe_manual_shift_var = tk.StringVar(value='0')
         # Start/end boutframes: analysis processing style (Bout Analysis tab)
@@ -3232,6 +3246,544 @@ class FPAnalysisGUI:
         # becomes visible keeps the preview honest without touching those paths.
         parent.bind('<Map>', lambda _e: self._refresh_identity_preview())
 
+    # -- Per-subject session start/end -------------------------------
+
+    def _build_session_bounds_options(self, parent):
+        """Editor for the per-subject real start / end of a session, in video frames.
+
+        Rigs get started before the animal is in the apparatus and stopped after
+        it comes out, so the head and tail of a recording are the animal being
+        carried, a hand in frame, or an empty arena.  Both stretches corrupt more
+        than they look like they should: pixel->cm calibration is fitted to the
+        observed X range, so a few seconds of out-of-arena tracking rescales the
+        whole session and moves every zone boundary with it.
+        """
+        frame = ttk.LabelFrame(parent, text="Session Start / End (video frames)", padding=5)
+        frame.pack(fill='both', expand=True, padx=5, pady=5)
+
+        ttk.Label(frame,
+                  text="Where each recording's real session begins and ends, numbered in VIDEO frames —\n"
+                       "the same frames boutframes are scored in.  Everything before the start frame and\n"
+                       "after the end frame is dropped: the photometry, the position track, and any bouts\n"
+                       "scored there.  Frames are converted to the recording's own sampling rate, so the\n"
+                       "same number means the same moment on every rig.\n"
+                       "Leave a cell at 0 for no bound at that end.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(700), justify='left').pack(anchor='w', pady=(0, 5))
+
+        ttk.Checkbutton(frame, text="Apply per-subject session bounds",
+                        variable=self.session_bounds_enabled_var,
+                        command=self._on_session_bounds_toggled).pack(anchor='w', pady=(0, 4))
+
+        ttk.Label(frame,
+                  text="Trimming happens while the raw file is read, so these take effect on the next "
+                       "Process run — re-extracting bouts alone will not move data that is already "
+                       "processed.  The recording-length cap is applied AFTER the start bound, so "
+                       "600 s means 600 s of real session.",
+                  foreground='#a05000', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(700), justify='left').pack(anchor='w', pady=(0, 6))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill='x', pady=(0, 4))
+        ttk.Button(btn_row, text="Populate Subjects", style='Compact.TButton',
+                   command=self._populate_session_bounds).pack(side='left', padx=(0, 4))
+        ttk.Button(btn_row, text="Import from File...", style='Compact.TButton',
+                   command=self._import_session_bounds_file).pack(side='left', padx=(0, 4))
+        ttk.Button(btn_row, text="Paste from Clipboard", style='Compact.TButton',
+                   command=self._paste_session_bounds_from_clipboard).pack(side='left', padx=(0, 4))
+        ttk.Button(btn_row, text="Copy to Clipboard", style='Compact.TButton',
+                   command=self._copy_session_bounds_to_clipboard).pack(side='left', padx=(0, 4))
+        ttk.Button(btn_row, text="Clear Selected", style='Compact.TButton',
+                   command=self._clear_selected_session_bound).pack(side='left', padx=(0, 4))
+        ttk.Button(btn_row, text="Clear All", style='Compact.TButton',
+                   command=self._clear_all_session_bounds).pack(side='left', padx=(0, 4))
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill='both', expand=True, pady=(0, 4))
+        cols = ('subject', 'start', 'start_s', 'end', 'end_s', 'status')
+        self.session_bounds_tree = ttk.Treeview(tree_frame, columns=cols, show='headings',
+                                                height=14, selectmode='browse')
+        for key, text, width, anchor in (
+                ('subject',  'Subject',       140, 'w'),
+                ('start',    'Start frame',   100, 'center'),
+                ('start_s',  'Start (s)',      80, 'center'),
+                ('end',      'End frame',     100, 'center'),
+                ('end_s',    'End (s)',        80, 'center'),
+                ('status',   'Processed as',  220, 'w')):
+            self.session_bounds_tree.heading(key, text=text)
+            # Only the note column stretches: letting Subject absorb the slack
+            # pushes the four numeric columns to the far right of a wide window,
+            # away from the ID they belong to.
+            self.session_bounds_tree.column(key, width=self.ui_px(width), anchor=anchor,
+                                            stretch=(key == 'status'))
+        sb_vsb = ttk.Scrollbar(tree_frame, orient='vertical',
+                               command=self.session_bounds_tree.yview)
+        self.session_bounds_tree.configure(yscrollcommand=sb_vsb.set)
+        self.session_bounds_tree.grid(row=0, column=0, sticky='nsew')
+        sb_vsb.grid(row=0, column=1, sticky='ns')
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.session_bounds_tree.bind('<Double-1>', self._on_session_bounds_double_click)
+        self._session_bounds_inline_entry = None
+
+        ttk.Label(frame,
+                  text="Double-click a Start frame or End frame cell to edit it; Tab moves down the "
+                       "column.  'Import from File...' reads an Excel/CSV sheet with a subject-ID column "
+                       "and a start (and optionally end) frame column, matching IDs case-insensitively.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(700), justify='left').pack(anchor='w')
+
+        self.session_bounds_status = ttk.Label(frame, text="", font=('Segoe UI', 8))
+        self.session_bounds_status.pack(anchor='w', pady=(4, 0))
+
+        self._refresh_session_bounds_list()
+        # The subject set changes as projects are processed or loaded and there
+        # is no single hook for it, so rebuild whenever the tab is shown.
+        parent.bind('<Map>', lambda _e: self._refresh_session_bounds_list())
+
+    def _session_bounds_store(self):
+        """The bounds dict in params, created on first use."""
+        store = self.params.get('session_bounds_frames')
+        if not isinstance(store, dict):
+            store = {}
+            self.params['session_bounds_frames'] = store
+        return store
+
+    def _set_session_bound(self, subject, key, value):
+        """Write one bound (key 'start' or 'end') for *subject*, in video frames."""
+        store = self._session_bounds_store()
+        rec = store.setdefault(str(subject), {'start': 0, 'end': 0})
+        rec[key] = max(0, int(value))
+
+    def _on_session_bounds_toggled(self):
+        self.params['session_bounds_enabled'] = bool(self.session_bounds_enabled_var.get())
+        self._refresh_session_bounds_list()
+
+    def _known_subject_ids(self):
+        """Every subject this project could process, processed or not.
+
+        Bounds are usually entered BEFORE the first run, so falling back to the
+        data folder matters: an empty table would otherwise force a processing
+        pass with no bounds applied just to learn the names.
+        """
+        subjects = list(self.processed_data.keys())
+        if subjects:
+            return sorted(subjects, key=str)
+        folder = ''
+        for var in ('batch_folder_var', 'fpdata_path_var'):
+            v = getattr(self, var, None)
+            if v is not None and v.get():
+                folder = v.get()
+                break
+        if folder and os.path.isdir(folder):
+            pattern = str(self.params.get('fpdata_pattern', 'FPData')).lower()
+            suffix = self.params.get('fpdata_suffix', '.csv')
+            found = []
+            for f in sorted(os.listdir(folder)):
+                if pattern in f.lower() and f.lower().endswith('.csv'):
+                    found.append(self.extract_subject_id(f, pattern, suffix))
+            return sorted(set(found), key=str)
+        return []
+
+    def _refresh_session_bounds_list(self):
+        """Repopulate the bounds table from params, with a per-row processed-as note."""
+        if not hasattr(self, 'session_bounds_tree'):
+            return
+        self._close_session_bounds_inline_entry(save=False, refresh=False)
+        tree = self.session_bounds_tree
+        for item in tree.get_children():
+            tree.delete(item)
+
+        store = self._session_bounds_store()
+        vfps = float(self.params.get('boutframes_video_fps', 30) or 30) or 30.0
+        subjects = self._known_subject_ids()
+        known = set(map(str, subjects))
+        # Bounds keyed to a subject this project does not hold are still listed,
+        # so a typo'd or stale ID is visible instead of silently doing nothing.
+        for k in store:
+            if str(k) not in known:
+                subjects.append(k)
+
+        n_stale = 0
+        for subj in sorted(subjects, key=str):
+            rec = store.get(str(subj)) or {}
+            start = int(rec.get('start', 0) or 0)
+            end = int(rec.get('end', 0) or 0)
+            data = self.processed_data.get(subj)
+            if str(subj) not in known:
+                status = 'ID not in this project'
+            elif data is None:
+                status = 'not processed yet'
+            else:
+                was = data.get('session_bound_frames')
+                if was is None:
+                    status = 'processed before bounds existed'
+                    if start or end:
+                        n_stale += 1
+                else:
+                    w_start, w_end = int(was[0] or 0), int(was[1] or 0)
+                    if (w_start, w_end) == (start, end):
+                        status = 'matches processed data'
+                    else:
+                        status = 'processed as %d-%s - reprocess' % (
+                            w_start, w_end or 'end')
+                        n_stale += 1
+            tree.insert('', 'end', values=(
+                subj,
+                start,
+                ('%.1f' % (start / vfps)) if start else '-',
+                end,
+                ('%.1f' % (end / vfps)) if end else '-',
+                status))
+
+        if hasattr(self, 'session_bounds_status'):
+            if not self.session_bounds_enabled_var.get():
+                self.session_bounds_status.config(
+                    text="Bounds are switched off - nothing below is being applied.",
+                    foreground='#a05000')
+            elif n_stale:
+                self.session_bounds_status.config(
+                    text=f"{n_stale} subject(s) were processed with different bounds. "
+                         f"Re-run Process to apply the current ones.",
+                    foreground='#a05000')
+            else:
+                n_set = sum(1 for r in store.values()
+                            if (r or {}).get('start') or (r or {}).get('end'))
+                self.session_bounds_status.config(
+                    text=f"{n_set} subject(s) bounded @ {vfps:g} fps video.",
+                    foreground='gray')
+
+    def _populate_session_bounds(self):
+        """List every subject this project knows about, with no bounds set."""
+        subjects = self._known_subject_ids()
+        if not subjects:
+            messagebox.showinfo(
+                "Session Start/End",
+                "No subjects found. Select the data folder on the Processing tab, "
+                "or process the project first.")
+            return
+        store = self._session_bounds_store()
+        for subj in subjects:
+            store.setdefault(str(subj), {'start': 0, 'end': 0})
+        self._refresh_session_bounds_list()
+
+    # -- Inline cell editing -----------------------------------------
+
+    _SESSION_BOUND_COLUMNS = {'#2': 'start', '#4': 'end'}
+
+    def _on_session_bounds_double_click(self, event):
+        tree = self.session_bounds_tree
+        if tree.identify_region(event.x, event.y) != 'cell':
+            return
+        col = tree.identify_column(event.x)
+        if col not in self._SESSION_BOUND_COLUMNS:
+            return
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        self._close_session_bounds_inline_entry(save=True)
+        self._open_session_bounds_inline_entry(item, col)
+
+    def _open_session_bounds_inline_entry(self, item, col):
+        tree = self.session_bounds_tree
+        bbox = tree.bbox(item, col)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        key = self._SESSION_BOUND_COLUMNS[col]
+        subject = tree.item(item, 'values')[0]
+        current = (self._session_bounds_store().get(str(subject)) or {}).get(key, 0) or 0
+
+        var = tk.StringVar(value=str(int(current)))
+        entry = tk.Entry(tree, textvariable=var, justify='center',
+                         font=('Segoe UI', 9), relief='flat',
+                         highlightthickness=1, highlightbackground='#0078d7')
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.select_range(0, 'end')
+        entry.focus_set()
+        self._session_bounds_inline_entry = (entry, var, item, col)
+
+        # The row index is resolved at commit time, not captured here: saving
+        # rebuilds the table, so the item ids taken now are stale by then.
+        row_pos = list(tree.get_children()).index(item) if item in tree.get_children() else -1
+
+        def _commit(advance=False):
+            self._close_session_bounds_inline_entry(save=True)
+            if advance and row_pos >= 0:
+                rows = tree.get_children()
+                if row_pos + 1 < len(rows):
+                    nxt = rows[row_pos + 1]
+                    tree.selection_set(nxt)
+                    tree.see(nxt)
+                    self._open_session_bounds_inline_entry(nxt, col)
+
+        entry.bind('<Return>', lambda e: _commit(advance=False))
+        entry.bind('<Tab>',    lambda e: (_commit(advance=True), 'break')[1])
+        entry.bind('<Escape>', lambda e: self._close_session_bounds_inline_entry(save=False))
+
+    def _close_session_bounds_inline_entry(self, save=True, refresh=True):
+        rec = getattr(self, '_session_bounds_inline_entry', None)
+        if not rec:
+            return
+        entry, var, item, col = rec
+        self._session_bounds_inline_entry = None
+        if save and hasattr(self, 'session_bounds_tree') \
+                and self.session_bounds_tree.exists(item):
+            try:
+                val = max(0, int(float(var.get())))
+            except (ValueError, TypeError):
+                val = None
+            if val is not None:
+                subject = self.session_bounds_tree.item(item, 'values')[0]
+                self._set_session_bound(subject, self._SESSION_BOUND_COLUMNS[col], val)
+        try:
+            entry.destroy()
+        except Exception:
+            pass
+        if refresh:
+            self._refresh_session_bounds_list()
+
+    # -- Bulk entry --------------------------------------------------
+
+    @staticmethod
+    def _match_bounds_columns(columns):
+        """Pick (id, start, end) columns out of a spreadsheet's headers.
+
+        Header wording varies ('Real Start Frame', 'start_frame', 'first frame'),
+        so match on keywords rather than an exact name -- but require the word
+        'frame' on a bound column.  A 'Real Start Time (sec)' column sitting next
+        to the frame one would otherwise be read as frames and put the start
+        thirty times too early.
+        """
+        norm = {c: str(c).strip().lower() for c in columns}
+        id_col = start_col = end_col = None
+        for c, low in norm.items():
+            if 'frame' not in low:
+                continue
+            if start_col is None and 'start' in low:
+                start_col = c
+            elif end_col is None and ('end' in low or 'stop' in low):
+                end_col = c
+        for c, low in norm.items():
+            if c in (start_col, end_col):
+                continue
+            if any(k in low for k in ('animal', 'subject', 'id', 'mouse')):
+                id_col = c
+                break
+        return id_col, start_col, end_col
+
+    def _import_session_bounds_file(self):
+        """Read subject bounds from an Excel/CSV sheet, matching IDs to this project."""
+        path = filedialog.askopenfilename(
+            title="Import session start/end frames",
+            filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            frames = self._read_bounds_candidates(path)
+        except Exception as exc:
+            messagebox.showerror("Import failed",
+                                 f"Could not read {os.path.basename(path)}:\n{exc}")
+            return
+
+        chosen = None
+        for df in frames:
+            id_col, start_col, end_col = self._match_bounds_columns(df.columns)
+            if id_col is not None and (start_col is not None or end_col is not None):
+                chosen = (df, id_col, start_col, end_col)
+                break
+        if chosen is None:
+            messagebox.showerror(
+                "Import failed",
+                "No usable columns found.\n\nThe sheet needs a subject/animal ID column "
+                "and at least one column whose name contains both 'start' (or 'end') "
+                "and 'frame'.")
+            return
+
+        df, id_col, start_col, end_col = chosen
+        applied, unmatched, skipped = self._apply_bounds_table(df, id_col, start_col, end_col)
+
+        self._refresh_session_bounds_list()
+        store = self._session_bounds_store()
+        msg = [f"Imported bounds for {len(applied)} subject(s) from "
+               f"{os.path.basename(path)}."]
+        if skipped:
+            msg.append(f"{skipped} row(s) had no start or end frame and were skipped.")
+        if unmatched:
+            shown = ', '.join(unmatched[:12]) + ('...' if len(unmatched) > 12 else '')
+            msg.append(f"\n{len(unmatched)} ID(s) are not in this project and were "
+                       f"ignored: {shown}")
+        no_bounds = [str(s) for s in self._known_subject_ids()
+                     if not (store.get(str(s)) or {}).get('start')
+                     and not (store.get(str(s)) or {}).get('end')]
+        if no_bounds:
+            shown = ', '.join(no_bounds[:12]) + ('...' if len(no_bounds) > 12 else '')
+            msg.append(f"\n{len(no_bounds)} subject(s) in the project got no bounds "
+                       f"and will be analysed in full: {shown}")
+        self.log_message('  ' + ' '.join(msg).replace('\n', ' '))
+        messagebox.showinfo("Import complete", '\n'.join(msg))
+
+    @staticmethod
+    def _read_bounds_candidates(path):
+        """Every plausible (sheet, header row) reading of a bounds spreadsheet.
+
+        Sheets kept for humans often carry title rows above the real header, so a
+        straight read comes back with 'Unnamed: n' columns.  Rather than fail,
+        offer each of the first few rows as the header and let the column matcher
+        pick the reading that works.
+        """
+        if str(path).lower().endswith('.csv'):
+            base = [pd.read_csv(path)]
+        else:
+            xl = pd.ExcelFile(path)
+            base = [xl.parse(sheet) for sheet in xl.sheet_names]
+
+        candidates = []
+        for df in base:
+            candidates.append(df)
+            if all(str(c).startswith('Unnamed') for c in df.columns):
+                for hdr in range(1, min(5, len(df))):
+                    shifted = df.iloc[hdr:].copy()
+                    shifted.columns = [str(v).strip() for v in df.iloc[hdr - 1]]
+                    candidates.append(shifted)
+        return candidates
+
+    def _apply_bounds_table(self, df, id_col, start_col, end_col):
+        """Write one parsed bounds table into params.
+
+        Returns ``(applied, unmatched, skipped)``.
+        """
+        known = {str(s).lower(): str(s) for s in self._known_subject_ids()}
+        store = self._session_bounds_store()
+        applied, unmatched, skipped = [], [], 0
+
+        def _frames(row, col):
+            if col is None:
+                return 0
+            try:
+                v = float(row[col])
+            except (TypeError, ValueError):
+                return 0
+            return 0 if not np.isfinite(v) or v < 0 else int(round(v))
+
+        for _, row in df.iterrows():
+            raw_id = row[id_col]
+            if pd.isna(raw_id):
+                continue
+            sid = str(raw_id).strip()
+            if not sid:
+                continue
+            start, end = _frames(row, start_col), _frames(row, end_col)
+            if not start and not end:
+                skipped += 1
+                continue
+            # Store under the project's own casing, so the key is the subject ID
+            # the pipeline will look up rather than the spreadsheet's variant.
+            target = known.get(sid.lower())
+            if target is None:
+                unmatched.append(sid)
+                continue
+            store[target] = {'start': start, 'end': end}
+            applied.append(target)
+        return applied, unmatched, skipped
+
+    def _paste_session_bounds_from_clipboard(self):
+        """Paste 'Subject<tab>start[<tab>end]' rows, or a bare column of starts.
+
+        A bare column is distributed down the visible rows from the selection,
+        the way the per-subject shift table works.  Rows that lead with a known
+        subject ID are matched by name instead, so a spreadsheet ordered
+        differently from the table still lands on the right animals.
+        """
+        self._close_session_bounds_inline_entry(save=True)
+        try:
+            raw = self.root.clipboard_get()
+        except Exception:
+            messagebox.showwarning("Paste", "Clipboard is empty or unreadable.")
+            return
+
+        rows = [ln.split('\t') for ln in raw.splitlines() if ln.strip()]
+        if not rows:
+            messagebox.showwarning("Paste", "Clipboard holds no rows.")
+            return
+
+        def _num(tok):
+            try:
+                v = float(str(tok).strip())
+            except (TypeError, ValueError):
+                return None
+            return None if not np.isfinite(v) or v < 0 else int(round(v))
+
+        known = {str(s).lower(): str(s) for s in self._known_subject_ids()}
+        store = self._session_bounds_store()
+        by_name = [r for r in rows if len(r) >= 2 and str(r[0]).strip().lower() in known]
+
+        applied = 0
+        if by_name:
+            for r in by_name:
+                target = known[str(r[0]).strip().lower()]
+                start = _num(r[1]) or 0
+                end = (_num(r[2]) or 0) if len(r) >= 3 else 0
+                store[target] = {'start': start, 'end': end}
+                applied += 1
+        else:
+            tree = self.session_bounds_tree
+            all_rows = tree.get_children()
+            if not all_rows:
+                messagebox.showinfo("Paste",
+                                    "No subjects listed. Click 'Populate Subjects' first.")
+                return
+            sel = tree.selection()
+            start_idx = list(all_rows).index(sel[0]) if sel else 0
+            for i, r in enumerate(rows):
+                row_idx = start_idx + i
+                if row_idx >= len(all_rows):
+                    break
+                subject = tree.item(all_rows[row_idx], 'values')[0]
+                start = _num(r[0])
+                if start is None:
+                    continue
+                end = _num(r[1]) if len(r) >= 2 else None
+                rec = store.setdefault(str(subject), {'start': 0, 'end': 0})
+                rec['start'] = start
+                if end is not None:
+                    rec['end'] = end
+                applied += 1
+
+        self._refresh_session_bounds_list()
+        if not applied:
+            messagebox.showwarning(
+                "Paste",
+                "Nothing was applied.\n\nPaste either a column of start frames, or "
+                "rows of 'Subject<TAB>start<TAB>end'.")
+
+    def _copy_session_bounds_to_clipboard(self):
+        """Copy the table as tab-separated Subject/start/end rows."""
+        store = self._session_bounds_store()
+        lines = ['Subject\tStartFrame\tEndFrame']
+        lines += [f"{subj}\t{int((rec or {}).get('start', 0) or 0)}"
+                  f"\t{int((rec or {}).get('end', 0) or 0)}"
+                  for subj, rec in sorted(store.items())]
+        self.root.clipboard_clear()
+        self.root.clipboard_append('\n'.join(lines))
+
+    def _clear_selected_session_bound(self):
+        if not hasattr(self, 'session_bounds_tree'):
+            return
+        sel = self.session_bounds_tree.selection()
+        if not sel:
+            return
+        subject = self.session_bounds_tree.item(sel[0], 'values')[0]
+        self._session_bounds_store().pop(str(subject), None)
+        self._refresh_session_bounds_list()
+
+    def _clear_all_session_bounds(self):
+        if not messagebox.askyesno("Clear All", "Remove all per-subject session bounds?"):
+            return
+        self._session_bounds_store().clear()
+        self._refresh_session_bounds_list()
+
     def _toggle_pooled_zscore(self, enable):
         """Apply or revert pooled z-scoring across the loaded subjects."""
         if not self.processed_data:
@@ -3490,6 +4042,9 @@ class FPAnalysisGUI:
         identity_outer = ttk.Frame(advanced_nb)
         advanced_nb.add(identity_outer, text="Animals & Sessions")
         self._build_identity_options(identity_outer)
+        bounds_outer = ttk.Frame(advanced_nb)
+        advanced_nb.add(bounds_outer, text="Session Start/End")
+        self._build_session_bounds_options(bounds_outer)
 
         # Offset Bout Definitions
         offset_frame = ttk.LabelFrame(offset_outer, text="Offset Bout Definitions", padding=5)
@@ -12324,6 +12879,48 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Each subject can be given the real START and END of its session, in
+    Settings > Session Start/End. A rig is started before the animal is in the
+    apparatus and stopped after it is lifted out, and those two stretches are not
+    merely uninteresting: the position track leaves the arena there, and pixel→cm
+    calibration is fitted to the OBSERVED X range, so a few seconds of the animal
+    being carried past the camera rescales the entire session and moves every zone
+    boundary with it. Bounds are numbered in VIDEO frames — the same frames
+    boutframes are scored in, and the number an experimenter can read off the video
+    — and are converted to each recording's own sampling rate, so one number means
+    the same moment on every rig. Everything outside them is dropped: photometry,
+    the position track (ABEL tracks included), and any bouts scored there. Bounds
+    are applied BEFORE the recording-length cap, so a 600 s cap is 600 s of real
+    session rather than 600 s counted from the experimenter's hand. The table takes
+    typed cells (Tab walks down a column), a pasted spreadsheet column, or an
+    Excel/CSV import matched on subject ID case-insensitively; a per-row note says
+    whether each subject's processed data still matches its bounds, because
+    trimming happens as the raw file is read and takes effect on the next Process
+    run. An end frame at or before its start is refused rather than emptying the
+    recording, and the log names the raw rows actually kept.
+  • Fix — Reopening a project could land every bout at the wrong place in the
+    signal. The offset between video time zero and photometry sample 0 was measured
+    from the raw file, which is never saved, so a reloaded project silently fell
+    back to estimating it as precut / LED-state count — a row count, not a time —
+    and re-extracted bouts against a different origin than the one they were first
+    cut on. The measured offset, and the rows actually trimmed from the head, are
+    now written with the project and read back.
+  • Fix — In a cohort recorded at two sampling rates, "Compare Across Bouts" came
+    back empty while every per-subject plot looked right. A stored bout did not
+    remember the rate its samples are spaced at, so on reload a slower subject's
+    window was read at the project's FASTEST rate — a 20 Hz subject's 5 s window
+    read as 3.3 s — and the analysis window ran off the end of the trace into
+    padding. The rate is now saved per bout entry, and projects saved earlier are
+    repaired on load from the subject's own recording rate, with no re-extraction.
+  • Fix — A single missing sample inside an analysis window turned that bout's
+    peak, mean and AUC into NaN, and one NaN poisoned the pooled mean for every
+    other subject at that bout number. Slower subjects in a mixed-rate project
+    always carry one, because resampling onto a faster axis cannot produce the
+    sample at exactly the window edge. Windows are now reduced over their real
+    samples only.
+
+Version 1.16.0  •  August 23, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Position tracks exported by ABEL are read directly. Drop
     {{SubjectID}}ABELposition.csv beside the FPData file and TRACY finds it like any
     other position file. It cannot be synchronised like one: ABEL never sees the
@@ -13829,6 +14426,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     'num_photometry_channels': data.get('num_photometry_channels', 0),
                     'n_led_states': data.get('n_led_states'),
                     'photometry_fps': data.get('photometry_fps'),
+                    # Where this subject's signal actually starts. `raw` is not
+                    # saved, so without these a reloaded project cannot tell
+                    # video frame 0 from signal sample 0 and re-extracts bouts
+                    # against a different origin than they were extracted on.
+                    'start_trim_rows': data.get('start_trim_rows'),
+                    'start_offset_samples': data.get('start_offset_samples'),
+                    # The session bounds in force when it was processed, so the
+                    # UI can say when the current settings no longer match.
+                    'session_bound_frames': data.get('session_bound_frames'),
                     'channel_names': data.get('channel_names', []),
                     'channel_name_map': {str(k): v for k, v in ch_name_map.items()},
                     # Boutframes file this subject's bouts were extracted from, so
@@ -14050,6 +14656,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             entry['prebout'] = int(bout_data.get('_prebout'))
                             entry['postbout'] = int(bout_data.get('_postbout',
                                                     self.params.get('postboutframes', 90)))
+                        # ...and the RATE those samples are spaced at. Without it
+                        # a reloaded entry falls back to analysis_fps() -- the
+                        # fastest rate in the project -- so in a mixed-rate
+                        # cohort a slower subject's window is read as shorter
+                        # than it is and every metric over it comes back NaN.
+                        if bout_data.get('_fs'):
+                            entry['fs'] = float(bout_data['_fs'])
                         # Persist the onsets too. Without them a reloaded project
                         # has to re-derive bout positions from the boutframes
                         # workbook and the *current* transform settings, so the
@@ -14323,6 +14936,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.auto_scale_boutframes_var.set(bool(self.params.get('auto_scale_boutframes', False)))
             if hasattr(self, 'precut_correct_boutframes_var'):
                 self.precut_correct_boutframes_var.set(bool(self.params.get('precut_correct_boutframes', True)))
+            self.params['session_bounds_frames'] = {
+                str(k): {'start': int(float((v or {}).get('start', 0) or 0)),
+                         'end': int(float((v or {}).get('end', 0) or 0))}
+                for k, v in (self.params.get('session_bounds_frames') or {}).items()
+                if isinstance(v, dict)
+            }
+            if hasattr(self, 'session_bounds_enabled_var'):
+                self.session_bounds_enabled_var.set(
+                    bool(self.params.get('session_bounds_enabled', True)))
+            if hasattr(self, 'session_bounds_tree'):
+                self._refresh_session_bounds_list()
+            if self.params['session_bounds_frames']:
+                self.log_message(
+                    f"  Loaded session start/end bounds for "
+                    f"{len(self.params['session_bounds_frames'])} subject(s)")
             if hasattr(self, 'boutframes_video_fps_var'):
                 self.boutframes_video_fps_var.set(str(self.params.get('boutframes_video_fps', 30)))
 
@@ -14476,6 +15104,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 stored_fps = metadata.get('photometry_fps')
                                 if stored_fps is not None:
                                     subject_data['photometry_fps'] = float(stored_fps)
+                                # Restore where the signal starts relative to
+                                # video frame 0 (see _photometry_start_offset_samples).
+                                stored_trim = metadata.get('start_trim_rows')
+                                if stored_trim is not None:
+                                    subject_data['start_trim_rows'] = int(stored_trim)
+                                stored_off = metadata.get('start_offset_samples')
+                                if stored_off is not None:
+                                    subject_data['start_offset_samples'] = int(stored_off)
+                                stored_bounds = metadata.get('session_bound_frames')
+                                if stored_bounds is not None:
+                                    subject_data['session_bound_frames'] = list(stored_bounds)
                                 # Restore channel naming so the Exclusions tab can
                                 # determine which channels a subject has after reload.
                                 if metadata.get('channel_names'):
@@ -14686,6 +15325,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         bouts[behavior]['_postbout'] = int(
                                             _w.get('postbout',
                                                    self.params.get('postboutframes', 90)))
+                                    # Projects saved before the rate was
+                                    # persisted still carry it on the subject:
+                                    # extract_bouts spaces the traces at the
+                                    # subject's own rate, so that is the value,
+                                    # and taking it here repairs those projects
+                                    # without a re-extract.
+                                    _entry_fs = _w.get('fs') or subject_data.get('photometry_fps')
+                                    if _entry_fs:
+                                        bouts[behavior]['_fs'] = float(_entry_fs)
                                     # Restore the onsets the traces were cut at,
                                     # so the Bouts Overlay marks those rather
                                     # than re-deriving positions from the
@@ -15654,6 +16302,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Update boutframes FPS scaling settings
         self.params['auto_scale_boutframes'] = self.auto_scale_boutframes_var.get()
         self.params['precut_correct_boutframes'] = self.precut_correct_boutframes_var.get()
+        if hasattr(self, 'session_bounds_enabled_var'):
+            self.params['session_bounds_enabled'] = bool(self.session_bounds_enabled_var.get())
         try:
             self.params['boutframes_video_fps'] = float(self.boutframes_video_fps_var.get())
         except ValueError:
@@ -17886,6 +18536,31 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if hasattr(self, 'processing_summary') and subject_id not in self.processing_summary['missing_behavior']:
                     self.processing_summary['missing_behavior'].append(subject_id)
         
+        # Drop the position rows outside this subject's session bounds before
+        # anything reads them.  The bounds and the position file are both
+        # numbered in video frames, so this is a direct filter -- and it has to
+        # happen here, because pixel->cm calibration is fitted to the observed X
+        # range: a few seconds of the animal being carried past the camera
+        # rescales the entire session.
+        if beh_raw is not None and len(beh_raw):
+            _keep = self._apply_session_bounds_to_frames(subject_id, beh_raw[:, 0])
+            if not _keep.all():
+                _n_drop = int((~_keep).sum())
+                if _keep.any():
+                    beh_raw = beh_raw[_keep]
+                    if abel_position is not None:
+                        _af, _ax, _ay, _afps = abel_position
+                        _am = self._apply_session_bounds_to_frames(subject_id, _af)
+                        abel_position = (_af[_am], _ax[_am], _ay[_am], _afps)
+                    self.log_message(
+                        f"  Session bounds dropped {_n_drop} position frame(s) outside "
+                        f"the real session; {len(beh_raw)} kept.")
+                else:
+                    self.log_message(
+                        f"  Session bounds would drop every position frame "
+                        f"({_n_drop}) — bounds ignored for the position track. "
+                        f"Check that they are numbered in video frames.")
+
         result['raw'] = fp_raw
         result['beh'] = beh_raw
         
@@ -17899,7 +18574,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # one.  Rows are cut at the first sample past the cap so the interleave
         # stays contiguous.
         precut = self.params['precut']
-        fp_raw = fp_raw[precut:, :]
+        # Per-subject session bounds (video frames) are applied here, BEFORE the
+        # length cap, so "600 s" means 600 s of real session instead of 600 s
+        # counted from whatever the rig recorded while the animal was still in
+        # the experimenter's hand.
+        _start_row, _end_row = self._session_bound_rows(subject_id, fp_raw, precut)
+        _sb_start, _sb_end = self._subject_session_bounds(subject_id)
+        _n_raw_before = len(fp_raw)
+        fp_raw = fp_raw[_start_row:_end_row, :]
+        # The rows actually dropped from the head -- not the precut setting --
+        # are what separates signal sample 0 from video frame 0, so every later
+        # frame<->sample conversion reads this back instead of recomputing it.
+        result['start_trim_rows'] = int(_start_row)
+        result['session_bound_frames'] = [int(_sb_start),
+                                          (int(_sb_end) if _sb_end is not None else 0)]
+        if _sb_start or _sb_end is not None:
+            _vfps = float(self.params.get('boutframes_video_fps', 30) or 30)
+            _end_txt = (f"end frame {_sb_end} ({_sb_end / _vfps:.1f} s)"
+                        if _sb_end is not None else "end of recording")
+            self.log_message(
+                f"  Session bounds: start frame {_sb_start} "
+                f"({_sb_start / _vfps:.1f} s) to {_end_txt} @ {_vfps:g} fps video — "
+                f"kept raw rows {_start_row}:{_end_row} of {_n_raw_before} "
+                f"(precut alone would have kept {precut}:{_n_raw_before})")
 
         max_seconds = float(self.params.get('maxlengthseconds', 0.0) or 0.0)
         if max_seconds > 0 and len(fp_raw) > 0:
@@ -17979,6 +18676,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             self.detected_fps_label.config(
                                 text=f"Photometry FPS detected: {_detected:.3f} Hz",
                                 foreground='green')
+
+        # Samples between video time zero and signal sample 0, measured now while
+        # the raw array is still in hand.  `raw` is not saved to disk, so without
+        # this a reloaded project falls back to the legacy precut/n_led_states
+        # estimate and re-extracts bouts against a different origin.
+        _fs_now = result.get('photometry_fps') or getattr(self, 'detected_photometry_fps', None)
+        if _fs_now and float(_fs_now) > 0 and _start_row < len(result['raw']):
+            _t0 = float(result['raw'][_start_row, 1]) - float(result['raw'][0, 1])
+            if np.isfinite(_t0) and _t0 >= 0:
+                result['start_offset_samples'] = int(round(_t0 * float(_fs_now)))
 
         # Validate we have enough data
         process_green = self.process_green.get() and has_470
@@ -18181,6 +18888,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 _seed['photometry_fps'] = result.get(
                     'photometry_fps', _seed.get('photometry_fps'))
                 _seed['n_led_states'] = result.get('n_led_states', _seed.get('n_led_states', 1))
+                _seed['start_trim_rows'] = result.get(
+                    'start_trim_rows', _seed.get('start_trim_rows'))
+                _seed['start_offset_samples'] = result.get(
+                    'start_offset_samples', _seed.get('start_offset_samples'))
                 _seed['num_photometry_channels'] = result.get(
                     'num_photometry_channels', _seed.get('num_photometry_channels'))
                 self.processed_data[subject_id] = _seed
@@ -21976,6 +22687,137 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 behaviors.append((str(c), start_arr, None))
         return behaviors, has_end_any
 
+    def _subject_session_bounds(self, subject_id):
+        """Real start / end of *subject_id*'s session, in VIDEO frames.
+
+        Rigs are started before the animal is in the apparatus and stopped after
+        it is taken out, so the head and tail of a recording hold the animal
+        being carried, the experimenter's hand, or nothing at all.  Those
+        stretches are not merely uninteresting: the position track leaves the
+        arena there, and pixel->cm calibration is fitted to the observed X range
+        (:meth:`process_position_data`), so a few seconds of out-of-arena
+        tracking rescales the *whole* session and moves every zone boundary.
+
+        Bounds are numbered in video frames, the same numbering boutframes
+        arrive in, because that is the number an experimenter can read off the
+        video.  ``0`` at either end means "no bound".
+
+        Returns ``(start_frame, end_frame)``; *end_frame* is None when unset.
+        """
+        if not self.params.get('session_bounds_enabled', True):
+            return 0, None
+        bounds = self.params.get('session_bounds_frames') or {}
+        rec = bounds.get(str(subject_id))
+        if rec is None:
+            # Subject IDs come from filenames, while bounds are typed or pasted
+            # from a spreadsheet where the case usually differs ('1-F' vs
+            # '1-f').  Matching case-insensitively stops a whole cohort's bounds
+            # from silently doing nothing.
+            low = str(subject_id).lower()
+            for k, v in bounds.items():
+                if str(k).lower() == low:
+                    rec = v
+                    break
+        if not isinstance(rec, dict):
+            return 0, None
+
+        def _int(key):
+            try:
+                return max(0, int(float(rec.get(key, 0) or 0)))
+            except (TypeError, ValueError):
+                return 0
+
+        start = _int('start')
+        end = _int('end')
+        if end and end <= start:
+            # An end at or before the start would empty the recording. Refusing
+            # it here beats producing a zero-length subject that fails much
+            # further downstream with an unrelated-looking error.
+            self.log_message(
+                f"  Session bounds for {subject_id} ignored: end frame {end} is not "
+                f"after start frame {start}.")
+            return 0, None
+        return start, (end or None)
+
+    def _session_bound_rows(self, subject_id, fp_raw, precut):
+        """Raw-row slice bounds for *subject_id*'s real session.
+
+        The bounds are video frames; the raw file is a row-interleaved stream of
+        LED states carrying an acquisition clock.  The conversion goes through
+        TIME rather than a row count, because that is what makes the two agree
+        on any rig: video frame *f* is ``f / video_fps`` seconds after video time
+        zero, video time zero is the first raw row (the assumption
+        :meth:`_photometry_start_offset_samples` is already built on), so the row
+        wanted is the first whose elapsed time has passed that mark.  A row count
+        would need both the raw sampling rate and the LED-state count baked in,
+        and would mean a different duration on every rig.
+
+        Returns ``(start_row, end_row)`` for ``fp_raw[start_row:end_row]``.
+        *start_row* is never below *precut* -- a session bound moves the start
+        later, never earlier.
+        """
+        start_row, end_row = max(0, int(precut)), len(fp_raw)
+        start_frame, end_frame = self._subject_session_bounds(subject_id)
+        if not start_frame and end_frame is None:
+            return start_row, end_row
+
+        vfps = float(self.params.get('boutframes_video_fps', 30) or 30)
+        if vfps <= 0:
+            self.log_message(
+                f"  Session bounds for {subject_id} not applied: video FPS is {vfps}.")
+            return start_row, end_row
+
+        ts = np.asarray(fp_raw, dtype=float)
+        if ts.ndim != 2 or ts.shape[1] < 2 or ts.shape[0] == 0:
+            return start_row, end_row
+        elapsed = ts[:, 1] - ts[0, 1]
+        if not np.all(np.isfinite(elapsed)):
+            self.log_message(
+                f"  Session bounds for {subject_id} not applied: raw timestamps are unusable.")
+            return start_row, end_row
+
+        if start_frame:
+            over = np.flatnonzero(elapsed >= start_frame / vfps)
+            start_row = max(start_row, int(over[0]) if over.size else len(fp_raw))
+            # Snap the head back onto the interleave grid.  One raw row is one
+            # LED state, so cutting on the wrong phase moves one channel a
+            # sample relative to the others and stops the trimmed arrays from
+            # being a clean suffix of the untrimmed ones -- a sub-sample error,
+            # but a systematic one that shows up as a fixed lag between
+            # channels.  Rounding down to the precut's own phase leaves every
+            # channel exactly where it was, at a cost of under one sample.
+            cycle = 1
+            if ts.shape[1] > 2:
+                _led = ts[:, 2]
+                _states = np.unique(_led[np.isfinite(_led) & (_led <= 4)])
+                cycle = max(1, int(_states.size))
+            base = max(0, int(precut))
+            if cycle > 1 and start_row > base:
+                start_row = base + ((start_row - base) // cycle) * cycle
+        if end_frame is not None:
+            over = np.flatnonzero(elapsed > end_frame / vfps)
+            if over.size:
+                end_row = min(end_row, int(over[0]))
+        return start_row, max(start_row, end_row)
+
+    def _apply_session_bounds_to_frames(self, subject_id, frame_col):
+        """Boolean mask of the behavior rows inside *subject_id*'s session bounds.
+
+        Position files are numbered in the same video frames as the bounds, so
+        they are filtered on the frame column directly rather than through the
+        photometry clock.  Trimming here (instead of leaving the rows in with no
+        signal behind them) is what keeps the out-of-arena head and tail out of
+        the pixel->cm calibration.
+        """
+        start_frame, end_frame = self._subject_session_bounds(subject_id)
+        frames = np.asarray(frame_col, dtype=float)
+        keep = np.ones(frames.shape, dtype=bool)
+        if start_frame:
+            keep &= ~(frames < start_frame)
+        if end_frame is not None:
+            keep &= ~(frames > end_frame)
+        return keep
+
     def _photometry_start_offset_samples(self, subject_id):
         """Samples between video time zero and the first analysed photometry sample.
 
@@ -21992,26 +22834,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subject_data = self.processed_data.get(subject_id, {})
         fs = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
         precut = max(0, int(self.params.get('precut', 0)))
+        # Rows actually dropped from the head of the raw file, which equals the
+        # precut unless a per-subject session start pushed it later.  Reading the
+        # applied trim rather than the current setting is deliberate: if the
+        # bound is edited without reprocessing, the arrays still begin where they
+        # began, and bouts must keep landing against that origin.
+        trim = subject_data.get('start_trim_rows')
+        try:
+            trim = precut if trim is None else max(0, int(trim))
+        except (TypeError, ValueError):
+            trim = precut
         raw = subject_data.get('raw')
 
         if fs and float(fs) > 0 and raw is not None:
             try:
                 arr = np.asarray(raw)
-                if arr.ndim == 2 and arr.shape[1] >= 2 and arr.shape[0] > precut:
+                if arr.ndim == 2 and arr.shape[1] >= 2 and arr.shape[0] > trim:
                     # Column 1 is an absolute acquisition clock, not a
                     # recording-relative one: Bonsai's SystemTimestamp counts
                     # from system boot, so row 0 is already tens of thousands of
                     # seconds in.  The delay we want is the time elapsed between
                     # the first raw row and the first retained one, so subtract
                     # row 0 the same way calculate_dff does with ts1.
-                    t0 = float(arr[precut, 1]) - float(arr[0, 1])
+                    t0 = float(arr[trim, 1]) - float(arr[0, 1])
                     if np.isfinite(t0) and t0 >= 0:
                         return int(round(t0 * float(fs)))
             except Exception:
                 pass
 
+        # `raw` is never written to disk, so a reloaded project would otherwise
+        # fall back to the legacy estimate below and re-extract bouts against a
+        # different origin than the one they were extracted on.  The value
+        # measured during processing is saved with the subject for exactly that.
+        stored = subject_data.get('start_offset_samples')
+        if stored is not None:
+            try:
+                return max(0, int(stored))
+            except (TypeError, ValueError):
+                pass
+
         nl = int(subject_data.get('n_led_states', 1) or 1)
-        return max(0, precut // max(1, nl))
+        return max(0, trim // max(1, nl))
 
     def _transform_boutframe_values(self, frames, subject_id, as_int=True):
         """Convert video-frame bout numbers into photometry sample indices.
@@ -22280,6 +23143,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         Falls back to the 'onset' slice whenever end-frame data is unavailable or
         cannot be aligned to this bout.  Returns ``None`` for an empty window.
+
+        The result holds only real samples: NaNs are stripped here rather than
+        by each caller.  Every caller reduces the array (mean/max/min/AUC/tau/
+        derivative) and none builds a time axis from it, so a single NaN
+        anywhere would otherwise turn that bout's metric into NaN -- and a NaN
+        in one subject poisons the pooled mean for every other.  Slower
+        subjects in a mixed-rate project always carry one: resampling a 20 Hz
+        trace onto a 30 Hz axis cannot produce the sample at exactly the window
+        edge, so the last one comes back empty.
         """
         prebout = self.params.get('preboutframes', 90)
         onset_idx = prebout
@@ -22293,12 +23165,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             stored_bout, self._entry_prebout(_entry),
             src_fs=self._entry_fs(_entry), dst_fs=axis_fs)
 
+        def _real(seg):
+            """Drop NaNs; None when nothing real is left."""
+            if seg is None:
+                return None
+            seg = np.asarray(seg, dtype=float)
+            seg = seg[~np.isnan(seg)]
+            return seg if seg.size else None
+
         def _onset_slice():
             a = max(0, onset_idx + int(round(window_start_sec * axis_fs)))
             b = min(len(onset_bout), onset_idx + int(round(window_end_sec * axis_fs)))
             if b <= a:
                 return None
-            return onset_bout[a:b]
+            return _real(onset_bout[a:b])
 
         if hasattr(self, 'boutframe_processing_style_var'):
             style = self.boutframe_processing_style_var.get()
@@ -22360,7 +23240,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 base = base[~np.isnan(base)]
                 if base.size:
                     seg = seg - np.mean(base)
-        return seg
+        return _real(seg)
 
     def extract_bouts(self, subject_id, beh_synced, boutframes_file):
         """Extract bout-aligned data"""
@@ -33433,10 +34313,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if window_data is None or len(window_data) == 0:
                     continue
 
-                # Calculate metrics
-                peak = np.max(window_data)
-                avg = np.mean(window_data)
-                auc = self._trapz_compat(window_data) / fps  # Area under curve
+                # Calculate metrics (the segment holds real samples only)
+                peak = float(np.max(window_data))
+                avg = float(np.mean(window_data))
+                auc = float(self._trapz_compat(window_data) / fps)  # Area under curve
 
                 metrics_by_bout[bout_num]['peak'].append(peak)
                 metrics_by_bout[bout_num]['avg'].append(avg)
