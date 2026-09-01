@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.17.0"
-APP_VERSION_DATE = "August 24, 2026"
+APP_VERSION = "1.18.0"
+APP_VERSION_DATE = "September 1, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -56,6 +56,14 @@ MAX_PLOT_WIDTH_IN = 13.0
 # SMALL by default (never filling the window); the user's plot_scale setting
 # multiplies on top of this. See _embed_plot_canvas and set_plot_scale.
 PLOT_BASE_SCALE = 0.8
+# Resolution used whenever a figure is written to disk (the Export Plot button,
+# the matplotlib toolbar's save button, the kinematics figure save). The
+# on-screen dpi is deliberately small (PLOT_BASE_SCALE above); saved files must
+# not inherit that, or a figure dropped into Prism/Illustrator is a soft, blocky
+# bitmap. 600 dpi is the print standard for line art and keeps a 13in-wide
+# figure at 7800 px. Fonts and line widths are in points, so raising this
+# changes only pixel count, not layout.
+PLOT_EXPORT_DPI = 600
 CONTROL_PANEL_W = 320
 SECTION_PAD = 5
 WIDGET_PAD = 3
@@ -473,6 +481,171 @@ def facet_series_order(split_factors, levels_by_factor):
     return labels
 
 
+
+# How the Edit Processing Parameters dialog is laid out: one notebook tab per
+# stage of the pipeline, each holding titled sections of related settings. A
+# single vertical list of ~60 boxes gave no clue which analysis a setting fed
+# into, so the grouping IS the documentation here; the raw parameter key is
+# still shown under each label because that is the name the logs, the project
+# file and the Current Parameters panel use.
+#
+# Structure: [(tab_title, [(section_title, section_hint,
+#                           [(key, label, hint), ...]), ...]), ...]
+#
+# Any parameter missing from this table still appears, under "Other" -- the
+# table is a layout hint, never a filter, so a newly added parameter can never
+# become uneditable by being forgotten here.
+PARAM_GROUPS = [
+    ("Input Files", [
+        ("Photometry files", "How subject files are recognised during batch processing.", [
+            ('fpdata_pattern', "FPData name pattern",
+             "Text that identifies a photometry file"),
+            ('fpdata_suffix', "FPData suffix",
+             "Text after the subject ID, e.g. 0.csv"),
+        ]),
+        ("Position / timestamp files", "", [
+            ('timestamp_pattern', "Timestamp name pattern",
+             "Use | to list alternatives"),
+            ('timestamp_suffix', "Timestamp suffix",
+             "Text after the subject ID"),
+            ('abel_position_enabled', "Accept ABEL position files",
+             "True / False"),
+            ('abel_position_pattern', "ABEL position pattern",
+             "Frame-numbered position files from ABEL's Export tab"),
+        ]),
+        ("Subject IDs", "", [
+            ('session_pattern', "Session-splitting pattern",
+             "Splits a subject ID into animal + session"),
+        ]),
+    ]),
+
+    ("Signal Processing", [
+        ("Recording bounds", "Which part of each recording is analysed.", [
+            ('precut', "Precut (samples)",
+             "Samples trimmed from the start of the recording"),
+            ('maxlengthseconds', "Max recording length (s)",
+             "0 = analyse the whole recording"),
+            ('session_bounds_enabled', "Apply per-subject session bounds",
+             "True / False; bounds are set under Processing > Session Start/End"),
+        ]),
+        ("Smoothing", "Applied as the final processing step.", [
+            ('processing_rolling_avg_enabled', "Smoothing enabled",
+             "True / False - master switch"),
+            ('processing_smoothing_method', "Method",
+             "butterworth | savgol | rolling"),
+            ('processing_butter_cutoff_hz', "Butterworth cutoff (Hz)", ""),
+            ('processing_butter_order', "Butterworth order", ""),
+            ('processing_savgol_window_frames', "Savitzky-Golay window (frames)",
+             "Odd number of frames"),
+            ('processing_savgol_polyorder', "Savitzky-Golay poly order", ""),
+            ('processing_rolling_window_frames', "Rolling average window (frames)",
+             "1 disables smoothing"),
+        ]),
+    ]),
+
+    ("Bouts", [
+        ("Bout window",
+         "Feeds Extracted Bouts, Compare Across Bouts and every peri-event plot.", [
+            ('preboutseconds', "Pre-bout window (s)", ""),
+            ('postboutseconds', "Post-bout window (s)", ""),
+            ('baseline_correct_bouts', "Baseline-correct bouts", "True / False"),
+            ('baseline_seconds', "Baseline window (s)",
+             "0 = half the pre-bout window"),
+        ]),
+        ("Bout Analysis metrics",
+         "The window metrics are measured over, in the Bout Analysis tab.", [
+            ('analysis_window_start_sec', "Metric window start (s)",
+             "Negative = before the bout"),
+            ('analysis_window_end_sec', "Metric window end (s)", ""),
+            ('boutframe_processing_style', "Window anchored to",
+             "onset | whole | offset"),
+            ('decay_strictness', "Decay strictness for Tau / half-life",
+             "strict | balanced | permissive"),
+        ]),
+    ]),
+
+    ("Bout Frames", [
+        ("Video / photometry alignment",
+         "How boutframe numbers become photometry sample indices.", [
+            ('boutframes_video_fps', "Source video FPS", ""),
+            ('auto_scale_boutframes', "Scale video frames to samples",
+             "True / False - a unit conversion, normally on"),
+            ('precut_correct_boutframes', "Shift for precut trim", "True / False"),
+            ('boutframe_manual_shift', "Manual shift (frames)",
+             "Positive = later, negative = earlier"),
+            ('ttl_format', "Raw TTL file format",
+             "pairs_start | single | pairs_startend"),
+        ]),
+        ("Bout exclusion filter",
+         "Non-destructive; applied when bouts are extracted. 0 disables a rule.", [
+            ('bout_exclude_enabled', "Exclusion filter on", "True / False"),
+            ('bout_exclude_min_duration', "Drop bouts shorter than (frames)",
+             "Needs end frames"),
+            ('bout_exclude_max_duration', "Drop bouts longer than (frames)",
+             "Needs end frames"),
+            ('bout_exclude_min_gap', "Drop bouts within (frames) of the previous", ""),
+            ('exclude_frames_before', "Drop bouts before frame", ""),
+        ]),
+    ]),
+
+    ("Zones & Entries", [
+        ("Arena", "", [
+            ('maze_type', "Maze type", "EPM | EPM_Complex | OFT | Custom Arena"),
+            ('maze_width_cm', "Maze width (cm)", "Sets the pixel-to-cm calibration"),
+            ('y_calibration_method', "Y calibration method",
+             "legacy | normalize_y_min | independent_y_scale"),
+            ('distal_threshold', "Distal threshold (cm)",
+             "Distance from centre counted as distal open arm"),
+        ]),
+        # The question this dialog gets asked most. Kept in one block, labelled
+        # by which analysis each pair actually drives, so it is clear that
+        # changing the EPM value does not move the metrics table.
+        ("Minimum time in zone to count as an entry",
+         "Each pair drives a different analysis - change the one whose output you are reading.", [
+            ('min_open_arm_duration', "EPM - min time in open arm (s)",
+             "Zone Entry Bouts, EPM / EPM_Complex"),
+            ('min_time_between_entries', "EPM - min time between entries (s)",
+             "Re-entries inside this window are ignored"),
+            ('oft_min_entry_duration', "OFT / Custom - min time in zone (s)",
+             "Zone Entry Bouts, OFT / Custom Arena"),
+            ('oft_min_time_between_entries', "OFT / Custom - min time between entries (s)",
+             "Re-entries inside this window are ignored"),
+            ('metrics_min_entry_duration', "Metrics table - min time in zone (s)",
+             "Entry counts in Behavioral Data, all maze types"),
+            ('metrics_min_refractory_sec', "Metrics table - min time between entries (s)",
+             "Refractory period between counted entries"),
+        ]),
+        ("Movement", "", [
+            ('velocity_outlier_threshold', "Velocity outlier threshold (SD)", ""),
+            ('outback_velocity_threshold', "Out/Back velocity threshold (cm/s)", ""),
+        ]),
+    ]),
+
+    ("Transients", [
+        ("Spike / transient detection", "Used by the Spike Analysis tab.", [
+            ('spike_threshold_mad', "Threshold (MADs)", "2.0 - 3.0 is typical"),
+            ('spike_min_prominence', "Min prominence (MADs)", ""),
+            ('spike_min_width', "Min width (frames)", ""),
+            ('spike_max_width', "Max width (frames)", ""),
+            ('spike_min_interval', "Min interval between events (frames)", ""),
+        ]),
+    ]),
+
+    ("Binning & Plots", [
+        ("Binning", "", [
+            ('time_bin_size', "Time bin (s)", "0 = no binning"),
+            ('spatial_bin_size', "Spatial bin (cm)", "Heatmap bin size"),
+        ]),
+        ("Plot defaults", "", [
+            ('series_factor', "Factor plotted as series", ""),
+            ('bout_overlay_line_thickness', "Bout overlay line width (pt)", ""),
+            ('zero_line_color', "Time-zero line colour", "Hex, e.g. #808080"),
+            ('zero_line_width', "Time-zero line width (pt)", ""),
+        ]),
+    ]),
+]
+
+
 # Which option clusters each plot type actually uses. Kept as a table rather
 # than a predicate hung off each widget so a tab's whole disclosure rule can be
 # read in one place, and so one generic handler drives every tab. A plot type
@@ -493,7 +666,7 @@ VIZ_OPTIONS_BY_PLOT = {
     'Zone Averages':                    {'channels'},
     'Distance from Center (Euclidean)': {'channels'},
     'Distance from Center':             {'channels'},
-    'Out/Back':                         {'channels'},
+    'Out/Back':                         {'channels', 'outback'},
 }
 
 
@@ -598,14 +771,23 @@ class FacetControls(ttk.Frame):
         else:
             self._hint.pack(anchor='w')
 
-        for factor in factors:
-            row = ttk.Frame(self._rows)
-            row.pack(fill='x', pady=1)
-            ttk.Label(row, text=f"{factor}:", font=('Segoe UI', 8),
-                      width=9, anchor='w').pack(side='left')
+        # One grid rather than a frame per row: the factor names then share a
+        # column and line up, and the dropdown column is the one that takes the
+        # slack. Packed side by side they each demanded a fixed character
+        # count instead, and the dropdown's arrow was the part that fell off
+        # the edge of a narrow control column.
+        self._rows.grid_columnconfigure(0, weight=0)
+        self._rows.grid_columnconfigure(1, weight=1)
+        for r, factor in enumerate(factors):
+            ttk.Label(self._rows, text=f"{factor}:", font=('Segoe UI', 8),
+                      anchor='w').grid(row=r, column=0, sticky='w',
+                                       padx=(0, self.app.ui_px(4)), pady=1)
             var = tk.StringVar()
+            # width is only a floor here (the grid column supplies the rest), so
+            # keep it small enough that a narrow column shrinks instead of
+            # clipping.
             combo = ttk.Combobox(
-                row, textvariable=var, state='readonly', width=14,
+                self._rows, textvariable=var, state='readonly', width=8,
                 values=[FACTOR_COMBINE, FACTOR_SPLIT] + list(levels[factor]))
             # Restore what was chosen before, but only if it still exists --
             # a level can disappear when assignments change underneath.
@@ -622,7 +804,7 @@ class FacetControls(ttk.Frame):
                             and factor == self.app.series_factor)
                         else FACTOR_COMBINE)
             var.set(want)
-            combo.pack(side='left', fill='x', expand=True)
+            combo.grid(row=r, column=1, sticky='ew', pady=1)
             combo.bind('<<ComboboxSelected>>', lambda _e: self._changed())
             self._combos[factor] = combo
             self._vars[factor] = var
@@ -1220,6 +1402,9 @@ class ZoneEditor:
         self.main_app.zones = {k: v.copy() for k, v in self.zones.items()}
         self.main_app.params['maze_width_cm'] = self.maze_width
         self.main_app.params['maze_type'] = self.template_var.get()
+        # The maze type selects which entry-threshold pair is in force, so the
+        # Visualization boxes have to be repointed at the new one.
+        self.main_app._refresh_entry_threshold_controls()
         if notify:
             messagebox.showinfo("Success", "Zones saved successfully!")
         if close:
@@ -1390,6 +1575,7 @@ class ZoneEditor:
                 self.main_app.params['min_time_between_entries'] = float(epm_ref_var.get())
                 self.main_app.params['metrics_min_entry_duration'] = float(met_dur_var.get())
                 self.main_app.params['metrics_min_refractory_sec'] = float(met_ref_var.get())
+                self.main_app._refresh_entry_threshold_controls()
                 win.destroy()
             except ValueError:
                 messagebox.showerror(
@@ -1905,6 +2091,9 @@ class FPAnalysisGUI:
             'bout_epoch_pre_sec': 10.0,
             'bout_epoch_post_sec': 10.0,
             'bout_epoch_max_bouts': 0,
+            # Zone-entry epochs: minimum time the animal must remain in the
+            # target zone from the entry onward. 0 = detection thresholds only.
+            'zone_entry_min_dwell_sec': 0.0,
             # Plot axis ranges
             'freq_xmin': 0.0, 'freq_xmax': 3.0,
             'coh_ymin': 0.0, 'coh_ymax': 1.0,
@@ -2185,6 +2374,7 @@ class FPAnalysisGUI:
         self.zones = copy.deepcopy(template['zones'])
         self.params['maze_type'] = template_name
         self.params['maze_width_cm'] = template['maze_width_cm']
+        self._refresh_entry_threshold_controls()
 
     def open_zone_editor(self):
         """Open interactive zone editor window"""
@@ -2498,9 +2688,13 @@ class FPAnalysisGUI:
         scrolls separately, because a tall figure and a long option list are
         genuinely independent.
 
-        The column is sized with ui_px and a grid weight, never a character
-        count, so it stays proportional under Windows display scaling.
+        The column is sized from its own measured content (see _fit_controls),
+        never a character count, so it stays proportional under Windows display
+        scaling and grows just enough for whatever the widest control turns out
+        to need at that density.
         """
+        if not hasattr(self, '_control_columns'):
+            self._control_columns = []
         container = ttk.Frame(parent)
         container.pack(fill='both', expand=True)
         container.grid_rowconfigure(0, weight=1)
@@ -2551,8 +2745,19 @@ class FPAnalysisGUI:
                         - self.ui_px(8))
             _column_canvas.configure(
                 height=min(column.winfo_reqheight(), avail))
+            self.fit_control_columns()
+
         column.bind('<Configure>', _fit_controls, add='+')
         left.bind('<Configure>', _fit_controls, add='+')
+        container.bind('<Configure>', _fit_controls, add='+')
+        # Every graphing tab's column is measured together, so register this one
+        # and let the shared pass decide the width.
+        self._control_columns.append((_column_canvas, column, container,
+                                      self.ui_px(column_px)))
+        # Controls built after this call (and content swapped at runtime) only
+        # change the *requested* width, which fires no <Configure>; measure once
+        # the tab is fully built.
+        self.root.after_idle(_fit_controls)
 
         output_host = ttk.Frame(container)
         output_host.grid(row=0, column=1, sticky='nsew', pady=self.ui_px(4),
@@ -2561,6 +2766,98 @@ class FPAnalysisGUI:
         # narrow the window may get; keep it modest for the same reason.
         output = self.make_scrollable(output_host, width=self.ui_px(320))
         return selection, settings, output, actions
+
+    def fit_notebook_tabs(self):
+        """Keep every tab label readable by fitting the row to the notebook.
+
+        ttk does not wrap, scroll or elide a row of tabs that is wider than its
+        notebook -- it just cuts each label off, which is how "Decision
+        Probability" becomes "Decision Probabili". Eight tabs at the authored
+        size need ~1560 px, more than a 1366 px screen has at the larger UI
+        densities, so the padding gives way first and then the type size, both
+        only as far as the overflow actually requires.
+        """
+        style = ttk.Style()
+        for nb in ([getattr(self, 'notebook', None)]
+                   + list(getattr(self, '_sub_notebooks', ()))):
+            if nb is None:
+                continue
+            try:
+                avail = nb.winfo_width() - self.ui_px(12)
+                labels = [nb.tab(t, 'text') for t in nb.tabs()]
+            except tk.TclError:
+                continue
+            if avail <= 1 or not labels:
+                continue
+            name = getattr(nb, '_fit_style', None)
+            if name is None:
+                name = f"Fit{len(getattr(self, '_fitted_notebooks', ()))}.TNotebook"
+                self._fitted_notebooks = getattr(self, '_fitted_notebooks', []) + [nb]
+                nb._fit_style = name
+                nb.configure(style=name)
+
+            pad, pt = self._tab_base_padx, self._tab_base_font_pt
+            for _attempt in range(6):
+                font = tkfont.Font(family='Segoe UI', size=pt, weight='bold')
+                need = sum(font.measure(text) + 2 * pad + self.ui_px(4)
+                           for text in labels)
+                if need <= avail:
+                    break
+                if pad > self.ui_px(3):
+                    pad = max(self.ui_px(3), int(pad * avail / need))
+                    continue
+                if pt > 7:
+                    pt -= 1
+                    continue
+                break
+            style.configure(f"{name}.Tab", padding=[pad, self._tab_base_pady],
+                            font=('Segoe UI', pt, 'bold'))
+
+    def fit_control_columns(self):
+        """Size every graphing tab's control column to the widest one's content.
+
+        A fixed column width is a guess made at one font size: the same controls
+        measure ~230 px at the Compact density and ~430 px at Large, so any
+        single number either clips the dense tabs or wastes a strip of the
+        figure on the sparse ones. Measuring is what makes it right at every
+        density -- and measuring them *together* is what keeps the column from
+        jumping width as the user moves between tabs, which is the whole point
+        of the tabs sharing a layout. The floor is what the tab asked for; the
+        ceiling stops one over-wide control from eating the figure.
+        """
+        columns = getattr(self, '_control_columns', ())
+        if not columns:
+            return
+        need = floor = 0
+        room = 0
+        for canvas, content, container, column_floor in columns:
+            try:
+                need = max(need, content.winfo_reqwidth()
+                           + self._scroll_gutter_px(canvas))
+                floor = max(floor, column_floor)
+                room = max(room, container.winfo_width())
+            except tk.TclError:
+                continue
+        ceiling = max(floor, self.ui_px(520))
+        if room > 1:
+            ceiling = max(floor, min(ceiling, int(room * 0.42)))
+        want = max(floor, min(need, ceiling))
+        for canvas, _content, _container, _floor in columns:
+            try:
+                if abs(canvas.winfo_reqwidth() - want) > 1:
+                    canvas.configure(width=want)
+            except tk.TclError:
+                continue
+
+    def _scroll_gutter_px(self, canvas):
+        """Width of the scrollbar beside *canvas*, which the content does not get."""
+        try:
+            for sib in canvas.master.winfo_children():
+                if sib.winfo_class() == 'TScrollbar':
+                    return max(sib.winfo_width(), sib.winfo_reqwidth())
+        except tk.TclError:
+            pass
+        return self.ui_px(16)
 
     def button_grid(self, parent, items, cols=3, style=None):
         """Lay *items* out as a wrapping grid of buttons rather than one row.
@@ -2706,11 +3003,16 @@ class FPAnalysisGUI:
         
         # Configure notebook (tabs)
         style.configure('TNotebook', background=self.colors['bg_light'], borderwidth=0)
+        # Authored tab metrics. fit_notebook_tabs() scales down from these when
+        # a row of tabs is wider than its notebook; keeping them here is what
+        # lets it scale back up again when the window grows.
+        self._tab_base_padx, self._tab_base_pady = px(11), px(5)
+        self._tab_base_font_pt = 10
         style.configure('TNotebook.Tab',
                        background=self.colors['bg_medium'],
                        foreground=self.colors['text_light'],
-                       padding=[px(11), px(5)],
-                       font=('Segoe UI', 10, 'bold'),
+                       padding=[self._tab_base_padx, self._tab_base_pady],
+                       font=('Segoe UI', self._tab_base_font_pt, 'bold'),
                        borderwidth=0)
         style.map('TNotebook.Tab',
                  background=[('selected', self.colors['bg_dark'])],
@@ -2788,7 +3090,13 @@ class FPAnalysisGUI:
         # bottom. Every tree in the app (subject x factor grid, exclusions,
         # per-subject shifts) is fed from here.
         try:
-            style.configure('Treeview', rowheight=px(22))
+            # From the font's own line height, not a scaled constant: at the
+            # larger densities a fixed 22 px row cut the descenders off every
+            # value in the grid ("Drug" lost the tail of its g).
+            _row_font = tkfont.nametofont('TkDefaultFont')
+            style.configure('Treeview',
+                            rowheight=max(px(22),
+                                          _row_font.metrics('linespace') + px(8)))
         except tk.TclError:
             pass
         # Trim the default label/checkbutton/radiobutton padding so dense
@@ -2840,7 +3148,7 @@ class FPAnalysisGUI:
                 'figure.titleweight': 'bold',
                 'axes.facecolor': 'white',
                 'savefig.facecolor': 'white',
-                'savefig.dpi': 150,
+                'savefig.dpi': PLOT_EXPORT_DPI,
                 'axes.prop_cycle': plt.cycler(color=cycle),
             })
         except Exception:
@@ -2909,8 +3217,166 @@ class FPAnalysisGUI:
             _sub_nb.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
         self.root.after(50, self._on_notebook_tab_changed)
 
+        # Explanatory paragraphs are authored with a wraplength in pixels, which
+        # is a width chosen for one window on one display; reflow them to the
+        # pane they actually landed in.
+        self._wrap_authored = {}
+        self._wrap_fit_job = None
+        self.root.bind('<Configure>', self._schedule_wrap_fit, add='+')
+        self.notebook.bind('<<NotebookTabChanged>>', self._schedule_wrap_fit,
+                           add='+')
+        for _sub_nb in self._sub_notebooks:
+            _sub_nb.bind('<<NotebookTabChanged>>', self._schedule_wrap_fit,
+                         add='+')
+        self.root.after(120, self._fit_wrap_labels)
+
         # Auto-check for updates on startup (background thread, non-blocking)
         self.root.after(1500, self.check_for_updates)
+
+    # ------------------------------------------------------------------
+    # Fluid help text
+    #
+    # A hard `wraplength` is a promise about how wide the pane will be. When it
+    # is wrong the label does not wrap early, it makes its container wider than
+    # the window -- which is how a paragraph of grey help text ends up pushing
+    # the controls beside it off the right edge at a larger UI scale. These two
+    # methods clamp every wrapping label to the width it was actually given,
+    # while never widening one past the width its author chose.
+    # ------------------------------------------------------------------
+    def _schedule_wrap_fit(self, event=None):
+        """Debounce the reflow; a resize delivers a flood of <Configure>."""
+        if event is not None and getattr(event, 'widget', None) not in (
+                self.root, self.notebook, *getattr(self, '_sub_notebooks', ())):
+            return
+        if self._wrap_fit_job is not None:
+            try:
+                self.root.after_cancel(self._wrap_fit_job)
+            except Exception:
+                pass
+        self._wrap_fit_job = self.root.after(150, self._fit_wrap_labels)
+
+    @staticmethod
+    def _wrap_px(value):
+        # ttk returns wraplength as a Tcl_Obj, which int() refuses.
+        try:
+            return int(str(value) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _fit_wrap_labels(self):
+        """Reflow wrapping labels to their container's current width."""
+        self._wrap_fit_job = None
+        floor = self.ui_px(150)
+        margin = self.ui_px(18)
+        stack = [self.root]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except tk.TclError:
+                continue
+            if widget.winfo_class() not in ('TLabel', 'Label'):
+                continue
+            try:
+                if not widget.winfo_ismapped():
+                    continue
+                key = str(widget)
+                authored = self._wrap_authored.get(key)
+                if authored is None:
+                    authored = self._wrap_px(widget.cget('wraplength'))
+                    if authored <= 0:
+                        # Not a wrapping label; remember that so the cget cost
+                        # is paid once per label rather than once per resize.
+                        self._wrap_authored[key] = 0
+                        continue
+                    self._wrap_authored[key] = authored
+                if not authored:
+                    continue
+                room = widget.master.winfo_width() - margin
+                if room <= 1:
+                    continue
+                want = max(floor, min(authored, room))
+                if abs(self._wrap_px(widget.cget('wraplength')) - want) > 2:
+                    widget.configure(wraplength=want)
+            except tk.TclError:
+                continue
+        # A row of tabs is measured against the same window, so fit it here too.
+        try:
+            self.fit_notebook_tabs()
+        except tk.TclError:
+            pass
+        # Re-wrapping changed how tall the advanced pages are.
+        self._fit_advanced_notebook()
+        # Re-wrapping changes how tall the content is, and a scroll viewport
+        # pins its content to a height measured before that -- as does any
+        # other content that grew since the viewport was last configured.
+        self.root.after_idle(self._resync_scroll_regions)
+
+    def _fit_advanced_notebook(self):
+        """Shrink the Processing tab's advanced notebook to the page on show.
+
+        Without this the pane is as tall as the tallest page for every page,
+        which is why a four-widget Offset Bout Definitions tab opened a screen
+        of empty space.
+        """
+        nb = getattr(self, '_advanced_nb', None)
+        if nb is None:
+            return
+        try:
+            page = nb.nametowidget(nb.select())
+            want = max(page.winfo_reqheight(), self.ui_px(60))
+            if abs(self._wrap_px(nb.cget('height')) - want) > 2:
+                nb.configure(height=want)
+        except (tk.TclError, KeyError):
+            return
+
+    def _resync_scroll_regions(self):
+        """Re-measure every scrolling viewport against its current content.
+
+        Content that grew taller (a paragraph that re-wrapped to more lines, a
+        table that gained rows) otherwise keeps the height its viewport pinned
+        it to when it was first laid out, and the overflow is cut off with no
+        scrollbar offering to reach it.
+        """
+        try:
+            # Requested sizes are recomputed lazily, so without this the
+            # measurement below is the one from before the content changed --
+            # which is the very thing being corrected.
+            self.root.update_idletasks()
+        except tk.TclError:
+            return
+        stack = [self.root]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except tk.TclError:
+                continue
+            if widget.winfo_class() != 'Canvas':
+                continue
+            resync = getattr(widget, '_resync_content', None)
+            if callable(resync):
+                try:
+                    resync()
+                except tk.TclError:
+                    pass
+                continue
+            try:
+                items = widget.find_withtag('all')
+                # One embedded window == a scroll viewport. Anything else is a
+                # drawing canvas (zone editor, plot preview); leave it alone.
+                if len(items) != 1:
+                    continue
+                name = widget.itemcget(items[0], 'window')
+                if not name:
+                    continue
+                inner = widget.nametowidget(name)
+                widget.itemconfigure(
+                    items[0],
+                    height=max(widget.winfo_height(), inner.winfo_reqheight()))
+                widget.configure(scrollregion=widget.bbox('all'))
+            except (tk.TclError, KeyError):
+                continue
 
     def _register_tab_mousewheel(self, tab, canvas, content_frame=None):
         """Register a tab-specific mousewheel handler for a scrollable canvas."""
@@ -2961,7 +3427,14 @@ class FPAnalysisGUI:
         self._refresh_group_name_lists()
     
     def create_welcome_tab(self):
-        """Welcome/Landing page tab"""
+        """Welcome/Landing page tab.
+
+        Everything here is one centred block of type. Its natural height is
+        ~750 px at the default density and ~880 px at Large, both taller than
+        the tab area of a 1366x768 laptop, so the block is measured against the
+        window and scaled down to fit rather than having its top and bottom
+        silently cropped by the centring.
+        """
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="Welcome")
         
@@ -2972,31 +3445,28 @@ class FPAnalysisGUI:
         # Center content frame
         center_frame = tk.Frame(main_frame, bg=self.colors['bg_dark'])
         center_frame.place(relx=0.5, rely=0.5, anchor='center')
-        
-        # Tracy logo/title
-        title_label = tk.Label(center_frame, 
-                              text="TRACY",
-                              font=('Segoe UI', 72, 'bold'),
-                              fg=self.colors['accent_blue'],
-                              bg=self.colors['bg_dark'])
-        title_label.pack(pady=(0, 10))
-        
-        # Subtitle
-        subtitle_label = tk.Label(center_frame,
-                                 text="Fiber Photometry Analysis Suite",
-                                 font=('Segoe UI', 20),
-                                 fg=self.colors['text_light'],
-                                 bg=self.colors['bg_dark'])
-        subtitle_label.pack(pady=(0, 8))
 
-        # Tagline summarizing what the app does
-        tagline_label = tk.Label(center_frame,
-                                 text="Processing  •  Behavior Sync  •  Bout & Spike Analysis  •  Connectivity  •  Visualization",
-                                 font=('Segoe UI', 11),
-                                 fg=self.colors['text_muted'],
-                                 bg=self.colors['bg_dark'])
-        tagline_label.pack(pady=(0, 40))
-        
+        dark, light = self.colors['bg_dark'], self.colors['text_light']
+        blue, muted = self.colors['accent_blue'], self.colors['text_muted']
+        # (widget, base point size, base pady) -- the one place the page's
+        # vertical rhythm is written down, and what _fit_welcome scales.
+        scaled = []
+
+        def line(parent, text, size, color, pady=0, bold=False):
+            lbl = tk.Label(parent, text=text, bg=dark, fg=color,
+                           font=('Segoe UI', size, 'bold') if bold
+                           else ('Segoe UI', size))
+            lbl.pack(pady=pady)
+            scaled.append((lbl, size, pady))
+            return lbl
+
+        line(center_frame, "TRACY", 72, blue, pady=(0, 10), bold=True)
+        line(center_frame, "Fiber Photometry Analysis Suite", 20, light, pady=(0, 8))
+        line(center_frame,
+             "Processing  •  Behavior Sync  •  Bout & Spike Analysis"
+             "  •  Connectivity  •  Visualization",
+             11, muted, pady=(0, 40))
+
         # Separator line
         separator = tk.Frame(center_frame, height=2, bg=self.colors['accent_blue'])
         separator.pack(fill='x', padx=50, pady=20)
@@ -3004,50 +3474,23 @@ class FPAnalysisGUI:
         # Credits frame
         credits_frame = tk.Frame(center_frame, bg=self.colors['bg_dark'])
         credits_frame.pack(pady=20)
-        
-        # Created by
-        created_label = tk.Label(credits_frame,
-                                text="Created by Jobe Ritchie",
-                                font=('Segoe UI', 14),
-                                fg=self.colors['text_light'],
-                                bg=self.colors['bg_dark'])
-        created_label.pack(pady=5)
-        
-        # Lab and institution
-        lab_label = tk.Label(credits_frame,
-                            text="Kash Lab",
-                            font=('Segoe UI', 14, 'bold'),
-                            fg=self.colors['accent_blue'],
-                            bg=self.colors['bg_dark'])
-        lab_label.pack(pady=5)
-        
-        institution_label = tk.Label(credits_frame,
-                                    text="University of North Carolina at Chapel Hill",
-                                    font=('Segoe UI', 13),
-                                    fg=self.colors['text_light'],
-                                    bg=self.colors['bg_dark'])
-        institution_label.pack(pady=5)
+
+        line(credits_frame, "Created by Jobe Ritchie", 14, light, pady=5)
+        line(credits_frame, "Kash Lab", 14, blue, pady=5, bold=True)
+        line(credits_frame, "University of North Carolina at Chapel Hill",
+             13, light, pady=5)
         
         # Version info
         version_frame = tk.Frame(center_frame, bg=self.colors['bg_dark'])
         version_frame.pack(pady=30)
-        
-        version_label = tk.Label(version_frame,
-                    text=f"Version {APP_VERSION}  •  {APP_VERSION_DATE}",
-                                font=('Segoe UI', 16),
-                                fg=self.colors['accent_blue'],
-                                bg=self.colors['bg_dark'])
-        version_label.pack()
 
+        line(version_frame,
+             f"Version {APP_VERSION}  •  {APP_VERSION_DATE}", 16, blue)
         # Active-development reminder: Tracy ships frequent updates, so nudge
         # users to check for them regularly via the System Check tab.
-        update_reminder_label = tk.Label(
-            version_frame,
-            text="🔄 Tracy is in active development — check for updates regularly in the 'System Check' tab",
-            font=('Segoe UI', 11),
-            fg=self.colors['text_muted'],
-            bg=self.colors['bg_dark'])
-        update_reminder_label.pack(pady=(8, 0))
+        line(version_frame,
+             "🔄 Tracy is in active development — check for updates "
+             "regularly in the 'System Check' tab", 11, muted, pady=(8, 0))
 
         # Live update-availability badge. Driven by the startup update check
         # (_apply_update_check_result): a red blinking "Update available" when
@@ -3062,6 +3505,7 @@ class FPAnalysisGUI:
             fg=self.colors['bg_dark'],
             bg=self.colors['bg_dark'])
         self.welcome_update_badge.pack(pady=(12, 0))
+        scaled.append((self.welcome_update_badge, 13, (12, 0)))
 
         # Getting started hint
         hint_frame = tk.Frame(main_frame, bg=self.colors['bg_medium'], padx=30, pady=15)
@@ -3073,7 +3517,37 @@ class FPAnalysisGUI:
                              fg=self.colors['text_light'],
                              bg=self.colors['bg_medium'])
         hint_label.pack()
-        
+
+        self._welcome_fit = 1.0
+
+        def _fit_welcome(_e=None):
+            """Shrink the block until it fits the tab, then leave it alone."""
+            avail = main_frame.winfo_height() - hint_frame.winfo_reqheight()
+            if avail <= 1:
+                return
+            natural = center_frame.winfo_reqheight() / max(0.2, self._welcome_fit)
+            # 0.55 keeps the smallest type legible; below that the page would be
+            # unreadable anyway and cropping is the lesser evil.
+            fit = max(0.55, min(1.0, (avail - self.ui_px(24)) / natural))
+            if abs(fit - self._welcome_fit) < 0.02:
+                return
+            self._welcome_fit = fit
+            for widget, size, pady in scaled:
+                bold = 'bold' in str(widget.cget('font'))
+                pts = max(8, int(round(size * fit)))
+                widget.configure(font=('Segoe UI', pts, 'bold') if bold
+                                 else ('Segoe UI', pts))
+                if isinstance(pady, tuple):
+                    scaled_pady = tuple(max(0, int(round(v * fit))) for v in pady)
+                else:
+                    scaled_pady = max(0, int(round(pady * fit)))
+                widget.pack_configure(pady=scaled_pady)
+            for frame, pad in ((separator, 20), (credits_frame, 20),
+                               (version_frame, 30)):
+                frame.pack_configure(pady=max(2, int(round(pad * fit))))
+
+        main_frame.bind('<Configure>', _fit_welcome, add='+')
+
     def create_project_tab(self):
         """Tab for project creation and management"""
         tab_outer = ttk.Frame(self.project_notebook)
@@ -3145,7 +3619,9 @@ class FPAnalysisGUI:
         ttk.Button(quick_frame, text="Clear Subject Data", 
                   command=self.clear_subject_data).pack(side='left', padx=5)
         
-        self.project_status_text = tk.Text(status_frame, height=20, width=80)
+        # Height and width are only a floor: both are fixed demands once the
+        # font scales, and this panel fills whatever room the tab has.
+        self.project_status_text = tk.Text(status_frame, height=8)
         self.project_status_text.pack(fill='both', expand=True)
         scrollbar = ttk.Scrollbar(status_frame, command=self.project_status_text.yview)
         scrollbar.pack(side='right', fill='y')
@@ -3909,12 +4385,20 @@ class FPAnalysisGUI:
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
         
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        proc_win = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
         # Pack canvas and scrollbar
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # Pin the content to the viewport width. There is no horizontal
+        # scrollbar here, so anything a wide child pushes past the right edge is
+        # simply unreachable; keeping the content at the viewport width makes
+        # every `fill='x'` row reflow to the window instead.
+        canvas.bind('<Configure>',
+                    lambda e: canvas.itemconfigure(proc_win, width=e.width),
+                    add='+')
         
         self._register_tab_mousewheel(tab, canvas, scrollable_frame)
         
@@ -3938,12 +4422,14 @@ class FPAnalysisGUI:
         
         ttk.Label(self.single_frame, text="FPData File:").grid(row=1, column=0, sticky='w', pady=2)
         self.fpdata_path_var = tk.StringVar()
-        ttk.Entry(self.single_frame, textvariable=self.fpdata_path_var, width=50).grid(row=1, column=1, pady=2)
+        ttk.Entry(self.single_frame, textvariable=self.fpdata_path_var,
+                  width=28).grid(row=1, column=1, sticky='ew', pady=2)
         ttk.Button(self.single_frame, text="Browse", command=self.browse_fpdata).grid(row=1, column=2, padx=3)
         
         ttk.Label(self.single_frame, text="Timestamp File (optional):").grid(row=2, column=0, sticky='w', pady=2)
         self.computerts_path_var = tk.StringVar()
-        ttk.Entry(self.single_frame, textvariable=self.computerts_path_var, width=50).grid(row=2, column=1, pady=2)
+        ttk.Entry(self.single_frame, textvariable=self.computerts_path_var,
+                  width=28).grid(row=2, column=1, sticky='ew', pady=2)
         ttk.Button(self.single_frame, text="Browse", command=self.browse_computerts).grid(row=2, column=2, padx=3)
         
         # Batch processing inputs
@@ -3951,13 +4437,21 @@ class FPAnalysisGUI:
         
         ttk.Label(self.batch_frame, text="Data Folder:").grid(row=0, column=0, sticky='w', pady=2)
         self.batch_folder_var = tk.StringVar()
-        ttk.Entry(self.batch_frame, textvariable=self.batch_folder_var, width=50).grid(row=0, column=1, pady=2)
+        ttk.Entry(self.batch_frame, textvariable=self.batch_folder_var,
+                  width=28).grid(row=0, column=1, sticky='ew', pady=2)
         ttk.Button(self.batch_frame, text="Browse", command=self.browse_batch_folder).grid(row=0, column=2, padx=3)
         
+        # The path column takes the slack, so the entries grow with the window
+        # instead of asking for a fixed character count that a narrow one or a
+        # large font cannot honour.
+        for _grid in (input_frame, self.single_frame, self.batch_frame):
+            _grid.grid_columnconfigure(1, weight=1)
+
         # Boutframes file
         ttk.Label(input_frame, text="Boutframes File (optional):").grid(row=2, column=0, sticky='w', pady=2)
         self.boutframes_path_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.boutframes_path_var, width=50).grid(row=2, column=1, pady=2)
+        ttk.Entry(input_frame, textvariable=self.boutframes_path_var,
+                  width=28).grid(row=2, column=1, sticky='ew', pady=2)
         ttk.Button(input_frame, text="Browse", command=self.browse_boutframes).grid(row=2, column=2, padx=3)
 
         # How the workbook's sheets map onto this project's recordings.  Filled
@@ -3968,7 +4462,8 @@ class FPAnalysisGUI:
             input_frame,
             text="One worksheet per subject.  Multi-session projects may instead "
                  "key sheets by animal and add a 'Session' column.",
-            foreground='gray', font=('Segoe UI', 8))
+            foreground='gray', font=('Segoe UI', 8),
+            wraplength=self.ui_px(620), justify='left')
         self.boutframes_layout_label.grid(row=3, column=1, columnspan=2, sticky='w', pady=(0, 4))
 
         # Boutframes FPS scaling
@@ -3982,29 +4477,36 @@ class FPAnalysisGUI:
         self.detected_fps_label = ttk.Label(boutframes_scale_frame,
                                             text="Photometry FPS: (not yet detected)",
                                             foreground='gray', font=('Segoe UI', 8))
-        self.detected_fps_label.pack(side='left', padx=(0, 16))
+        self.detected_fps_label.pack(side='left')
 
-        ttk.Label(boutframes_scale_frame, text="Manual Boutframe Shift:").pack(side='left', padx=(0, 4))
-        ttk.Entry(boutframes_scale_frame, textvariable=self.boutframe_manual_shift_var, width=8).pack(side='left', padx=(0, 4))
-        ttk.Label(boutframes_scale_frame, text="frames (±, applied after scaling)",
+        # Second line rather than a longer first one: the single row measured
+        # 1410 px at the Large density, so its tail (the shift box and what the
+        # number means) was cut off the right of a 1366 px screen.
+        boutframes_shift_row = ttk.Frame(input_frame)
+        boutframes_shift_row.grid(row=5, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        ttk.Label(boutframes_shift_row, text="Manual Boutframe Shift:").pack(side='left', padx=(0, 4))
+        ttk.Entry(boutframes_shift_row, textvariable=self.boutframe_manual_shift_var, width=8).pack(side='left', padx=(0, 4))
+        ttk.Label(boutframes_shift_row, text="frames (±, applied after scaling)",
                   foreground='gray', font=('Segoe UI', 8)).pack(side='left')
 
         # Precut boutframe correction
         boutframes_precut_row = ttk.Frame(input_frame)
-        boutframes_precut_row.grid(row=5, column=0, columnspan=3, sticky='w', pady=(0, 4))
+        boutframes_precut_row.grid(row=6, column=0, columnspan=3, sticky='ew', pady=(0, 4))
         ttk.Checkbutton(boutframes_precut_row,
                         text="Correct boutframes for precut (subtract precut ÷ n_LED_states offset)",
-                        variable=self.precut_correct_boutframes_var).pack(side='left', padx=(0, 8))
+                        variable=self.precut_correct_boutframes_var).pack(anchor='w')
         ttk.Label(boutframes_precut_row,
                   text="Enable when boutframes were scored from the full FP recording (includes pre-session frames).",
-                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(700), justify='left').pack(anchor='w', padx=(self.ui_px(18), 0))
 
         # TTL/DigitalIOs file
-        ttk.Label(input_frame, text="TTL/DigitalIOs File (optional):").grid(row=6, column=0, sticky='w', pady=2)
+        ttk.Label(input_frame, text="TTL/DigitalIOs File (optional):").grid(row=7, column=0, sticky='w', pady=2)
         self.ttl_path_var = tk.StringVar()
         ttl_entry_frame = ttk.Frame(input_frame)
-        ttl_entry_frame.grid(row=6, column=1, columnspan=2, sticky='ew', pady=2)
-        ttk.Entry(ttl_entry_frame, textvariable=self.ttl_path_var, width=50).pack(side=tk.LEFT)
+        ttl_entry_frame.grid(row=7, column=1, columnspan=2, sticky='ew', pady=2)
+        ttk.Entry(ttl_entry_frame, textvariable=self.ttl_path_var,
+                  width=28).pack(side=tk.LEFT, fill='x', expand=True)
         ttk.Button(ttl_entry_frame, text="Browse", command=self.browse_ttl).pack(side=tk.LEFT, padx=3)
         ttk.Button(ttl_entry_frame, text="❓", width=3, command=self.show_ttl_help).pack(side=tk.LEFT, padx=3)
 
@@ -4017,23 +4519,32 @@ class FPAnalysisGUI:
             'Paired (onset/offset) — start & end bouts':   'pairs_startend',
         }
         self._ttl_format_label_by_value = {v: k for k, v in self._ttl_format_labels.items()}
-        ttk.Label(input_frame, text="Raw TTL event format:").grid(row=7, column=0, sticky='w', pady=2)
+        ttk.Label(input_frame, text="Raw TTL event format:").grid(row=8, column=0, sticky='w', pady=2)
         _ttl_fmt_frame = ttk.Frame(input_frame)
-        _ttl_fmt_frame.grid(row=7, column=1, columnspan=2, sticky='ew', pady=2)
+        _ttl_fmt_frame.grid(row=8, column=1, columnspan=2, sticky='ew', pady=2)
         self.ttl_format_var = tk.StringVar(
             value=self._ttl_format_label_by_value.get(
                 self.params.get('ttl_format', 'pairs_start'),
                 'Paired (onset/offset) — onsets only [legacy]'))
         ttk.Combobox(_ttl_fmt_frame, textvariable=self.ttl_format_var, state='readonly',
-                     width=44, values=list(self._ttl_format_labels.keys())).pack(side=tk.LEFT)
+                     width=36, values=list(self._ttl_format_labels.keys())).pack(
+            anchor='w', fill='x')
         ttk.Label(_ttl_fmt_frame,
                   text="(legacy files have onset+offset pairs; one-row-per-bout files were stripped of offsets)",
-                  foreground='gray', font=('Segoe UI', 8)).pack(side=tk.LEFT, padx=6)
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(560), justify='left').pack(anchor='w')
 
         # Advanced processing options grouped into a compact sub-notebook to
         # keep the main Processing tab uncluttered (these are used less often).
         advanced_nb = ttk.Notebook(scrollable_frame)
         advanced_nb.pack(fill='x', padx=5, pady=5)
+        # A ttk.Notebook reserves the height of its TALLEST page, so the long
+        # Session Start/End table left every other tab -- Offset Bout
+        # Definitions most visibly -- with several hundred pixels of dead space
+        # under its last row. Size the pane area to the page actually showing.
+        self._advanced_nb = advanced_nb
+        advanced_nb.bind('<<NotebookTabChanged>>',
+                         lambda _e: self.root.after_idle(self._fit_advanced_notebook))
 
         offset_outer = ttk.Frame(advanced_nb)
         advanced_nb.add(offset_outer, text="Offset Bout Definitions")
@@ -4046,33 +4557,44 @@ class FPAnalysisGUI:
         advanced_nb.add(bounds_outer, text="Session Start/End")
         self._build_session_bounds_options(bounds_outer)
 
-        # Offset Bout Definitions
-        offset_frame = ttk.LabelFrame(offset_outer, text="Offset Bout Definitions", padding=5)
-        offset_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        
+        # Offset Bout Definitions. The notebook tab already carries the title,
+        # so this is a plain frame: a LabelFrame repeating it cost a border and
+        # a caption for nothing.
+        offset_frame = ttk.Frame(offset_outer, padding=(6, 4))
+        offset_frame.pack(fill='both', expand=True)
+
         ttk.Label(offset_frame,
-                  text="Generate additional behaviors by shifting boutframe/TTL onsets by a fixed number of frames.\n"
-                       "Each offset is treated as a separate behavior for bout analysis and visualization.",
-                  foreground='gray', font=('Segoe UI', 8), wraplength=self.ui_px(600), justify='left').pack(anchor='w', pady=(0, 5))
-        
+                  text="Generate additional behaviors by shifting boutframe/TTL onsets by a fixed number "
+                       "of frames; each offset becomes its own behavior for bout analysis and plots.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(620), justify='left').pack(anchor='w', pady=(0, 4))
+
         offset_add_row = ttk.Frame(offset_frame)
-        offset_add_row.pack(fill='x', pady=2)
-        ttk.Label(offset_add_row, text="Offset (frames):").pack(side='left', padx=(0, 5))
+        offset_add_row.pack(fill='x')
+        ttk.Label(offset_add_row, text="Offset (frames):").pack(side='left', padx=(0, 4))
         self.offset_frames_var = tk.StringVar(value="600")
-        ttk.Entry(offset_add_row, textvariable=self.offset_frames_var, width=10).pack(side='left', padx=(0, 10))
-        ttk.Label(offset_add_row, text="Label suffix:").pack(side='left', padx=(0, 5))
+        ttk.Entry(offset_add_row, textvariable=self.offset_frames_var, width=8).pack(side='left', padx=(0, 10))
+        ttk.Label(offset_add_row, text="Label suffix:").pack(side='left', padx=(0, 4))
         self.offset_label_var = tk.StringVar(value="")
-        ttk.Entry(offset_add_row, textvariable=self.offset_label_var, width=20).pack(side='left', padx=(0, 5))
-        ttk.Label(offset_add_row, text="(leave blank for auto)", foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=(0, 10))
-        ttk.Button(offset_add_row, text="Add Offset", command=self.add_bout_offset).pack(side='left', padx=5)
-        
-        self.offset_listbox = tk.Listbox(offset_frame, height=4, width=70)
-        self.offset_listbox.pack(fill='x', pady=5)
-        
-        offset_btn_row = ttk.Frame(offset_frame)
-        offset_btn_row.pack(fill='x')
-        ttk.Button(offset_btn_row, text="Remove Selected", command=self.remove_bout_offset).pack(side='left', padx=5)
-        ttk.Button(offset_btn_row, text="Clear All", command=self.clear_bout_offsets).pack(side='left', padx=5)
+        ttk.Entry(offset_add_row, textvariable=self.offset_label_var, width=16).pack(side='left', padx=(0, 4))
+        ttk.Label(offset_add_row, text="(blank = auto)", foreground='gray',
+                  font=('Segoe UI', 8)).pack(side='left', padx=(0, 8))
+        ttk.Button(offset_add_row, text="Add Offset", style='Compact.TButton',
+                   command=self.add_bout_offset).pack(side='left')
+        # The list actions share the add row: three short buttons fit in one
+        # strip, and a row of their own bought nothing but height.
+        ttk.Separator(offset_add_row, orient='vertical').pack(
+            side='left', fill='y', padx=8, pady=1)
+        ttk.Button(offset_add_row, text="Remove Selected", style='Compact.TButton',
+                   command=self.remove_bout_offset).pack(side='left', padx=(0, 4))
+        ttk.Button(offset_add_row, text="Clear All", style='Compact.TButton',
+                   command=self.clear_bout_offsets).pack(side='left')
+
+        # No `width=`: a character count is a fixed pixel demand once the font
+        # scales, and 70 of them (1451 px at the default density) made the whole
+        # Processing tab wider than a 1366 px screen. It fills the row instead.
+        self.offset_listbox = tk.Listbox(offset_frame, height=3, exportselection=False)
+        self.offset_listbox.pack(fill='x', pady=(4, 0))
         
         # File naming configuration
         naming_frame = ttk.LabelFrame(naming_outer, text="File Naming Configuration (for Batch Processing)", padding=5)
@@ -4230,26 +4752,45 @@ class FPAnalysisGUI:
         param_frame = ttk.LabelFrame(side_by_side_frame, text="Current Parameters", padding=5)
         param_frame.pack(side='left', fill='both', expand=True, padx=(3, 0))
         
-        # Create scrollable parameters area
-        param_canvas = tk.Canvas(param_frame, height=self.ui_px(120), highlightthickness=0)
-        param_scrollbar = ttk.Scrollbar(param_frame, orient="vertical", command=param_canvas.yview)
+        # Create scrollable parameters area. The list and its scrollbar share a
+        # row of their own so the button below lands beneath them; packed
+        # straight into param_frame it was squeezed into the sliver left beside
+        # an `expand=True` canvas instead.
+        param_scroll_row = ttk.Frame(param_frame)
+        param_canvas = tk.Canvas(param_scroll_row, height=self.ui_px(120), highlightthickness=0)
+        param_scrollbar = ttk.Scrollbar(param_scroll_row, orient="vertical", command=param_canvas.yview)
         param_inner = ttk.Frame(param_canvas)
         
         param_inner.bind("<Configure>", lambda e: param_canvas.configure(scrollregion=param_canvas.bbox("all")))
-        param_canvas.create_window((0, 0), window=param_inner, anchor="nw")
+        param_win = param_canvas.create_window((0, 0), window=param_inner, anchor="nw")
+        param_canvas.bind("<Configure>",
+                          lambda e: param_canvas.itemconfigure(param_win, width=e.width),
+                          add='+')
         param_canvas.configure(yscrollcommand=param_scrollbar.set)
         
+        # Name above value rather than beside it. Side by side, a name like
+        # `processing_savgol_window_frames` took the whole width of this panel
+        # and left ~30 px for its value; the panel scrolls vertically only, so
+        # everything past that was unreadable. Stacked, both always fit, and the
+        # value wraps if it is a regex or a list.
+        param_inner.grid_columnconfigure(0, weight=1)
         self.param_labels = {}
         for i, (key, value) in enumerate(self.params.items()):
-            ttk.Label(param_inner, text=f"{key}:").grid(row=i, column=0, sticky='w', padx=5, pady=2)
-            label = ttk.Label(param_inner, text=str(value), foreground='blue')
-            label.grid(row=i, column=1, sticky='w', padx=5, pady=2)
+            ttk.Label(param_inner, text=f"{key}:",
+                      font=('Segoe UI', 8)).grid(row=2 * i, column=0, sticky='w',
+                                                 padx=5, pady=(2, 0))
+            label = ttk.Label(param_inner, text=str(value), foreground='blue',
+                              wraplength=self.ui_px(300), justify='left')
+            label.grid(row=2 * i + 1, column=0, sticky='w',
+                       padx=(self.ui_px(16), 5), pady=(0, 2))
             self.param_labels[key] = label
         
+        param_scroll_row.pack(side='top', fill='both', expand=True)
         param_canvas.pack(side='left', fill='both', expand=True)
         param_scrollbar.pack(side='right', fill='y')
-        
-        ttk.Button(param_frame, text="Edit Parameters", command=self.edit_parameters).pack(pady=3)
+
+        ttk.Button(param_frame, text="Edit Parameters", style='Compact.TButton',
+                   command=self.edit_parameters).pack(side='top', fill='x', pady=3)
         
         # Process button
         ttk.Button(scrollable_frame, text="Run Processing", command=self.run_processing, 
@@ -4319,7 +4860,8 @@ class FPAnalysisGUI:
         ttk.Label(reextract_frame,
                   text="Updates bout-aligned traces for all subjects using stored FP signals\u2014"
                        "no full reprocessing required.",
-                  foreground='gray').pack(side='left', padx=(20, 0))
+                  foreground='gray', wraplength=self.ui_px(620),
+                  justify='left').pack(side='left', padx=(20, 0))
 
         # ── Nested notebook ─────────────────────────────────────────────
         self.boutframes_sub_notebook = ttk.Notebook(tab)
@@ -4332,7 +4874,7 @@ class FPAnalysisGUI:
         tree_frame = ttk.Frame(editor_tab)
         tree_frame.pack(fill='both', expand=True, padx=5, pady=5)
 
-        self.bout_tree = ttk.Treeview(tree_frame, show='tree headings', height=20)
+        self.bout_tree = ttk.Treeview(tree_frame, show='tree headings', height=8)
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.bout_tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.bout_tree.xview)
         self.bout_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -4378,11 +4920,14 @@ class FPAnalysisGUI:
         table_frame = ttk.LabelFrame(preview_body, text="Frame Mapping", padding=4)
         table_frame.pack(side='left', fill='y', padx=(0, 6))
 
-        self.preview_tree = ttk.Treeview(table_frame, columns=('raw', 'scaled'), show='headings', height=22)
+        # A row count is a fixed pixel demand once the row height scales, and
+        # 22 of them do not fit a 768 px screen; the tree fills its pane.
+        self.preview_tree = ttk.Treeview(table_frame, columns=('raw', 'scaled'),
+                                         show='headings', height=8)
         self.preview_tree.heading('raw', text='Raw Frame\n(video FPS)')
         self.preview_tree.heading('scaled', text='Scaled Frame\n(photometry FPS)')
-        self.preview_tree.column('raw', width=110, anchor='center')
-        self.preview_tree.column('scaled', width=120, anchor='center')
+        self.preview_tree.column('raw', width=self.ui_px(110), anchor='center')
+        self.preview_tree.column('scaled', width=self.ui_px(120), anchor='center')
         ptree_sb = ttk.Scrollbar(table_frame, orient='vertical', command=self.preview_tree.yview)
         self.preview_tree.configure(yscrollcommand=ptree_sb.set)
         self.preview_tree.pack(side='left', fill='y')
@@ -4394,12 +4939,28 @@ class FPAnalysisGUI:
 
         self.preview_fig = Figure(figsize=(6, 4), dpi=90)
         self.preview_canvas = FigureCanvasTkAgg(self.preview_fig, master=plot_frame)
-        self.preview_canvas.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(self.preview_canvas, plot_frame).update()
+        # Toolbar first, and from the bottom. Packed after an `expand=True`
+        # canvas it is given only the leftovers -- 2 px on a 1024x768 screen,
+        # with every button squashed out of existence.
+        toolbar = NavigationToolbar2Tk(self.preview_canvas, plot_frame,
+                                       pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side='bottom', fill='x')
+        _preview_widget = self.preview_canvas.get_tk_widget()
+        # A figure canvas asks for figsize x dpi, which under DPI awareness is
+        # far more than this pane has (2682 px at the Large density) and made
+        # the pane demand a width the window could not give. It fills whatever
+        # room it gets, so ask for a floor instead.
+        _preview_widget.configure(width=self.ui_px(320), height=self.ui_px(220))
+        _preview_widget.pack(side='top', fill='both', expand=True)
 
         # ── Sub-tab 3: Per-Subject Shifts ───────────────────────────────
-        shifts_tab = ttk.Frame(self.boutframes_sub_notebook)
-        self.boutframes_sub_notebook.add(shifts_tab, text="Per-Subject Shifts")
+        shifts_outer = ttk.Frame(self.boutframes_sub_notebook)
+        self.boutframes_sub_notebook.add(shifts_outer, text="Per-Subject Shifts")
+        # Grid, button row and both hints outgrow this sub-tab at a large UI
+        # density; scrolling keeps the trailing hint readable instead of
+        # cropping its last line.
+        shifts_tab = self.make_scrollable(shifts_outer)
 
         # Instruction label
         ttk.Label(shifts_tab,
@@ -4428,7 +4989,7 @@ class FPAnalysisGUI:
 
         self.per_subject_shifts_tree = ttk.Treeview(shifts_tree_frame,
                                                      columns=('subject', 'shift'),
-                                                     show='headings', height=22,
+                                                     show='headings', height=8,
                                                      selectmode='browse')
         self.per_subject_shifts_tree.heading('subject', text='Subject')
         self.per_subject_shifts_tree.heading('shift', text='Shift (frames, ±)')
@@ -4455,8 +5016,12 @@ class FPAnalysisGUI:
         self._refresh_per_subject_shifts_list()
 
         # ── Sub-tab 4: Bout Exclusions ──────────────────────────────────
-        excl_tab = ttk.Frame(self.boutframes_sub_notebook)
-        self.boutframes_sub_notebook.add(excl_tab, text="Bout Exclusions")
+        excl_outer = ttk.Frame(self.boutframes_sub_notebook)
+        self.boutframes_sub_notebook.add(excl_outer, text="Bout Exclusions")
+        # Rules, hints and the preview together are taller than this sub-tab at
+        # a large UI density -- the preview panel fell off the bottom entirely
+        # with nothing to scroll -- so the page scrolls.
+        excl_tab = self.make_scrollable(excl_outer)
 
         ttk.Label(excl_tab,
                   text="Exclude bouts by duration or by proximity to the preceding bout.  This is a "
@@ -4725,6 +5290,36 @@ class FPAnalysisGUI:
                                         width=8, state='disabled')
         self.time_bin_entry.pack(side='left', padx=(self.ui_px(6), 0))
 
+        # Entry counts in the metrics table have their own thresholds, separate
+        # from the ones zone-entry *bouts* use; they are read on every
+        # Calculate Metrics, so no reprocess is involved in changing them.
+        entry_frame = ttk.LabelFrame(settings, text="Counts as a zone entry", padding=5)
+        entry_frame.pack(fill='x', pady=(self.ui_px(6), 0))
+
+        dur_row = ttk.Frame(entry_frame)
+        dur_row.pack(fill='x')
+        ttk.Label(dur_row, text="Min time in zone (s):").pack(side='left')
+        self.behav_entry_dur_var = tk.StringVar()
+        ttk.Spinbox(dur_row, from_=0.0, to=60.0, increment=0.1, width=7,
+                    textvariable=self.behav_entry_dur_var).pack(
+            side='left', padx=(self.ui_px(6), 0))
+
+        ref_row = ttk.Frame(entry_frame)
+        ref_row.pack(fill='x', pady=(self.ui_px(3), 0))
+        ttk.Label(ref_row, text="Min time between entries (s):").pack(side='left')
+        self.behav_entry_ref_var = tk.StringVar()
+        ttk.Spinbox(ref_row, from_=0.0, to=120.0, increment=0.5, width=7,
+                    textvariable=self.behav_entry_ref_var).pack(
+            side='left', padx=(self.ui_px(6), 0))
+
+        ttk.Label(entry_frame,
+                  text="Applies to the entry counts in this table, all maze types. "
+                       "Zone Entry Bouts have their own thresholds on the "
+                       "Visualization tab.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').pack(
+            anchor='w', pady=(self.ui_px(3), 0))
+
         ttk.Checkbutton(settings, text="Apply exclusions",
                         variable=self.use_exclusions_behavioral).pack(
             anchor='w', pady=(self.ui_px(6), 0))
@@ -4755,7 +5350,7 @@ class FPAnalysisGUI:
         tree_container = ttk.Frame(results_frame)
         tree_container.pack(fill='both', expand=True)
 
-        self.behav_tree = ttk.Treeview(tree_container, show='tree headings', height=15)
+        self.behav_tree = ttk.Treeview(tree_container, show='tree headings', height=8)
         vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.behav_tree.yview)
         hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.behav_tree.xview)
         self.behav_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -4887,8 +5482,11 @@ class FPAnalysisGUI:
         right_panel = ttk.LabelFrame(main_container, text="Subject Assignments", padding=5)
         right_panel.grid(row=0, column=1, sticky='nsew')
 
+        # Wraps rather than running on: unwrapped, this sentence set the
+        # panel's width and pushed the assignment grid past the window edge.
         self.factor_status_label = ttk.Label(right_panel, text="", foreground='gray',
-                                             font=('Segoe UI', 8))
+                                             font=('Segoe UI', 8), justify='left',
+                                             wraplength=self.ui_px(700))
         self.factor_status_label.pack(anchor='w', pady=(0, 4))
 
         tree_frame = ttk.Frame(right_panel)
@@ -6318,12 +6916,90 @@ class FPAnalysisGUI:
             values=zone_entry_types, width=20)
         self.zone_entry_type_combo.grid(row=0, column=1, sticky='ew', padx=(4, 0))
 
+        # The entry thresholds live here as well as in Edit Parameters: they are
+        # what decides which transitions became the bouts on screen, so they
+        # belong beside the plot they change rather than three dialogs away.
+        # Only the pair the current maze type actually uses is shown.
+        ttk.Separator(entry_box, orient='horizontal').grid(
+            row=1, column=0, columnspan=2, sticky='ew', pady=(6, 4))
+        self.viz_entry_maze_label = ttk.Label(
+            entry_box, text="", font=('Segoe UI', 8, 'bold'))
+        self.viz_entry_maze_label.grid(row=2, column=0, columnspan=2, sticky='w')
+
+        ttk.Label(entry_box, text="Min time in zone (s):").grid(
+            row=3, column=0, sticky='w', pady=(2, 0))
+        self.viz_entry_dur_var = tk.StringVar()
+        ttk.Spinbox(entry_box, from_=0.0, to=60.0, increment=0.1, width=8,
+                    textvariable=self.viz_entry_dur_var).grid(
+            row=3, column=1, sticky='w', padx=(4, 0), pady=(2, 0))
+
+        ttk.Label(entry_box, text="Min time between entries (s):").grid(
+            row=4, column=0, sticky='w', pady=(2, 0))
+        self.viz_entry_ref_var = tk.StringVar()
+        ttk.Spinbox(entry_box, from_=0.0, to=120.0, increment=0.5, width=8,
+                    textvariable=self.viz_entry_ref_var).grid(
+            row=4, column=1, sticky='w', padx=(4, 0), pady=(2, 0))
+
+        ttk.Button(entry_box, text="Apply & Recompute Entries",
+                   style='Compact.TButton',
+                   command=self.apply_viz_entry_thresholds).grid(
+            row=5, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Label(entry_box,
+                  text="Re-runs entry detection on processed subjects - no reprocess needed.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').grid(
+            row=6, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        # Out/Back velocity threshold. Same reasoning as the entry thresholds
+        # above: it is what decides which frames counted as outward or inward
+        # movement in the plot on screen, so it belongs beside that plot rather
+        # than only in Edit Parameters, where changing it meant reprocessing.
+        outback_box = cluster('outback')
+        ttk.Label(outback_box, text="Out/Back detection",
+                  font=('Segoe UI', 8, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky='w')
+        ttk.Label(outback_box, text="Min velocity (cm/s):").grid(
+            row=1, column=0, sticky='w', pady=(2, 0))
+        self.viz_outback_vel_var = tk.StringVar()
+        ttk.Spinbox(outback_box, from_=0.0, to=100.0, increment=0.5, width=8,
+                    textvariable=self.viz_outback_vel_var).grid(
+            row=1, column=1, sticky='w', padx=(4, 0), pady=(2, 0))
+        ttk.Button(outback_box, text="Apply & Recompute Out/Back",
+                   style='Compact.TButton',
+                   command=self.apply_viz_outback_threshold).grid(
+            row=2, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Label(outback_box,
+                  text="Frames slower than this are ignored. Re-runs Out/Back on "
+                       "processed subjects - no reprocess needed.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
         num_box = cluster('bout_number')
         ttk.Label(num_box, text="Show Bout #:").grid(row=0, column=0, sticky='w')
         self.bout_number_var = tk.StringVar(value="All")
         self.bout_number_combo = ttk.Combobox(num_box, textvariable=self.bout_number_var,
                                               values=["All"], width=10)
         self.bout_number_combo.grid(row=0, column=1, sticky='w', padx=(4, 0))
+        # Bin bouts by ordinal: 1 = one series per bout, 3 = bouts 1-3, 4-6, ...
+        # Compare Across Bouts averages within each bin, so a long session
+        # collapses from an unreadable pile of single traces to a handful of
+        # mean +/- SEM lines that show how the response drifts with bout order.
+        ttk.Label(num_box, text="Bouts per bin:").grid(row=1, column=0, sticky='w',
+                                                      pady=(4, 0))
+        self.viz_bout_bin_var = tk.StringVar(value="1")
+        ttk.Entry(num_box, textvariable=self.viz_bout_bin_var, width=6).grid(
+            row=1, column=1, sticky='w', padx=(4, 0), pady=(4, 0))
+        # The hint gets its own wrapped row: on a narrow settings column a
+        # trailing label beside the entry is clipped rather than wrapped.
+        ttk.Label(num_box, text='1 = one line per bout; 3 = bouts 1-3, 4-6, ...',
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(230), justify='left').grid(
+                      row=2, column=0, columnspan=2, sticky='w')
+        self.viz_bout_bin_individual = tk.BooleanVar(value=False)
+        ttk.Checkbutton(num_box, text="Also draw individual bouts",
+                        variable=self.viz_bout_bin_individual).grid(
+                            row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
         # Bout aggregation.
         bouts_box = cluster('bouts')
@@ -6363,6 +7039,12 @@ class FPAnalysisGUI:
 
         self.register_option_clusters('visualization', self.plot_type_var,
                                       clusters, VIZ_OPTIONS_BY_PLOT)
+        # The threshold pair on show follows the maze type, which the Zone
+        # Editor can change at any time; re-read it whenever the cluster is
+        # about to be revealed.
+        self.plot_type_var.trace_add(
+            'write', lambda *_a: self._refresh_entry_threshold_controls())
+        self._refresh_entry_threshold_controls()
 
         # ── Actions: bottom-pinned so they stay reachable on a short screen ──
         ttk.Button(actions, text="Generate Plot",
@@ -6593,10 +7275,14 @@ class FPAnalysisGUI:
                         variable=self.conn_sliding_var).pack(side='left', padx=4)
         ttk.Checkbutton(ws_opts, text="Rolling Correlation",
                         variable=self.conn_rolling_var).pack(side='left', padx=4)
-        ttk.Separator(ws_opts, orient='vertical').pack(side='left', fill='y', padx=8)
+        # Preset on its own line: on one line with the three checkboxes the row
+        # outgrew the pane at a large UI scale and the dropdown was what got
+        # squeezed away.
+        ws_preset = ttk.Frame(ws_tab)
+        ws_preset.pack(fill='x', pady=(0, 6))
         self.conn_preset_var = tk.StringVar(value="Long Session")
-        ttk.Label(ws_opts, text="Preset:").pack(side='left', padx=(0, 4))
-        ttk.Combobox(ws_opts, textvariable=self.conn_preset_var,
+        ttk.Label(ws_preset, text="Preset:").pack(side='left', padx=(0, 4))
+        ttk.Combobox(ws_preset, textvariable=self.conn_preset_var,
                      values=["Long Session", "Short Assay"],
                      state='readonly', width=14).pack(side='left', padx=4)
 
@@ -6607,7 +7293,7 @@ class FPAnalysisGUI:
             ("📊 Visualize Coherence", self.visualize_connectivity),
             ("📈 Power Spectra", self.visualize_power_spectra),
             ("🌊 Wavelet Spectrogram", self.visualize_wavelet_spectrogram),
-            ("📈 Band Bars", self.visualize_connectivity_band_bars),
+            ("📈 Band Bars", self.visualize_static_band_bars),
             ("💾 Export", self.export_connectivity_results)))
 
         ws_tree_frame = ttk.Frame(ws_tab)
@@ -6632,7 +7318,9 @@ class FPAnalysisGUI:
 
         ttk.Label(bout_tab,
                   text="Compute coherence in baseline (pre-onset) and post-onset windows for each bout, "
-                       "averaged across all selected subjects / groups from the selector above.",
+                       "averaged across all selected subjects / groups from the selector above.  "
+                       "Behaviors prefixed “Zone:” align to detected zone entries instead of "
+                       "scored bouts.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(680)).pack(anchor='w', pady=(0, 8))
 
@@ -6670,6 +7358,25 @@ class FPAnalysisGUI:
         ttk.Entry(bout_params_frame, textvariable=self.bout_epoch_max_bouts_var,
                   width=8).grid(row=3, column=1, sticky='w', padx=3, pady=3)
 
+        # Zone-entry epochs only: an entry whose window outlives the visit is
+        # measuring coherence in whatever zone the animal moved to next, so the
+        # post window is the value that actually keeps an epoch honest.
+        ttk.Label(bout_params_frame, text="Min time in zone (s):").grid(
+            row=4, column=0, sticky='w', padx=3, pady=3)
+        self.zone_entry_min_dwell_var = tk.StringVar(
+            value=str(self.conn_params.get('zone_entry_min_dwell_sec', 0.0)))
+        ttk.Entry(bout_params_frame, textvariable=self.zone_entry_min_dwell_var,
+                  width=8).grid(row=4, column=1, sticky='w', padx=3, pady=3)
+        ttk.Button(bout_params_frame, text="= post window",
+                   style='Compact.TButton',
+                   command=lambda: self.zone_entry_min_dwell_var.set(
+                       self.bout_epoch_post_var.get())).grid(row=4, column=2, padx=3)
+        ttk.Label(bout_params_frame,
+                  text="Zone entries only — drops entries the animal left too soon. "
+                       "0 = use the detection thresholds alone.",
+                  foreground='gray', font=('Segoe UI', 8)).grid(
+            row=5, column=0, columnspan=3, sticky='w', padx=3, pady=(0, 3))
+
         bout_btns = ttk.Frame(bout_tab)
         bout_btns.pack(fill='x', pady=(0, 6))
         self.button_grid(bout_btns, (
@@ -6677,7 +7384,8 @@ class FPAnalysisGUI:
             ("📊 Plot Epoch Coherence", self.visualize_bout_epoch_coherence),
             ("📈 Plot Band Bars", self.visualize_connectivity_band_bars),
             ("🌊 Epoch Spectrogram", self.visualize_bout_epoch_spectrogram),
-            ("💾 Export Epoch Data", self.export_bout_epoch_coherence)))
+            ("💾 Export Epoch Data", self.export_bout_epoch_coherence),
+            ("📋 Prism Copy/Paste", self.export_bout_epoch_prism)))
 
         self.bout_epoch_status_var = tk.StringVar(value="No epoch analysis run yet.")
         ttk.Label(bout_tab, textvariable=self.bout_epoch_status_var,
@@ -6722,8 +7430,9 @@ class FPAnalysisGUI:
         ttk.Button(self._grp_bout_params_row, text="\u21ba Refresh",
                    command=self._refresh_epoch_behavior_list_beg).pack(side='left', padx=3)
         ttk.Label(self._grp_bout_params_row,
-                  text="Pre/post window lengths are set in the By Bout tab.",
-                  foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=8)
+                  text="Pre/post window and min time in zone are set in the By Bout tab.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(320), justify='left').pack(side='left', padx=8)
 
         # Subject pool + facet column (row 3). The list used to hold group
         # names, which made the series factor the only one this comparison
@@ -6735,7 +7444,7 @@ class FPAnalysisGUI:
         # so gridding them into separate columns threw the facet dropdowns to
         # the far right of the page, a screen away from the list they divide.
         grp_sel_frame = ttk.Frame(grp_tab)
-        grp_sel_frame.grid(row=3, column=1, sticky='w', padx=3, pady=3)
+        grp_sel_frame.grid(row=3, column=1, sticky='ew', padx=3, pady=3)
         grp_lb_frame = ttk.Frame(grp_sel_frame)
         grp_lb_frame.pack(side='left', fill='both', expand=True)
         grp_lb_sb = ttk.Scrollbar(grp_lb_frame, orient='vertical')
@@ -6744,7 +7453,7 @@ class FPAnalysisGUI:
         # tab clears this selection and the comparison silently falls back to
         # the whole pool.
         self.grp_comp_listbox = tk.Listbox(grp_lb_frame, selectmode='multiple', height=5,
-                                           yscrollcommand=grp_lb_sb.set, width=28,
+                                           yscrollcommand=grp_lb_sb.set, width=18,
                                            exportselection=False)
         self.grp_comp_listbox.pack(side='left', fill='both', expand=True)
         grp_lb_sb.config(command=self.grp_comp_listbox.yview)
@@ -6780,6 +7489,7 @@ class FPAnalysisGUI:
             ("📊 Plot Spectra", self.visualize_group_coherence_spectra),
             ("📈 Plot Band Bars", self.visualize_group_coherence_bands),
             ("💾 Export", self.export_group_coherence_comparison),
+            ("📋 Prism Copy/Paste", self.export_group_coherence_prism),
             ("🔗 Zone Coherence", self.run_zone_coherence)))
 
         self._grp_bout_btns = ttk.Frame(grp_tab)
@@ -6790,7 +7500,8 @@ class FPAnalysisGUI:
             ("📈 Plot Band Bars (Pre vs Post)", self.visualize_beg_band_bars),
             ("📈 Plot Delta Coherence", self.visualize_beg_delta),
             ("🌡 Peri-Event Spectrogram", self.visualize_beg_peri_event_spectrogram),
-            ("💾 Export", self.export_beg_comparison)))
+            ("💾 Export", self.export_beg_comparison),
+            ("📋 Prism Copy/Paste", self.export_beg_prism)))
 
         # Status label (row 6) — shared
         self.grp_comp_status_var = tk.StringVar(value="No group comparison run yet.")
@@ -7299,6 +8010,57 @@ class FPAnalysisGUI:
                 {'name': 'High',       'fmin': 8.0,  'fmax': 12.0},
             ]
         return bands
+
+    def _coh_freq_axis_range(self, freqs):
+        """Frequency limits for a coherence plot, honouring Plot Axis Ranges.
+
+        The spectrogram panels used to pin the y-axis to the analysis range
+        (``static_fmin``/``static_fmax``), so narrowing "Freq axis min/max" in
+        Coherence Settings moved the line plots and left every heatmap
+        unchanged.  The requested window is intersected with the frequencies
+        actually computed -- an axis stretched past the data would only add
+        blank space, and a log axis cannot show the default min of 0 -- and a
+        window that misses the data entirely falls back to the data range.
+        """
+        f = np.asarray(freqs, dtype=float)
+        f = f[np.isfinite(f)]
+        if f.size == 0:
+            return 0.0, 1.0
+        data_lo, data_hi = float(np.min(f)), float(np.max(f))
+        try:
+            req_lo = float(self.conn_params.get('freq_xmin', data_lo))
+            req_hi = float(self.conn_params.get('freq_xmax', data_hi))
+        except (TypeError, ValueError):
+            return data_lo, data_hi
+        lo = max(req_lo, data_lo) if req_lo > 0 else data_lo
+        hi = min(req_hi, data_hi) if req_hi > 0 else data_hi
+        if not (hi > lo):
+            return data_lo, data_hi
+        return lo, hi
+
+    def _apply_coh_freq_axis(self, ax, freqs):
+        """Set a spectrogram's log Hz axis to the requested window and label it.
+
+        Narrowing the window is what makes the labelling matter: under a
+        decade, matplotlib's log locator offers a single major tick, and these
+        panels blank the minor labels -- so a narrowed axis read "1" and
+        nothing else.  Inside that range the minor ticks are labelled instead.
+        """
+        import matplotlib.ticker as mticker
+
+        lo, hi = self._coh_freq_axis_range(freqs)
+        ax.set_ylim(lo, hi)
+
+        fmt = mticker.FuncFormatter(lambda v, _: f'{v:g}')
+        ax.yaxis.set_major_formatter(fmt)
+        if lo > 0 and np.log10(hi / lo) < 1.5:
+            ax.yaxis.set_minor_locator(
+                mticker.LogLocator(base=10.0, subs=(2, 3, 5), numticks=12))
+            ax.yaxis.set_minor_formatter(fmt)
+            ax.yaxis.set_tick_params(which='minor', labelsize=7)
+        else:
+            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+        return lo, hi
 
     def _band_mean_from_spectrum(self, freqs, coh, band):
         """Return mean coherence within a band's frequency range."""
@@ -7835,7 +8597,7 @@ class FPAnalysisGUI:
                     behaviors.update(self.boutframes_behavior_columns(boutframes_file))
                 except Exception:
                     pass
-        behaviors = sorted(behaviors)
+        behaviors = sorted(behaviors) + self._available_zone_entry_epochs()
         self.beg_behavior_combo['values'] = behaviors
         if behaviors and not self.beg_behavior_var.get():
             self.beg_behavior_var.set(behaviors[0])
@@ -7916,6 +8678,8 @@ class FPAnalysisGUI:
         self.beg_results = {}
         _pd     = self.processed_data
         _cp     = dict(self.conn_params)
+        # Read on the main thread: a Tk variable must not be touched from the worker.
+        _min_dwell = self._epoch_min_dwell_sec()
 
         def _worker(q):
             done = 0
@@ -7936,27 +8700,11 @@ class FPAnalysisGUI:
                         continue
 
                     data = _pd[subj]
-                    stored_bouts = data.get('bouts', {})
 
-                    # Resolve behavior key (case-insensitive)
-                    beh_key = behavior if behavior in stored_bouts else next(
-                        (k for k in stored_bouts
-                         if str(k).lower() == behavior.lower()), None)
-
-                    onset_frames = []
-                    if beh_key and 'onset_frames' in stored_bouts.get(beh_key, {}):
-                        onset_frames = stored_bouts[beh_key]['onset_frames']
-                    elif _use_file_fallback:
-                        try:
-                            df_b = self.read_boutframes_sheet(boutframes_file, subj)
-                            cols_ci = {str(c).lower(): c for c in df_b.columns}
-                            bcol = cols_ci.get(behavior.lower())
-                            if bcol:
-                                onset_frames = (pd.to_numeric(df_b[bcol], errors='coerce')
-                                                .dropna().astype(int).tolist())
-                        except Exception as exc:
-                            q.put(('log', f"  Skipping {subj}: {exc}"))
-
+                    onset_frames = self._resolve_epoch_onsets(
+                        subj, data, behavior, min_dwell_sec=_min_dwell,
+                        boutframes_file=(boutframes_file if _use_file_fallback else ''),
+                        log=lambda m: q.put(('log', m)))
                     if not onset_frames:
                         q.put(('log', f"  Skipping {subj}: no onset frames for '{behavior}'"))
                         continue
@@ -8093,8 +8841,10 @@ class FPAnalysisGUI:
 
     def visualize_beg_spectra(self):
         """
-        Plot grand-mean coherence spectra (pre vs post) for each group side by side.
-        Each group gets its own subplot; pre=solid, post=dashed.
+        Plot grand-mean coherence spectra (baseline vs post-onset) for each
+        group side by side, with an all-group overlay beneath.  Post-onset is
+        solid and in the group colour; the baseline it is read against is
+        dashed.
         """
         if not hasattr(self, 'beg_results') or not self.beg_results:
             messagebox.showwarning("No Data",
@@ -8125,12 +8875,23 @@ class FPAnalysisGUI:
             gdata = results[gname]
             ax = axes[0][gi]
 
+            freqs_pre,  mean_pre,  sem_pre,  _      = self._beg_group_grand_mean(gdata, 'pre')
             freqs_post, mean_post, sem_post, n_post = self._beg_group_grand_mean(gdata, 'post')
 
             if show_traces:
                 for sdata in gdata['subjects'].values():
+                    ax.plot(sdata['pre_freqs'], sdata['pre_coh_mean'],
+                            color='gray', lw=0.5, alpha=0.3)
                     ax.plot(sdata['post_freqs'], sdata['post_coh_mean'],
                             color=color, lw=0.5, alpha=0.3)
+
+            # The baseline spectrum is what the post-onset one has to be read
+            # against; this panel drew post alone, so a group looked the same
+            # whether or not the onset had changed anything.
+            ax.plot(freqs_pre, mean_pre, color='#666666', lw=1.6, ls='--',
+                    label=f"Baseline (−{r0['pre_sec']:.0f}s)")
+            ax.fill_between(freqs_pre, mean_pre - sem_pre, mean_pre + sem_pre,
+                            color='#666666', alpha=0.12)
 
             ax.plot(freqs_post, mean_post, color=color, lw=2.0,
                     label=f"Post-onset (+{r0['post_sec']:.0f}s)")
@@ -8150,34 +8911,37 @@ class FPAnalysisGUI:
             ax.legend(fontsize=7)
             ax.grid(True, alpha=0.3)
 
-        # Bottom row: overlay all groups — pre (solid) and post (dashed)
-        ax_ov = fig.add_subplot(2, 1, 2)  # spans full width
-        for spine in [axes[1][gi].get_position() for gi in range(ncols)]:
-            pass
-        # Remove bottom subplot placeholders
-        for gi in range(ncols):
-            fig.delaxes(axes[1][gi])
+        # Bottom row: overlay all groups, post solid and baseline dashed.
+        # The placeholder axes of the second subplot row are deleted before the
+        # overlay is added; an add_subplot(2, 1, 2) drawn on top of them left
+        # their empty frames showing through it.
+        for col in range(ncols):
+            fig.delaxes(axes[1][col])
         ax_ov = fig.add_axes([0.07, 0.05, 0.90, 0.35])
 
         for gi, gname in enumerate(group_names):
             color = self._GRP_PALETTE[gi % len(self._GRP_PALETTE)]
             gdata = results[gname]
+            freqs_pre,  mean_pre,  _,        _ = self._beg_group_grand_mean(gdata, 'pre')
             freqs_post, mean_post, sem_post, _ = self._beg_group_grand_mean(gdata, 'post')
             n_subj = len(gdata['subjects'])
             n_bouts = sum(s['n_bouts'] for s in gdata['subjects'].values())
 
             ax_ov.plot(freqs_post, mean_post, color=color, lw=2.2,
-                       label=f"{gname} (n={n_subj}, {n_bouts} bouts)")
+                       label=f"{gname} post (n={n_subj}, {n_bouts} bouts)")
             ax_ov.fill_between(freqs_post, mean_post - sem_post, mean_post + sem_post,
                                color=color, alpha=0.15)
+            ax_ov.plot(freqs_pre, mean_pre, color=color, lw=1.3, ls='--',
+                       alpha=0.75, label=f"{gname} baseline")
 
         ax_ov.set_xlim(fxmin, fxmax)
         ax_ov.set_ylim(ymin, ymax)
         ax_ov.set_xlabel('Frequency (Hz)', fontsize=10)
         ax_ov.set_ylabel('Coherence', fontsize=10)
-        ax_ov.set_title('All Groups Overlay — Post-onset Grand Mean ± SEM',
+        ax_ov.set_title('All Groups Overlay — Grand Mean ± SEM  '
+                        '(solid = post-onset, dashed = baseline)',
                         fontsize=10, fontweight='bold')
-        ax_ov.legend(fontsize=7, ncol=min(n_grp, 6))
+        ax_ov.legend(fontsize=7, ncol=min(n_grp * 2, 6))
         ax_ov.grid(True, alpha=0.3)
 
         fig.suptitle(
@@ -8563,7 +9327,6 @@ class FPAnalysisGUI:
         smooth_len = max(3, int(fs * 1.0))
         times      = np.linspace(-pre_sec, post_sec, epoch_len)
 
-        import matplotlib.ticker as mticker
         from scipy.ndimage import uniform_filter1d
 
         _parula_colors = [
@@ -8589,6 +9352,7 @@ class FPAnalysisGUI:
             [0.9839, 0.9874, 0.7013], [1.0000, 1.0000, 0.8510],
         ]
         parula = LinearSegmentedColormap.from_list('parula', _parula_colors, N=256)
+        _min_dwell = self._epoch_min_dwell_sec()
 
         def _epoch_spectrogram_for_subjects(subject_list):
             """Compute grand-mean CWT coherence matrix across all subjects in the list."""
@@ -8598,29 +9362,8 @@ class FPAnalysisGUI:
                 data = self.processed_data.get(subject)
                 if data is None:
                     continue
-                stored_bouts = data.get('bouts', {})
-                _beh_key = behavior if behavior in stored_bouts else next(
-                    (k for k in stored_bouts if str(k).lower() == behavior.lower()), None)
-
-                onset_frames = []
-                if _beh_key and 'onset_frames' in stored_bouts.get(_beh_key, {}):
-                    onset_frames = stored_bouts[_beh_key]['onset_frames']
-                else:
-                    bfp = self.boutframes_path_var.get()
-                    if bfp and os.path.exists(bfp):
-                        try:
-                            df_b = self.read_boutframes_sheet(bfp, subject)
-                            cols_ci = {str(c).lower(): c for c in df_b.columns}
-                            bcol = cols_ci.get(behavior.lower())
-                            if bcol:
-                                raw_f = (pd.to_numeric(df_b[bcol], errors='coerce')
-                                         .dropna().to_numpy(dtype=float))
-                                raw_f = self._transform_boutframe_values(raw_f, subject, as_int=True)
-                                _excl = int(self.params.get('exclude_frames_before', 0))
-                                onset_frames = raw_f[raw_f >= _excl].tolist()
-                        except Exception:
-                            pass
-
+                onset_frames = self._resolve_epoch_onsets(
+                    subject, data, behavior, min_dwell_sec=_min_dwell)
                 if not onset_frames:
                     continue
 
@@ -8690,13 +9433,13 @@ class FPAnalysisGUI:
         valid_groups = list(group_matrices.keys())
         n_valid = len(valid_groups)
 
+        f_lo, f_hi = self._coh_freq_axis_range(freqs)
+
         def _draw_panel(ax, times, freqs, coh_tf, title, cmap=None, vmin=0, vmax=1):
             cmap = cmap or parula
             pcm = ax.pcolormesh(times, freqs, coh_tf,
                                 cmap=cmap, vmin=vmin, vmax=vmax, shading='auto')
             ax.set_yscale('log')
-            ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{v:g}'))
-            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
             ax.axvline(x=0, color='white', linestyle='--', linewidth=0.6, alpha=0.9)
             cb = ax.get_figure().colorbar(pcm, ax=ax, pad=0.02, fraction=0.046)
             cb.set_label('Coherence', fontsize=9)
@@ -8704,7 +9447,7 @@ class FPAnalysisGUI:
             ax.set_ylabel('Hz', fontsize=10)
             ax.set_title(title, fontsize=10, fontweight='bold')
             ax.set_xlim(times[0], times[-1])
-            ax.set_ylim(freqs[0], freqs[-1])
+            self._apply_coh_freq_axis(ax, freqs)
 
         # ── Select two groups for the contrast panel ──────────────────
         contrast_groups = {'A': None, 'B': None}
@@ -8776,9 +9519,6 @@ class FPAnalysisGUI:
                                           vmin=-abs_max, vmax=abs_max,
                                           shading='auto')
             ax_diff.set_yscale('log')
-            ax_diff.yaxis.set_major_formatter(
-                mticker.FuncFormatter(lambda v, _: f'{v:g}'))
-            ax_diff.yaxis.set_minor_formatter(mticker.NullFormatter())
             ax_diff.axvline(x=0, color='black', linestyle='--', lw=0.6, alpha=0.7)
             ax_diff.axhline(y=0, color='none')  # prevents log-scale warning
             cb = fig.colorbar(pcm_diff, ax=ax_diff, pad=0.02, fraction=0.046)
@@ -8790,7 +9530,7 @@ class FPAnalysisGUI:
                 f"Blue = A higher  |  Red = B higher",
                 fontsize=10, fontweight='bold')
             ax_diff.set_xlim(times[0], times[-1])
-            ax_diff.set_ylim(freqs[0], freqs[-1])
+            self._apply_coh_freq_axis(ax_diff, freqs)
 
         fig.suptitle(
             f"BEG Peri-Event Spectrogram  |  {ch1} ↔ {ch2}  "
@@ -8966,8 +9706,10 @@ class FPAnalysisGUI:
         f5.pack(fill='x', padx=10, pady=5)
         ttk.Label(f5, text='Spectral / Coherence plots',
                   font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w', padx=6, pady=(0, 2))
-        vars_['freq_xmin'] = row(f5, 'Freq axis min (Hz)',  'freq_xmin', 1)
-        vars_['freq_xmax'] = row(f5, 'Freq axis max (Hz)',  'freq_xmax', 2)
+        vars_['freq_xmin'] = row(f5, 'Freq axis min (Hz)',  'freq_xmin', 1,
+                                 'spectra x-axis and spectrogram Hz axis')
+        vars_['freq_xmax'] = row(f5, 'Freq axis max (Hz)',  'freq_xmax', 2,
+                                 '0 = use the analysed range')
         vars_['coh_ymin']  = row(f5, 'Coherence Y min',    'coh_ymin',  3)
         vars_['coh_ymax']  = row(f5, 'Coherence Y max',    'coh_ymax',  4)
         ttk.Separator(f5, orient='horizontal').grid(row=5, column=0, columnspan=3, sticky='ew', pady=4)
@@ -9085,19 +9827,335 @@ class FPAnalysisGUI:
         dlg.wait_window()
 
     # ------------------------------------------------------------------ #
+    #  Zone-entry epochs for coherence                                      #
+    # ------------------------------------------------------------------ #
+    #  The coherence tabs are onset-driven: everything they do needs a list of
+    #  frame indices to centre a pre/post window on.  Zone entries are already
+    #  detected during processing (detect_zone_entries -> entry_frames), so they
+    #  can feed that same machinery provided they are (a) offered in the
+    #  behavior dropdown under a name that cannot collide with a real behavior,
+    #  and (b) filtered by how long the animal actually stayed in the zone -- an
+    #  epoch whose post-onset window runs past the moment the animal left is
+    #  measuring coherence somewhere else.
+    ZONE_EPOCH_PREFIX = 'Zone: '
+
+    def _zone_entry_epoch_labels(self):
+        """Pseudo-behavior labels for the current maze's zone entry types."""
+        return [self.ZONE_EPOCH_PREFIX + label
+                for label in self._get_zone_entry_type_map()]
+
+    def _available_zone_entry_epochs(self):
+        """Zone-entry labels worth offering in the behavior dropdown.
+
+        Only entry types that at least one processed subject actually has
+        detections for, so a photometry-only project (or an arena whose zones
+        the animal never visited) does not fill the list with dead options.
+        """
+        detected = set()
+        for data in (self.processed_data or {}).values():
+            for key, frames in (data.get('entry_frames') or {}).items():
+                if frames is not None and len(frames):
+                    detected.add(key)
+        if not detected:
+            return []
+        return [self.ZONE_EPOCH_PREFIX + label
+                for label, (entry_key, _d) in self._get_zone_entry_type_map().items()
+                if entry_key in detected]
+
+    def _zone_entry_epoch_key(self, behavior):
+        """``entry_key`` behind a 'Zone: ...' pseudo-behavior, or None.
+
+        Matching is case-insensitive on the UI label so a name typed by hand
+        into the editable combobox still resolves."""
+        name = str(behavior or '').strip()
+        prefix = self.ZONE_EPOCH_PREFIX.strip().lower()
+        if not name.lower().startswith(prefix):
+            return None
+        label = name[len(prefix):].lstrip(': ').strip()
+        for ui_label, (entry_key, _display) in self._get_zone_entry_type_map().items():
+            if ui_label.lower() == label.lower():
+                return entry_key
+        return None
+
+    def _entry_target_zones(self, entry_key):
+        """Zone names whose occupancy counts as 'in zone' for an entry type.
+
+        This is the zone the *onset frame itself* lands in, which is not always
+        the zone the entry is named after: 'center_to_open' and the explore /
+        avoid decisions are all timestamped at a CENTRE entry, so their dwell is
+        time spent in the centre before the animal commits.  Reading it as the
+        open arm instead would measure a zone the animal is not in yet and
+        reject every epoch.
+        """
+        def _cats(*wanted):
+            return [z for z, info in self.zones.items()
+                    if (info.get('category') if isinstance(info, dict) else None) in wanted]
+
+        if entry_key == 'transition_to_open':
+            return _cats('open', 'open_proximal', 'open_distal')
+        if entry_key == 'transition_to_open_distal':
+            return _cats('open_distal')
+        if entry_key in ('center_to_open', 'explore_decision', 'avoid_decision',
+                         'transition_to_center'):
+            return _cats('center')
+        if entry_key == 'transition_to_corner':
+            return _cats('corner')
+        if entry_key == 'transition_to_edge':
+            return _cats('edge')
+        if entry_key and entry_key.startswith('transition_to_'):
+            zone = entry_key[len('transition_to_'):]
+            return [zone] if zone in self.zones else []
+        return []
+
+    def _zone_labels_for(self, subject, data):
+        """Per-frame zone classification for a processed subject.
+
+        Cached on the app rather than on the subject dict, which is serialised
+        into the project file, and keyed by the zone geometry so that editing
+        zones invalidates it without anyone having to remember to clear it.
+        """
+        beh = data.get('beh_synced')
+        if beh is None or beh.shape[1] < 4:
+            return None
+        sig = repr(sorted(
+            (z, round(float(i.get('x_min', 0)), 4), round(float(i.get('x_max', 0)), 4),
+             round(float(i.get('y_min', 0)), 4), round(float(i.get('y_max', 0)), 4))
+            for z, i in self.zones.items() if isinstance(i, dict)))
+        cache = getattr(self, '_zone_label_cache', None)
+        if cache is None:
+            cache = self._zone_label_cache = {}
+        hit = cache.get(subject)
+        if hit is not None and hit[0] == sig and len(hit[1]) == len(beh):
+            return hit[1]
+
+        xs = beh[:, 2]
+        ys = beh[:, 3]
+        labels = ['unknown'] * len(beh)
+        for i in range(len(beh)):
+            x = xs[i]
+            y = ys[i]
+            if not (np.isnan(x) or np.isnan(y)):
+                labels[i] = self.classify_zone(x, y)
+        cache[subject] = (sig, labels)
+        return labels
+
+    def _photometry_elapsed(self, data):
+        """The elapsed-time column of the matrix the channel signals come from."""
+        names = self._ordered_channel_names(data)
+        ref = self._get_channel_signal(data, names[0]) if names else None
+        if ref is None:
+            return None
+        for key in ('corrected_470', 'zscore_470', 'dff_470',
+                    'corrected', 'zscore', 'dff',
+                    'corrected_570', 'zscore_570', 'dff_570'):
+            mat = data.get(key)
+            if mat is None:
+                continue
+            arr = np.asarray(mat)
+            if arr.ndim == 2 and arr.shape[0] == len(ref) and arr.shape[1] >= 1:
+                return arr[:, 0]
+        return None
+
+    def _beh_row_rate(self, subject, data):
+        """Samples per second of the beh_synced row grid.
+
+        Measured from the elapsed column rather than assumed to be the
+        photometry rate, because on the acquisition-position path beh_synced has
+        one row per VIDEO frame.  Falls back to the photometry rate when the
+        column carries no usable time.
+        """
+        fallback = float(self.get_fps(subject)) or 1.0
+        beh = data.get('beh_synced')
+        if beh is None:
+            return fallback
+        kb = self._beh_kin_base(self._beh_channel_count(data))
+        if beh.shape[1] <= kb:
+            return fallback
+        el = np.asarray(beh[:, kb], dtype=float)
+        ok = np.flatnonzero(np.isfinite(el))
+        if len(ok) > 10:
+            span_s = (float(el[ok[-1]]) - float(el[ok[0]])) * 60.0   # elapsed is minutes
+            if span_s > 0:
+                return (ok[-1] - ok[0]) / span_s
+        return fallback
+
+    def _entry_frames_to_signal_index(self, subject, data, frames, log=None):
+        """Map beh_synced row indices onto photometry sample indices.
+
+        ``entry_frames`` index beh_synced; the coherence code slices the
+        photometry matrices.  Those two grids coincide on the ABEL-position and
+        photometry-only paths and diverge on the acquisition-position path,
+        where beh_synced has one row per video frame.  The join key is the
+        elapsed time :meth:`synchronize_behavior` already wrote into each
+        behavior row from the photometry sample it matched, so this is exact in
+        both sync modes rather than a rate assumption that drifts with time.
+        """
+        def _log(msg):
+            (log or self.log_message)(msg)
+
+        beh = data.get('beh_synced')
+        names = self._ordered_channel_names(data)
+        ref = self._get_channel_signal(data, names[0]) if names else None
+        if beh is None or ref is None or len(ref) == len(beh):
+            return list(frames)
+
+        kb = self._beh_kin_base(self._beh_channel_count(data))
+        el_photo = self._photometry_elapsed(data)
+        if beh.shape[1] <= kb or el_photo is None:
+            _log(f"  {subject}: cannot map zone entries from the {len(beh)}-row behavior "
+                 f"grid onto {len(ref)} photometry samples (no elapsed column); "
+                 f"onsets used as-is and may be misaligned.")
+            return list(frames)
+
+        el_photo = np.asarray(el_photo, dtype=float)
+        order = np.argsort(el_photo, kind='stable')
+        el_sorted = el_photo[order]
+
+        mapped = []
+        n_unmatched = 0
+        for f in frames:
+            if not (0 <= f < len(beh)):
+                n_unmatched += 1
+                continue
+            t = float(beh[f, kb])
+            if not np.isfinite(t):
+                # This behavior frame had no photometry sample within tolerance.
+                n_unmatched += 1
+                continue
+            j = int(np.searchsorted(el_sorted, t))
+            if j > 0 and (j >= len(el_sorted)
+                          or abs(el_sorted[j - 1] - t) <= abs(el_sorted[j] - t)):
+                j -= 1
+            mapped.append(int(order[j]))
+
+        _log(f"  {subject}: zone entries mapped from the behavior grid ({len(beh)} rows) "
+             f"onto the photometry grid ({len(ref)} samples)"
+             + (f"; {n_unmatched} entry(s) had no matching sample and were dropped"
+                if n_unmatched else ""))
+        return mapped
+
+    def _zone_entry_dwell_frames(self, labels, onset, targets):
+        """Consecutive frames from ``onset`` for which the animal is in ``targets``."""
+        n = len(labels)
+        j = onset
+        while j < n and labels[j] in targets:
+            j += 1
+        return j - onset
+
+    def _resolve_zone_entry_onsets(self, subject, data, entry_key,
+                                   min_dwell_sec=0.0, log=None):
+        """Zone-entry onsets for one subject, filtered by time spent in zone.
+
+        Returns ``(onsets, n_detected, n_rejected)``.  Dwell is re-measured from
+        the stored position track on every call rather than read from a cached
+        entry-bout store, so the filter reflects the CURRENT zone definitions
+        and the current threshold without anyone having to re-extract from the
+        Visualization tab first.
+        """
+        def _log(msg):
+            (log or self.log_message)(msg)
+
+        frames = self._as_onset_indices(
+            (data.get('entry_frames') or {}).get(entry_key, []))
+        n_detected = len(frames)
+        if not frames:
+            return [], 0, 0
+
+        # The dwell filter runs in beh_synced's own row space, because that is
+        # where the position track (and so the zone classification) lives; only
+        # the surviving onsets are mapped onto the signal grid afterwards.
+        kept = frames
+        n_rejected = 0
+        if min_dwell_sec > 0:
+            targets = self._entry_target_zones(entry_key)
+            labels = self._zone_labels_for(subject, data)
+            if not targets or labels is None:
+                _log(f"  {subject}: no zone geometry behind '{entry_key}' - "
+                     f"minimum time in zone not applied")
+            else:
+                rate = self._beh_row_rate(subject, data)
+                min_rows = int(round(min_dwell_sec * rate))
+                kept = [f for f in frames
+                        if 0 <= f < len(labels)
+                        and self._zone_entry_dwell_frames(labels, f, targets) >= min_rows]
+                n_rejected = n_detected - len(kept)
+                if n_rejected:
+                    _log(f"  {subject}: {n_rejected}/{n_detected} '{entry_key}' entries "
+                         f"dropped (under {min_dwell_sec:g} s in zone)")
+
+        return (self._entry_frames_to_signal_index(subject, data, kept, log=log),
+                n_detected, n_rejected)
+
+    def _resolve_epoch_onsets(self, subject, data, behavior,
+                              min_dwell_sec=0.0, boutframes_file=None, log=None):
+        """Onset frames for a coherence epoch analysis, from either source.
+
+        ``behavior`` is a scored behavior name, or a 'Zone: ...' pseudo-behavior
+        naming one of the maze's zone entry types.  Scored behaviors come from
+        the stored bouts, falling back to the boutframes workbook; zone entries
+        come from the stored ``entry_frames`` with the minimum-time-in-zone
+        filter applied.  Every coherence entry point resolves onsets through
+        here so all of them accept zone entries and agree on what they mean.
+        """
+        def _log(msg):
+            (log or self.log_message)(msg)
+
+        entry_key = self._zone_entry_epoch_key(behavior)
+        if entry_key is not None:
+            onsets, _n, _rej = self._resolve_zone_entry_onsets(
+                subject, data, entry_key, min_dwell_sec=min_dwell_sec, log=log)
+            return onsets
+
+        stored_bouts = data.get('bouts', {}) or {}
+        beh_key = behavior if behavior in stored_bouts else next(
+            (k for k in stored_bouts if str(k).lower() == str(behavior).lower()), None)
+        if beh_key is not None and 'onset_frames' in (stored_bouts.get(beh_key) or {}):
+            return self._as_onset_indices(stored_bouts[beh_key]['onset_frames'])
+
+        if boutframes_file is None:
+            boutframes_file = self.boutframes_path_var.get()
+        if boutframes_file and os.path.exists(boutframes_file):
+            try:
+                df_b = self.read_boutframes_sheet(boutframes_file, subject)
+                cols_ci = {str(c).lower(): c for c in df_b.columns}
+                bcol = cols_ci.get(str(behavior).lower())
+                if bcol:
+                    raw_f = (pd.to_numeric(df_b[bcol], errors='coerce')
+                             .dropna().to_numpy(dtype=float))
+                    # Same conversion as extract_bouts, so an epoch lands where
+                    # the bout analysis tab puts the same bout.
+                    raw_f = self._transform_boutframe_values(raw_f, subject, as_int=True)
+                    _excl = int(self.params.get('exclude_frames_before', 0))
+                    return self._as_onset_indices(raw_f[raw_f >= _excl].tolist())
+            except Exception as exc:
+                _log(f"  {subject}: could not read boutframes ({exc})")
+        return []
+
+    def _epoch_min_dwell_sec(self):
+        """The 'Min time in zone' field, or 0 when blank / invalid."""
+        try:
+            v = float(self.zone_entry_min_dwell_var.get())
+        except (AttributeError, ValueError, TypeError):
+            return 0.0
+        return max(0.0, v)
+
+    # ------------------------------------------------------------------ #
     #  Bout Epoch Coherence helpers                                        #
     # ------------------------------------------------------------------ #
     def _refresh_epoch_behavior_list(self):
         """Populate the behavior dropdown from processed_data (preferred) or boutframes Excel file."""
         behaviors = set()
+        # Zone entries are offered alongside scored behaviors so the epoch
+        # analyses reach them without a separate control path.
+        zone_epochs = self._available_zone_entry_epochs()
 
         # Primary source: behaviors already extracted into processed_data
         if self.processed_data:
             for data in self.processed_data.values():
                 bouts = data.get('bouts', {})
                 behaviors.update(str(b) for b in bouts if b not in ('onset_frames',))
-            if behaviors:
-                behaviors = sorted(behaviors)
+            if behaviors or zone_epochs:
+                behaviors = sorted(behaviors) + zone_epochs
                 self.bout_epoch_behavior_combo['values'] = behaviors
                 if behaviors and not self.bout_epoch_behavior_var.get():
                     self.bout_epoch_behavior_var.set(behaviors[0])
@@ -9117,7 +10175,7 @@ class FPAnalysisGUI:
             return
         try:
             behaviors.update(self.boutframes_behavior_columns(boutframes_file))
-            behaviors = sorted(behaviors)
+            behaviors = sorted(behaviors) + zone_epochs
             self.bout_epoch_behavior_combo['values'] = behaviors
             if behaviors and not self.bout_epoch_behavior_var.get():
                 self.bout_epoch_behavior_var.set(behaviors[0])
@@ -9146,6 +10204,7 @@ class FPAnalysisGUI:
                 "Pre/post seconds must be > 0 and max bouts must be >= 0.")
             return
         self.conn_params['bout_epoch_max_bouts'] = max_bouts
+        self.conn_params['zone_entry_min_dwell_sec'] = self._epoch_min_dwell_sec()
 
         # boutframes_file is only needed as a fallback for legacy data that was
         # processed before onset_frames were stored in processed_data.
@@ -9190,15 +10249,24 @@ class FPAnalysisGUI:
         self.bout_epoch_coherence_results = {}
         total = len(subjects)
 
+        _is_zone = self._zone_entry_epoch_key(behavior) is not None
         self.log_message(
             f"Bout epoch coherence — behavior='{behavior}', "
-            f"pre={pre_sec}s, post={post_sec}s, max_bouts={max_bouts if max_bouts else 'all'}, method={coh_method}")
+            f"pre={pre_sec}s, post={post_sec}s, max_bouts={max_bouts if max_bouts else 'all'}, method={coh_method}"
+            + (f", min time in zone={self._epoch_min_dwell_sec():g}s" if _is_zone else ""))
+        if _is_zone and self._epoch_min_dwell_sec() < post_sec:
+            self.log_message(
+                f"    Note: min time in zone ({self._epoch_min_dwell_sec():g}s) is shorter than the "
+                f"post window ({post_sec}s), so some epochs continue after the animal has left "
+                f"the zone. Click '= post window' to require the whole epoch be spent in zone.")
 
         # Capture conn_params snapshot for thread safety
         _conn_params        = dict(self.conn_params)
         _use_excl           = self.use_exclusions_conn.get()
         _processed_data     = self.processed_data
         _subject_to_group_c = dict(_subject_to_group)  # thread-safe copy
+        # Read on the main thread: a Tk variable must not be touched from the worker.
+        _min_dwell          = self._epoch_min_dwell_sec()
 
         def _worker(q):
             n_processed = 0
@@ -9213,54 +10281,13 @@ class FPAnalysisGUI:
                         continue
 
                 data = _processed_data[subject]
-                stored_bouts = data.get('bouts', {})
 
-                # Case-insensitive behavior name lookup in stored bouts
-                _beh_key = None
-                if behavior in stored_bouts:
-                    _beh_key = behavior
-                else:
-                    for k in stored_bouts:
-                        if str(k).lower() == behavior.lower():
-                            _beh_key = k
-                            break
-
-                if _beh_key is not None and 'onset_frames' in stored_bouts[_beh_key]:
-                    onset_frames = stored_bouts[_beh_key]['onset_frames']
-                    if not onset_frames:
-                        q.put(('log', f"  Skipping {subject}: no stored onset frames for '{behavior}'"))
-                        continue
-                elif _use_file_fallback:
-                    try:
-                        df_bouts = self.read_boutframes_sheet(boutframes_file, subject)
-                    except Exception as e:
-                        q.put(('log', f"  Skipping {subject}: no boutframes sheet ({e})"))
-                        continue
-
-                    if behavior in df_bouts.columns:
-                        behavior_col = behavior
-                    else:
-                        cols_lower = {str(c).lower(): c for c in df_bouts.columns}
-                        if behavior.lower() in cols_lower:
-                            behavior_col = cols_lower[behavior.lower()]
-                        else:
-                            q.put(('log', f"  Skipping {subject}: behavior '{behavior}' not in boutframes"))
-                            continue
-                    raw_frames = (pd.to_numeric(df_bouts[behavior_col], errors='coerce')
-                                  .dropna().to_numpy(dtype=float))
-                    # Same conversion as extract_bouts so alignment matches what
-                    # is used in the bout analysis tab.
-                    raw_frames = self._transform_boutframe_values(raw_frames, subject, as_int=True)
-                    _excl = int(self.params.get('exclude_frames_before', 0))
-                    raw_frames = raw_frames[raw_frames >= _excl]
-                    onset_frames = raw_frames.tolist()
-                    if not onset_frames:
-                        q.put(('log', f"  Skipping {subject}: no valid onset frames for '{behavior}'"))
-                        continue
-                else:
-                    q.put(('log',
-                           f"  Skipping {subject}: no onset frames for '{behavior}' in "
-                           f"processed data and no boutframes file is loaded."))
+                onset_frames = self._resolve_epoch_onsets(
+                    subject, data, behavior, min_dwell_sec=_min_dwell,
+                    boutframes_file=(boutframes_file if _use_file_fallback else ''),
+                    log=lambda m: q.put(('log', m)))
+                if not onset_frames:
+                    q.put(('log', f"  Skipping {subject}: no usable onset frames for '{behavior}'"))
                     continue
 
                 n_bouts_available = len(onset_frames)
@@ -9361,6 +10388,8 @@ class FPAnalysisGUI:
                     'max_bouts':      max_bouts,
                     'pre_sec':        pre_sec,
                     'post_sec':       post_sec,
+                    'is_zone_entry':  _is_zone,
+                    'min_dwell_sec':  _min_dwell if _is_zone else 0.0,
                     'ch1': ch1, 'ch2': ch2,
                     'pre_freqs':      pre_freqs,
                     'post_freqs':     post_freqs,
@@ -9381,7 +10410,8 @@ class FPAnalysisGUI:
             n_processed = len(self.bout_epoch_coherence_results)
             status = (f"{n_processed} subject(s) processed. "
                       f"Behavior: '{behavior}', pre={pre_sec}s, post={post_sec}s, "
-                      f"max bouts={max_bouts if max_bouts else 'all'}.  "
+                      f"max bouts={max_bouts if max_bouts else 'all'}"
+                      + (f", min time in zone={_min_dwell:g}s" if _is_zone else "") + ".  "
                       f"Click '\U0001f4ca Plot' to visualize.")
             self.bout_epoch_status_var.set(status)
             self.log_message(f"Bout epoch coherence complete. {n_processed} subject(s).")
@@ -9463,9 +10493,13 @@ class FPAnalysisGUI:
                 c_post = palette_post[gi]
 
                 ax0.plot(freqs, post_m, color=c_post, lw=2,
-                         label=f"{gname} (n={n} subj)")
+                         label=f"{gname} post (n={n} subj)")
                 ax0.fill_between(freqs, post_m - post_s, post_m + post_s,
                                  color=c_post, alpha=0.18)
+                # The baseline arm was computed and thrown away, which left a
+                # plot titled "baseline vs post-onset" showing only post.
+                ax0.plot(freqs, pre_m, color=c_post, lw=1.2, ls='--', alpha=0.8,
+                         label=f"{gname} baseline")
 
                 per_subj_deltas = [results[s]['mean_post_coh'] - results[s]['mean_pre_coh']
                                    for s in subj_list]
@@ -9478,7 +10512,10 @@ class FPAnalysisGUI:
             ax0.set_ylabel('Coherence', fontsize=10)
             ax0.set_ylim(self.conn_params.get('coh_ymin', 0),
                          self.conn_params.get('coh_ymax', 1))
-            ax0.set_title(f"Post-onset Grand Mean \u00b1 SEM (+{r0['post_sec']:.0f}s)",
+            ax0.set_xlim(self.conn_params.get('freq_xmin', 0),
+                         self.conn_params.get('freq_xmax', 10))
+            ax0.set_title(f"Grand Mean \u00b1 SEM  |  baseline dashed, "
+                          f"post-onset (+{r0['post_sec']:.0f}s) solid",
                           fontsize=11, fontweight='bold')
             ax0.legend(fontsize=9)
             ax0.grid(True, alpha=0.3)
@@ -9502,6 +10539,13 @@ class FPAnalysisGUI:
             ax_list = axes[0]
             for ax, subject in zip(ax_list, subjects):
                 r = results[subject]
+                ax.plot(r['pre_freqs'], r['pre_coh_mean'], color='#666666',
+                        lw=1.5, ls='--',
+                        label=f"Baseline (\u2212{r['pre_sec']:.0f}s to 0)")
+                ax.fill_between(r['pre_freqs'],
+                                r['pre_coh_mean'] - r['pre_coh_sem'],
+                                r['pre_coh_mean'] + r['pre_coh_sem'],
+                                alpha=0.15, color='#666666')
                 ax.plot(r['post_freqs'], r['post_coh_mean'], color='crimson', lw=2,
                         label=f"Post-onset (0 to +{r['post_sec']:.0f}s)")
                 ax.fill_between(r['post_freqs'],
@@ -9512,6 +10556,8 @@ class FPAnalysisGUI:
                 ax.set_ylabel('Coherence', fontsize=9)
                 ax.set_ylim(self.conn_params.get('coh_ymin', 0),
                             self.conn_params.get('coh_ymax', 1))
+                ax.set_xlim(self.conn_params.get('freq_xmin', 0),
+                            self.conn_params.get('freq_xmax', 10))
                 ax.set_title(f"{subject}\n(n={r['n_bouts']} bouts)", fontsize=9,
                              fontweight='bold')
                 ax.legend(fontsize=7)
@@ -9523,6 +10569,10 @@ class FPAnalysisGUI:
 
             freqs, pre_m, pre_s, post_m, post_s, n = _group_grand_mean(subjects)
 
+            ax0.plot(freqs, pre_m, color='#666666', lw=1.5, ls='--',
+                     label=f"Baseline (\u2212{r0['pre_sec']:.0f}s to 0)")
+            ax0.fill_between(freqs, pre_m - pre_s, pre_m + pre_s,
+                             alpha=0.15, color='#666666')
             ax0.plot(freqs, post_m, color='crimson', lw=2,
                      label=f"Post-onset (0 to +{r0['post_sec']:.0f}s)")
             ax0.fill_between(freqs, post_m - post_s, post_m + post_s,
@@ -9531,7 +10581,9 @@ class FPAnalysisGUI:
             ax0.set_ylabel('Coherence', fontsize=10)
             ax0.set_ylim(self.conn_params.get('coh_ymin', 0),
                          self.conn_params.get('coh_ymax', 1))
-            ax0.set_title(f'Post-onset Grand Mean \u00b1 SEM  (n={n_subj} subjects)',
+            ax0.set_xlim(self.conn_params.get('freq_xmin', 0),
+                         self.conn_params.get('freq_xmax', 10))
+            ax0.set_title(f'Grand Mean \u00b1 SEM  (n={n_subj} subjects)',
                           fontsize=11, fontweight='bold')
             ax0.legend(fontsize=9)
             ax0.grid(True, alpha=0.3)
@@ -9550,10 +10602,14 @@ class FPAnalysisGUI:
             ax1.set_title('\u0394 Coherence per Subject', fontsize=11, fontweight='bold')
             ax1.grid(True, axis='y', alpha=0.3)
 
+        _dwell_note = (f"  |  min in zone: {r0.get('min_dwell_sec', 0.0):g}s"
+                       if r0.get('is_zone_entry') and r0.get('min_dwell_sec', 0.0) > 0
+                       else "")
         fig.suptitle(
             f"Bout Epoch Coherence  {r0['ch1']} \u2194 {r0['ch2']}  |  "
             f"Behavior: {r0['behavior']}  |  "
-            f"Method: {self.conn_params.get('coherence_method', 'Welch')}",
+            f"Method: {self.conn_params.get('coherence_method', 'Welch')}"
+            + _dwell_note,
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.94])
 
@@ -9661,7 +10717,6 @@ class FPAnalysisGUI:
             [0.9826, 0.9341, 0.4242], [0.9769, 0.9657, 0.5714],
             [0.9839, 0.9874, 0.7013], [1.0000, 1.0000, 0.8510],
         ]
-        import matplotlib.ticker as mticker
         from scipy.ndimage import uniform_filter1d
         parula = LinearSegmentedColormap.from_list('parula', _parula_colors, N=256)
 
@@ -9695,31 +10750,8 @@ class FPAnalysisGUI:
                 self.log_message(f"  Epoch spectrogram: {subject} not in processed data")
                 continue
 
-            stored_bouts = data.get('bouts', {})
-            _beh_key = behavior if behavior in stored_bouts else next(
-                (k for k in stored_bouts if str(k).lower() == behavior.lower()), None)
-
-            onset_frames = []
-            if _beh_key is not None and 'onset_frames' in stored_bouts.get(_beh_key, {}):
-                onset_frames = stored_bouts[_beh_key]['onset_frames']
-            else:
-                boutframes_file = self.boutframes_path_var.get()
-                if boutframes_file and os.path.exists(boutframes_file):
-                    try:
-                        df_b = self.read_boutframes_sheet(boutframes_file, subject)
-                        cols_ci = {str(c).lower(): c for c in df_b.columns}
-                        bcol = cols_ci.get(behavior.lower())
-                        if bcol:
-                            raw_f = (pd.to_numeric(df_b[bcol], errors='coerce')
-                                     .dropna().to_numpy(dtype=float))
-                            # Same conversion as extract_bouts
-                            raw_f = self._transform_boutframe_values(raw_f, subject, as_int=True)
-                            _excl = int(self.params.get('exclude_frames_before', 0))
-                            onset_frames = raw_f[raw_f >= _excl].tolist()
-                    except Exception as exc:
-                        self.log_message(
-                            f"  Epoch spectrogram: could not read boutframes for {subject}: {exc}")
-
+            onset_frames = self._resolve_epoch_onsets(
+                subject, data, behavior, min_dwell_sec=self._epoch_min_dwell_sec())
             if not onset_frames:
                 self.log_message(
                     f"  Epoch spectrogram: no onsets found for {subject} / '{behavior}'")
@@ -9786,8 +10818,6 @@ class FPAnalysisGUI:
             pcm = ax.pcolormesh(times, freqs, coh_tf,
                                 cmap=parula, vmin=0.0, vmax=1.0, shading='auto')
             ax.set_yscale('log')
-            ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{v:g}'))
-            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
             ax.axvline(x=0, color='white', linestyle='--', linewidth=0.6, alpha=0.9)
             cb = ax.get_figure().colorbar(pcm, ax=ax, pad=0.02, fraction=0.046)
             cb.set_label('Coherence', fontsize=10)
@@ -9796,7 +10826,7 @@ class FPAnalysisGUI:
             ax.set_ylabel('Hz', fontsize=11)
             ax.set_title(title, fontsize=11, fontweight='bold')
             ax.set_xlim(times[0], times[-1])
-            ax.set_ylim(freqs[0], freqs[-1])
+            self._apply_coh_freq_axis(ax, freqs)
 
         valid_subjects = list(subject_mean_matrices.keys())
 
@@ -9843,6 +10873,413 @@ class FPAnalysisGUI:
                 fig, "Bout Epoch Wavelet Coherence Spectrogram",
                 "1300x{}".format(min(900, max(500, int(fig_h * 100)))))
 
+    # ------------------------------------------------------------------ #
+    #  Prism copy/paste exports                                          #
+    # ------------------------------------------------------------------ #
+    #  Prism pastes a rectangle, not a long table: a Grouped table wants one
+    #  column per (series x epoch) with replicates down the rows, and an XY
+    #  table wants X in the first column with Y (or Mean/SEM/N) beside it.  The
+    #  CSVs the tab already writes are long-format -- correct, but every paste
+    #  needs a pivot first.  These blocks are the shapes Prism accepts as-is.
+
+    @staticmethod
+    def _prism_num(v, digits=6):
+        """One cell: blank for a missing value rather than 'nan'."""
+        if v is None:
+            return ''
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        if not np.isfinite(f):
+            return ''
+        return f"{f:.{digits}f}".rstrip('0').rstrip('.') or '0'
+
+    def _prism_spectrum_grid(self, series):
+        """Common frequency axis for the spectra blocks, plus interpolators.
+
+        Subjects normally share a grid; one that does not (a shorter epoch, a
+        different method) is interpolated onto the first series' axis rather
+        than dropped, which is what the on-screen grand means already do.
+        """
+        ref = None
+        for entries in series.values():
+            for rec in entries.values():
+                f = np.asarray(rec['freqs'], dtype=float)
+                if f.size:
+                    ref = f
+                    break
+            if ref is not None:
+                break
+        if ref is None:
+            return None
+
+        def on_grid(rec, epoch):
+            y = rec.get(epoch)
+            if y is None:
+                return np.full(ref.shape, np.nan)
+            f = np.asarray(rec['freqs'], dtype=float)
+            y = np.asarray(y, dtype=float)
+            if f.shape == ref.shape and np.allclose(f, ref):
+                return y
+            return np.interp(ref, f, y)
+
+        return ref, on_grid
+
+    def _coherence_prism_text(self, series, epochs, meta):
+        """Tab-separated Prism blocks for one coherence result store.
+
+        *series* is ``{series_label: {subject: {'freqs', <epoch>: spectrum,
+        'n_bouts': int|None}}}`` and *epochs* names the spectra each subject
+        carries -- two for a pre/post analysis, one for a whole-session one.
+        """
+        import datetime
+
+        bands = self._get_active_freq_bands()
+        series_names = list(series.keys())
+        two_epoch = len(epochs) == 2
+
+        L = []
+        L.append(f"# {meta.get('title', 'Coherence export')}")
+        L.append("# Generated {:%Y-%m-%d %H:%M}".format(datetime.datetime.now()))
+        for key in ('channels', 'behavior', 'method', 'window', 'freq_range',
+                    'display_range', 'notes'):
+            if meta.get(key):
+                L.append(f"# {key.replace('_', ' ').capitalize()}: {meta[key]}")
+        L.append("# Values are per-subject means; each subject is one replicate.")
+        L.append("")
+
+        # ── 1. Band means, one row per subject ──────────────────────────
+        # The long-ish block: everything in one rectangle, for a pivot table or
+        # a mixed model rather than for a Prism graph.
+        L.append("BAND MEANS \u2014 one row per subject")
+        header = ['Group', 'Subject', 'N_Bouts']
+        for b in bands:
+            for ep in epochs:
+                header.append(f"{ep}_{b['name']}")
+            if two_epoch:
+                header.append(f"Change_{b['name']}")
+        L.append('\t'.join(header))
+
+        band_vals = {}   # (series, subject, band, epoch) -> float
+        for sname in series_names:
+            for subj, rec in series[sname].items():
+                row = [sname, subj,
+                       '' if rec.get('n_bouts') is None else str(rec['n_bouts'])]
+                for b in bands:
+                    vals = []
+                    for ep in epochs:
+                        v = self._band_mean_from_spectrum(
+                            np.asarray(rec['freqs'], dtype=float),
+                            np.asarray(rec[ep], dtype=float), b)
+                        band_vals[(sname, subj, b['name'], ep)] = v
+                        vals.append(v)
+                        row.append(self._prism_num(v))
+                    if two_epoch:
+                        d = (vals[1] - vals[0]
+                             if all(v is not None and np.isfinite(v) for v in vals)
+                             else np.nan)
+                        row.append(self._prism_num(d))
+                L.append('\t'.join(row))
+        L.append("")
+
+        # ── 2. Band means, Prism Grouped layout (one table per band) ────
+        # Columns are the graph's bars; rows are replicates.  Groups hold
+        # different animals, so the columns are ragged and pad with blanks --
+        # which is exactly how Prism reads an unequal-n grouped table.
+        max_n = max((len(series[g]) for g in series_names), default=0)
+        subj_lists = {g: list(series[g].keys()) for g in series_names}
+
+        L.append("BAND MEANS \u2014 Prism Grouped layout (paste one table per graph)")
+        L.append("# Columns = bars, rows = replicates (one subject per row, "
+                 "blank where a group has fewer).")
+        L.append("")
+        for b in bands:
+            L.append(f"{b['name']}  ({b['fmin']:g}\u2013{b['fmax']:g} Hz)")
+            cols = [(g, ep) for g in series_names for ep in epochs]
+            L.append('\t'.join(['Replicate'] +
+                               [f"{g} {ep}" if len(epochs) > 1 else g
+                                for g, ep in cols]))
+            for r in range(max_n):
+                cells = [str(r + 1)]
+                for g, ep in cols:
+                    subs = subj_lists[g]
+                    cells.append(self._prism_num(band_vals.get((g, subs[r], b['name'], ep)))
+                                 if r < len(subs) else '')
+                L.append('\t'.join(cells))
+            L.append("")
+
+        if two_epoch:
+            L.append("BAND CHANGE (post \u2212 baseline) \u2014 Prism Grouped layout")
+            for b in bands:
+                # Prefixed: without it the change tables repeat the titles of
+                # the tables above them, and the line over a block is the only
+                # thing naming what was copied.
+                L.append(f"Change: {b['name']}  ({b['fmin']:g}\u2013{b['fmax']:g} Hz)")
+                L.append('\t'.join(['Replicate'] + list(series_names)))
+                for r in range(max_n):
+                    cells = [str(r + 1)]
+                    for g in series_names:
+                        subs = subj_lists[g]
+                        if r >= len(subs):
+                            cells.append('')
+                            continue
+                        pre = band_vals.get((g, subs[r], b['name'], epochs[0]))
+                        post = band_vals.get((g, subs[r], b['name'], epochs[1]))
+                        cells.append(self._prism_num(post - pre)
+                                     if (pre is not None and post is not None
+                                         and np.isfinite(pre) and np.isfinite(post))
+                                     else '')
+                    L.append('\t'.join(cells))
+                L.append("")
+
+        # ── 3 & 4. Spectra, Prism XY ────────────────────────────────────
+        grid = self._prism_spectrum_grid(series)
+        if grid is not None:
+            ref, on_grid = grid
+
+            L.append("SPECTRA \u2014 Prism XY, Mean/SEM/N per column")
+            L.append("# XY table, 'Enter and plot error values already "
+                     "calculated' \u2192 Mean, SEM, N.")
+            header = ['Frequency_Hz']
+            stacks = []
+            for g in series_names:
+                for ep in epochs:
+                    label = f"{g} {ep}" if len(epochs) > 1 else g
+                    header += [f"{label} Mean", f"{label} SEM", f"{label} N"]
+                    rows = [on_grid(rec, ep) for rec in series[g].values()]
+                    stacks.append(np.vstack(rows) if rows
+                                  else np.empty((0, ref.size)))
+            L.append('\t'.join(header))
+            for i in range(ref.size):
+                cells = [f"{ref[i]:.6g}"]
+                for arr in stacks:
+                    col = arr[:, i] if arr.shape[0] else np.array([])
+                    col = col[np.isfinite(col)]
+                    n = col.size
+                    cells.append(self._prism_num(np.mean(col)) if n else '')
+                    cells.append(self._prism_num(np.std(col, ddof=1) / np.sqrt(n))
+                                 if n > 1 else '')
+                    cells.append(str(n))
+                L.append('\t'.join(cells))
+            L.append("")
+
+            L.append("SPECTRA \u2014 Prism XY, one column per subject")
+            L.append("# XY table, 'Enter replicate values in side-by-side "
+                     "subcolumns'; the header names the group each column "
+                     "belongs to.")
+            header = ['Frequency_Hz']
+            cols = []
+            for g in series_names:
+                for ep in epochs:
+                    for subj, rec in series[g].items():
+                        header.append(f"{g} {ep} {subj}" if len(epochs) > 1
+                                      else f"{g} {subj}")
+                        cols.append(on_grid(rec, ep))
+            L.append('\t'.join(header))
+            for i in range(ref.size):
+                L.append('\t'.join([f"{ref[i]:.6g}"] +
+                                   [self._prism_num(c[i]) for c in cols]))
+            L.append("")
+
+        # ── 5. Which subject is which replicate row ─────────────────────
+        L.append("# Subject key for the Grouped layouts")
+        L.append('\t'.join(['Replicate'] + series_names))
+        for r in range(max_n):
+            L.append('\t'.join([str(r + 1)] +
+                               [subj_lists[g][r] if r < len(subj_lists[g]) else ''
+                                for g in series_names]))
+
+        return '\n'.join(L)
+
+    def _show_tsv_export_window(self, title, text_content, initialfile):
+        """Copy/paste window for a tab-separated export."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        self.fit_toplevel(win, 820, 560)
+
+        ttk.Label(win,
+                  text="Tab-separated. Copy a block (or the lot) straight into "
+                       "Prism or Excel, or save it as a file.\n"
+                       "Lines starting with # are notes \u2014 they are not part "
+                       "of any table.",
+                  font=('Segoe UI', 9), justify='left').pack(
+            pady=(8, 4), padx=10, anchor='w')
+
+        # Reserved before the expanding text box so the actions stay on-screen
+        # when the window is clamped to a short display.
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(side=tk.BOTTOM, fill='x', padx=10, pady=(0, 10))
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill='both', expand=True, padx=10, pady=(0, 6))
+        ysb = ttk.Scrollbar(text_frame, orient='vertical')
+        ysb.pack(side='right', fill='y')
+        xsb = ttk.Scrollbar(text_frame, orient='horizontal')
+        xsb.pack(side='bottom', fill='x')
+        box = tk.Text(text_frame, wrap='none', font=('Consolas', 9),
+                      yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        box.pack(fill='both', expand=True)
+        ysb.config(command=box.yview)
+        xsb.config(command=box.xview)
+        box.insert('1.0', text_content)
+        box.config(state='disabled')
+
+        def _copy_all():
+            win.clipboard_clear()
+            win.clipboard_append(text_content)
+            messagebox.showinfo("Copied",
+                "Everything copied to the clipboard.", parent=win)
+
+        def _copy_selection():
+            try:
+                sel = box.get('sel.first', 'sel.last')
+            except tk.TclError:
+                messagebox.showinfo("Nothing selected",
+                    "Drag over the block you want first.", parent=win)
+                return
+            win.clipboard_clear()
+            win.clipboard_append(sel)
+            messagebox.showinfo("Copied", "Selection copied.", parent=win)
+
+        def _save():
+            fname = filedialog.asksaveasfilename(
+                parent=win, defaultextension='.txt',
+                filetypes=[('Tab-separated', '*.txt *.tsv *.csv'),
+                           ('All files', '*.*')],
+                initialfile=initialfile)
+            if fname:
+                with open(fname, 'w', encoding='utf-8') as fh:
+                    fh.write(text_content)
+                messagebox.showinfo("Saved", f"Saved to:\n{fname}", parent=win)
+
+        ttk.Button(btn_frame, text="Copy All", command=_copy_all).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Copy Selection", command=_copy_selection).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Save to File\u2026", command=_save).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side='right', padx=5)
+        return win
+
+    def _coh_meta_common(self, ch1, ch2, method, extra=None):
+        """Header lines every coherence export shares."""
+        p = self.conn_params
+        meta = {
+            'channels': f"{ch1} \u2194 {ch2}",
+            'method': method,
+            'freq_range': f"{p.get('static_fmin', 0.05):g}\u2013"
+                          f"{p.get('static_fmax', 3.0):g} Hz (analysis)",
+            'display_range': f"{p.get('freq_xmin', 0):g}\u2013"
+                             f"{p.get('freq_xmax', 3):g} Hz (plot axis)",
+        }
+        meta.update(extra or {})
+        return meta
+
+    def export_beg_prism(self):
+        """Prism blocks for the bout-epoch group comparison (baseline vs post)."""
+        if not getattr(self, 'beg_results', None):
+            messagebox.showwarning("No Data",
+                "Run '\u25b6 Run Bout-Epoch Group Comparison' first.")
+            return
+
+        epochs = ['Baseline', 'Post']
+        series = {}
+        for gname, gdata in self.beg_results.items():
+            entry = {}
+            for subj, sdata in gdata['subjects'].items():
+                entry[subj] = {
+                    'freqs': sdata['pre_freqs'],
+                    'Baseline': sdata['pre_coh_mean'],
+                    'Post': sdata['post_coh_mean'],
+                    'n_bouts': sdata.get('n_bouts'),
+                }
+            if entry:
+                series[gname] = entry
+        if not series:
+            messagebox.showwarning("No Data", "No subjects in the comparison.")
+            return
+
+        r0 = next(iter(self.beg_results.values()))
+        meta = self._coh_meta_common(r0['ch1'], r0['ch2'], r0['method'], {
+            'title': "Bout-epoch coherence by group \u2014 baseline vs post-onset",
+            'behavior': r0['behavior'],
+            'window': f"baseline {r0['pre_sec']:g}s before onset, "
+                      f"post {r0['post_sec']:g}s after",
+        })
+        text = self._coherence_prism_text(series, epochs, meta)
+        self._show_tsv_export_window(
+            "Prism Export \u2014 Bout-Epoch Group Coherence", text,
+            f"coherence_group_prepost_{r0['behavior']}.txt")
+        self.log_message("Bout-epoch group coherence: Prism export opened.")
+
+    def export_bout_epoch_prism(self):
+        """Prism blocks for the per-subject bout-epoch analysis."""
+        results = getattr(self, 'bout_epoch_coherence_results', None)
+        if not results:
+            messagebox.showwarning("No Data",
+                "Run '\u25b6 Run Bout Epoch Coherence' first.")
+            return
+
+        epochs = ['Baseline', 'Post']
+        series = {}
+        for subj, r in results.items():
+            gname = (r.get('group') or '').strip() or 'All subjects'
+            series.setdefault(gname, {})[subj] = {
+                'freqs': r['pre_freqs'],
+                'Baseline': r['pre_coh_mean'],
+                'Post': r['post_coh_mean'],
+                'n_bouts': r.get('n_bouts'),
+            }
+
+        r0 = next(iter(results.values()))
+        dwell = (f"; min time in zone {r0.get('min_dwell_sec', 0):g}s"
+                 if r0.get('is_zone_entry') and r0.get('min_dwell_sec', 0) > 0 else '')
+        meta = self._coh_meta_common(
+            r0['ch1'], r0['ch2'],
+            self.conn_params.get('coherence_method', 'Welch'), {
+                'title': "Bout-epoch coherence by subject \u2014 baseline vs post-onset",
+                'behavior': r0['behavior'],
+                'window': f"baseline {r0['pre_sec']:g}s before onset, "
+                          f"post {r0['post_sec']:g}s after{dwell}",
+            })
+        text = self._coherence_prism_text(series, epochs, meta)
+        self._show_tsv_export_window(
+            "Prism Export \u2014 Bout Epoch Coherence", text,
+            f"coherence_bout_epoch_{r0['behavior']}.txt")
+        self.log_message("Bout epoch coherence: Prism export opened.")
+
+    def export_group_coherence_prism(self):
+        """Prism blocks for the whole-session group comparison."""
+        if not getattr(self, 'group_coherence_results', None):
+            messagebox.showwarning("No Data",
+                "Run '\u25b6 Run Group Comparison' first.")
+            return
+
+        epochs = ['Coherence']
+        series = {}
+        for gname, gdata in self.group_coherence_results.items():
+            entry = {}
+            for subj, sdata in gdata['subjects'].items():
+                entry[subj] = {
+                    'freqs': sdata['freqs'],
+                    'Coherence': sdata['coh'],
+                    'n_bouts': None,
+                }
+            if entry:
+                series[gname] = entry
+        if not series:
+            messagebox.showwarning("No Data", "No subjects in the comparison.")
+            return
+
+        g0 = next(iter(self.group_coherence_results.values()))
+        meta = self._coh_meta_common(g0['ch1'], g0['ch2'], g0.get('method', 'Welch'), {
+            'title': "Whole-session coherence by group",
+            'window': 'whole session',
+        })
+        text = self._coherence_prism_text(series, epochs, meta)
+        self._show_tsv_export_window(
+            "Prism Export \u2014 Whole-Session Group Coherence", text,
+            "coherence_whole_session_by_group.txt")
+        self.log_message("Group coherence: Prism export opened.")
+
     def export_bout_epoch_coherence(self):
         """Export per-frequency bout epoch coherence to CSV."""
         if not hasattr(self, 'bout_epoch_coherence_results') \
@@ -9872,6 +11309,8 @@ class FPAnalysisGUI:
                     'Ch2':                   r['ch2'],
                     'Pre_sec':               r['pre_sec'],
                     'Post_sec':              r['post_sec'],
+                    'Zone_Entry':            bool(r.get('is_zone_entry', False)),
+                    'Min_Time_In_Zone_sec':  r.get('min_dwell_sec', 0.0),
                     'Frequency_Hz':          round(float(freq),   6),
                     'Baseline_Coherence':    round(float(pre_c),  6),
                     'Baseline_SEM':          round(float(pre_sem),6),
@@ -10183,94 +11622,205 @@ class FPAnalysisGUI:
         fig.tight_layout()
         self._embed_plot_window(fig, "Connectivity Analysis Visualization", "1400x800")
 
+    def _bands_overlapping(self, freqs):
+        """Active bands that the computed frequency vector actually covers.
+
+        A band wholly outside the analysis range contributes an empty slot to
+        every bar chart, which reads as "measured, and zero".
+        """
+        f = np.asarray(freqs, dtype=float)
+        if f.size == 0:
+            return []
+        lo, hi = float(np.nanmin(f)), float(np.nanmax(f))
+        return [b for b in self._get_active_freq_bands()
+                if b['fmax'] >= lo and b['fmin'] <= hi]
+
     def visualize_connectivity_band_bars(self):
-        """Plot baseline vs post-onset coherence bars by frequency range for bout epoch results."""
+        """Baseline vs post-onset coherence per frequency band, bout epochs.
+
+        Bands come from the editable list on the tab; this used to use a
+        hardcoded five-band table clipped to the plot axis limits, so renaming
+        or re-ranging a band changed every other chart but not this one.
+        """
         if not hasattr(self, 'bout_epoch_coherence_results') or not self.bout_epoch_coherence_results:
-            messagebox.showwarning("No Data", "Run '▶ Bout Epoch Coherence' first.")
+            messagebox.showwarning("No Data", "Run '\u25b6 Bout Epoch Coherence' first.")
             return
-
-        def _frequency_bands(fmin, fmax):
-            base = [
-                ('Infra-slow', 0.05, 0.5),
-                ('Slow', 0.5, 1.0),
-                ('Delta', 1.0, 4.0),
-                ('Theta', 4.0, 8.0),
-                ('High', 8.0, 12.0),
-            ]
-            out = []
-            for name, lo, hi in base:
-                lo_c = max(lo, fmin)
-                hi_c = min(hi, fmax)
-                if hi_c > lo_c:
-                    out.append((name, lo_c, hi_c))
-            return out
-
-        def _band_means(freqs, coh, bands):
-            vals = []
-            for _, lo, hi in bands:
-                mask = (freqs >= lo) & (freqs <= hi)
-                vals.append(float(np.mean(coh[mask])) if np.any(mask) else np.nan)
-            return vals
 
         results = self.bout_epoch_coherence_results
         subjects = list(results.keys())
         r0 = results[subjects[0]]
-        bands = _frequency_bands(self.conn_params.get('freq_xmin', 0.0),
-                                 self.conn_params.get('freq_xmax', 10.0))
+
+        bands = self._bands_overlapping(r0['pre_freqs'])
         if not bands:
             messagebox.showwarning("No Bands",
-                                   "No predefined frequency bands overlap the current frequency axis limits.")
+                "None of the frequency bands overlap the analysed frequency "
+                "range.\n\nEdit the bands on the Coherence tab, or widen "
+                "Freq min/max in Coherence Settings.")
             return
 
-        band_labels = [b[0] for b in bands]
-        x = np.arange(len(band_labels))
+        band_labels = [f"{b['name']}\n({b['fmin']:g}\u2013{b['fmax']:g} Hz)" for b in bands]
+        x = np.arange(len(bands))
 
-        fig = Figure(figsize=(12, 7), dpi=100)
+        pre_rows, post_rows = [], []
+        for subj in subjects:
+            r = results[subj]
+            pre_rows.append([self._band_mean_from_spectrum(r['pre_freqs'], r['pre_coh_mean'], b)
+                             for b in bands])
+            post_rows.append([self._band_mean_from_spectrum(r['post_freqs'], r['post_coh_mean'], b)
+                              for b in bands])
+        pre_arr = np.asarray(pre_rows, dtype=float)
+        post_arr = np.asarray(post_rows, dtype=float)
+        n_subj = len(subjects)
+
+        def _mean_sem(arr):
+            with np.errstate(invalid='ignore'):
+                mean = np.nanmean(arr, axis=0)
+            n_ok = np.sum(~np.isnan(arr), axis=0)
+            sd = (np.nanstd(arr, axis=0, ddof=1) if arr.shape[0] > 1
+                  else np.zeros(arr.shape[1]))
+            sem = np.where(n_ok > 1, sd / np.sqrt(np.maximum(n_ok, 1)), 0.0)
+            return mean, sem
+
+        pre_mean, pre_sem = _mean_sem(pre_arr)
+        post_mean, post_sem = _mean_sem(post_arr)
+
+        fig = Figure(figsize=(max(8, len(bands) * 1.8 + 2), 5.5), dpi=100)
         ax = fig.add_subplot(1, 1, 1)
 
-        n_subj = len(subjects)
-        subj_entries = []
-        for s in subjects:
-            r = results[s]
-            subj_entries.append((
-                s,
-                _band_means(r['pre_freqs'], r['pre_coh_mean'], bands),
-                _band_means(r['post_freqs'], r['post_coh_mean'], bands)
-            ))
+        bar_w = 0.34
+        ax.bar(x - bar_w / 2, pre_mean, bar_w, color='#8c8c8c', alpha=0.85,
+               yerr=pre_sem, capsize=4, label='Baseline (pre-onset)',
+               error_kw={'elinewidth': 1.3})
+        ax.bar(x + bar_w / 2, post_mean, bar_w, color='crimson', alpha=0.85,
+               yerr=post_sem, capsize=4, label='Post-onset',
+               error_kw={'elinewidth': 1.3})
 
-        # If many subjects are selected, plot grand mean bars to keep readability.
-        if n_subj > 6:
-            post_stack = np.vstack([np.asarray(e[2], dtype=float) for e in subj_entries])
-            post_mean = np.nanmean(post_stack, axis=0)
-            post_sem = np.nanstd(post_stack, axis=0) / np.sqrt(n_subj)
-            w = 0.5
-            ax.bar(x, post_mean, w, color='crimson', alpha=0.85,
-                   yerr=post_sem, capsize=3,
-                   label=f"Post-onset (n={n_subj} subjects)")
-            ax.set_title('Grand Mean Coherence by Frequency Band', fontweight='bold')
-        else:
-            n_series = max(1, n_subj)
-            bar_w = min(0.7 / n_series, 0.22)
-            offsets = np.linspace(-(n_series - 1) / 2, (n_series - 1) / 2, n_series) * bar_w
-            for idx, (subj, pre_vals, post_vals) in enumerate(subj_entries):
-                ax.bar(x + offsets[idx], post_vals, width=bar_w, alpha=0.80,
-                       label=f"{subj}")
-            ax.set_title('Per-Subject Post-onset Coherence by Frequency Band', fontweight='bold')
+        # Per-subject points, joined pre-to-post so a paired shift is visible
+        # rather than only the difference of two means.
+        for si in range(n_subj):
+            jit = np.random.uniform(-0.06, 0.06, len(bands))
+            ax.scatter(x - bar_w / 2 + jit, pre_arr[si], s=16, color='#4d4d4d',
+                       alpha=0.55, zorder=5, edgecolors='white', linewidths=0.3)
+            ax.scatter(x + bar_w / 2 + jit, post_arr[si], s=16, color='#7f1128',
+                       alpha=0.55, zorder=5, edgecolors='white', linewidths=0.3)
+            for bi in range(len(bands)):
+                if np.isnan(pre_arr[si, bi]) or np.isnan(post_arr[si, bi]):
+                    continue
+                ax.plot([x[bi] - bar_w / 2 + jit[bi], x[bi] + bar_w / 2 + jit[bi]],
+                        [pre_arr[si, bi], post_arr[si, bi]],
+                        color='gray', lw=0.5, alpha=0.35, zorder=4)
 
         ax.set_xticks(x)
-        ax.set_xticklabels(band_labels, rotation=20, ha='right')
+        ax.set_xticklabels(band_labels, fontsize=9)
         ax.set_ylabel('Mean Coherence')
         ax.set_ylim([self.conn_params.get('coh_ymin', 0), self.conn_params.get('coh_ymax', 1)])
         ax.grid(True, axis='y', alpha=0.3)
-        ax.legend(fontsize=8, ncol=2)
+        ax.legend(fontsize=9)
+        ax.set_title(f'Baseline vs Post-onset by Frequency Band  (n={n_subj} subjects)',
+                     fontweight='bold', fontsize=10)
 
         fig.suptitle(
-            f"Bout Epoch Coherence Bands  {r0['ch1']} ↔ {r0['ch2']}  |  Behavior: {r0['behavior']}",
+            f"Bout Epoch Coherence Bands  {r0['ch1']} \u2194 {r0['ch2']}  |  Behavior: {r0['behavior']}",
             fontsize=11, fontweight='bold')
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
 
         win, canvas = self._embed_plot_window(
-            fig, "Bout Epoch Coherence — Frequency-Band Bars", "1200x700")
+            fig, "Bout Epoch Coherence \u2014 Frequency-Band Bars", "1200x700")
+
+    def visualize_static_band_bars(self):
+        """Whole-session static coherence per frequency band, one bar per series.
+
+        The Whole Session tab's band-bar button used to call the bout-epoch
+        chart, which refuses to draw without a bout-epoch run -- an analysis
+        that tab cannot start.
+        """
+        if not getattr(self, 'connectivity_results', None):
+            messagebox.showwarning("No Data", "Run '\u25b6 Run Analysis' first.")
+            return
+
+        # series -> list of (label, freqs, coh); a group carries one row per
+        # subject so the bars keep their per-animal spread.
+        series = {}
+        for name, result in self.connectivity_results.items():
+            label = result.get('subject', result.get('group', name))
+            traces = result.get('spectral_traces_by_subject', {})
+            rows = []
+            if traces:
+                for subj, v in traces.items():
+                    if v.get('freqs') is None or v.get('coh') is None:
+                        continue
+                    rows.append((subj, np.asarray(v['freqs']), np.asarray(v['coh'])))
+            elif 'static_coherence' in result:
+                c = result['static_coherence']
+                if c.get('freqs') is not None and c.get('coh') is not None:
+                    rows.append((label, np.asarray(c['freqs']), np.asarray(c['coh'])))
+            if rows:
+                series[label] = rows
+
+        if not series:
+            messagebox.showwarning("No Data",
+                "No static coherence found in the current results.\n\n"
+                "Tick 'Static Coherence' before running the analysis.")
+            return
+
+        ref_freqs = next(iter(series.values()))[0][1]
+        bands = self._bands_overlapping(ref_freqs)
+        if not bands:
+            messagebox.showwarning("No Bands",
+                "None of the frequency bands overlap the analysed frequency "
+                "range.\n\nEdit the bands on the Coherence tab, or widen "
+                "Freq min/max in Coherence Settings.")
+            return
+
+        series_names = list(series.keys())
+        n_ser = len(series_names)
+        band_labels = [f"{b['name']}\n({b['fmin']:g}\u2013{b['fmax']:g} Hz)" for b in bands]
+        x = np.arange(len(bands))
+
+        fig = Figure(figsize=(max(8, len(bands) * 1.6 + n_ser * 0.6 + 2), 5.5), dpi=100)
+        ax = fig.add_subplot(1, 1, 1)
+
+        bar_w = min(0.72 / n_ser, 0.3)
+        offsets = np.linspace(-(n_ser - 1) / 2, (n_ser - 1) / 2, n_ser) * bar_w
+
+        for si, sname in enumerate(series_names):
+            color = self._GRP_PALETTE[si % len(self._GRP_PALETTE)]
+            mat = np.asarray([
+                [self._band_mean_from_spectrum(f, c, b) for b in bands]
+                for _lab, f, c in series[sname]
+            ], dtype=float)
+            n_rows = mat.shape[0]
+            with np.errstate(invalid='ignore'):
+                means = np.nanmean(mat, axis=0)
+            sems = (np.nanstd(mat, axis=0, ddof=1) / np.sqrt(n_rows)
+                    if n_rows > 1 else np.zeros(len(bands)))
+
+            ax.bar(x + offsets[si], means, bar_w, color=color, alpha=0.85,
+                   yerr=sems, capsize=4, error_kw={'elinewidth': 1.3},
+                   label=f"{sname} (n={n_rows})")
+            if n_rows > 1:
+                for row in mat:
+                    jit = np.random.uniform(-bar_w * 0.22, bar_w * 0.22, len(bands))
+                    ax.scatter(x + offsets[si] + jit, row, s=16, color=color,
+                               alpha=0.55, zorder=5, edgecolors='white', linewidths=0.3)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(band_labels, fontsize=9)
+        ax.set_ylabel('Mean Coherence')
+        ax.set_ylim([self.conn_params.get('coh_ymin', 0), self.conn_params.get('coh_ymax', 1)])
+        ax.grid(True, axis='y', alpha=0.3)
+        ax.legend(fontsize=8, ncol=min(n_ser, 4))
+
+        ch1 = self.conn_channel1_var.get()
+        ch2 = self.conn_channel2_var.get()
+        fig.suptitle(
+            f"Whole-Session Coherence by Frequency Band  |  {ch1} \u2194 {ch2}  "
+            f"|  Method: {self.conn_params.get('coherence_method', 'Welch')}",
+            fontsize=11, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+        self._embed_plot_window(
+            fig, "Whole-Session Coherence \u2014 Frequency-Band Bars", "1200x700")
 
     # ------------------------------------------------------------------ #
     #  Wavelet Coherence Spectrogram (time × frequency heatmap)           #
@@ -10383,7 +11933,6 @@ class FPAnalysisGUI:
             [0.9826, 0.9341, 0.4242], [0.9769, 0.9657, 0.5714],
             [0.9839, 0.9874, 0.7013], [1.0000, 1.0000, 0.8510],
         ]
-        import matplotlib.ticker as mticker
         parula = LinearSegmentedColormap.from_list('parula', _parula_colors, N=256)
 
         def _draw_spectrogram(ax, times, freqs, coh_tf, title):
@@ -10391,8 +11940,6 @@ class FPAnalysisGUI:
             pcm = ax.pcolormesh(times, freqs, coh_tf,
                                 cmap=parula, vmin=0.0, vmax=1.0, shading='auto')
             ax.set_yscale('log')
-            ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{v:g}'))
-            ax.yaxis.set_minor_formatter(mticker.NullFormatter())
             cb = ax.get_figure().colorbar(pcm, ax=ax, pad=0.02, fraction=0.046)
             cb.set_label('Coherence', fontsize=10)
             cb.set_ticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
@@ -10400,7 +11947,7 @@ class FPAnalysisGUI:
             ax.set_ylabel('Hz', fontsize=11)
             ax.set_title(title, fontsize=12, fontweight='bold')
             ax.set_xlim(times[0], times[-1])
-            ax.set_ylim(freqs[0], freqs[-1])
+            self._apply_coh_freq_axis(ax, freqs)
 
         if display_mode == 'grandmean' and len(selected_names) > 1:
             # ── Grand Mean path ───────────────────────────────────────
@@ -10842,6 +12389,8 @@ class FPAnalysisGUI:
                                 command=self.export_bout_metrics_all)
         export_menu.add_command(label="Plot Data — copy/paste (Prism, Excel)…",
                                 command=self.export_bout_order_data)
+        export_menu.add_command(label="Binned Progression, all behaviors → Excel (current settings)…",
+                                command=self.export_binned_progression_all)
         export_menu.add_separator()
         export_menu.add_command(label="Time-Course Stats — copy/paste (Prism, Excel)…",
                                 command=self.export_timecourse_flmm)
@@ -10959,8 +12508,11 @@ class FPAnalysisGUI:
         stats_text_container = ttk.Frame(stats_frame)
         stats_text_container.pack(fill='both', expand=True)
 
+        # A Text defaults to 80 characters wide, which at a large UI scale is
+        # a ~960 px demand the results pane cannot meet; it fills the pane, so
+        # the width here is only a floor.
         self.bout_stats_text = tk.Text(
-            stats_text_container, height=8, wrap='word',
+            stats_text_container, height=8, width=40, wrap='word',
             font=('Consolas', 9), state='disabled')
         stats_vsb = ttk.Scrollbar(stats_text_container, orient="vertical",
                                    command=self.bout_stats_text.yview)
@@ -12856,7 +14408,8 @@ Common issues:
 Tips:
 • Use the live preview on Spike Analysis to tune detection before a full run.
 • Drag the divider on split tabs (e.g. Spike Analysis) to resize panes.
-• Plots are exported at high resolution; use 'Export Plot' / 'Export Data'.
+• 'Export Plot' saves PNG/TIFF at 600 dpi, or PDF/SVG/EPS as true vector —
+  pick a vector format for Prism or Illustrator so it never pixelates.
 • The System Check tab confirms all dependencies are installed.
 """),
             ("Support", f"""
@@ -12878,6 +14431,80 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Zone entries can drive the Coherence tab. Every epoch analysis there
+    needs a list of onsets to centre a pre/post window on, and only scored
+    behaviors could supply them, so coherence around an open-arm entry could not
+    be asked for at all — even though the entries were already detected during
+    processing. Entries now sit in the same picker as behaviors and resolve
+    through one shared onset path, with a minimum-time-in-zone filter of their
+    own. That filter is not detection's duration threshold under another name:
+    detection asks how long the animal stayed before the entry counted, usually a
+    fraction of a second, while an epoch asks whether the animal was still there
+    for the whole post window. An entry left after two seconds, measured with a
+    ten second window, is mostly coherence in whatever zone came next.
+  • New — Coherence results paste straight into Prism. The copy/save blocks build
+    a Grouped table per frequency band — one column per group × epoch, animals as
+    replicates down the rows — and XY tables for the spectra themselves, which is
+    the shape Prism expects rather than one that has to be transposed by hand
+    first. A static band-bar plot summarises the same numbers on screen.
+  • New — "Compare Across Bouts" bins bouts by their ordinal. A dozen bouts across
+    a handful of animals used to draw as a dozen individual lines, which is a pile
+    rather than a result; "Bouts per bin: 3" collapses that to bouts 1–3, 4–6, ...
+    as mean ± SEM, with the individual traces still available underneath as an
+    overlay. The z-scored traces behind the plot now export to CSV, which they
+    could not do at all before.
+  • New — Binned Progression exports every behavior in one workbook. The view
+    could only export whatever was on screen, so six scored behaviors meant six
+    plot-then-export round trips with the bin size and max-bouts settings typed in
+    again each time. One run now writes one sheet per behavior × channel, computed
+    from the same helper the plot draws from, with the current settings applied to
+    all of them.
+  • New — Edit Processing Parameters is grouped into tabs with a search box
+    instead of one long undifferentiated list. Parameters that answer the same
+    question sit together — in particular the three separate pairs of "how long
+    must the animal stay in a zone for it to count as an entry?", which drive EPM
+    detection, OFT/Custom detection and the Behavioral Data metrics table, and
+    which were previously indistinguishable from one another. The grouping is a
+    layout hint and never a filter: a parameter the table has not heard of still
+    gets an editor, on a catch-all "Other" tab.
+  • New — The thresholds that decide what is on screen are editable beside the
+    plot. The Visualization tab carries the entry duration and refractory pair the
+    current maze type actually uses, and the Out/Back minimum velocity; the
+    Behavioral Data tab carries the metrics-table pair. Applying re-runs detection
+    over the stored position track for every processed subject and redraws in
+    seconds — retuning any of these previously meant a full reprocess from the
+    source files.
+  • New — The window fits itself to the screen it is on. Three measured passes run
+    on resize: the notebook tab row gives up padding and then type size, each only
+    as far as an overflow actually requires (ttk does not wrap, scroll or elide a
+    too-wide tab row — it cuts each label off, which is how "Decision Probability"
+    became "Decision Probabili" on a 1366 px screen); the settings columns are
+    sized from what their contents really request; and wrapped help text is
+    re-wrapped to the width it ended up with rather than an assumed one.
+  • Fix — "Freq axis min/max (Hz)" moved the coherence line plots but left every
+    spectrogram unchanged, because the heatmaps pinned their axis to the ANALYSIS
+    range instead. Both now read the same setting, intersected with the
+    frequencies actually computed: a log axis cannot show a minimum of 0, and
+    stretching past the data only adds blank space.
+  • Fix — Decision probability read the wrong column for a one-channel subject
+    designated G1. The slot a second channel would occupy holds a kinematics field
+    for that subject, so the curve was computed against elapsed time. The column
+    is now resolved from the subject's own channel designation. Two further things
+    were wrong with the same measure: the look-ahead window was converted with the
+    project's sampling rate rather than each subject's, so a 20 Hz animal in a
+    mixed cohort was scanned over a different number of seconds than a 30 Hz one;
+    and the per-frame look-ahead is now a prefix sum, which stops the whole
+    analysis growing with the window length.
+  • Fix — The kinematics binned-signal curves ("Signal by acceleration bin" and
+    its velocity and distance siblings) exported group means only — four columns,
+    one row per bin — so the animals behind the error bars never left the GUI. The
+    table now follows the Bout Analysis plot-data layout, one row per animal with
+    mean / SEM / n underneath, and those summary rows are the values the error
+    bars are actually drawn from rather than a second computation that can drift
+    from the plot.
+
+Version 1.17.0  •  August 24, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Each subject can be given the real START and END of its session, in
     Settings > Session Start/End. A rig is started before the animal is in the
@@ -16116,45 +17743,191 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if os.path.isdir(sub_dir):
                 shutil.rmtree(sub_dir, ignore_errors=True)
 
+    # Parameters whose value is one of a fixed set. Offered as a combobox so the
+    # spelling cannot drift (a mistyped 'savgol' silently fell through to the
+    # default filter), but left editable rather than readonly so a value written
+    # by an older version still shows and can be kept.
+    PARAM_CHOICES = {
+        'processing_smoothing_method': ['butterworth', 'savgol', 'rolling'],
+        'boutframe_processing_style': ['onset', 'whole', 'offset'],
+        'ttl_format': ['pairs_start', 'single', 'pairs_startend'],
+        'decay_strictness': ['strict', 'balanced', 'permissive'],
+        'y_calibration_method': ['legacy', 'normalize_y_min', 'independent_y_scale'],
+        'maze_type': ['EPM', 'EPM_Complex', 'OFT', 'Custom Arena'],
+    }
+
     def edit_parameters(self):
-        """Open dialog to edit processing parameters"""
+        """Edit every processing parameter, grouped by the analysis it feeds.
+
+        Laid out from PARAM_GROUPS: a notebook of pipeline stages, each holding
+        titled sections. The flat alphabetical-by-insertion list this replaced
+        ran to ~60 boxes in one column, so finding a setting meant knowing its
+        internal key already. A filter box searches key, label and hint across
+        every tab, and tabs with no match are hidden while it is active.
+        """
         dialog = tk.Toplevel(self.root)
         dialog.title("Edit Processing Parameters")
-        self.fit_toplevel(dialog, 500, 600)
-        
-        # Create scrollable canvas
-        canvas = tk.Canvas(dialog)
-        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
+        self.fit_toplevel(dialog, self.ui_px(1040), self.ui_px(680))
+
         # Derived from the seconds settings at each subject's own rate, so
         # showing them as editable boxes would invite an edit that the next
         # sync silently discards.
         derived = {'preboutframes', 'postboutframes', 'baseline_frames'}
 
+        # Structured params (dict/list) — e.g. bout_overlay_colors,
+        # factor_definitions — are edited via their own dialogs, not as free
+        # text, and str()'ing a dict here would break the parser on Save.
+        editable = {k: v for k, v in self.params.items()
+                    if not isinstance(v, (dict, list)) and k not in derived}
+
         entries = {}
-        i = 0
-        for key, value in self.params.items():
-            # Skip structured params (dict/list) — e.g. bout_overlay_colors.
-            # They are edited via their own dialogs, not as free text, and
-            # str()'ing a dict here would break the numeric parser on Save.
-            if isinstance(value, (dict, list)) or key in derived:
-                continue
-            ttk.Label(scrollable_frame, text=f"{key}:").grid(row=i, column=0, sticky='w', padx=10, pady=5)
+        # The filter works bottom-up over these: hide a row, then any section
+        # left with no visible rows, then any tab left with no visible sections.
+        sections = []   # (LabelFrame, [(row_frame, searchable_text), ...])
+        tab_rows = {}   # page -> [searchable_text, ...]
+
+        # ---- Save row and filter box sit outside the notebook so they stay put.
+        save_row = ttk.Frame(dialog)
+        save_row.pack(side=tk.BOTTOM, fill='x')
+
+        filter_row = ttk.Frame(dialog, padding=(10, 8, 10, 4))
+        filter_row.pack(side=tk.TOP, fill='x')
+        ttk.Label(filter_row, text="Find:").pack(side='left')
+        filter_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=filter_var, width=26).pack(
+            side='left', padx=(6, 6))
+        ttk.Label(filter_row,
+                  text='e.g. "entry", "smoothing", "spike"',
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
+
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(side=tk.TOP, fill='both', expand=True, padx=8, pady=(0, 6))
+
+        def add_row(parent, key, label, hint, row_index):
+            """One parameter: label, editor, and a grey `key - hint` note."""
+            value = editable[key]
+            holder = ttk.Frame(parent)
+            holder.grid(row=row_index, column=0, sticky='ew', pady=1)
+            holder.grid_columnconfigure(2, weight=1)
+
+            ttk.Label(holder, text=label, width=42, anchor='w').grid(
+                row=0, column=0, sticky='w', padx=(2, 6))
+
             var = tk.StringVar(value=str(value))
-            entry = ttk.Entry(scrollable_frame, textvariable=var, width=30)
-            entry.grid(row=i, column=1, padx=10, pady=5)
+            if isinstance(value, bool):
+                editor = ttk.Combobox(holder, textvariable=var,
+                                      values=['True', 'False'], width=16,
+                                      state='readonly')
+            elif key in self.PARAM_CHOICES:
+                editor = ttk.Combobox(holder, textvariable=var,
+                                      values=self.PARAM_CHOICES[key], width=16)
+            else:
+                editor = ttk.Entry(holder, textvariable=var, width=18)
+            editor.grid(row=0, column=1, sticky='w')
+
+            note = key if not hint else f"{key}  -  {hint}"
+            ttk.Label(holder, text=note, foreground='gray',
+                      font=('Segoe UI', 8), anchor='w',
+                      wraplength=self.ui_px(330), justify='left').grid(
+                row=0, column=2, sticky='w', padx=(8, 2))
+
             entries[key] = var
-            i += 1
-        
+            return holder, f"{key} {label} {hint}".lower()
+
+        def build_tab(title, group_sections):
+            """A scrollable page of titled sections. Returns its outer frame."""
+            page = ttk.Frame(notebook)
+            notebook.add(page, text=title)
+
+            canvas = tk.Canvas(page, highlightthickness=0)
+            bar = ttk.Scrollbar(page, orient='vertical', command=canvas.yview)
+            inner = ttk.Frame(canvas)
+            inner.bind("<Configure>",
+                       lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+            canvas.bind("<Configure>",
+                        lambda e: canvas.itemconfigure(win_id, width=e.width),
+                        add='+')
+            canvas.configure(yscrollcommand=bar.set)
+            canvas.pack(side='left', fill='both', expand=True)
+            bar.pack(side='right', fill='y')
+            inner.grid_columnconfigure(0, weight=1)
+
+            page_rows = []
+            r = 0
+            for sec_title, sec_hint, keys in group_sections:
+                present = [(k, lbl, h) for k, lbl, h in keys if k in editable]
+                if not present:
+                    continue
+                box = ttk.LabelFrame(inner, text=sec_title, padding=6)
+                box.grid(row=r, column=0, sticky='ew', padx=6, pady=(4, 2))
+                box.grid_columnconfigure(0, weight=1)
+                r += 1
+                sr = 0
+                if sec_hint:
+                    ttk.Label(box, text=sec_hint, foreground='gray',
+                              font=('Segoe UI', 8), wraplength=self.ui_px(940),
+                              justify='left').grid(row=sr, column=0, sticky='w',
+                                                   padx=2, pady=(0, 4))
+                    sr += 1
+                sec_rows = []
+                for key, lbl, hint in present:
+                    holder, hay = add_row(box, key, lbl, hint, sr)
+                    sr += 1
+                    sec_rows.append((holder, hay))
+                    page_rows.append(hay)
+                sections.append((box, sec_rows))
+            tab_rows[page] = page_rows
+            return page
+
+        claimed = set()
+        for tab_title, group_sections in PARAM_GROUPS:
+            for _sec, _hint, keys in group_sections:
+                claimed.update(k for k, _l, _h in keys)
+            build_tab(tab_title, group_sections)
+
+        # Anything the table does not mention still gets an editor, so adding a
+        # parameter without touching PARAM_GROUPS costs discoverability, never
+        # access.
+        leftover = [(k, k.replace('_', ' ').capitalize(), "")
+                    for k in editable if k not in claimed]
+        if leftover:
+            build_tab("Other", [("Ungrouped parameters",
+                                 "Not yet filed under a stage above.", leftover)])
+
+        all_pages = list(notebook.tabs())
+
+        def apply_filter(*_):
+            needle = filter_var.get().strip().lower()
+            for box, sec_rows in sections:
+                any_visible = False
+                for holder, hay in sec_rows:
+                    if not needle or needle in hay:
+                        holder.grid()
+                        any_visible = True
+                    else:
+                        holder.grid_remove()
+                if any_visible:
+                    box.grid()
+                else:
+                    box.grid_remove()
+            # Hide tabs with nothing left, so the filter reads as an answer
+            # rather than as a set of empty pages to click through.
+            first_visible = None
+            for page_id in all_pages:
+                page = dialog.nametowidget(page_id)
+                hits = [h for h in tab_rows.get(page, []) if not needle or needle in h]
+                if hits:
+                    notebook.add(page)
+                    if first_visible is None:
+                        first_visible = page_id
+                else:
+                    notebook.hide(page)
+            if needle and first_visible is not None:
+                notebook.select(first_visible)
+
+        filter_var.trace_add('write', apply_filter)
+
         def save_params():
             try:
                 for key, var in entries.items():
@@ -16179,14 +17952,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # Strings (file naming patterns, method choices) and any
                         # None-valued parameter are stored verbatim.
                         self.params[key] = value_str
-                
+
                 self._sync_bout_window_frames()
                 self._sync_analysis_window_vars()
+                # update_param_labels() also refreshes the entry-threshold boxes
+                # on the Visualization and Behavioral Data tabs.
                 self.update_param_labels()
                 # Update UI elements that display parameters
                 self.time_bin_var.set(str(self.params['time_bin_size']))
                 self.spatial_bin_var.set(str(self.params['spatial_bin_size']))
-                
+
                 # Update file naming UI vars if they exist
                 if hasattr(self, 'fpdata_pattern_var'):
                     self.fpdata_pattern_var.set(self.params['fpdata_pattern'])
@@ -16196,7 +17971,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.timestamp_pattern_var.set(self.params['timestamp_pattern'])
                 if hasattr(self, 'timestamp_suffix_var'):
                     self.timestamp_suffix_var.set(self.params['timestamp_suffix'])
-                
+
                 # Update baseline correction UI vars
                 if hasattr(self, 'baseline_correct_bouts'):
                     self.baseline_correct_bouts.set(self.params['baseline_correct_bouts'])
@@ -16217,7 +17992,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.processing_savgol_window_var.set(str(self.params['processing_savgol_window_frames']))
                 if hasattr(self, 'processing_savgol_poly_var'):
                     self.processing_savgol_poly_var.set(str(self.params['processing_savgol_polyorder']))
-                
+
                 # Auto-save project to persist parameter changes. Only the
                 # settings files need rewriting — editing parameters here does
                 # not touch any processed subject array (the new values apply on
@@ -16231,20 +18006,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 dialog.destroy()
             except ValueError as e:
                 messagebox.showerror("Error", f"Please enter valid values.\nNumeric parameters must be numbers.\n\nError: {str(e)}")
-        
-        # Save sits outside the scrolling canvas and is packed first, so it is
-        # always visible instead of hiding below a screen-height parameter list.
-        save_row = ttk.Frame(dialog)
-        save_row.pack(side=tk.BOTTOM, fill='x')
+
+        # Save sits outside the notebook and is packed first, so it is always
+        # visible instead of hiding below a screen-height parameter list.
         ttk.Button(save_row, text="Save", command=save_params).pack(pady=12)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-    
+
     def update_param_labels(self):
         """Update parameter display labels"""
         for key, label in self.param_labels.items():
             label.config(text=str(self.params[key]))
+        # Every path that edits params ends here, so this is where the tab-level
+        # copies of the entry thresholds are brought back into line.
+        self._refresh_entry_threshold_controls()
     
     def sync_ui_to_params(self):
         """Sync UI variables to params dictionary before processing"""
@@ -20093,6 +21867,151 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return beh_synced
     
+    # ==================== Zone entry thresholds ====================
+    # "How long must the animal stay in a zone for it to count as an entry?" is
+    # asked of three different analyses, each with its own pair of parameters:
+    # EPM detection, OFT/Custom detection, and the Behavioral Data metrics
+    # table. Which pair is live depends on the maze type, so the choice lives
+    # here rather than being re-derived at each place that edits it.
+
+    ENTRY_THRESHOLD_DEFAULTS = {
+        'min_open_arm_duration': 2.0,
+        'min_time_between_entries': 3.0,
+        'oft_min_entry_duration': 0.5,
+        'oft_min_time_between_entries': 1.0,
+        'metrics_min_entry_duration': 0.5,
+        'metrics_min_refractory_sec': 1.0,
+    }
+
+    def entry_threshold_keys(self):
+        """The (min duration, min gap) parameter keys zone-entry detection reads
+        for the current maze type."""
+        if self.params.get('maze_type', 'EPM') in ('OFT', 'Custom Arena'):
+            return 'oft_min_entry_duration', 'oft_min_time_between_entries'
+        return 'min_open_arm_duration', 'min_time_between_entries'
+
+    def _entry_threshold_label(self):
+        """Which maze type's thresholds the Visualization boxes are editing."""
+        maze = self.params.get('maze_type', 'EPM')
+        return 'OFT / Custom Arena' if maze in ('OFT', 'Custom Arena') else 'EPM'
+
+    def _read_entry_threshold(self, var, key):
+        """Parse one threshold box, raising with a message fit for a dialog."""
+        try:
+            value = float(var.get())
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError(f"{key} must be a number of seconds.")
+        if value < 0:
+            raise ValueError(f"{key} cannot be negative.")
+        return value
+
+    def _refresh_entry_threshold_controls(self):
+        """Point the Visualization threshold boxes at whichever pair the current
+        maze type uses, and reload every tab-level copy from params.
+
+        Called whenever the maze type or the parameters can have changed, so the
+        boxes never show a value that nothing is reading.
+        """
+        dur_key, gap_key = self.entry_threshold_keys()
+        label = getattr(self, 'viz_entry_maze_label', None)
+        if label is not None:
+            try:
+                label.config(
+                    text=f"{self._entry_threshold_label()} thresholds "
+                         f"(maze type: {self.params.get('maze_type', 'EPM')})")
+            except tk.TclError:
+                return
+        for var_name, key in (('viz_entry_dur_var', dur_key),
+                              ('viz_entry_ref_var', gap_key),
+                              ('behav_entry_dur_var', 'metrics_min_entry_duration'),
+                              ('behav_entry_ref_var', 'metrics_min_refractory_sec')):
+            var = getattr(self, var_name, None)
+            if var is None:
+                continue
+            value = float(self.params.get(key, self.ENTRY_THRESHOLD_DEFAULTS[key]))
+            var.set(f"{value:g}")
+
+        # The Out/Back velocity threshold is reloaded from the same call sites,
+        # for the same reason: it is editable in two places at once.
+        outback_var = getattr(self, 'viz_outback_vel_var', None)
+        if outback_var is not None:
+            outback_var.set(f"{float(self.params.get('outback_velocity_threshold', 2.0)):g}")
+
+    def apply_viz_entry_thresholds(self):
+        """Save the Visualization threshold boxes and re-run entry detection.
+
+        Detection is cheap next to processing -- it walks the stored position
+        track -- so the thresholds can be tuned against the plot without a
+        reprocess, which is the whole point of having them on the tab.
+        """
+        dur_key, gap_key = self.entry_threshold_keys()
+        try:
+            duration = self._read_entry_threshold(self.viz_entry_dur_var, dur_key)
+            gap = self._read_entry_threshold(self.viz_entry_ref_var, gap_key)
+        except ValueError as exc:
+            messagebox.showerror("Invalid Value", str(exc))
+            return
+        self.params[dur_key] = duration
+        self.params[gap_key] = gap
+        self.update_param_labels()
+        n = self._recompute_zone_entries_all()
+        self.log_message(
+            f"Recomputed zone entries for {n} subject(s): {self._entry_threshold_label()} "
+            f"min time in zone {duration:g}s, min time between entries {gap:g}s")
+        if self.current_project:
+            self.save_project_config()
+        if n and self.current_viz_figure is not None:
+            self.generate_plot()
+        elif not n:
+            messagebox.showinfo(
+                "No Position Data",
+                "Thresholds saved, but no processed subject has position data "
+                "to re-run entry detection on.")
+
+    def apply_viz_outback_threshold(self):
+        """Save the Out/Back velocity threshold from the Visualization tab and
+        re-run Out/Back detection on the processed cohort.
+
+        Detection only re-walks the stored position track, so the threshold can
+        be tuned against the plot rather than forcing a full reprocess.
+        """
+        try:
+            threshold = float(self.viz_outback_vel_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror(
+                "Invalid Value",
+                "Out/Back minimum velocity must be a number in cm/s.")
+            return
+        if threshold < 0:
+            messagebox.showerror(
+                "Invalid Value",
+                "Out/Back minimum velocity cannot be negative.")
+            return
+
+        self.params['outback_velocity_threshold'] = threshold
+        self.update_param_labels()
+        self._refresh_entry_threshold_controls()
+        n = self._recompute_outback_all()
+        self.log_message(
+            f"Recomputed Out/Back movements for {n} subject(s): "
+            f"min velocity {threshold:g} cm/s")
+        if self.current_project:
+            self.save_project_config()
+        if n and self.current_viz_figure is not None:
+            self.generate_plot()
+        elif not n:
+            maze_type = self.params.get('maze_type', 'EPM')
+            if maze_type not in ('EPM', 'EPM_Complex'):
+                messagebox.showinfo(
+                    "Out/Back Not Applicable",
+                    f"Threshold saved, but Out/Back movements are only computed "
+                    f"for EPM mazes (current maze type: {maze_type}).")
+            else:
+                messagebox.showinfo(
+                    "No Position Data",
+                    "Threshold saved, but no processed subject has position data "
+                    "to re-run Out/Back detection on.")
+
     def detect_zone_entries(self, beh_synced, fps=None):
         """Detect zone entries using simple transition detection
         
@@ -20108,14 +22027,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             Dictionary with entry frame numbers for each zone type
         """
         fps = fps if fps is not None else self.get_fps()
-        # Use OFT-specific thresholds for OFT and Custom Arena; EPM thresholds for EPM/EPM_Complex
-        _maze_type_early = self.params.get('maze_type', 'EPM')
-        if _maze_type_early in ('OFT', 'Custom Arena'):
-            min_open_duration_sec = self.params.get('oft_min_entry_duration', 0.5)
-            min_time_between_sec = self.params.get('oft_min_time_between_entries', 1.0)
-        else:
-            min_open_duration_sec = self.params.get('min_open_arm_duration', 2.0)
-            min_time_between_sec = self.params.get('min_time_between_entries', 3.0)
+        # OFT-specific thresholds for OFT / Custom Arena, EPM thresholds for
+        # EPM / EPM_Complex -- see entry_threshold_keys(), which is also what
+        # the tab-level controls edit, so they cannot drift apart.
+        dur_key, gap_key = self.entry_threshold_keys()
+        min_open_duration_sec = self.params.get(dur_key, self.ENTRY_THRESHOLD_DEFAULTS[dur_key])
+        min_time_between_sec = self.params.get(gap_key, self.ENTRY_THRESHOLD_DEFAULTS[gap_key])
         
         min_open_duration_frames = int(min_open_duration_sec * fps)
         min_time_between_frames = int(min_time_between_sec * fps)
@@ -20978,6 +22895,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if excluded_count > 0:
                     self.log_message(f"Excluded {excluded_count} subject(s) based on behavioral data exclusion settings")
             
+            # The entry thresholds are read here, not cached at build time, so
+            # editing them and pressing Calculate is the whole workflow.
+            try:
+                self.params['metrics_min_entry_duration'] = self._read_entry_threshold(
+                    self.behav_entry_dur_var, 'metrics_min_entry_duration')
+                self.params['metrics_min_refractory_sec'] = self._read_entry_threshold(
+                    self.behav_entry_ref_var, 'metrics_min_refractory_sec')
+                self.update_param_labels()
+            except (AttributeError, ValueError) as exc:
+                messagebox.showerror("Invalid Value", str(exc))
+                return
+
             use_bins = self.use_time_bins.get()
             try:
                 bin_size = float(self.time_bin_var.get()) if use_bins else 0
@@ -27285,6 +29214,36 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.log_message(f"  Zone-entry recompute failed for {subject}: {exc}")
         return updated
 
+    def _recompute_outback_all(self):
+        """Re-run open-arm Out/Back detection for every processed subject that
+        has position data, using the current velocity threshold. Lets the
+        threshold be retuned from the Visualization tab without re-running the
+        whole processing pipeline.
+
+        Returns the number of subjects updated. Non-EPM maze types have no
+        Out/Back analysis, so they update nothing and return 0.
+        """
+        updated = 0
+        for subject, data in self.processed_data.items():
+            beh = data.get('beh_synced')
+            if beh is None or not data.get('has_position', False):
+                continue
+            try:
+                zones = []
+                for i in range(len(beh)):
+                    x, y = beh[i, 2], beh[i, 3]
+                    zones.append('unknown' if (np.isnan(x) or np.isnan(y))
+                                 else self.classify_zone(x, y))
+                outback = self.calculate_outback_movements(
+                    beh, zones, n_channels=self._beh_channel_count(data),
+                    fps=data.get('photometry_fps'))
+                if outback:
+                    data['outback'] = outback
+                    updated += 1
+            except Exception as exc:
+                self.log_message(f"  Out/Back recompute failed for {subject}: {exc}")
+        return updated
+
     def recalculate_position_analyses(self, subjects=None, progress=None):
         """Re-derive every position-dependent result from the stored position
         track, using the CURRENT zone definitions, maze width and calibration
@@ -27682,6 +29641,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.params['min_time_between_entries'] = float(epm_ref_var.get())
                 self.params['oft_min_entry_duration'] = float(oft_dur_var.get())
                 self.params['oft_min_time_between_entries'] = float(oft_ref_var.get())
+                self._refresh_entry_threshold_controls()
             except ValueError:
                 messagebox.showerror(
                     "Invalid Value",
@@ -29620,18 +31580,47 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message(f"Error exporting z-score traces: {str(e)}")
 
     def export_plot(self):
-        """Export current plot"""
+        """Save the current visualization figure at publication resolution.
+
+        The embedded figure carries a deliberately small on-screen dpi (see
+        _embed_plot_canvas); savefig's own dpi overrides it, so the file is
+        written at PLOT_EXPORT_DPI regardless of the plot-size setting. PDF and
+        SVG are true vector — the sharpest option for Prism or Illustrator,
+        since they never pixelate at any size.
+        """
         if not hasattr(self, 'current_viz_figure') or self.current_viz_figure is None:
             messagebox.showerror("Error", "No plot to export")
             return
-        
+
         filename = filedialog.asksaveasfilename(
             defaultextension=".png",
-            filetypes=[("PNG files", "*.png"), ("PDF files", "*.pdf"), ("SVG files", "*.svg")]
+            filetypes=[("PNG files (600 dpi)", "*.png"),
+                       ("TIFF files (600 dpi)", "*.tif"),
+                       ("PDF files (vector)", "*.pdf"),
+                       ("SVG files (vector)", "*.svg"),
+                       ("EPS files (vector)", "*.eps")]
         )
-        
-        if filename:
-            self.current_viz_figure.savefig(filename, dpi=300, bbox_inches='tight')
+
+        if not filename:
+            return
+
+        fig = self.current_viz_figure
+        try:
+            fig.savefig(filename, dpi=PLOT_EXPORT_DPI, bbox_inches='tight',
+                        facecolor='white')
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not save the plot:\n{e}")
+            self.log_message(f"Error exporting plot: {e}")
+            return
+
+        if filename.lower().endswith(('.pdf', '.svg', '.eps')):
+            self.log_message(f"Exported plot (vector) to {filename}")
+        else:
+            w_in, h_in = fig.get_size_inches()
+            self.log_message(
+                f"Exported plot to {filename} "
+                f"({int(w_in * PLOT_EXPORT_DPI)} x {int(h_in * PLOT_EXPORT_DPI)} px "
+                f"@ {PLOT_EXPORT_DPI} dpi)")
     
     def export_plot_data(self):
         """Export currently plotted data to CSV, respecting all selected options"""
@@ -29688,6 +31677,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         
         try:
+            # Compare Across Bouts exports the binned z-scored traces themselves,
+            # so it takes its own path rather than the per-wavelength session
+            # loop below (which has no notion of bout ordinal bins).
+            if "Compare Across Bouts" in plot_type:
+                self._export_bout_bin_traces(filename, valid_subjects, subject_to_group)
+                return
+
             # Get wavelength and channel selections
             show_470 = self.show_470.get()
             show_570 = self.show_570.get()
@@ -33514,561 +35510,440 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         fig.tight_layout()
     
+    # ── Compare Across Bouts: traces binned by bout ordinal ──────────────
+    # These plots used to draw every individual bout as its own line, so a
+    # cohort with a dozen bouts per subject came out as an unreadable pile.
+    # Bouts are binned by their ordinal instead ("every 3 bouts") and each bin
+    # is drawn as one mean ± SEM trace, which is also the shape the export
+    # writes out.
+
+    def _viz_bout_bin_size(self):
+        """Bouts per bin for Compare Across Bouts; 1 = one series per bout."""
+        try:
+            n = int(float(str(self.viz_bout_bin_var.get()).strip()))
+        except (AttributeError, TypeError, ValueError):
+            return 1
+        return max(1, n)
+
+    @staticmethod
+    def _bout_bin_label(bin_idx, bin_size):
+        """Human label for a bout-ordinal bin, e.g. 'Bouts #4-6'."""
+        lo = bin_idx * bin_size + 1
+        if bin_size == 1:
+            return f"Bout #{lo}"
+        return f"Bouts #{lo}–{lo + bin_size - 1}"
+
+    def _viz_selected_bout_number(self):
+        """The 'Show Bout #' selection as an int, or None when set to All."""
+        raw = str(self.bout_number_var.get()).strip()
+        if not raw or raw.lower() == 'all':
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    def _collect_bout_number_bins(self, subjects_by_slot, behavior, bin_size,
+                                  selected_bout=None):
+        """Group bout traces by channel slot and bout-ordinal bin.
+
+        ``subjects_by_slot`` maps a ``Ch{n}`` bout key to the subjects that may
+        contribute to it (already filtered for exclusions by the caller).
+        Returns ``{slot_key: {bin_idx: [(subject, bout_tag, trace), ...]}}``,
+        traces realigned to the current pre/post window.  When "Average
+        bouts/traces within subject" is on, each subject contributes one mean
+        trace per bin instead of its individual bouts.
+        """
+        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
+        average_within = bool(self.viz_average_within_subject.get())
+        collected = {}
+        for slot_key, subjects in subjects_by_slot.items():
+            if slot_key is None:
+                continue
+            per_bin = {}
+            for subject in subjects:
+                data = self.processed_data.get(subject)
+                if not data:
+                    continue
+                entry = data.get('bouts', {}).get(behavior)
+                if not entry:
+                    continue
+                subject_bins = {}
+                for bout_num, bout in enumerate(
+                        self._entry_channel_bouts(entry, slot_key, max_bouts), 1):
+                    if bout is None or len(bout) == 0:
+                        continue
+                    if selected_bout is not None and bout_num != selected_bout:
+                        continue
+                    trace = np.asarray(bout, dtype=float)
+                    if np.all(np.isnan(trace)):
+                        continue
+                    subject_bins.setdefault((bout_num - 1) // bin_size, []).append(
+                        (bout_num, trace))
+                for bin_idx, items in subject_bins.items():
+                    if average_within and len(items) > 1:
+                        mean_trace, _, _ = self._bout_bin_mean_sem(
+                            [t for _, t in items])
+                        first, last = items[0][0], items[-1][0]
+                        tag = f"{first}-{last}avg" if first != last else f"{first}avg"
+                        per_bin.setdefault(bin_idx, []).append(
+                            (subject, tag, mean_trace))
+                    else:
+                        for bout_num, trace in items:
+                            per_bin.setdefault(bin_idx, []).append(
+                                (subject, str(bout_num), trace))
+            if per_bin:
+                collected[slot_key] = per_bin
+        return collected
+
+    @staticmethod
+    def _bout_bin_mean_sem(traces):
+        """Mean, SEM and per-sample n over a ragged list of 1-D traces."""
+        max_len = max(len(t) for t in traces)
+        padded = np.full((len(traces), max_len), np.nan)
+        for i, t in enumerate(traces):
+            padded[i, :len(t)] = t
+        with np.errstate(invalid='ignore'):
+            mean = np.nanmean(padded, axis=0)
+            n_valid = np.sum(~np.isnan(padded), axis=0)
+            sem = np.nanstd(padded, axis=0) / np.sqrt(np.maximum(n_valid, 1))
+        sem[n_valid < 2] = 0.0
+        return mean, sem, n_valid
+
+    @staticmethod
+    def _bout_bin_shade(base_color, frac):
+        """A lighter-to-full shade of *base_color*; frac 0 = lightest."""
+        r, g, b = mcolors.to_rgb(base_color)
+        t = 0.6 * (1.0 - float(frac))
+        return (r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t)
+
+    def _draw_bout_bin_axis(self, ax, per_bin, bin_size, fps, prebout, all_bins,
+                            base_color=None, series_label=None, linestyle='-'):
+        """Draw one mean ± SEM trace per bout bin onto *ax*.
+
+        ``all_bins`` is the bin order shared by every panel so a bin keeps the
+        same colour throughout the figure.  ``base_color`` shades the bins of a
+        single group; without one the bins run along viridis.
+        """
+        mean_width, trace_width, trace_alpha = self.get_trace_styling()
+        try:
+            show_individual = bool(self.viz_bout_bin_individual.get())
+        except AttributeError:
+            show_individual = False
+        n_bins = max(len(all_bins), 1)
+        drawn = 0
+        for pos, bin_idx in enumerate(all_bins):
+            items = per_bin.get(bin_idx)
+            if not items:
+                continue
+            frac = pos / max(n_bins - 1, 1)
+            if base_color is None:
+                color = plt.cm.viridis(frac if n_bins > 1 else 0.35)
+            else:
+                color = self._bout_bin_shade(base_color, frac)
+            traces = [t for _, _, t in items]
+            mean, sem, _ = self._bout_bin_mean_sem(traces)
+            time_axis = (np.arange(len(mean)) - prebout) / fps
+            if show_individual:
+                for trace in traces:
+                    ax.plot(time_axis[:len(trace)], trace, color=color,
+                            alpha=trace_alpha, linewidth=trace_width, zorder=1)
+            label = self._bout_bin_label(bin_idx, bin_size)
+            if series_label:
+                label = f"{series_label} — {label}"
+            ax.plot(time_axis, mean, color=color, linewidth=mean_width,
+                    linestyle=linestyle, label=f"{label} (n={len(traces)})", zorder=3)
+            ax.fill_between(time_axis, mean - sem, mean + sem, color=color,
+                            alpha=0.18, zorder=2)
+            drawn += 1
+        return drawn
+
+    def _render_bout_comparison(self, fig, series, slot_defs, behavior, fps,
+                                bin_size, subtitle):
+        """Lay out the Compare Across Bouts figure: one panel per channel slot.
+
+        ``series`` is an ordered list of ``(label_or_None, base_color_or_None,
+        collected)`` where ``collected`` is a ``_collect_bout_number_bins``
+        result -- one entry per group, or a single pooled entry.
+        """
+        prebout = self.params.get('preboutframes', 90)
+        active_slots = [(key, label) for key, label in slot_defs
+                        if key is not None and any(key in c for _, _, c in series)]
+        if not active_slots:
+            fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
+                     ha='center', va='center', fontsize=14)
+            return
+        all_bins = sorted({b for _, _, collected in series
+                           for per_slot in collected.values()
+                           for b in per_slot})
+        line_styles = ['-', '--', '-.', ':']
+        for panel_idx, (slot_key, slot_label) in enumerate(active_slots, 1):
+            ax = fig.add_subplot(len(active_slots), 1, panel_idx)
+            total = 0
+            for s_idx, (series_label, base_color, collected) in enumerate(series):
+                per_bin = collected.get(slot_key)
+                if not per_bin:
+                    continue
+                total += sum(len(v) for v in per_bin.values())
+                self._draw_bout_bin_axis(
+                    ax, per_bin, bin_size, fps, prebout, all_bins,
+                    base_color=base_color, series_label=series_label,
+                    linestyle=(line_styles[s_idx % len(line_styles)]
+                               if len(series) > 1 else '-'))
+            self.draw_zero_line(ax)
+            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+            ax.set_xlabel('Time from bout onset (s)')
+            ax.set_ylabel(f'{slot_label} Z-score')
+            ax.set_title(f'{slot_label}: {behavior}\n{subtitle} ({total} bouts)',
+                         fontsize=10)
+            ax.grid(True, alpha=0.3)
+            handles, _ = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(loc='best', fontsize=7,
+                          ncol=2 if len(handles) > 6 else 1,
+                          title='Bout bin' if len(series) == 1 else None)
+        fig.tight_layout()
+
+    def _bout_comparison_subtitle(self, bin_size, selected_bout, n_subjects):
+        """One-line description of what the panels show."""
+        subj = f"{n_subjects} subject{'s' if n_subjects != 1 else ''}"
+        if selected_bout is not None:
+            return f'Bout #{selected_bout} only, mean ± SEM over {subj}'
+        if bin_size > 1:
+            return f'Mean ± SEM per {bin_size}-bout bin, {subj}'
+        return f'Mean ± SEM per bout number, {subj}'
+
+    def _bout_comparison_slot_subjects(self, subjects, slot_defs):
+        """Map each channel slot to the subjects allowed to contribute to it."""
+        by_slot = {}
+        for key, _label in slot_defs:
+            if key is None:
+                continue
+            by_slot[key] = (self.included_subjects_for_slot_key(subjects, key)
+                            if self.use_exclusions_viz.get() else list(subjects))
+        return by_slot
+
     def plot_bout_comparison_single(self, fig, data, subject):
-        """Compare data across individual bouts for a single subject (grouped by bout number)"""
+        """Compare bout traces for one subject, binned by bout number."""
         behavior = self.behavior_var.get()
         if not behavior:
             fig.text(0.5, 0.5, 'Please select a behavior',
-                    ha='center', va='center', fontsize=14)
+                     ha='center', va='center', fontsize=14)
             return
-        
         if 'bouts' not in data or behavior not in data['bouts']:
             fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
-                    ha='center', va='center', fontsize=14)
+                     ha='center', va='center', fontsize=14)
             return
-        
-        bout_data = data['bouts'][behavior]
 
-        # Resolve the two plot slots from the channel checkboxes so the selected
-        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
-        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots([subject], max_slots=2)
-
-        # Apply exclusions if enabled
-        show_g0 = key_a is not None
-        show_g1 = key_b is not None
-        if self.use_exclusions_viz.get():
-            if show_g0:
-                show_g0 = not self.is_channel_slot_excluded(subject, self.channel_slot_index(key_a))
-            if show_g1:
-                show_g1 = not self.is_channel_slot_excluded(subject, self.channel_slot_index(key_b))
-
-        # Realign to current window so the onset marker matches the traces even
-        # if pre/post changed since extraction.
-        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-        bouts_g0 = self._entry_channel_bouts(bout_data, key_a, max_bouts) if show_g0 else []
-        bouts_g1 = self._entry_channel_bouts(bout_data, key_b, max_bouts) if show_g1 else []
-
-        # Filter by selected bout number if not "All"
-        selected_bout = self.bout_number_var.get()
-        if selected_bout != "All":
-            try:
-                bout_idx = int(selected_bout) - 1  # Convert to 0-indexed
-                if bout_idx < len(bouts_g0):
-                    bouts_g0 = [bouts_g0[bout_idx]]
-                else:
-                    bouts_g0 = []
-                if bout_idx < len(bouts_g1):
-                    bouts_g1 = [bouts_g1[bout_idx]]
-                else:
-                    bouts_g1 = []
-            except (ValueError, IndexError):
-                pass
-        
-        if not bouts_g0 and not bouts_g1:
-            fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
-                    ha='center', va='center', fontsize=14)
+        slot_defs = self._viz_bout_channel_slots([subject], max_slots=2)
+        bin_size = self._viz_bout_bin_size()
+        selected_bout = self._viz_selected_bout_number()
+        by_slot = self._bout_comparison_slot_subjects([subject], slot_defs)
+        collected = self._collect_bout_number_bins(by_slot, behavior, bin_size,
+                                                   selected_bout)
+        if not collected:
+            msg = (f'No bout #{selected_bout} data for behavior: {behavior}'
+                   if selected_bout is not None
+                   else f'No bout data for behavior: {behavior}')
+            fig.text(0.5, 0.5, msg, ha='center', va='center', fontsize=14)
             return
-        
-        fps = self.get_fps(data)
-        current_prebout = self.params['preboutframes']
-        current_postbout = self.params['postboutframes']
-        
-        # Infer actual prebout from bout length (since bouts may have been extracted with different params)
-        all_bout_lengths = [len(b) for b in bouts_g0] + [len(b) for b in bouts_g1]
-        if all_bout_lengths:
-            typical_length = int(np.median(all_bout_lengths))
-            # Estimate prebout - use current setting but adjust if bout length doesn't match
-            estimated_prebout = current_prebout
-            estimated_postbout = typical_length - current_prebout
-            if abs(estimated_postbout - current_postbout) > 30:  # More than 1 second different
-                estimated_postbout = typical_length - current_prebout
-                # Log warning about mismatch
-                self.log_message(f"Info: Bout window mismatch detected for {subject}")
-                self.log_message(f"  Current params: {current_prebout} pre, {current_postbout} post (total: {current_prebout + current_postbout})")
-                self.log_message(f"  Bout length: {typical_length} frames (implies {estimated_postbout} post)")
+        if selected_bout is not None:
+            detail = f'Bout #{selected_bout} only'
+        elif bin_size > 1:
+            detail = f'Mean ± SEM per {bin_size}-bout bin'
         else:
-            estimated_prebout = current_prebout
-        
-        # Determine layout based on what data exists
-        if bouts_g0 and bouts_g1:
-            ax1 = fig.add_subplot(211)
-            ax2 = fig.add_subplot(212)
-        elif bouts_g0:
-            ax1 = fig.add_subplot(111)
-        elif bouts_g1:
-            ax2 = fig.add_subplot(111)
-        
-        # Plot G0 comparison - each bout number gets its own color
-        if bouts_g0:
-            max_len = max(len(b) for b in bouts_g0)
-            # Use estimated prebout based on actual bout length
-            actual_prebout = min(estimated_prebout, max_len - 1)
-            time_axis = (np.arange(max_len) - actual_prebout) / fps
-            
-            if selected_bout == "All":
-                # Use a colormap to distinguish bout numbers
-                colors = plt.cm.viridis(np.linspace(0, 1, len(bouts_g0)))
-                
-                for bout_num, (bout, color) in enumerate(zip(bouts_g0, colors), 1):
-                    padded = np.full(max_len, np.nan)
-                    padded[:len(bout)] = bout
-                    ax1.plot(time_axis, padded, color=color, alpha=0.8, linewidth=2.0, 
-                            label=f'Bout #{bout_num}')
-                
-                title = f'{label_a}: {subject} - {behavior}\n(Comparing Bout Order: n={len(bouts_g0)} bouts)'
-                if len(bouts_g0) <= 15:
-                    ax1.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
-            else:
-                # Single bout - use solid color
-                bout = bouts_g0[0]
-                padded = np.full(max_len, np.nan)
-                padded[:len(bout)] = bout
-                ax1.plot(time_axis, padded, color='blue', alpha=0.8, linewidth=2.0,
-                        label=f'Bout #{selected_bout}')
-                title = f'{label_a}: {subject} - {behavior}\n(Bout #{selected_bout} only)'
-                ax1.legend(loc='best', fontsize=8)
+            detail = 'One trace per bout'
+        self._render_bout_comparison(fig, [(None, None, collected)], slot_defs,
+                                     behavior, self.get_fps(data), bin_size,
+                                     f'{subject} — {detail}')
 
-            self.draw_zero_line(ax1)
-            ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel(f'{label_a} Z-score')
-            ax1.set_title(title)
-            ax1.grid(True, alpha=0.3)
-        
-        # Plot G1 comparison - each bout number gets its own color
-        if bouts_g1:
-            max_len = max(len(b) for b in bouts_g1)
-            # Use estimated prebout based on actual bout length
-            actual_prebout = min(estimated_prebout, max_len - 1)
-            time_axis = (np.arange(max_len) - actual_prebout) / fps
-            
-            if selected_bout == "All":
-                # Use a colormap to distinguish bout numbers
-                colors = plt.cm.plasma(np.linspace(0, 1, len(bouts_g1)))
-                
-                for bout_num, (bout, color) in enumerate(zip(bouts_g1, colors), 1):
-                    padded = np.full(max_len, np.nan)
-                    padded[:len(bout)] = bout
-                    ax2.plot(time_axis, padded, color=color, alpha=0.8, linewidth=2.0, 
-                            label=f'Bout #{bout_num}')
-                
-                title = f'{label_b}: {subject} - {behavior}\n(Comparing Bout Order: n={len(bouts_g1)} bouts)'
-                if len(bouts_g1) <= 15:
-                    ax2.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
-            else:
-                # Single bout - use solid color
-                bout = bouts_g1[0]
-                padded = np.full(max_len, np.nan)
-                padded[:len(bout)] = bout
-                ax2.plot(time_axis, padded, color='green', alpha=0.8, linewidth=2.0,
-                        label=f'Bout #{selected_bout}')
-                title = f'{label_b}: {subject} - {behavior}\n(Bout #{selected_bout} only)'
-                ax2.legend(loc='best', fontsize=8)
-
-            self.draw_zero_line(ax2)
-            ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel(f'{label_b} Z-score')
-            ax2.set_title(title)
-            ax2.grid(True, alpha=0.3)
-        
-        fig.tight_layout()
-    
     def plot_bout_comparison_multi(self, fig, subjects):
-        """Compare data across bouts for multiple subjects (grouped by bout number)"""
+        """Compare bout traces pooled across subjects, binned by bout number."""
         behavior = self.behavior_var.get()
         if not behavior:
             fig.text(0.5, 0.5, 'Please select a behavior',
-                    ha='center', va='center', fontsize=14)
+                     ha='center', va='center', fontsize=14)
             return
-        
-        # Resolve the two plot slots from the channel checkboxes so the selected
-        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
-        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(subjects, max_slots=2)
 
-        # Apply exclusions if enabled
-        subjects_for_g0 = subjects
-        subjects_for_g1 = subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
-            subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
-
-        # Collect bouts from all subjects organized by bout number
-        g0_bouts_by_number = {}  # {bout_num: [traces]}
-        g1_bouts_by_number = {}
-
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'bouts' in data and behavior in data['bouts']:
-                bout_data = data['bouts'][behavior]
-
-                # Check if subject is excluded for each channel.  Realign to the
-                # current window so bouts pooled by number across subjects share a
-                # common onset even when extracted with different pre/post.
-                max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                if key_a is not None and subject in subjects_for_g0 and bout_data.get(key_a):
-                    bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
-                    for bout_num, bout in enumerate(bouts, 1):
-                        if bout_num not in g0_bouts_by_number:
-                            g0_bouts_by_number[bout_num] = []
-                        g0_bouts_by_number[bout_num].append(bout)
-
-                if key_b is not None and subject in subjects_for_g1 and bout_data.get(key_b):
-                    bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
-                    for bout_num, bout in enumerate(bouts, 1):
-                        if bout_num not in g1_bouts_by_number:
-                            g1_bouts_by_number[bout_num] = []
-                        g1_bouts_by_number[bout_num].append(bout)
-        
-        if not g0_bouts_by_number and not g1_bouts_by_number:
-            fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
-                    ha='center', va='center', fontsize=14)
+        slot_defs = self._viz_bout_channel_slots(subjects, max_slots=2)
+        bin_size = self._viz_bout_bin_size()
+        selected_bout = self._viz_selected_bout_number()
+        by_slot = self._bout_comparison_slot_subjects(subjects, slot_defs)
+        collected = self._collect_bout_number_bins(by_slot, behavior, bin_size,
+                                                   selected_bout)
+        if not collected:
+            msg = (f'No bout #{selected_bout} data for behavior: {behavior}'
+                   if selected_bout is not None
+                   else f'No bout data for behavior: {behavior}')
+            fig.text(0.5, 0.5, msg, ha='center', va='center', fontsize=14)
             return
-        
-        # Filter by selected bout number
-        selected_bout = self.bout_number_var.get()
-        if selected_bout != "All":
-            try:
-                bout_idx = int(selected_bout)
-            except (TypeError, ValueError):
-                fig.text(0.5, 0.5, 'Invalid bout selection. Choose "All" or a valid bout number.',
-                        ha='center', va='center', fontsize=12)
-                return
-            # Keep only the selected bout number
-            if bout_idx in g0_bouts_by_number:
-                g0_bouts_by_number = {bout_idx: g0_bouts_by_number[bout_idx]}
-            else:
-                g0_bouts_by_number = {}
-            
-            if bout_idx in g1_bouts_by_number:
-                g1_bouts_by_number = {bout_idx: g1_bouts_by_number[bout_idx]}
-            else:
-                g1_bouts_by_number = {}
-            
-            # Check if any data remains after filtering
-            if not g0_bouts_by_number and not g1_bouts_by_number:
-                fig.text(0.5, 0.5, f'No bout #{bout_idx} data for behavior: {behavior}',
-                        ha='center', va='center', fontsize=14)
-                return
-        
-        fps = self.get_fps()
-        prebout = self.params['preboutframes']
-        
-        # Determine layout
-        if g0_bouts_by_number and g1_bouts_by_number:
-            ax1 = fig.add_subplot(211)
-            ax2 = fig.add_subplot(212)
-        elif g0_bouts_by_number:
-            ax1 = fig.add_subplot(111)
-        elif g1_bouts_by_number:
-            ax2 = fig.add_subplot(111)
-        
-        # Plot G0 comparison - group by bout number
-        if g0_bouts_by_number:
-            max_bout_num = max(g0_bouts_by_number.keys())
-            all_bouts = [bout for bouts in g0_bouts_by_number.values() for bout in bouts]
-            max_len = max(len(bout) for bout in all_bouts)
-            time_axis = (np.arange(max_len) - prebout) / fps
-            
-            # Choose colors based on whether we're showing all bouts or specific bout
-            if selected_bout == "All":
-                # Use colormap for bout numbers
-                colors = plt.cm.viridis(np.linspace(0, 1, max_bout_num))
-            else:
-                # Single color for specific bout
-                colors = {max_bout_num: 'blue'}
-            
-            for bout_num in sorted(g0_bouts_by_number.keys()):
-                bouts = g0_bouts_by_number[bout_num]
-                if selected_bout == "All":
-                    color = colors[bout_num - 1]
-                else:
-                    color = colors[max_bout_num]
-                
-                for i, bout in enumerate(bouts):
-                    padded = np.full(max_len, np.nan)
-                    padded[:len(bout)] = bout
-                    # Only add label for first instance of this bout number
-                    label = f'Bout #{bout_num} (n={len(bouts)})' if i == 0 else None
-                    ax1.plot(time_axis, padded, color=color, alpha=0.6, linewidth=1.2, label=label)
-            
-            self.draw_zero_line(ax1)
-            ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel(f'{label_a} Z-score')
-            total_bouts = sum(len(bouts) for bouts in g0_bouts_by_number.values())
-            if selected_bout == "All":
-                ax1.set_title(f'{label_a}: {behavior}\nComparing by Bout Order ({len(subjects)} subjects, {total_bouts} total bouts)')
-            else:
-                ax1.set_title(f'{label_a}: {behavior}\nBout #{selected_bout} only ({len(subjects)} subjects, {total_bouts} total bouts)')
-            if max_bout_num <= 15 or selected_bout != "All":
-                ax1.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
-            ax1.grid(True, alpha=0.3)
-        
-        # Plot G1 comparison - group by bout number
-        if g1_bouts_by_number:
-            max_bout_num = max(g1_bouts_by_number.keys())
-            all_bouts = [bout for bouts in g1_bouts_by_number.values() for bout in bouts]
-            max_len = max(len(bout) for bout in all_bouts)
-            time_axis = (np.arange(max_len) - prebout) / fps
-            
-            # Choose colors based on whether we're showing all bouts or specific bout
-            if selected_bout == "All":
-                # Use colormap for bout numbers
-                colors = plt.cm.plasma(np.linspace(0, 1, max_bout_num))
-            else:
-                # Single color for specific bout
-                colors = {max_bout_num: 'green'}
-            
-            for bout_num in sorted(g1_bouts_by_number.keys()):
-                bouts = g1_bouts_by_number[bout_num]
-                if selected_bout == "All":
-                    color = colors[bout_num - 1]
-                else:
-                    color = colors[max_bout_num]
-                
-                for i, bout in enumerate(bouts):
-                    padded = np.full(max_len, np.nan)
-                    padded[:len(bout)] = bout
-                    # Only add label for first instance of this bout number
-                    label = f'Bout #{bout_num} (n={len(bouts)})' if i == 0 else None
-                    ax2.plot(time_axis, padded, color=color, alpha=0.6, linewidth=1.2, label=label)
-            
-            self.draw_zero_line(ax2)
-            ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel(f'{label_b} Z-score')
-            total_bouts = sum(len(bouts) for bouts in g1_bouts_by_number.values())
-            if selected_bout == "All":
-                ax2.set_title(f'{label_b}: {behavior}\nComparing by Bout Order ({len(subjects)} subjects, {total_bouts} total bouts)')
-            else:
-                ax2.set_title(f'{label_b}: {behavior}\nBout #{selected_bout} only ({len(subjects)} subjects, {total_bouts} total bouts)')
-            if max_bout_num <= 15 or selected_bout != "All":
-                ax2.legend(loc='best', fontsize=8, ncol=2, title='Bout Number')
-            ax2.grid(True, alpha=0.3)
-        
-        fig.tight_layout()
-    
+        subtitle = self._bout_comparison_subtitle(bin_size, selected_bout, len(subjects))
+        self._render_bout_comparison(fig, [(None, None, collected)], slot_defs,
+                                     behavior, self.get_fps(), bin_size, subtitle)
+
     def plot_bout_comparison_by_group(self, fig, selected_groups):
-        """Compare data across bouts by group (grouped by bout number within each group)"""
+        """Compare bout traces per group, binned by bout number."""
         behavior = self.behavior_var.get()
         if not behavior:
             fig.text(0.5, 0.5, 'Please select a behavior',
-                    ha='center', va='center', fontsize=14)
+                     ha='center', va='center', fontsize=14)
             return
-        
-        # Collect subjects from selected groups
+
         all_subjects = []
         for group_name in selected_groups:
-            all_subjects.extend(self._series_members(group_name))
-        
-        # Remove duplicates
-        all_subjects = list(set(all_subjects))
-        
+            for s in self._series_members(group_name):
+                if s not in all_subjects:
+                    all_subjects.append(s)
         if not all_subjects:
             fig.text(0.5, 0.5, 'Selected groups have no members',
-                    ha='center', va='center', fontsize=14)
+                     ha='center', va='center', fontsize=14)
             return
-        
-        # Resolve the two plot slots from the channel checkboxes so the selected
-        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
-        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(all_subjects, max_slots=2)
 
-        # Apply exclusions if enabled
-        subjects_for_g0 = all_subjects
-        subjects_for_g1 = all_subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.included_subjects_for_slot_key(all_subjects, key_a)
-            subjects_for_g1 = self.included_subjects_for_slot_key(all_subjects, key_b)
-        
-        # Collect bouts organized by group and bout number: {group: {bout_num: [traces]}}
-        g0_data_by_group = {group: {} for group in selected_groups}
-        g1_data_by_group = {group: {} for group in selected_groups}
-        
-        for group_name in selected_groups:
-            group_subjects = self._series_members(group_name)
-            
-            for subject in group_subjects:
-                if subject not in self.processed_data:
-                    continue
-                
-                data = self.processed_data[subject]
-                if 'bouts' in data and behavior in data['bouts']:
-                    bout_data = data['bouts'][behavior]
-                    
-                    # Check if subject is excluded for each channel.  Realign to
-                    # the current window so bouts pooled by number across groups
-                    # share a common onset regardless of extraction pre/post.
-                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    if key_a is not None and subject in subjects_for_g0 and bout_data.get(key_a):
-                        bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
-                        for bout_num, bout in enumerate(bouts, 1):
-                            if bout_num not in g0_data_by_group[group_name]:
-                                g0_data_by_group[group_name][bout_num] = []
-                            g0_data_by_group[group_name][bout_num].append(bout)
+        slot_defs = self._viz_bout_channel_slots(all_subjects, max_slots=2)
+        bin_size = self._viz_bout_bin_size()
+        selected_bout = self._viz_selected_bout_number()
 
-                    if key_b is not None and subject in subjects_for_g1 and bout_data.get(key_b):
-                        bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
-                        for bout_num, bout in enumerate(bouts, 1):
-                            if bout_num not in g1_data_by_group[group_name]:
-                                g1_data_by_group[group_name][bout_num] = []
-                            g1_data_by_group[group_name][bout_num].append(bout)
-        
-        # Check if we have any data
-        has_g0 = any(len(bout_dict) > 0 for bout_dict in g0_data_by_group.values())
-        has_g1 = any(len(bout_dict) > 0 for bout_dict in g1_data_by_group.values())
-        
-        if not has_g0 and not has_g1:
-            fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
-                    ha='center', va='center', fontsize=14)
-            return
-        
-        # Filter by selected bout number
-        selected_bout = self.bout_number_var.get()
-        if selected_bout != "All":
-            try:
-                bout_idx = int(selected_bout)
-            except (TypeError, ValueError):
-                fig.text(0.5, 0.5, 'Invalid bout selection. Choose "All" or a valid bout number.',
-                        ha='center', va='center', fontsize=12)
-                return
-            # Keep only the selected bout number for each group
-            for group_name in selected_groups:
-                if bout_idx in g0_data_by_group[group_name]:
-                    g0_data_by_group[group_name] = {bout_idx: g0_data_by_group[group_name][bout_idx]}
-                else:
-                    g0_data_by_group[group_name] = {}
-                
-                if bout_idx in g1_data_by_group[group_name]:
-                    g1_data_by_group[group_name] = {bout_idx: g1_data_by_group[group_name][bout_idx]}
-                else:
-                    g1_data_by_group[group_name] = {}
-            
-            # Recheck if we have data after filtering
-            has_g0 = any(len(bout_dict) > 0 for bout_dict in g0_data_by_group.values())
-            has_g1 = any(len(bout_dict) > 0 for bout_dict in g1_data_by_group.values())
-            
-            if not has_g0 and not has_g1:
-                fig.text(0.5, 0.5, f'No bout #{bout_idx} data for behavior: {behavior}',
-                        ha='center', va='center', fontsize=14)
-                return
-        
-        fps = self.get_fps()
-        prebout = self.params['preboutframes']
-        
-        # Create group-specific base colors
-        group_base_colors = {}
         cmap_groups = plt.cm.Set1 if len(selected_groups) <= 9 else plt.cm.tab10
-        for i, group in enumerate(selected_groups):
-            group_base_colors[group] = cmap_groups(i % (9 if len(selected_groups) <= 9 else 10))
-        
-        # Determine layout
-        if has_g0 and has_g1:
-            ax1 = fig.add_subplot(211)
-            ax2 = fig.add_subplot(212)
-        elif has_g0:
-            ax1 = fig.add_subplot(111)
-        elif has_g1:
-            ax2 = fig.add_subplot(111)
-        
-        # Plot G0 comparison - by bout number within groups
-        if has_g0:
-            # Find max bout number across all groups
-            max_bout_num = max([max(bout_dict.keys()) if bout_dict else 0 
-                               for bout_dict in g0_data_by_group.values()])
-            
-            # Get max trace length
-            all_bouts = [bout for bout_dict in g0_data_by_group.values() 
-                        for bouts in bout_dict.values() for bout in bouts]
-            max_len = max(len(bout) for bout in all_bouts) if all_bouts else 0
+        n_colors = 9 if len(selected_groups) <= 9 else 10
+        series = []
+        for g_idx, group_name in enumerate(selected_groups):
+            members = [s for s in self._series_members(group_name)
+                       if s in self.processed_data]
+            by_slot = self._bout_comparison_slot_subjects(members, slot_defs)
+            collected = self._collect_bout_number_bins(by_slot, behavior, bin_size,
+                                                       selected_bout)
+            if collected:
+                series.append((group_name, cmap_groups(g_idx % n_colors), collected))
+
+        if not series:
+            msg = (f'No bout #{selected_bout} data for behavior: {behavior}'
+                   if selected_bout is not None
+                   else f'No bout data for behavior: {behavior}')
+            fig.text(0.5, 0.5, msg, ha='center', va='center', fontsize=14)
+            return
+        subtitle = self._bout_comparison_subtitle(bin_size, selected_bout,
+                                                  len(all_subjects))
+        self._render_bout_comparison(fig, series, slot_defs, behavior,
+                                     self.get_fps(), bin_size, subtitle)
+
+    def _export_bout_bin_traces(self, filename, subjects, subject_to_group):
+        """Write the z-scored bout traces behind Compare Across Bouts.
+
+        Per channel: one summary CSV of mean/SEM/n per series x bout bin, and a
+        companion CSV holding every contributing bout trace.  Binning matches
+        the plot exactly -- both go through _collect_bout_number_bins.
+        """
+        behavior = self.behavior_var.get()
+        if not behavior:
+            messagebox.showerror("Error", "Please select a behavior to export.")
+            return
+        bin_size = self._viz_bout_bin_size()
+        selected_bout = self._viz_selected_bout_number()
+        slot_defs = self._viz_bout_channel_slots(subjects, max_slots=2)
+
+        if subject_to_group:
+            groups = []
+            for s in subjects:
+                g = subject_to_group.get(s, 'Unknown')
+                if g not in groups:
+                    groups.append(g)
+            series = [(g, [s for s in subjects
+                           if subject_to_group.get(s, 'Unknown') == g])
+                      for g in groups]
+        else:
+            series = [('All', list(subjects))]
+
+        collected_by_series = []
+        for series_name, members in series:
+            by_slot = self._bout_comparison_slot_subjects(members, slot_defs)
+            collected = self._collect_bout_number_bins(by_slot, behavior, bin_size,
+                                                       selected_bout)
+            if collected:
+                collected_by_series.append((series_name, collected))
+
+        if not collected_by_series:
+            messagebox.showerror(
+                "Error", f"No bout data to export for behavior '{behavior}'.")
+            return
+
+        fps = self.get_fps()
+        prebout = self.params.get('preboutframes', 90)
+        all_bins = sorted({b for _, collected in collected_by_series
+                           for per_slot in collected.values() for b in per_slot})
+
+        def _safe(text):
+            return re.sub(r'[^A-Za-z0-9._-]+', '_', str(text)).strip('_') or 'x'
+
+        base = filename.rsplit('.', 1)[0]
+        metadata = self._create_export_metadata('plot')
+        metadata['Behavior'] = behavior
+        metadata['Bouts per bin'] = bin_size
+        metadata['Show Bout #'] = self.bout_number_var.get()
+        exported = []
+
+        for slot_key, slot_label in slot_defs:
+            if slot_key is None:
+                continue
+            panels = [(name, collected[slot_key])
+                      for name, collected in collected_by_series
+                      if slot_key in collected]
+            if not panels:
+                continue
+
+            max_len = max(len(t) for _, per_bin in panels
+                          for items in per_bin.values() for _, _, t in items)
             time_axis = (np.arange(max_len) - prebout) / fps
-            
-            # Use different line styles for bout numbers
-            line_styles = ['-', '--', '-.', ':']
-            
-            for group_name in selected_groups:
-                bout_dict = g0_data_by_group[group_name]
-                if not bout_dict:
-                    continue
-                
-                base_color = group_base_colors[group_name]
-                
-                for bout_num in sorted(bout_dict.keys()):
-                    bouts = bout_dict[bout_num]
-                    # Vary line style by bout number
-                    line_style = line_styles[(bout_num - 1) % len(line_styles)]
-                    
-                    for i, bout in enumerate(bouts):
+
+            summary = {'time_from_onset_s': time_axis}
+            traces_out = {'time_from_onset_s': time_axis}
+            n_traces = 0
+            for series_name, per_bin in panels:
+                for bin_idx in all_bins:
+                    items = per_bin.get(bin_idx)
+                    if not items:
+                        continue
+                    bin_tag = _safe(self._bout_bin_label(bin_idx, bin_size)
+                                    .replace('#', '').replace('–', '-'))
+                    prefix = f"{_safe(series_name)}_{bin_tag}"
+                    mean, sem, n_valid = self._bout_bin_mean_sem(
+                        [t for _, _, t in items])
+                    for name, arr in (('mean', mean), ('sem', sem),
+                                      ('n', n_valid.astype(float))):
                         padded = np.full(max_len, np.nan)
-                        padded[:len(bout)] = bout
-                        # Only add label for first instance
-                        label = f'{group_name} Bout #{bout_num} (n={len(bouts)})' if i == 0 else None
-                        ax1.plot(time_axis, padded, color=base_color, linestyle=line_style,
-                               alpha=0.6, linewidth=1.2, label=label)
-            
-            self.draw_zero_line(ax1)
-            ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel(f'{label_a} Z-score')
-            total_bouts = sum(len(bouts) for bout_dict in g0_data_by_group.values()
-                            for bouts in bout_dict.values())
-            if selected_bout == "All":
-                ax1.set_title(f'{label_a}: {behavior}\nComparing by Bout Order within Groups ({total_bouts} total bouts)')
-            else:
-                ax1.set_title(f'{label_a}: {behavior}\nBout #{selected_bout} only within Groups ({total_bouts} total bouts)')
-            ax1.legend(loc='best', fontsize=7, ncol=1)
-            ax1.grid(True, alpha=0.3)
-        
-        # Plot G1 comparison - by bout number within groups
-        if has_g1:
-            # Find max bout number across all groups
-            max_bout_num = max([max(bout_dict.keys()) if bout_dict else 0 
-                               for bout_dict in g1_data_by_group.values()])
-            
-            # Get max trace length
-            all_bouts = [bout for bout_dict in g1_data_by_group.values() 
-                        for bouts in bout_dict.values() for bout in bouts]
-            max_len = max(len(bout) for bout in all_bouts) if all_bouts else 0
-            time_axis = (np.arange(max_len) - prebout) / fps
-            
-            # Use different line styles for bout numbers
-            line_styles = ['-', '--', '-.', ':']
-            
-            for group_name in selected_groups:
-                bout_dict = g1_data_by_group[group_name]
-                if not bout_dict:
-                    continue
-                
-                base_color = group_base_colors[group_name]
-                
-                for bout_num in sorted(bout_dict.keys()):
-                    bouts = bout_dict[bout_num]
-                    # Vary line style by bout number
-                    line_style = line_styles[(bout_num - 1) % len(line_styles)]
-                    
-                    for i, bout in enumerate(bouts):
+                        padded[:len(arr)] = arr
+                        summary[f"{prefix}_{name}"] = padded
+                    for subject, bout_tag, trace in items:
                         padded = np.full(max_len, np.nan)
-                        padded[:len(bout)] = bout
-                        # Only add label for first instance
-                        label = f'{group_name} Bout #{bout_num} (n={len(bouts)})' if i == 0 else None
-                        ax2.plot(time_axis, padded, color=base_color, linestyle=line_style,
-                               alpha=0.6, linewidth=1.2, label=label)
-            
-            self.draw_zero_line(ax2)
-            ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel(f'{label_b} Z-score')
-            total_bouts = sum(len(bouts) for bout_dict in g1_data_by_group.values()
-                            for bouts in bout_dict.values())
-            if selected_bout == "All":
-                ax2.set_title(f'{label_b}: {behavior}\nComparing by Bout Order within Groups ({total_bouts} total bouts)')
-            else:
-                ax2.set_title(f'{label_b}: {behavior}\nBout #{selected_bout} only within Groups ({total_bouts} total bouts)')
-            ax2.legend(loc='best', fontsize=7, ncol=1)
-            ax2.grid(True, alpha=0.3)
-        
-        fig.tight_layout()
-    
+                        padded[:len(trace)] = trace
+                        traces_out[f"{prefix}_{_safe(subject)}_bout{_safe(bout_tag)}"] = padded
+                        n_traces += 1
+
+            summary_path = f"{base}_{_safe(behavior)}_{_safe(slot_label)}_boutbins.csv"
+            traces_path = f"{base}_{_safe(behavior)}_{_safe(slot_label)}_boutbins_traces.csv"
+            pd.DataFrame(summary).to_csv(summary_path, index=False)
+            pd.DataFrame(traces_out).to_csv(traces_path, index=False)
+            for path in (summary_path, traces_path):
+                self._add_metadata_comment_to_csv(path, metadata)
+            exported.append((slot_label, summary_path, traces_path, n_traces))
+
+        if not exported:
+            messagebox.showerror("Error",
+                                 "No bout traces matched the current selection.")
+            return
+
+        file_list = '\n'.join(
+            f"  • {label}: {os.path.basename(sp)} + {os.path.basename(tp)} "
+            f"({n} bouts)" for label, sp, tp, n in exported)
+        messagebox.showinfo(
+            "Export Successful",
+            f"Bout traces exported to {2 * len(exported)} file(s):\n\n{file_list}\n\n"
+            f"Behavior: {behavior}\n"
+            f"Bouts per bin: {bin_size}\n"
+            f"Show Bout #: {self.bout_number_var.get()}\n"
+            f"Averaged within subject: {self.viz_average_within_subject.get()}\n"
+            f"Exclusions applied: {self.use_exclusions_viz.get()}\n"
+            f"Max bouts/subject: {self.viz_max_bouts_var.get()}")
+
     def compare_bout_channels(self):
         """Bout Analysis: overlay each channel's mean peri-onset trace so channels
         (e.g. G0 vs R4) can be compared within each group in the GUI.
@@ -39564,6 +41439,113 @@ cat("OK\n")
             f"({behavior}, {channel})")
 
     # ------------------------------------------------------------------
+    BINNED_PROGRESSION_METRICS = ['peak', 'avg', 'auc']
+    BINNED_PROGRESSION_METRIC_LABELS = {
+        'peak': 'Peak (z-score)',
+        'avg':  'Average (z-score)',
+        'auc':  'AUC (z-score*s)',
+    }
+
+    def _compute_binned_progression(self, behavior, channel, subjects, subject_to_group,
+                                    bin_size, max_bouts, win_start_samples, win_end_samples,
+                                    fps, pre_frames, group_mode=False):
+        """Bin one behavior x channel's bouts into groups of ``bin_size`` and
+        return the per-subject / per-group means the progression plot draws.
+
+        Shared by the on-screen plot and the all-behaviours export so both apply
+        the same window, max-bouts cap and realignment. Returns ``None`` when no
+        subject has usable bouts for this combination.
+        """
+        METRICS = list(self.BINNED_PROGRESSION_METRICS)
+        subject_bin_data = {}   # {subject: {bin_idx: {metric: mean_val}}}
+        all_bin_indices  = set()
+
+        for subject in subjects:
+            if subject not in self.processed_data:
+                continue
+            data = self.processed_data[subject]
+            if 'bouts' not in data or behavior not in data['bouts']:
+                continue
+            entry = data['bouts'][behavior]
+            # Realigned so the onset index below is valid even if this subject's
+            # bouts were extracted with a different pre/post window.
+            bouts_data = self._entry_channel_bouts(entry, channel, max_bouts)
+            if not bouts_data:
+                continue
+
+            # Assign each bout to a bin (0-based)
+            bin_accum = {}  # {bin_idx: {metric: [values]}}
+            for bout_idx, bout in enumerate(bouts_data):
+                bin_idx = bout_idx // bin_size  # 0, 1, 2, ...
+                onset   = pre_frames
+                ws = max(0, onset + win_start_samples)
+                we = min(len(bout), onset + win_end_samples)
+                if we <= ws:
+                    continue
+                wd = bout[ws:we]
+                if bin_idx not in bin_accum:
+                    bin_accum[bin_idx] = {m: [] for m in METRICS}
+                bin_accum[bin_idx]['peak'].append(float(np.max(wd)))
+                bin_accum[bin_idx]['avg'].append(float(np.mean(wd)))
+                bin_accum[bin_idx]['auc'].append(float(self._trapz_compat(wd) / fps))
+
+            if not bin_accum:
+                continue
+
+            subject_bin_data[subject] = {}
+            for bin_idx, mdata in bin_accum.items():
+                subject_bin_data[subject][bin_idx] = {
+                    m: float(np.mean(mdata[m])) for m in METRICS if mdata[m]
+                }
+                all_bin_indices.add(bin_idx)
+
+        if not subject_bin_data:
+            return None
+
+        sorted_bins = sorted(all_bin_indices)
+
+        # Build human-readable bin labels
+        def bin_label(b):
+            start = b * bin_size + 1
+            end   = (b + 1) * bin_size
+            return f"{start}-{end}" if bin_size > 1 else str(start)
+        bin_labels = [bin_label(b) for b in sorted_bins]
+
+        # --- aggregate across subjects (or by group) ---
+        if group_mode and subject_to_group:
+            groups_present = sorted(set(subject_to_group.values()))
+        else:
+            groups_present = ['All']  # single series
+
+        # For each group/all: per-bin list of per-subject means
+        group_series = {g: {b: {m: [] for m in METRICS} for b in sorted_bins}
+                        for g in groups_present}
+
+        for subject, bin_data in subject_bin_data.items():
+            grp = subject_to_group.get(subject, 'All') if group_mode else 'All'
+            if grp not in group_series:
+                grp = groups_present[0]
+            for bin_idx in sorted_bins:
+                if bin_idx in bin_data:
+                    for m in METRICS:
+                        if m in bin_data[bin_idx]:
+                            group_series[grp][bin_idx][m].append(bin_data[bin_idx][m])
+
+        return {
+            'type': 'binned',
+            'behavior': behavior,
+            'channel': channel,
+            'bin_size': bin_size,
+            'metrics': METRICS,
+            'sorted_bins': sorted_bins,
+            'bin_labels': bin_labels,
+            'group_series': group_series,
+            'groups_present': groups_present,
+            'subject_bin_data': subject_bin_data,
+            'subject_to_group': (dict(subject_to_group) if group_mode else {}),
+        }
+
+    # ------------------------------------------------------------------
     def plot_binned_bout_progression(self):
         """Bin bouts into groups of X and plot mean ± SEM line graph across bins."""
         try:
@@ -39625,99 +41607,23 @@ cat("OK\n")
                         subject_to_group[s] = g
 
         # --- collect per-subject per-bin means ---
-        # Structure: {subject: {bin_label: {metric: mean_val}}}
-        METRICS = ['peak', 'avg', 'auc']
-        subject_bin_data = {}   # {subject: {bin_idx: {metric: mean_val}}}
-        all_bin_indices  = set()
-
-        for subject in selected_subjects:
-            if subject not in self.processed_data:
-                continue
-            data = self.processed_data[subject]
-            if 'bouts' not in data or behavior not in data['bouts']:
-                continue
-            entry = data['bouts'][behavior]
-            bouts_data = entry.get(channel, [])
-            if not bouts_data:
-                continue
-            if max_bouts is not None:
-                bouts_data = bouts_data[:max_bouts]
-            # Realign so the onset index below is valid even if this subject's
-            # bouts were extracted with a different pre/post window.
-            bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
-                                                self._entry_fs(entry))
-
-            # Assign each bout to a bin (0-based)
-            bin_accum = {}  # {bin_idx: {metric: [values]}}
-            for bout_idx, bout in enumerate(bouts_data):
-                bin_idx = bout_idx // bin_size  # 0, 1, 2, ...
-                onset   = pre_frames
-                ws = max(0, onset + win_start_samples)
-                we = min(len(bout), onset + win_end_samples)
-                if we <= ws:
-                    continue
-                wd = bout[ws:we]
-                if bin_idx not in bin_accum:
-                    bin_accum[bin_idx] = {m: [] for m in METRICS}
-                bin_accum[bin_idx]['peak'].append(float(np.max(wd)))
-                bin_accum[bin_idx]['avg'].append(float(np.mean(wd)))
-                bin_accum[bin_idx]['auc'].append(float(self._trapz_compat(wd) / fps))
-
-            if not bin_accum:
-                continue
-
-            subject_bin_data[subject] = {}
-            for bin_idx, mdata in bin_accum.items():
-                subject_bin_data[subject][bin_idx] = {
-                    m: float(np.mean(mdata[m])) for m in METRICS if mdata[m]
-                }
-                all_bin_indices.add(bin_idx)
-
-        if not subject_bin_data:
+        progression = self._compute_binned_progression(
+            behavior, channel, selected_subjects, subject_to_group,
+            bin_size, max_bouts, win_start_samples, win_end_samples,
+            fps, pre_frames, group_mode=(analysis_mode == "Group"))
+        if progression is None:
             messagebox.showwarning("No Data", "No usable bout data found.")
             return
 
-        sorted_bins = sorted(all_bin_indices)
-        # Build human-readable bin labels
-        def bin_label(b):
-            start = b * bin_size + 1
-            end   = (b + 1) * bin_size
-            return f"{start}-{end}" if bin_size > 1 else str(start)
-        bin_labels = [bin_label(b) for b in sorted_bins]
-
-        # --- aggregate across subjects (or by group) ---
-        if analysis_mode == "Group" and subject_to_group:
-            groups_present = sorted(set(subject_to_group.values()))
-        else:
-            groups_present = ['All']  # single series
-
-        # For each group/all: per-bin list of per-subject means
-        group_series = {g: {b: {m: [] for m in METRICS} for b in sorted_bins}
-                        for g in groups_present}
-
-        for subject, bin_data in subject_bin_data.items():
-            grp = subject_to_group.get(subject, 'All')
-            if grp not in group_series:
-                grp = 'All'
-            for bin_idx in sorted_bins:
-                if bin_idx in bin_data:
-                    for m in METRICS:
-                        if m in bin_data[bin_idx]:
-                            group_series[grp][bin_idx][m].append(bin_data[bin_idx][m])
+        METRICS          = progression['metrics']
+        subject_bin_data = progression['subject_bin_data']
+        sorted_bins      = progression['sorted_bins']
+        bin_labels       = progression['bin_labels']
+        groups_present   = progression['groups_present']
+        group_series     = progression['group_series']
 
         # Store for export
-        self.bout_order_data = {
-            'type': 'binned',
-            'behavior': behavior,
-            'channel': channel,
-            'bin_size': bin_size,
-            'sorted_bins': sorted_bins,
-            'bin_labels': bin_labels,
-            'group_series': group_series,
-            'groups_present': groups_present,
-            'subject_bin_data': subject_bin_data,
-            'subject_to_group': subject_to_group,
-        }
+        self.bout_order_data = dict(progression)
 
         # --- clear old canvas ---
         if hasattr(self, 'current_bout_canvas') and self.current_bout_canvas:
@@ -40002,6 +41908,314 @@ cat("OK\n")
         ttk.Button(btn_frame, text="Copy to Clipboard", command=copy_to_clipboard).pack(side='left', padx=5)
         ttk.Button(btn_frame, text="Save to File...", command=save_to_file).pack(side='left', padx=5)
         ttk.Button(btn_frame, text="Close", command=export_win.destroy).pack(side='right', padx=5)
+
+    # ------------------------------------------------------------------
+    def export_binned_progression_all(self):
+        """Export the binned bout progression for ALL behaviors into one workbook.
+
+        Applies the current Bout Analysis settings — selected subjects/groups,
+        bouts-per-bin, max-bouts limit, analysis window, chosen metrics and
+        exclusions — to every behavior x channel that has bouts, so the numbers
+        match what "Plot > Binned Progression" would draw for each in turn.
+        """
+        import datetime
+        import re as _re
+
+        if not getattr(self, 'processed_data', None):
+            messagebox.showerror("Error", "No processed data available.")
+            return
+
+        # -- Bin size (same field the plot reads) --------------------------
+        try:
+            bin_size = int(self.bout_first_last_x_var.get())
+            if bin_size < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid positive integer for bouts per bin")
+            return
+
+        # -- Behaviors available across loaded subjects --------------------
+        behaviors = set()
+        for d in self.processed_data.values():
+            if 'bouts' in d:
+                behaviors.update(d['bouts'].keys())
+        behaviors = sorted(behaviors)
+        if not behaviors:
+            messagebox.showerror("Error", "No bout/behavior data found. Extract bouts first.")
+            return
+
+        # -- Metric selection (current checkboxes) -------------------------
+        metric_order = []
+        if self.metric_max_post.get(): metric_order.append('peak')
+        if self.metric_avg_post.get(): metric_order.append('avg')
+        if self.metric_auc.get():      metric_order.append('auc')
+        if not metric_order:
+            messagebox.showerror("No Metrics Selected",
+                                 "Please check at least one of Max/Average/AUC in the "
+                                 "'Metrics to Calculate' section.")
+            return
+        METRIC_LABELS = self.BINNED_PROGRESSION_METRIC_LABELS
+
+        # -- Subject/group selection (current UI) --------------------------
+        analysis_mode = self.bout_analysis_by_var.get()
+        if analysis_mode == "Group":
+            if not self.bout_analysis_group_listbox.curselection():
+                messagebox.showerror("Error", "Please select at least one subject")
+                return
+            selected_groups = self.selected_series('bout_analysis', self.bout_analysis_group_listbox)
+            base_subjects = []
+            for g in selected_groups:
+                base_subjects.extend(self._series_members(g))
+            base_subjects = list(dict.fromkeys(base_subjects))
+        else:
+            if not self.bout_analysis_subject_listbox.curselection():
+                messagebox.showerror("Error", "Please select at least one subject")
+                return
+            selected_groups = []
+            base_subjects = [self.bout_analysis_subject_listbox.get(i)
+                             for i in self.bout_analysis_subject_listbox.curselection()]
+        if not base_subjects:
+            messagebox.showerror("Error", "Please select at least one subject")
+            return
+
+        subject_to_group = {}
+        if analysis_mode == "Group":
+            for g in selected_groups:
+                for s in self._series_members(g):
+                    if s in base_subjects:
+                        subject_to_group[s] = g
+
+        # -- Window / caps (current settings) ------------------------------
+        try:
+            win_start_samples, win_end_samples = self.analysis_window_samples()
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
+        fps              = self.get_fps()
+        pre_frames       = self.params.get('preboutframes', 90)
+        max_bouts        = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
+        apply_exclusions = self.use_exclusions_bout.get()
+
+        # -- Channel slots present in the bout store -----------------------
+        # Keyed on Ch{n} (always written by the extractor) so a mixed cohort --
+        # one subject designated G0/G1 and another R4/R5 -- lands on one sheet
+        # per slot rather than four half-empty ones.
+        slot_indices = set()
+        for s in base_subjects:
+            d = self.processed_data.get(s) or {}
+            for entry in (d.get('bouts') or {}).values():
+                if isinstance(entry, dict):
+                    for k in entry:
+                        m = _re.match(r'^Ch(\d+)$', str(k))
+                        if m:
+                            slot_indices.add(int(m.group(1)))
+        if not slot_indices:
+            messagebox.showerror("Error", "No bout data found for the selected subjects.")
+            return
+
+        def _slot_label(idx):
+            for s in base_subjects:
+                d = self.processed_data.get(s)
+                if d:
+                    return str(self.get_channel_name(d, idx))
+            return f'Ch{idx}'
+
+        channel_slots = [(idx, _slot_label(idx)) for idx in sorted(slot_indices)]
+
+        # -- Compute every behavior x channel up front ---------------------
+        used_names = set()
+
+        def _sheet_name(beh, ch):
+            base = _re.sub(r'[\[\]\:\*\?\/\\]', '_', f"{beh}_{ch}")[:31]
+            name = base or 'Sheet'
+            i = 1
+            while name.lower() in used_names:
+                suffix = f"_{i}"
+                name = base[:31 - len(suffix)] + suffix
+                i += 1
+            used_names.add(name.lower())
+            return name
+
+        results   = []   # (sheet_name, behavior, channel_label, progression dict)
+        long_rows = []   # tidy mean/SEM/n across every combo
+
+        for behavior in behaviors:
+            for slot_idx, ch_label in channel_slots:
+                subs = base_subjects
+                if apply_exclusions:
+                    subs = self.get_included_subjects_for_slot(base_subjects, slot_idx)
+                if not subs:
+                    continue
+                prog = self._compute_binned_progression(
+                    behavior, f'Ch{slot_idx}', subs, subject_to_group,
+                    bin_size, max_bouts, win_start_samples, win_end_samples,
+                    fps, pre_frames, group_mode=(analysis_mode == "Group"))
+                if prog is None:
+                    continue
+                prog['channel'] = ch_label
+                results.append((_sheet_name(behavior, ch_label), behavior, ch_label, prog))
+
+                for grp in prog['groups_present']:
+                    for b, blabel in zip(prog['sorted_bins'], prog['bin_labels']):
+                        for m in metric_order:
+                            vals = [v for v in prog['group_series'][grp][b].get(m, [])
+                                    if not (isinstance(v, float) and np.isnan(v))]
+                            long_rows.append({
+                                'Behavior': behavior,
+                                'Channel': ch_label,
+                                'Group': grp,
+                                'Metric': METRIC_LABELS.get(m, m),
+                                'Bin': blabel,
+                                'Bin Index': b + 1,
+                                'Mean': float(np.mean(vals)) if vals else np.nan,
+                                'SEM': (float(np.std(vals) / np.sqrt(len(vals)))
+                                        if len(vals) > 1 else (0.0 if vals else np.nan)),
+                                'n': len(vals),
+                            })
+
+        if not results:
+            messagebox.showerror(
+                "No Data",
+                "No bouts matched the current settings for any behavior/channel.\n"
+                "Check the selected subjects/groups, exclusions, and max bouts.")
+            return
+
+        # -- Ask for output filename ---------------------------------------
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            initialfile="all_behaviors_binned_progression.xlsx",
+            title="Export All Behaviors - Binned Progression")
+        if not filename:
+            return
+
+        has_groups = bool(subject_to_group) and analysis_mode == "Group"
+
+        def _sheet_frame(prog):
+            """Per-subject rows then mean/SEM/n rows, one column per bin."""
+            labels   = prog['bin_labels']
+            bins     = prog['sorted_bins']
+            sbd      = prog['subject_bin_data']
+            s2g      = prog['subject_to_group']
+            subjects = sorted(sbd.keys(), key=lambda s: (s2g.get(s, ''), s))
+            rows = []
+            for m in metric_order:
+                for subj in subjects:
+                    row = {'Type': 'per-subject'}
+                    if has_groups:
+                        row['Group'] = s2g.get(subj, '')
+                    row['Subject'] = subj
+                    row['Metric']  = METRIC_LABELS.get(m, m)
+                    for b, lab in zip(bins, labels):
+                        v = sbd.get(subj, {}).get(b, {}).get(m, None)
+                        row[lab] = np.nan if v is None else float(v)
+                    rows.append(row)
+            for m in metric_order:
+                for grp in prog['groups_present']:
+                    stats = {'mean': [], 'SEM': [], 'n': []}
+                    for b in bins:
+                        vals = [v for v in prog['group_series'][grp][b].get(m, [])
+                                if not (isinstance(v, float) and np.isnan(v))]
+                        stats['mean'].append(float(np.mean(vals)) if vals else np.nan)
+                        stats['SEM'].append(float(np.std(vals) / np.sqrt(len(vals)))
+                                            if len(vals) > 1 else (0.0 if vals else np.nan))
+                        stats['n'].append(len(vals))
+                    for stat_name in ('mean', 'SEM', 'n'):
+                        row = {'Type': 'summary'}
+                        if has_groups:
+                            row['Group'] = grp
+                        row['Subject'] = stat_name
+                        row['Metric']  = METRIC_LABELS.get(m, m)
+                        for lab, v in zip(labels, stats[stat_name]):
+                            row[lab] = v
+                        rows.append(row)
+            cols = ['Type'] + (['Group'] if has_groups else []) + ['Subject', 'Metric'] + labels
+            return pd.DataFrame(rows, columns=cols)
+
+        try:
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                pd.DataFrame(long_rows).to_excel(writer, index=False,
+                                                 sheet_name='All Behaviors (long)')
+                for sheet, behavior, ch_label, prog in results:
+                    _sheet_frame(prog).to_excel(writer, index=False, sheet_name=sheet)
+
+                # -- Settings / metadata sheet -----------------------------
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                if analysis_mode == "Group":
+                    sel_label = ', '.join(sorted(set(subject_to_group.values()))) or '(none)'
+                else:
+                    sel_label = ', '.join(sorted(base_subjects))
+
+                settings = [
+                    ('Export Timestamp',         datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                    ('Scope',                    'Binned progression, all behaviors (current settings)'),
+                    ('Behaviors Exported',       ', '.join(sorted({b for _, b, _, _ in results}))),
+                    ('Sheets Written',           len(results)),
+                    ('Channels',                 ', '.join(lbl for _, lbl in channel_slots)),
+                    ('Bouts per Bin',            bin_size),
+                    ('Max Bouts per Subject',    self.bout_max_bouts_var.get()),
+                    ('Analysis Mode',            analysis_mode),
+                    ('Selected Groups/Subjects', sel_label),
+                    ('n Subjects Selected',      len(base_subjects)),
+                    ('Exclusions Applied',       'Yes' if apply_exclusions else 'No'),
+                    ('Metrics Exported',         ', '.join(METRIC_LABELS.get(m, m)
+                                                           for m in metric_order)),
+                    ('Window Start (s)',         self.window_start_sec_var.get()),
+                    ('Window End (s)',           self.window_end_sec_var.get()),
+                    ('Values',                   'Per-subject mean per bin; summary rows are '
+                                                 'mean/SEM/n across subjects'),
+                ]
+                if apply_exclusions and getattr(self, 'exclusions', None):
+                    excl_parts = [f"{s}: {','.join(chs)}"
+                                  for s, chs in self.exclusions.items() if chs]
+                    if excl_parts:
+                        settings.append(('Excluded Subjects/Channels', '; '.join(excl_parts)))
+
+                wb = writer.book
+                ws = wb.create_sheet('Export Settings')
+                header_font = Font(bold=True, color='FFFFFF')
+                header_fill = PatternFill(fill_type='solid', fgColor='4472C4')
+                for col, title in ((1, 'Setting'), (2, 'Value')):
+                    c = ws.cell(row=1, column=col, value=title)
+                    c.font = header_font
+                    c.fill = header_fill
+                    c.alignment = Alignment(horizontal='center')
+                for r, (key, val) in enumerate(settings, start=2):
+                    ws.cell(row=r, column=1, value=key)
+                    ws.cell(row=r, column=2, value=str(val))
+                ws.column_dimensions['A'].width = 30
+                ws.column_dimensions['B'].width = 60
+
+                # Per-combo summary beneath the settings
+                start = len(settings) + 3
+                for j, title in enumerate(['Behavior', 'Channel', 'Sheet', 'Subjects', 'Bins'],
+                                          start=1):
+                    c = ws.cell(row=start, column=j, value=title)
+                    c.font = header_font
+                    c.fill = header_fill
+                    c.alignment = Alignment(horizontal='center')
+                for i, (sheet, behavior, ch_label, prog) in enumerate(results, start=start + 1):
+                    ws.cell(row=i, column=1, value=behavior)
+                    ws.cell(row=i, column=2, value=ch_label)
+                    ws.cell(row=i, column=3, value=sheet)
+                    ws.cell(row=i, column=4, value=len(prog['subject_bin_data']))
+                    ws.cell(row=i, column=5, value=len(prog['sorted_bins']))
+
+            self.log_message(
+                f"Exported binned progression for all behaviors to "
+                f"{os.path.basename(filename)} - {len(results)} sheets, "
+                f"bin size {bin_size}, max bouts {self.bout_max_bouts_var.get()}")
+            messagebox.showinfo(
+                "Export Complete",
+                f"Exported {len(results)} behavior x channel sheets:\n"
+                f"{os.path.basename(filename)}\n\n"
+                f"Bouts per bin: {bin_size}  |  Max bouts: {self.bout_max_bouts_var.get()}  |  "
+                f"Subjects: {len(base_subjects)}")
+
+        except Exception as e:
+            messagebox.showerror("Error",
+                                 f"Failed to export binned progression:\n{str(e)}")
 
     # ------------------------------------------------------------------
     def compare_first_vs_last_bouts(self):
@@ -43093,6 +45307,26 @@ cat("OK\n")
                     out[:n_rows, col] = src[:n_rows, col]
         return out
 
+    def _as_onset_indices(self, onsets):
+        """Coerce stored onset frames to plain ints, dropping missing entries.
+
+        Onsets round-trip through the project file as floats (NaN where a bout
+        has no frame), so anything that slices a signal with them has to convert
+        first or it raises "slice indices must be integers".
+        """
+        out = []
+        for o in onsets or []:
+            if o is None:
+                continue
+            try:
+                v = float(o)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(v):
+                continue
+            out.append(int(round(v)))
+        return out
+
     def _get_channel_signal(self, data, channel_name):
         """
         Extract a 1-D signal array for a named channel (e.g. 'G0', 'R4', 'Ch2').
@@ -43501,26 +45735,47 @@ cat("OK\n")
                   foreground='gray', font=('TkDefaultFont', 8)).grid(
             row=1, column=0, columnspan=2, sticky='w', padx=6)
 
-        # Statistics
-        stf = ttk.LabelFrame(main, text="Statistics", padding=8)
-        stf.pack(fill='x', pady=(0, 8))
-        _row(stf, "Significance level (\u03b1):", self.dec_prob_alpha_var, 0)
-        ttk.Label(stf, text="Two-way ANOVA and Bonferroni post-hoc tests.\n"
-                            "Requires Subject-mean averaging method.",
-                  foreground='gray', font=('TkDefaultFont', 8)).grid(
-            row=1, column=0, columnspan=2, sticky='w', padx=6)
-
     # ── Core computation ──────────────────────────────────────────────────────
 
-    def _compute_dec_prob_for_subject(self, subject, channel_col,
+    def _dec_prob_zone_codes(self, beh_synced):
+        """Vectorised zone classification for every row of ``beh_synced``.
+
+        Returns ``(codes, index)``: ``codes[i]`` is the position of the frame's
+        zone in ``self.zones`` and -1 marks a frame outside every zone or with a
+        missing coordinate.  First match wins, exactly as classify_zone does, so
+        overlapping zone rectangles resolve identically.
+        """
+        x = np.asarray(beh_synced[:, 2], dtype=float)
+        y = np.asarray(beh_synced[:, 3], dtype=float)
+        codes = np.full(x.shape[0], -1, dtype=np.int32)
+        unset = ~(np.isnan(x) | np.isnan(y))
+        index = {}
+        for k, (name, z) in enumerate(self.zones.items()):
+            index[name] = k
+            if not unset.any():
+                continue
+            m = (unset & (x >= z['x_min']) & (x <= z['x_max'])
+                 & (y >= z['y_min']) & (y <= z['y_max']))
+            codes[m] = k
+            unset &= ~m
+        return codes, index
+
+    def _compute_dec_prob_for_subject(self, subject, channel,
                                       source_zones, outcome_zones,
-                                      lookahead_frames):
+                                      lookahead_sec, zone_cache=None):
         """Return (signals, outcomes) arrays for a single subject.
 
         For every frame where the subject is in *source_zones*, record:
           - the current photometry z-score
           - whether the subject entered *outcome_zones* within the next
-            *lookahead_frames* frames (1) or did not (0).
+            look-ahead window (1) or did not (0).
+
+        The window is converted to frames with *this subject's* sampling rate,
+        so a dataset that mixes 20 Hz and 30 Hz recordings still scans the same
+        number of seconds ahead for every animal.  The signal column is resolved
+        from the subject's own channel designation rather than assumed, so a
+        one-channel subject labelled G1 reads its real trace instead of the
+        column that would hold a second channel.
         """
         data = self.processed_data.get(subject)
         if data is None:
@@ -43531,78 +45786,118 @@ cat("OK\n")
         beh_synced = data['beh_synced']
         n_frames = len(beh_synced)
 
-        if beh_synced.shape[1] <= channel_col:
+        channel_col = self._bout_channel_column(data, channel)
+        if channel_col is None or beh_synced.shape[1] <= channel_col:
             return None
 
-        # Classify all frames into zones once
-        zones = []
-        for i in range(n_frames):
-            x = beh_synced[i, 2]
-            y = beh_synced[i, 3]
-            if not (np.isnan(x) or np.isnan(y)):
-                zones.append(self.classify_zone(x, y))
-            else:
-                zones.append('unknown')
-
-        source_set  = set(source_zones)
-        outcome_set = set(outcome_zones)
-        signals  = []
-        outcomes = []
-
-        for i in range(n_frames - lookahead_frames):
-            if zones[i] not in source_set:
-                continue
-            sig = beh_synced[i, channel_col]
-            if np.isnan(sig):
-                continue
-            # Check whether the outcome zone was entered within the look-ahead window
-            entered = any(zones[j] in outcome_set
-                          for j in range(i + 1, i + lookahead_frames + 1))
-            signals.append(sig)
-            outcomes.append(1 if entered else 0)
-
-        if not signals:
+        fps = self.get_fps(data)
+        if not fps or not np.isfinite(fps) or fps <= 0:
             return None
-        return {'signals': np.array(signals), 'outcomes': np.array(outcomes)}
+        lookahead_frames = max(1, int(round(lookahead_sec * fps)))
+        if n_frames <= lookahead_frames:
+            return None
 
-    def _bin_dec_prob_curves(self, signals_list, outcomes_list, bin_edges, min_frames, pool_edges=False):
+        if zone_cache is not None and subject in zone_cache:
+            codes, index = zone_cache[subject]
+        else:
+            codes, index = self._dec_prob_zone_codes(beh_synced)
+            if zone_cache is not None:
+                zone_cache[subject] = (codes, index)
+
+        src_codes = [index[z] for z in source_zones if z in index]
+        out_codes = [index[z] for z in outcome_zones if z in index]
+        if not src_codes or not out_codes:
+            return None
+
+        signal = np.asarray(beh_synced[:, channel_col], dtype=float)
+        in_source  = np.isin(codes, src_codes)
+        in_outcome = np.isin(codes, out_codes)
+
+        # Only frames with a full look-ahead window ahead of them can be scored;
+        # the tail is censored, as it was before.
+        last = n_frames - lookahead_frames
+        starts = np.flatnonzero(in_source[:last] & ~np.isnan(signal[:last]))
+        if starts.size == 0:
+            return None
+
+        # "Did the outcome zone appear in frames i+1 .. i+L?" for every start at
+        # once: a prefix count of outcome frames turns each window into one
+        # subtraction, instead of re-scanning L frames per start.
+        cum = np.concatenate(([0], np.cumsum(in_outcome, dtype=np.int64)))
+        entered = (cum[starts + 1 + lookahead_frames] - cum[starts + 1]) > 0
+
+        return {'signals': signal[starts],
+                'outcomes': entered.astype(np.int8),
+                'lookahead_frames': int(lookahead_frames),
+                'fps': float(fps)}
+
+    def _bin_dec_prob_curves(self, signals_list, outcomes_list, bin_edges,
+                             min_frames, pool_edges=False):
         """Bin (signal, outcome) data into a probability curve.
 
         Args:
             signals_list:  list of 1-D signal arrays, one per subject
             outcomes_list: list of 1-D binary outcome arrays, one per subject
             bin_edges:     1-D array of bin edges
-            min_frames:    minimum number of frames required to include a bin
+            min_frames:    minimum number of frames a subject needs in a bin for
+                           that subject to contribute to the bin
+            pool_edges:    count signals outside the range in the nearest edge bin
+
+        Bins are half-open [lo, hi) except the last, which is closed on both
+        sides so a signal sitting exactly on the range maximum is counted rather
+        than silently dropped.
 
         Returns:
-            bin_centers (1-D), mean_prob (1-D), sem_prob (1-D)  — NaN for sparse bins
+            bin_centers, mean_prob, sem_prob, per_subject_probs, n_frames
+            — mean/SEM are NaN for bins no subject could fill.
         """
+        bin_edges   = np.asarray(bin_edges, dtype=float)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        n_bins = len(bin_centers)
+        n_bins      = len(bin_centers)
+        n_subjects  = len(signals_list)
+
         mean_prob = np.full(n_bins, np.nan)
         sem_prob  = np.full(n_bins, np.nan)
+        n_frames  = np.zeros(n_bins, dtype=np.int64)
+        # subject x bin probability grid; NaN where the subject was too sparse
+        probs = np.full((n_subjects, n_bins), np.nan)
 
+        for si, (sigs, outs) in enumerate(zip(signals_list, outcomes_list)):
+            sigs = np.asarray(sigs, dtype=float)
+            outs = np.asarray(outs, dtype=float)
+            if sigs.size == 0:
+                continue
+            finite = np.isfinite(sigs)
+            sigs, outs = sigs[finite], outs[finite]
+            if sigs.size == 0:
+                continue
+            # One pass per subject instead of one masked pass per bin.
+            idx = np.searchsorted(bin_edges, sigs, side='right') - 1
+            idx[sigs == bin_edges[-1]] = n_bins - 1   # closed upper edge
+            if pool_edges:
+                idx = np.clip(idx, 0, n_bins - 1)
+            keep = (idx >= 0) & (idx < n_bins)
+            idx, outs = idx[keep], outs[keep]
+            if idx.size == 0:
+                continue
+            counts = np.bincount(idx, minlength=n_bins)
+            hits   = np.bincount(idx, weights=outs, minlength=n_bins)
+            ok = counts >= max(1, int(min_frames))
+            probs[si, ok] = hits[ok] / counts[ok]
+            n_frames[ok] += counts[ok]
+
+        # Kept as a list-of-lists per bin: the ANOVA consumes it that way.
         per_subject_probs = []
         for k in range(n_bins):
-            lo, hi = bin_edges[k], bin_edges[k + 1]
-            subject_probs = []
-            for sigs, outs in zip(signals_list, outcomes_list):
-                if pool_edges and k == 0:
-                    mask = sigs < hi
-                elif pool_edges and k == n_bins - 1:
-                    mask = sigs >= lo
-                else:
-                    mask = (sigs >= lo) & (sigs < hi)
-                if mask.sum() >= min_frames:
-                    subject_probs.append(float(outs[mask].mean()))
-            per_subject_probs.append(subject_probs)
-            if len(subject_probs) >= 1:
-                mean_prob[k] = float(np.mean(subject_probs))
-                sem_prob[k]  = (float(np.std(subject_probs, ddof=1) /
-                                      np.sqrt(len(subject_probs)))
-                                if len(subject_probs) > 1 else 0.0)
+            col = probs[:, k]
+            col = col[~np.isnan(col)]
+            per_subject_probs.append([float(v) for v in col])
+            if col.size >= 1:
+                mean_prob[k] = float(col.mean())
+                sem_prob[k]  = (float(col.std(ddof=1) / np.sqrt(col.size))
+                                if col.size > 1 else 0.0)
 
-        return bin_centers, mean_prob, sem_prob, per_subject_probs
+        return bin_centers, mean_prob, sem_prob, per_subject_probs, n_frames
 
     # ── Main run / plot / export ──────────────────────────────────────────────
 
@@ -43621,18 +45916,25 @@ cat("OK\n")
                                      f"Please check settings values:\n{exc}")
                 return
 
-            fps              = self.get_fps()
-            lookahead_frames = max(1, round(lookahead_sec * fps))
-            bin_edges        = np.arange(range_min,
-                                         range_max + bin_width * 0.5,
-                                         bin_width)
-            if len(bin_edges) < 2:
+            if lookahead_sec <= 0:
                 messagebox.showerror("Invalid Settings",
-                                     "Signal range / bin width produces fewer than 2 edges.")
+                                     "Look-ahead window must be greater than 0 seconds.")
                 return
+            if bin_width <= 0 or range_max <= range_min:
+                messagebox.showerror(
+                    "Invalid Settings",
+                    "Bin width must be > 0 and the range maximum must exceed "
+                    "the minimum.")
+                return
+            # Edges are built from a bin count rather than np.arange, whose
+            # accumulated float error can add or drop a bin at the top of the
+            # range; the final edge is pinned to range_max so the bins span
+            # exactly the range the user asked for.
+            n_bin_count = max(1, int(np.ceil((range_max - range_min) / bin_width - 1e-9)))
+            bin_edges   = np.minimum(range_min + bin_width * np.arange(n_bin_count + 1),
+                                     range_max)
 
-            channel     = self.dec_prob_channel_var.get()
-            channel_col = 7 if channel == "G1" else 6
+            channel = self.dec_prob_channel_var.get()
 
             show_explore = self.dec_prob_show_explore.get()
             show_retreat = self.dec_prob_show_retreat.get()
@@ -43685,73 +45987,56 @@ cat("OK\n")
                 sel_subjects = [self.dec_prob_subject_listbox.get(i) for i in sel_idx]
                 group_subjects = {s: [s] for s in sel_subjects}
 
-            # Compute per-group curves
-            results = {}   # group_name -> {explore: {...}, retreat: {...}}
+            # Compute per-group curves.  The two directions share one zone
+            # classification per subject, so position is classified once.
+            results    = {}   # group_name -> {explore: {...}, retreat: {...}}
+            zone_cache = {}
+            used_fps   = set()
+
+            directions = []
+            if show_explore:
+                directions.append(('explore', closed_zones, open_zones))
+            if show_retreat:
+                directions.append(('retreat', open_zones, closed_zones))
 
             for group_name, subjects in group_subjects.items():
-                explore_sigs, explore_outs = [], []
-                retreat_sigs, retreat_outs = [], []
-
-                for subj in subjects:
-                    if apply_excl and self.is_subject_channel_excluded(subj, channel):
-                        continue
-                    if show_explore:
-                        r = self._compute_dec_prob_for_subject(
-                            subj, channel_col, closed_zones, open_zones,
-                            lookahead_frames)
-                        if r is not None:
-                            explore_sigs.append(r['signals'])
-                            explore_outs.append(r['outcomes'])
-
-                    if show_retreat:
-                        r = self._compute_dec_prob_for_subject(
-                            subj, channel_col, open_zones, closed_zones,
-                            lookahead_frames)
-                        if r is not None:
-                            retreat_sigs.append(r['signals'])
-                            retreat_outs.append(r['outcomes'])
-
                 group_result = {}
+                for key, src_zones, dst_zones in directions:
+                    sigs_list, outs_list = [], []
+                    for subj in subjects:
+                        if apply_excl and self.is_subject_channel_excluded(subj, channel):
+                            continue
+                        r = self._compute_dec_prob_for_subject(
+                            subj, channel, src_zones, dst_zones,
+                            lookahead_sec, zone_cache=zone_cache)
+                        if r is not None:
+                            sigs_list.append(r['signals'])
+                            outs_list.append(r['outcomes'])
+                            used_fps.add(round(r['fps'], 3))
+                    if not sigs_list:
+                        continue
 
-                if show_explore and explore_sigs:
                     if avg_method == "Pool all frames":
-                        all_s = [np.concatenate(explore_sigs)]
-                        all_o = [np.concatenate(explore_outs)]
+                        all_s = [np.concatenate(sigs_list)]
+                        all_o = [np.concatenate(outs_list)]
                     else:
-                        all_s = explore_sigs
-                        all_o = explore_outs
-                    centers, mean_p, sem_p, per_subj = self._bin_dec_prob_curves(
+                        all_s, all_o = sigs_list, outs_list
+
+                    centers, mean_p, sem_p, per_subj, n_fr = self._bin_dec_prob_curves(
                         all_s, all_o, bin_edges, min_frames, pool_edges=pool_edges)
                     indiv_curves = []
                     if show_indiv:
                         for sv, ov in zip(all_s, all_o):
-                            _, ip, _, _ = self._bin_dec_prob_curves(
+                            _, ip, _, _, _ = self._bin_dec_prob_curves(
                                 [sv], [ov], bin_edges, 1, pool_edges=pool_edges)
                             indiv_curves.append(ip)
-                    group_result['explore'] = {
-                        'centers': centers, 'mean': mean_p,
-                        'sem': sem_p, 'indiv': indiv_curves,
-                        'per_subject': per_subj}
-
-                if show_retreat and retreat_sigs:
-                    if avg_method == "Pool all frames":
-                        all_s = [np.concatenate(retreat_sigs)]
-                        all_o = [np.concatenate(retreat_outs)]
-                    else:
-                        all_s = retreat_sigs
-                        all_o = retreat_outs
-                    centers, mean_p, sem_p, per_subj = self._bin_dec_prob_curves(
-                        all_s, all_o, bin_edges, min_frames, pool_edges=pool_edges)
-                    indiv_curves = []
-                    if show_indiv:
-                        for sv, ov in zip(all_s, all_o):
-                            _, ip, _, _ = self._bin_dec_prob_curves(
-                                [sv], [ov], bin_edges, 1, pool_edges=pool_edges)
-                            indiv_curves.append(ip)
-                    group_result['retreat'] = {
-                        'centers': centers, 'mean': mean_p,
-                        'sem': sem_p, 'indiv': indiv_curves,
-                        'per_subject': per_subj}
+                    group_result[key] = {
+                        'centers': centers, 'mean': mean_p, 'sem': sem_p,
+                        'indiv': indiv_curves, 'per_subject': per_subj,
+                        'n_frames': n_fr, 'n_subjects': len(sigs_list),
+                        'pooled': avg_method == "Pool all frames",
+                        'source_zones': list(src_zones),
+                        'outcome_zones': list(dst_zones)}
 
                 if group_result:
                     results[group_name] = group_result
@@ -43763,6 +46048,20 @@ cat("OK\n")
                 return
 
             self.dec_prob_results = results
+            self.dec_prob_meta = {
+                'channel': channel, 'from_zone': from_base, 'to_zone': to_base,
+                'lookahead_sec': lookahead_sec, 'avg_method': avg_method,
+                'min_frames': min_frames, 'pool_edges': pool_edges,
+                'bin_edges': bin_edges, 'fps': sorted(used_fps),
+                'exclusions_applied': apply_excl}
+            if len(used_fps) > 1:
+                # The window is converted per subject, so the seconds match; the
+                # frame counts do not, and that is worth saying out loud.
+                self.log_message(
+                    "  Decision probability: subjects span sampling rates "
+                    + ", ".join(f"{f:g} Hz" for f in sorted(used_fps))
+                    + f" - the {lookahead_sec:g} s look-ahead was converted "
+                      "separately for each.")
             try:
                 alpha = float(self.dec_prob_alpha_var.get())
                 if not (0 < alpha < 1):
@@ -43938,6 +46237,18 @@ cat("OK\n")
                      'bin_centers': bin_centers}
         lines = []
 
+        # Pooling collapses every subject into one aggregate curve, so each cell
+        # holds a single value and there is no between-subject variance left to
+        # test.  Say so rather than printing an ANOVA built on n=1 cells.
+        if any(d.get('pooled') for gd in results.values() for d in gd.values()):
+            stats_out['text'] = (
+                "\nNo ANOVA run - 'Pool all frames' averaging leaves one "
+                "curve per group, so there is no between-subject variance "
+                "to test." + '\\n' +
+                "Switch to Subject-mean averaging for statistics; error bars "
+                "are absent for the same reason.")
+            return stats_out
+
         if n_groups >= 2:
             all_outcomes = set()
             for gd in results.values():
@@ -44022,6 +46333,12 @@ cat("OK\n")
         lines.append("* p<\u03b1   ** p<0.01   *** p<0.001   ns = not significant")
         lines.append("Between-subjects two-way ANOVA (Type I SS); "
                      "post-hoc: Bonferroni-corrected Welch t-tests.")
+        lines.append(
+            "Note: Signal Bin is entered as a between-subjects factor, but every "
+            "subject contributes a value to" + '\\n' +
+            "every bin. The Bin and interaction terms are therefore "
+            "anti-conservative - read them as descriptive and confirm" + '\\n' +
+            "any bin effect with a repeated-measures test.")
         stats_out['text'] = "\n".join(lines)
         return stats_out
 
@@ -44192,7 +46509,7 @@ cat("OK\n")
 
         # ── Stats text area ────────────────────────────────────────────────────
         if stats_outer is not None:
-            stats_text = tk.Text(stats_outer, height=8,
+            stats_text = tk.Text(stats_outer, height=8, width=40,
                                  font=('Courier', 9), wrap='none',
                                  relief='flat', background='#f8f8f8')
             xscr = ttk.Scrollbar(stats_outer, orient='horizontal',
@@ -44224,21 +46541,37 @@ cat("OK\n")
             return
 
         try:
+            meta = getattr(self, 'dec_prob_meta', {}) or {}
             rows = []
             for group_name, gdata in self.dec_prob_results.items():
                 for outcome_name, d in gdata.items():
                     centers = d['centers']
                     mean_p  = d['mean']
                     sem_p   = d['sem']
+                    n_fr    = d.get('n_frames')
+                    per_sub = d.get('per_subject') or []
+                    src     = ', '.join(d.get('source_zones') or [])
+                    dst     = ', '.join(d.get('outcome_zones') or [])
                     for i in range(len(centers)):
                         rows.append({
                             'Group':            group_name,
-                            'Outcome':          outcome_name.capitalize(),
+                            'Outcome':          self._dec_prob_label(outcome_name),
+                            'From_zones':       src,
+                            'To_zones':         dst,
+                            'Channel':          meta.get('channel', ''),
+                            'Lookahead_s':      meta.get('lookahead_sec', ''),
+                            'Averaging':        meta.get('avg_method', ''),
                             'Signal_bin_center_zscore': round(float(centers[i]), 4),
                             'Mean_Probability': (round(float(mean_p[i]), 4)
                                                  if not np.isnan(mean_p[i]) else ''),
                             'SEM_Probability':  (round(float(sem_p[i]), 4)
                                                  if not np.isnan(sem_p[i]) else ''),
+                            # n behind each point: without it a bin resting on
+                            # one animal reads the same as one resting on twelve.
+                            'N_subjects_in_bin': (len(per_sub[i])
+                                                  if i < len(per_sub) else ''),
+                            'N_frames_in_bin':   (int(n_fr[i])
+                                                  if n_fr is not None else ''),
                         })
 
             df = pd.DataFrame(rows)
@@ -45091,7 +47424,7 @@ cat("OK\n")
         ttk.Label(self.sig_link_readout_frame, text=header,
                   font=('Segoe UI', 9, 'bold')).pack(anchor='w')
 
-        txt = tk.Text(self.sig_link_readout_frame,
+        txt = tk.Text(self.sig_link_readout_frame, width=40,
                       height=8 if not split else min(20, 3 + 5 * len(panels)),
                       wrap='word',
                       relief='flat', font=('Segoe UI', 9),
@@ -45375,7 +47708,11 @@ cat("OK\n")
         self.kin_zone_kinematic_var = tk.StringVar(value="Velocity")
         self.kin_figure        = None
         self.kin_canvas_widget = None
-        self.kin_last_table    = None   # DataFrame backing the current plot/summary
+        self.kin_last_table    = None   # DataFrame backing the current plot
+        # Summarize opens its own window with its own export button, so its
+        # table is kept apart from the plot's -- otherwise clicking Summarize
+        # after Run silently replaced what the tab's Export button wrote.
+        self.kin_summary_table = None
 
         # Graphics / display settings (editable via the Settings button).
         if not hasattr(self, 'kin_gfx'):
@@ -46502,6 +48839,40 @@ cat("OK\n")
 
     # ── Binned signal curves (velocity / acceleration / distance) ────────────
 
+    def _kin_binned_table(self, centers, curves, summary, has_groups):
+        """Per-subject wide table for the binned-signal curves.
+
+        Layout follows the Bout Analysis plot-data export: Group | Subject |
+        one column per bin, one row per animal, then mean / SEM / n rows per
+        group underneath. Exporting only the group means -- what this used to
+        do -- discarded every subject behind the error bars, so the file could
+        not be pasted into Prism or fed to a per-animal test.
+
+        `summary` maps a group to the (mean, sem, n) actually plotted, so the
+        summary rows are the drawn error bars rather than a second computation
+        that could drift from them.
+        """
+        labels = [f"{c:.4g}" for c in centers]
+        if len(set(labels)) != len(labels):     # two centers rounding alike
+            labels = [f"{c:.6g}" for c in centers]   # would merge into one column
+
+        def _row(head, values):
+            row = dict(zip(('Group', 'Subject') if has_groups else ('Subject',), head))
+            row.update({lab: values[i] for i, lab in enumerate(labels)})
+            return row
+
+        rows = [_row((grp, subj) if has_groups else (subj,), curve)
+                for grp, subj, curve in curves]
+        # Blank spacer so the summary block never reads as another animal.
+        rows.append({})
+        for grp, (mean, sem, n) in summary.items():
+            for stat, values in (('mean', mean), ('SEM', sem)):
+                rows.append(_row((grp, stat) if has_groups else (stat,), values))
+            rows.append(_row((grp, 'n') if has_groups else ('n',),
+                             [n] * len(labels)))
+        cols = (['Group', 'Subject'] if has_groups else ['Subject']) + labels
+        return pd.DataFrame(rows, columns=cols)
+
     def _kin_signal_by_bin(self, records, settings, ch_label, mode, field):
         nbins = settings['nbins']
         # Decide bin edges from pooled data for a common axis.
@@ -46539,32 +48910,41 @@ cat("OK\n")
         if field == 'vel':
             xlabel = 'Speed (z-score)' if settings['vel_zscore'] else 'Speed (cm/s)'
 
+        # Every subject's curve is kept, not just the group average: the export
+        # writes one row per subject (see _kin_binned_table), which is the shape
+        # the Bout Analysis plot-data export uses and what a per-animal stats
+        # test needs. The group mean/SEM handed to the table is the same pair
+        # the error bars are drawn from, so the two can never disagree.
+        curves = []
+        summary = {}
         if mode == "Group":
             groups = {}
             for k in records:
-                groups.setdefault(k['group'], []).append(subject_curve(k))
-            rows = []
-            for grp, curves in groups.items():
-                cm = np.array(curves)
+                curve = subject_curve(k)
+                groups.setdefault(k['group'], []).append(curve)
+                curves.append((k['group'], k['subject'], curve))
+            for grp, group_curves in groups.items():
+                cm = np.array(group_curves)
                 mean = np.nanmean(cm, axis=0)
                 sem = np.nanstd(cm, axis=0) / np.sqrt(max(1, cm.shape[0]))
+                summary[grp] = (mean, sem, cm.shape[0])
                 ax.errorbar(centers, mean, yerr=sem, marker='o', capsize=3,
                             linewidth=2, label=f"{grp} (n={cm.shape[0]})")
-                for ci, c in enumerate(centers):
-                    rows.append({'group': grp, 'bin_center': c,
-                                 'mean_signal': mean[ci], 'sem': sem[ci]})
             ax.legend(fontsize=9)
-            self.kin_last_table = pd.DataFrame(rows)
+            self.kin_last_table = self._kin_binned_table(centers, curves, summary, True)
         else:
-            rows = []
             for k in records:
                 curve = subject_curve(k)
                 ax.plot(centers, curve, marker='o', linewidth=1.5, alpha=0.85, label=k['subject'])
-                for ci, c in enumerate(centers):
-                    rows.append({'subject': k['subject'], 'bin_center': c, 'mean_signal': curve[ci]})
+                curves.append((k.get('group', ''), k['subject'], curve))
             if len(records) <= 10:
                 ax.legend(fontsize=8)
-            self.kin_last_table = pd.DataFrame(rows)
+            if curves:
+                cm = np.array([c for _g, _s, c in curves])
+                summary['All'] = (np.nanmean(cm, axis=0),
+                                  np.nanstd(cm, axis=0) / np.sqrt(max(1, cm.shape[0])),
+                                  cm.shape[0])
+            self.kin_last_table = self._kin_binned_table(centers, curves, summary, False)
 
         ax.set_xlabel(xlabel)
         ax.set_ylabel(f"Mean {ch_label} z-score")
@@ -47140,7 +49520,7 @@ cat("OK\n")
                 'xcorr_peak_lag_s': round(float(peak_lag), 3) if np.isfinite(peak_lag) else '',
             })
         df = pd.DataFrame(rows)
-        self.kin_last_table = df
+        self.kin_summary_table = df
         self._kin_show_table_window(df)
 
     def _kin_show_table_window(self, df):
@@ -47178,15 +49558,23 @@ cat("OK\n")
 
     def export_kinematics(self):
         """Export the data behind the current plot, or save the figure as PNG."""
-        if self.kin_last_table is not None and len(self.kin_last_table):
-            self._kin_export_df(self.kin_last_table)
+        # The plot's own table wins: Export is documented as "the data behind
+        # the current plot", and a summary run afterwards must not displace it.
+        table = self.kin_last_table
+        if table is None or not len(table):
+            table = getattr(self, 'kin_summary_table', None)
+        if table is not None and len(table):
+            self._kin_export_df(table)
         elif self.kin_figure is not None:
             path = filedialog.asksaveasfilename(
-                defaultextension=".png", filetypes=[("PNG", "*.png")],
+                defaultextension=".png",
+                filetypes=[("PNG (600 dpi)", "*.png"), ("TIFF (600 dpi)", "*.tif"),
+                           ("PDF (vector)", "*.pdf"), ("SVG (vector)", "*.svg")],
                 title="Save Kinematics Figure")
             if path:
                 try:
-                    self.kin_figure.savefig(path, dpi=150, bbox_inches='tight')
+                    self.kin_figure.savefig(path, dpi=PLOT_EXPORT_DPI,
+                                           bbox_inches='tight')
                     messagebox.showinfo("Saved", f"Figure saved to:\n{path}")
                 except Exception as exc:
                     messagebox.showerror("Save Error", f"Could not save figure:\n{exc}")

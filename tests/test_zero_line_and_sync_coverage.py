@@ -160,9 +160,11 @@ VIZ_PERI_EVENT_PLOTS = [
     'plot_extracted_bouts_by_group',
     'plot_zone_entry_bouts', 'plot_zone_entry_bouts_multi',
     '_plot_zone_entry_bouts_group_comparison',
-    'plot_bout_comparison_single', 'plot_bout_comparison_multi',
-    'plot_bout_comparison_by_group',
     'compare_bout_channels', '_plot_length_binned_axis',
+    # The three Compare Across Bouts entry points share one renderer, the way
+    # the bout-length views share _plot_length_binned_axis; the marker is drawn
+    # there, so that is what has to route through the helper.
+    '_render_bout_comparison',
 ]
 
 
