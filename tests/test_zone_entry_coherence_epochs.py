@@ -131,7 +131,7 @@ def test_min_time_in_zone_drops_entries_the_animal_left_early():
     data = _load(app)
 
     counts = [len(app._resolve_epoch_onsets(SUBJECT, data, 'Zone: Open Arm Entry',
-                                            min_dwell_sec=t))
+                                            min_bout_sec=t))
               for t in (0.0, 2.0, 5.0, 10.0, 15.0, 600.0)]
 
     assert counts == sorted(counts, reverse=True), counts
@@ -147,7 +147,7 @@ def test_surviving_entries_really_stay_in_the_zone():
 
     threshold = 10.0
     kept = app._resolve_epoch_onsets(SUBJECT, data, 'Zone: Open Arm Entry',
-                                     min_dwell_sec=threshold)
+                                     min_bout_sec=threshold)
     assert kept, 'expected at least one entry to survive a 10 s requirement'
 
     labels = app._zone_labels_for(SUBJECT, data)
@@ -170,7 +170,7 @@ def test_decision_entries_measure_dwell_in_the_centre():
         {'open_arm_up', 'open_arm_down'}
 
     kept = app._resolve_epoch_onsets(SUBJECT, data, 'Zone: Explore Decision',
-                                     min_dwell_sec=2.0)
+                                     min_bout_sec=2.0)
     assert len(kept) > 0
 
 

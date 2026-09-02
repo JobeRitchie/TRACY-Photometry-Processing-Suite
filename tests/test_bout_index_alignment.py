@@ -28,8 +28,12 @@ def _app():
     return app
 
 
-def test_bout_analysis_has_visible_settings_button():
-    root = tk.Tk()
+def test_bout_analysis_has_visible_settings_button(tk_root):
+    # A Toplevel off the session root, not a second tk.Tk(): a second Tcl
+    # interpreter in one process raises TclError (see conftest), and this
+    # module used to get away with it only because nothing alphabetically
+    # earlier had claimed the session root yet.
+    root = tk.Toplevel(tk_root)
     root.withdraw()
     try:
         app = G.FPAnalysisGUI(root)

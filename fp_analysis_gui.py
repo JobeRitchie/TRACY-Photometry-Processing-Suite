@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.18.0"
-APP_VERSION_DATE = "September 1, 2026"
+APP_VERSION = "1.19.0"
+APP_VERSION_DATE = "September 2, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -596,6 +596,8 @@ PARAM_GROUPS = [
              "legacy | normalize_y_min | independent_y_scale"),
             ('distal_threshold', "Distal threshold (cm)",
              "Distance from centre counted as distal open arm"),
+            ('zone_editor_sticky_edges', "Zone editor: sticky edges",
+             "True = dragging an edge moves the zone edges flush with it"),
         ]),
         # The question this dialog gets asked most. Kept in one block, labelled
         # by which analysis each pair actually drives, so it is clear that
@@ -644,6 +646,17 @@ PARAM_GROUPS = [
         ]),
     ]),
 ]
+
+
+# How individual bouts are laid out in heatmap rows and export columns.
+# "Group, then subject" keeps every bout of one subject together with the
+# subjects blocked by group -- the acquisition layout. "Bout number" instead
+# interleaves subjects so all first bouts sit side by side, then all second
+# bouts, and so on, which is what you want to read a within-session drift
+# across the whole cohort rather than one animal at a time.
+BOUT_ORDER_BY_SUBJECT = "Group, then subject"
+BOUT_ORDER_BY_NUMBER = "Bout number"
+BOUT_ORDER_CHOICES = [BOUT_ORDER_BY_SUBJECT, BOUT_ORDER_BY_NUMBER]
 
 
 # Which option clusters each plot type actually uses. Kept as a table rather
@@ -831,17 +844,31 @@ class _ProgressCancelled(Exception):
 
 class ZoneEditor:
     """Interactive zone editor for defining behavioral zones"""
-    
+
+    # How close (in screen pixels) the pointer has to be to count as grabbing
+    # an edge rather than the zone body.
+    EDGE_GRAB_PX = 8
+    # Two boundaries within this many cm of each other are the same boundary.
+    STICKY_TOL = 0.05
+    # No drag may shrink a zone below this (cm).
+    MIN_ZONE_SIZE = 0.5
+
     def __init__(self, parent, main_app):
         self.parent = parent
         self.main_app = main_app
         self.zones = {k: v.copy() for k, v in main_app.zones.items()}
         self.maze_width = main_app.params['maze_width_cm']
-        
+
         self.selected_zone = None
         self.drag_corner = None
         self.zone_patches = {}
-        
+        self.zone_labels = {}
+        self._drag_edges = {}
+        self._drag_bounds0 = {}
+        self._drag_anchor = (0.0, 0.0)
+        self._sticky_edges = bool(
+            main_app.params.get('zone_editor_sticky_edges', True))
+
         self.setup_ui()
         
     def setup_ui(self):
@@ -975,17 +1002,33 @@ class ZoneEditor:
         viz_frame = ttk.Frame(main_frame)
         viz_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Create matplotlib figure
-        self.fig, self.ax = plt.subplots(figsize=(6.5, 6.5))
+        # Drag options and instructions are packed against the BOTTOM before the
+        # canvas, so they keep their space on a short window.  Packed after it
+        # they were pushed off the bottom entirely: a figure canvas asks for its
+        # full figsize in pixels, which on a scaled display is taller than the
+        # editor window.
+        instructions = ("Drag an edge or corner to resize, the middle of a zone to move it.\n"
+                       "Turn off sticky edges to move one edge at a time.\n"
+                       "Adjust values in the left panel for precise control.")
+        ttk.Label(viz_frame, text=instructions, foreground='gray',
+                  justify=tk.LEFT).pack(side=tk.BOTTOM, pady=(2, 4))
+
+        options_frame = ttk.Frame(viz_frame)
+        options_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        self.sticky_edges_var = tk.BooleanVar(value=self._sticky_edges)
+        ttk.Checkbutton(
+            options_frame, text="Sticky edges (shared boundaries move together)",
+            variable=self.sticky_edges_var,
+            command=self._on_sticky_toggle).pack(anchor=tk.W)
+
+        # Create matplotlib figure.  Kept modest so the canvas can shrink with
+        # the window instead of demanding a fixed slab of pixels.
+        self.fig, self.ax = plt.subplots(figsize=(4.5, 4.5))
         self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
+        self._defeat_canvas_dpi_doubling()
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Instructions
-        instructions = ("Click and drag zone edges to resize.\n"
-                       "Adjust values in the left panel for precise control.")
-        ttk.Label(viz_frame, text=instructions, foreground='gray').pack(pady=5)
-        
+
         # Bind mouse events
         self.canvas.mpl_connect('button_press_event', self.on_mouse_press)
         self.canvas.mpl_connect('button_release_event', self.on_mouse_release)
@@ -1030,20 +1073,28 @@ class ZoneEditor:
         if not self.selected_zone:
             messagebox.showwarning("Warning", "Please select a zone first")
             return
-        
+
         try:
             x_min = float(self.x_min_var.get())
             x_max = float(self.x_max_var.get())
             y_min = float(self.y_min_var.get())
             y_max = float(self.y_max_var.get())
-            
+
             if x_min >= x_max or y_min >= y_max:
                 messagebox.showerror("Error", "Invalid zone dimensions: min must be less than max")
                 return
-            
-            # Get old values
-            old_zone = self.zones[self.selected_zone].copy()
-            
+
+            # Which neighbouring edges are flush with the edges about to move?
+            # Collected BEFORE the zone changes, while the old values still
+            # identify the shared boundary.
+            followers = []
+            if self.sticky_edges_enabled():
+                for key, new_value in (('x_min', x_min), ('x_max', x_max),
+                                       ('y_min', y_min), ('y_max', y_max)):
+                    if abs(self.zones[self.selected_zone][key] - new_value) > self.STICKY_TOL:
+                        followers.append((self._sticky_partners(self.selected_zone, key),
+                                          new_value))
+
             # Update selected zone
             self.zones[self.selected_zone]['x_min'] = x_min
             self.zones[self.selected_zone]['x_max'] = x_max
@@ -1056,34 +1107,27 @@ class ZoneEditor:
             color = self.zone_color_var.get().strip()
             if color:
                 self.zones[self.selected_zone]['color'] = color
-            
-            # Adjust adjacent zones to maintain continuity
-            # Check for zones that share borders and adjust them
-            for zone_name, zone_data in self.zones.items():
-                if zone_name == self.selected_zone:
-                    continue
-                
-                # Adjust horizontal adjacency (x-axis)
-                # If a zone's x_min matches our old x_max, update it to new x_max
-                if abs(zone_data['x_min'] - old_zone['x_max']) < 0.01:
-                    zone_data['x_min'] = x_max
-                # If a zone's x_max matches our old x_min, update it to new x_min
-                elif abs(zone_data['x_max'] - old_zone['x_min']) < 0.01:
-                    zone_data['x_max'] = x_min
-                
-                # Adjust vertical adjacency (y-axis)
-                # If a zone's y_min matches our old y_max, update it to new y_max
-                if abs(zone_data['y_min'] - old_zone['y_max']) < 0.01:
-                    zone_data['y_min'] = y_max
-                # If a zone's y_max matches our old y_min, update it to new y_min
-                elif abs(zone_data['y_max'] - old_zone['y_min']) < 0.01:
-                    zone_data['y_max'] = y_min
-            
+
+            # Drag the flush neighbours along so the arena stays tiled, skipping
+            # any move that would turn a neighbour inside out.
+            for partners, value in followers:
+                for zone_name, edge_key in partners:
+                    other = self.zones[zone_name]
+                    axis = edge_key[0]
+                    if edge_key.endswith('_min'):
+                        if value >= other[axis + '_max'] - self.MIN_ZONE_SIZE:
+                            continue
+                    else:
+                        if value <= other[axis + '_min'] + self.MIN_ZONE_SIZE:
+                            continue
+                    other[edge_key] = value
+
             self.plot_zones()
-            
+            self.highlight_selected_zone()
+
         except ValueError:
             messagebox.showerror("Error", "Invalid numeric values")
-    
+
     def load_template(self, event=None):
         """Load selected template"""
         template_name = self.template_var.get()
@@ -1106,14 +1150,16 @@ class ZoneEditor:
             template = self.main_app.zone_templates[template_name]
             self.zones = {k: v.copy() for k, v in template['zones'].items()}
             self.maze_width = template['maze_width_cm']
+            self.maze_width_var.set(str(self.maze_width))
             self.populate_zone_list()
             self.plot_zones()
-    
+
     def plot_zones(self):
         """Plot all zones on the canvas"""
         self.ax.clear()
         self.zone_patches = {}
-        
+        self.zone_labels = {}
+
         # Set up the plot
         self.ax.set_xlim(0, self.maze_width)
         self.ax.set_ylim(0, self.maze_width)
@@ -1122,14 +1168,14 @@ class ZoneEditor:
         self.ax.set_ylabel('Y (cm)')
         self.ax.set_title('Zone Configuration')
         self.ax.grid(True, alpha=0.3)
-        
+
         # Plot each zone
         for zone_name, zone_data in self.zones.items():
             x_min = zone_data['x_min']
             y_min = zone_data['y_min']
             width = zone_data['x_max'] - x_min
             height = zone_data['y_max'] - y_min
-            
+
             # Create rectangle patch
             rect = Rectangle((x_min, y_min), width, height,
                            linewidth=2, edgecolor='black',
@@ -1137,17 +1183,40 @@ class ZoneEditor:
                            alpha=0.5, picker=True)
             self.ax.add_patch(rect)
             self.zone_patches[zone_name] = rect
-            
+
             # Add label
             center_x = x_min + width / 2
             center_y = y_min + height / 2
-            self.ax.text(center_x, center_y, zone_name,
-                        ha='center', va='center',
-                        fontsize=8, weight='bold',
-                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-        
+            self.zone_labels[zone_name] = self.ax.text(
+                center_x, center_y, zone_name,
+                ha='center', va='center',
+                fontsize=8, weight='bold',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
         self.canvas.draw()
-    
+
+    def refresh_zone_geometry(self):
+        """Push the current zone numbers into the artists already on the axes.
+
+        Dragging used to re-run plot_zones() on every motion event, clearing the
+        axes and rebuilding every patch, label and grid line for each pixel of
+        travel; on an 8-zone template that is what makes the drag feel like it
+        is fighting back.  Moving the existing artists keeps it smooth."""
+        if set(self.zone_patches) != set(self.zones):
+            self.plot_zones()
+            self.highlight_selected_zone()
+            return
+        for zone_name, patch in self.zone_patches.items():
+            zone = self.zones[zone_name]
+            patch.set_bounds(zone['x_min'], zone['y_min'],
+                             zone['x_max'] - zone['x_min'],
+                             zone['y_max'] - zone['y_min'])
+            label = self.zone_labels.get(zone_name)
+            if label is not None:
+                label.set_position(((zone['x_min'] + zone['x_max']) / 2,
+                                    (zone['y_min'] + zone['y_max']) / 2))
+        self.canvas.draw_idle()
+
     def highlight_selected_zone(self):
         """Highlight the currently selected zone"""
         # Reset all zones to normal
@@ -1158,242 +1227,307 @@ class ZoneEditor:
             else:
                 patch.set_linewidth(2)
                 patch.set_edgecolor('black')
-        
-        self.canvas.draw()
-    
+
+        self.canvas.draw_idle()
+
+    # -- Edge stickiness ----------------------------------------------
+    # Zones in every template are a tiling: each boundary is stored twice, once
+    # as one zone's max and once as its neighbour's min.  Dragging only ever
+    # moved the edge under the cursor, so the two halves of a shared boundary
+    # came apart and left a gap (or an overlap) that position samples then fall
+    # into.  With stickiness on, an edge takes its flush neighbours with it;
+    # with it off, edges move one at a time, which is what you want when
+    # deliberately carving out a zone that is not meant to tile.
+
+    def sticky_edges_enabled(self):
+        """Whether shared edges move together (defaults to on)."""
+        var = getattr(self, 'sticky_edges_var', None)
+        if var is not None:
+            try:
+                return bool(var.get())
+            except Exception:
+                pass
+        return bool(getattr(self, '_sticky_edges', True))
+
+    def _on_sticky_toggle(self):
+        """Remember the toggle so it survives closing the editor."""
+        enabled = self.sticky_edges_enabled()
+        self._sticky_edges = enabled
+        try:
+            self.main_app.params['zone_editor_sticky_edges'] = enabled
+        except Exception:
+            pass
+
+    def _sticky_partners(self, zone_name, edge_key):
+        """Edges of other zones sitting on this zone's edge_key boundary.
+
+        A neighbour only counts if it also adjoins this zone along the other
+        axis (overlapping it or touching it), so a zone that happens to line up
+        across the far side of the arena is left where it is."""
+        zone = self.zones[zone_name]
+        value = zone[edge_key]
+        axis = edge_key[0]                       # 'x' or 'y'
+        perp = 'y' if axis == 'x' else 'x'
+        lo, hi = zone[perp + '_min'], zone[perp + '_max']
+
+        partners = []
+        for other_name, other in self.zones.items():
+            if other_name == zone_name:
+                continue
+            if (other[perp + '_max'] < lo - self.STICKY_TOL or
+                    other[perp + '_min'] > hi + self.STICKY_TOL):
+                continue
+            for other_key in (axis + '_min', axis + '_max'):
+                if abs(other[other_key] - value) <= self.STICKY_TOL:
+                    partners.append((other_name, other_key))
+        return partners
+
+    def _bounds_at_press(self, zone_name):
+        """The zone's geometry when the drag started (falls back to current)."""
+        snapshot = getattr(self, '_drag_bounds0', None) or {}
+        return snapshot.get(zone_name, self.zones[zone_name])
+
+    def _edge_limits(self, edges):
+        """How far a set of edges moving together may travel (min, max)."""
+        lo, hi = 0.0, float(self.maze_width)
+        for zone_name, edge_key in edges:
+            bounds = self._bounds_at_press(zone_name)
+            axis = edge_key[0]
+            if edge_key.endswith('_min'):
+                hi = min(hi, bounds[axis + '_max'] - self.MIN_ZONE_SIZE)
+            else:
+                lo = max(lo, bounds[axis + '_min'] + self.MIN_ZONE_SIZE)
+        return lo, hi
+
+    def _apply_edge_drag(self, edge_key, value):
+        """Move one boundary, and everything stuck to it, to value."""
+        edges = self._drag_edges.get(edge_key, [])
+        if not edges:
+            return
+        lo, hi = self._edge_limits(edges)
+        value = min(max(value, lo), max(lo, hi))
+        for zone_name, key in edges:
+            self.zones[zone_name][key] = value
+
+    def _apply_zone_move(self, dx, dy):
+        """Translate the selected zone, pushing any stuck boundaries with it."""
+        start = self._bounds_at_press(self.selected_zone)
+        limits = {'x': [-start['x_min'], self.maze_width - start['x_max']],
+                  'y': [-start['y_min'], self.maze_width - start['y_max']]}
+
+        for edge_key, edges in self._drag_edges.items():
+            axis = edge_key[0]
+            for zone_name, key in edges:
+                if zone_name == self.selected_zone:
+                    continue
+                bounds = self._bounds_at_press(zone_name)
+                origin = bounds[key]
+                if key.endswith('_min'):
+                    limits[axis][1] = min(limits[axis][1],
+                                          bounds[axis + '_max'] - self.MIN_ZONE_SIZE - origin)
+                    limits[axis][0] = max(limits[axis][0], -origin)
+                else:
+                    limits[axis][0] = max(limits[axis][0],
+                                          bounds[axis + '_min'] + self.MIN_ZONE_SIZE - origin)
+                    limits[axis][1] = min(limits[axis][1], self.maze_width - origin)
+
+        dx = min(max(dx, limits['x'][0]), max(limits['x'][0], limits['x'][1]))
+        dy = min(max(dy, limits['y'][0]), max(limits['y'][0], limits['y'][1]))
+
+        for edge_key, edges in self._drag_edges.items():
+            delta = dx if edge_key[0] == 'x' else dy
+            for zone_name, key in edges:
+                self.zones[zone_name][key] = self._bounds_at_press(zone_name)[key] + delta
+
+    # -- Mouse handling -----------------------------------------------
+
+    def _defeat_canvas_dpi_doubling(self):
+        """Keep the figure's pixels and Tk's pixels the same size.
+
+        TRACY runs DPI-aware (see _enable_dpi_awareness), so Tk's pixels are
+        already physical device pixels.  matplotlib's Tk backend does not know
+        that: on <Map> it reads `tk scaling`, concludes the display is 1.5x (at
+        150% Windows scaling), and re-renders the figure 1.5x larger than the
+        widget.  The image is then cropped at the widget's right and bottom
+        edge, while a click is still multiplied by that 1.5 -- so the pointer
+        grabbed a boundary well away from the one drawn under it, which is what
+        made dragging a zone edge feel unpredictable.  Dropping the <Map>
+        binding leaves the ratio at 1 and the two coordinate systems aligned."""
+        try:
+            self.canvas.get_tk_widget().unbind('<Map>')
+        except Exception:
+            pass
+
+    def _edge_tolerance(self):
+        """Edge grab distance in cm, held at a constant ~8 screen pixels.
+
+        The old tolerance was 10% of the zone's own size, so a thin zone was
+        nearly impossible to grab while a large one grabbed an edge from
+        several centimetres away."""
+        try:
+            inverse = self.ax.transData.inverted()
+            x0, y0 = inverse.transform((0.0, 0.0))
+            x1, y1 = inverse.transform((self.EDGE_GRAB_PX, self.EDGE_GRAB_PX))
+            tol_x, tol_y = abs(x1 - x0), abs(y1 - y0)
+            if tol_x > 0 and tol_y > 0:
+                return tol_x, tol_y
+        except Exception:
+            pass
+        fallback = max(self.maze_width, 1.0) * 0.02
+        return fallback, fallback
+
+    def _hit_test(self, x, y):
+        """The (zone, handle) under the cursor, or (None, None).
+
+        Edges beat interiors and corners beat edges, so a boundary shared by two
+        zones is grabbed as a boundary instead of selecting whichever zone
+        happens to come first in the dictionary."""
+        tol_x, tol_y = self._edge_tolerance()
+        best = None
+        best_rank = None
+
+        for zone_name, zone in self.zones.items():
+            if not (zone['x_min'] - tol_x <= x <= zone['x_max'] + tol_x and
+                    zone['y_min'] - tol_y <= y <= zone['y_max'] + tol_y):
+                continue
+
+            near_left = abs(x - zone['x_min']) <= tol_x
+            near_right = abs(x - zone['x_max']) <= tol_x
+            near_bottom = abs(y - zone['y_min']) <= tol_y
+            near_top = abs(y - zone['y_max']) <= tol_y
+
+            # A zone thinner than the grab distance is near both of its edges;
+            # take whichever is actually closer.
+            if near_left and near_right:
+                near_right = abs(x - zone['x_max']) < abs(x - zone['x_min'])
+                near_left = not near_right
+            if near_bottom and near_top:
+                near_top = abs(y - zone['y_max']) < abs(y - zone['y_min'])
+                near_bottom = not near_top
+
+            horizontal = 'left' if near_left else ('right' if near_right else None)
+            vertical = 'bottom' if near_bottom else ('top' if near_top else None)
+
+            if vertical and horizontal:
+                handle, rank = vertical + '_' + horizontal, 3
+            elif vertical or horizontal:
+                handle, rank = (vertical or horizontal), 2
+            elif (zone['x_min'] <= x <= zone['x_max'] and
+                  zone['y_min'] <= y <= zone['y_max']):
+                handle, rank = 'move', 1
+            else:
+                continue
+
+            # A shared boundary hits both zones that own it.  Prefer the one
+            # already selected -- with stickiness off, which side you are
+            # dragging is the whole point -- then the smaller zone, so a small
+            # zone nested inside a large one stays reachable.
+            area = (zone['x_max'] - zone['x_min']) * (zone['y_max'] - zone['y_min'])
+            key = (rank, 1 if zone_name == self.selected_zone else 0, -area)
+            if best_rank is None or key > best_rank:
+                best_rank, best = key, (zone_name, handle)
+
+        return best if best else (None, None)
+
+    _CURSORS = {'left': 'sb_h_double_arrow', 'right': 'sb_h_double_arrow',
+                'bottom': 'sb_v_double_arrow', 'top': 'sb_v_double_arrow',
+                'move': 'fleur'}
+
+    def _set_cursor(self, handle):
+        """Show what the pointer is about to grab."""
+        cursor = self._CURSORS.get(handle, 'sizing' if handle else '')
+        if cursor == getattr(self, '_current_cursor', None):
+            return
+        self._current_cursor = cursor
+        try:
+            self.canvas.get_tk_widget().config(cursor=cursor)
+        except Exception:
+            pass
+
     def on_mouse_press(self, event):
         """Handle mouse press for zone selection and dragging"""
-        if event.inaxes != self.ax:
+        # Cleared first: a click that landed on no handle used to leave the
+        # previous handle armed, so the next mouse move silently resized
+        # whatever had been dragged last.
+        self.drag_corner = None
+        self._drag_edges = {}
+        self._drag_bounds0 = {}
+
+        if event.inaxes != self.ax or event.button != 1:
             return
-        
-        # Find which zone was clicked
-        for zone_name, patch in self.zone_patches.items():
-            if patch.contains(event)[0]:
-                self.selected_zone = zone_name
-                
-                # Determine which corner/edge is being dragged
-                zone = self.zones[zone_name]
-                x, y = event.xdata, event.ydata
-                
-                # Check proximity to edges (within 10% of zone size)
-                tolerance = 0.1 * min(zone['x_max'] - zone['x_min'], 
-                                     zone['y_max'] - zone['y_min'])
-                
-                near_left = abs(x - zone['x_min']) < tolerance
-                near_right = abs(x - zone['x_max']) < tolerance
-                near_bottom = abs(y - zone['y_min']) < tolerance
-                near_top = abs(y - zone['y_max']) < tolerance
-                
-                if near_left and near_bottom:
-                    self.drag_corner = 'bottom_left'
-                elif near_right and near_bottom:
-                    self.drag_corner = 'bottom_right'
-                elif near_left and near_top:
-                    self.drag_corner = 'top_left'
-                elif near_right and near_top:
-                    self.drag_corner = 'top_right'
-                elif near_left:
-                    self.drag_corner = 'left'
-                elif near_right:
-                    self.drag_corner = 'right'
-                elif near_bottom:
-                    self.drag_corner = 'bottom'
-                elif near_top:
-                    self.drag_corner = 'top'
-                
-                # Update UI
-                for i, zname in enumerate(self.zones.keys()):
-                    if zname == zone_name:
-                        self.zone_listbox.selection_clear(0, tk.END)
-                        self.zone_listbox.selection_set(i)
-                        break
-                
-                self.update_zone_details()
-                self.highlight_selected_zone()
+        if event.xdata is None or event.ydata is None:
+            return
+
+        zone_name, handle = self._hit_test(event.xdata, event.ydata)
+        if zone_name is None:
+            return
+
+        self.selected_zone = zone_name
+        self.drag_corner = handle
+        self._drag_bounds0 = {name: dict(zone) for name, zone in self.zones.items()}
+        self._drag_anchor = (event.xdata, event.ydata)
+
+        # Resolved once, at press time: recomputing the stuck edges mid-drag
+        # would let the moving boundary snag on zones it sweeps past.
+        if handle == 'move':
+            keys = ['x_min', 'x_max', 'y_min', 'y_max']
+        else:
+            keys = []
+            if 'left' in handle:
+                keys.append('x_min')
+            if 'right' in handle:
+                keys.append('x_max')
+            if 'bottom' in handle:
+                keys.append('y_min')
+            if 'top' in handle:
+                keys.append('y_max')
+
+        sticky = self.sticky_edges_enabled()
+        for key in keys:
+            edges = [(zone_name, key)]
+            if sticky:
+                edges.extend(self._sticky_partners(zone_name, key))
+            self._drag_edges[key] = edges
+
+        # Update UI
+        for i, zname in enumerate(self.zones.keys()):
+            if zname == zone_name:
+                self.zone_listbox.selection_clear(0, tk.END)
+                self.zone_listbox.selection_set(i)
                 break
-    
+
+        self.update_zone_details()
+        self.highlight_selected_zone()
+
     def on_mouse_move(self, event):
         """Handle mouse movement for dragging"""
-        if event.inaxes != self.ax or not self.selected_zone or not self.drag_corner:
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            self._set_cursor(None)
             return
-        
-        zone = self.zones[self.selected_zone]
+
+        if not self.selected_zone or not self.drag_corner:
+            self._set_cursor(self._hit_test(event.xdata, event.ydata)[1])
+            return
+
         x, y = event.xdata, event.ydata
-        
-        # Store old values to calculate delta for connected zones
-        old_x_min = zone['x_min']
-        old_x_max = zone['x_max']
-        old_y_min = zone['y_min']
-        old_y_max = zone['y_max']
-        
-        # Update zone boundaries based on drag corner
-        if 'left' in self.drag_corner:
-            zone['x_min'] = max(0, min(x, zone['x_max'] - 1))
-        if 'right' in self.drag_corner:
-            zone['x_max'] = min(self.maze_width, max(x, zone['x_min'] + 1))
-        if 'bottom' in self.drag_corner:
-            zone['y_min'] = max(0, min(y, zone['y_max'] - 1))
-        if 'top' in self.drag_corner:
-            zone['y_max'] = min(self.maze_width, max(y, zone['y_min'] + 1))
-        
-        # For EPM and EPM_Complex, update connected zones to maintain adjacency
-        template_name = self.template_var.get()
-        if template_name in ['EPM', 'EPM_Complex']:
-            self._update_connected_zones(self.selected_zone, old_x_min, old_x_max, old_y_min, old_y_max)
-        
+
+        if self.drag_corner == 'move':
+            anchor_x, anchor_y = getattr(self, '_drag_anchor', (x, y))
+            self._apply_zone_move(x - anchor_x, y - anchor_y)
+        else:
+            for edge_key, value in (('x_min', x), ('x_max', x),
+                                    ('y_min', y), ('y_max', y)):
+                if edge_key in self._drag_edges:
+                    self._apply_edge_drag(edge_key, value)
+
         self.update_zone_details()
-        self.plot_zones()
-        self.highlight_selected_zone()
-    
-    def _update_connected_zones(self, zone_name, old_x_min, old_x_max, old_y_min, old_y_max):
-        """Update connected zones to maintain adjacency in EPM mazes"""
-        zone = self.zones[zone_name]
-        template_name = self.template_var.get()
-        
-        # Calculate what changed
-        x_min_changed = zone['x_min'] != old_x_min
-        x_max_changed = zone['x_max'] != old_x_max
-        y_min_changed = zone['y_min'] != old_y_min
-        y_max_changed = zone['y_max'] != old_y_max
-        
-        # Define edge connections for EPM
-        if template_name == 'EPM':
-            # When center changes, update arms' connection edges AND their width/position
-            if zone_name == 'center':
-                # Update open arms (vertical arms on Y-axis)
-                if 'open_arm_up' in self.zones:
-                    self.zones['open_arm_up']['y_min'] = zone['y_max']  # Connect to center top
-                    self.zones['open_arm_up']['x_min'] = zone['x_min']  # Match center width
-                    self.zones['open_arm_up']['x_max'] = zone['x_max']  # Match center width
-                
-                if 'open_arm_down' in self.zones:
-                    self.zones['open_arm_down']['y_max'] = zone['y_min']  # Connect to center bottom
-                    self.zones['open_arm_down']['x_min'] = zone['x_min']  # Match center width
-                    self.zones['open_arm_down']['x_max'] = zone['x_max']  # Match center width
-                
-                # Update closed arms (horizontal arms on X-axis)
-                if 'closed_arm_right' in self.zones:
-                    self.zones['closed_arm_right']['x_min'] = zone['x_max']  # Connect to center right
-                    self.zones['closed_arm_right']['y_min'] = zone['y_min']  # Match center width
-                    self.zones['closed_arm_right']['y_max'] = zone['y_max']  # Match center width
-                
-                if 'closed_arm_left' in self.zones:
-                    self.zones['closed_arm_left']['x_max'] = zone['x_min']  # Connect to center left
-                    self.zones['closed_arm_left']['y_min'] = zone['y_min']  # Match center width
-                    self.zones['closed_arm_left']['y_max'] = zone['y_max']  # Match center width
-            
-            # When arms change, update center edges
-            elif zone_name == 'open_arm_up':
-                if 'center' in self.zones and y_min_changed:
-                    self.zones['center']['y_max'] = zone['y_min']
-            elif zone_name == 'open_arm_down':
-                if 'center' in self.zones and y_max_changed:
-                    self.zones['center']['y_min'] = zone['y_max']
-            elif zone_name == 'closed_arm_right':
-                if 'center' in self.zones and x_min_changed:
-                    self.zones['center']['x_max'] = zone['x_min']
-            elif zone_name == 'closed_arm_left':
-                if 'center' in self.zones and x_max_changed:
-                    self.zones['center']['x_min'] = zone['x_max']
-                    
-        elif template_name == 'EPM_Complex':
-            # More complex connections with proximal/distal zones
-            if zone_name == 'center':
-                # Update proximal zones connected to center
-                if 'open_proximal_up' in self.zones:
-                    self.zones['open_proximal_up']['y_min'] = zone['y_max']
-                    self.zones['open_proximal_up']['x_min'] = zone['x_min']
-                    self.zones['open_proximal_up']['x_max'] = zone['x_max']
-                    # Cascade to distal
-                    if 'open_distal_up' in self.zones:
-                        self.zones['open_distal_up']['x_min'] = zone['x_min']
-                        self.zones['open_distal_up']['x_max'] = zone['x_max']
-                
-                if 'open_proximal_down' in self.zones:
-                    self.zones['open_proximal_down']['y_max'] = zone['y_min']
-                    self.zones['open_proximal_down']['x_min'] = zone['x_min']
-                    self.zones['open_proximal_down']['x_max'] = zone['x_max']
-                    # Cascade to distal
-                    if 'open_distal_down' in self.zones:
-                        self.zones['open_distal_down']['x_min'] = zone['x_min']
-                        self.zones['open_distal_down']['x_max'] = zone['x_max']
-                
-                if 'closed_proximal_right' in self.zones:
-                    self.zones['closed_proximal_right']['x_min'] = zone['x_max']
-                    self.zones['closed_proximal_right']['y_min'] = zone['y_min']
-                    self.zones['closed_proximal_right']['y_max'] = zone['y_max']
-                    # Cascade to distal
-                    if 'closed_distal_right' in self.zones:
-                        self.zones['closed_distal_right']['y_min'] = zone['y_min']
-                        self.zones['closed_distal_right']['y_max'] = zone['y_max']
-                
-                if 'closed_proximal_left' in self.zones:
-                    self.zones['closed_proximal_left']['x_max'] = zone['x_min']
-                    self.zones['closed_proximal_left']['y_min'] = zone['y_min']
-                    self.zones['closed_proximal_left']['y_max'] = zone['y_max']
-                    # Cascade to distal
-                    if 'closed_distal_left' in self.zones:
-                        self.zones['closed_distal_left']['y_min'] = zone['y_min']
-                        self.zones['closed_distal_left']['y_max'] = zone['y_max']
-            
-            # Update distal zones when proximal zones change
-            elif zone_name == 'open_proximal_up':
-                if 'center' in self.zones and y_min_changed:
-                    self.zones['center']['y_max'] = zone['y_min']
-                if 'open_distal_up' in self.zones:
-                    if y_max_changed:
-                        self.zones['open_distal_up']['y_min'] = zone['y_max']
-                    # Match width
-                    self.zones['open_distal_up']['x_min'] = zone['x_min']
-                    self.zones['open_distal_up']['x_max'] = zone['x_max']
-            
-            elif zone_name == 'open_proximal_down':
-                if 'center' in self.zones and y_max_changed:
-                    self.zones['center']['y_min'] = zone['y_max']
-                if 'open_distal_down' in self.zones:
-                    if y_min_changed:
-                        self.zones['open_distal_down']['y_max'] = zone['y_min']
-                    # Match width
-                    self.zones['open_distal_down']['x_min'] = zone['x_min']
-                    self.zones['open_distal_down']['x_max'] = zone['x_max']
-            
-            elif zone_name == 'closed_proximal_right':
-                if 'center' in self.zones and x_min_changed:
-                    self.zones['center']['x_max'] = zone['x_min']
-                if 'closed_distal_right' in self.zones:
-                    if x_max_changed:
-                        self.zones['closed_distal_right']['x_min'] = zone['x_max']
-                    # Match width
-                    self.zones['closed_distal_right']['y_min'] = zone['y_min']
-                    self.zones['closed_distal_right']['y_max'] = zone['y_max']
-            
-            elif zone_name == 'closed_proximal_left':
-                if 'center' in self.zones and x_max_changed:
-                    self.zones['center']['x_min'] = zone['x_max']
-                if 'closed_distal_left' in self.zones:
-                    if x_min_changed:
-                        self.zones['closed_distal_left']['x_max'] = zone['x_min']
-                    # Match width
-                    self.zones['closed_distal_left']['y_min'] = zone['y_min']
-                    self.zones['closed_distal_left']['y_max'] = zone['y_max']
-            
-            # When distal zones change, update proximal
-            elif zone_name == 'open_distal_up':
-                if 'open_proximal_up' in self.zones and y_min_changed:
-                    self.zones['open_proximal_up']['y_max'] = zone['y_min']
-            elif zone_name == 'open_distal_down':
-                if 'open_proximal_down' in self.zones and y_max_changed:
-                    self.zones['open_proximal_down']['y_min'] = zone['y_max']
-            elif zone_name == 'closed_distal_right':
-                if 'closed_proximal_right' in self.zones and x_min_changed:
-                    self.zones['closed_proximal_right']['x_max'] = zone['x_min']
-            elif zone_name == 'closed_distal_left':
-                if 'closed_proximal_left' in self.zones and x_max_changed:
-                    self.zones['closed_proximal_left']['x_min'] = zone['x_max']
-    
+        self.refresh_zone_geometry()
+
     def on_mouse_release(self, event):
         """Handle mouse release"""
         self.drag_corner = None
+        self._drag_edges = {}
+        self._drag_bounds0 = {}
     
     def save_zones(self, notify=True, close=True):
         """Save zones back to main application"""
@@ -1997,6 +2131,10 @@ class FPAnalysisGUI:
             # Behavioral metrics table entry thresholds (all maze types)
             'metrics_min_entry_duration': 0.5,     # Min duration for metrics table entry counts
             'metrics_min_refractory_sec': 1.0,     # Min time between counted entries in metrics table
+            # Zone editor: whether a dragged edge takes the zone edges flush
+            # with it along, keeping the arena tiled.  Remembered between
+            # editor sessions.
+            'zone_editor_sticky_edges': True,
             # Position calibration
             'y_calibration_method': 'legacy',      # 'legacy' | 'normalize_y_min' | 'independent_y_scale'
             'outback_velocity_threshold': 2.0,  # cm/s - minimum velocity for out/back movement detection
@@ -2091,9 +2229,12 @@ class FPAnalysisGUI:
             'bout_epoch_pre_sec': 10.0,
             'bout_epoch_post_sec': 10.0,
             'bout_epoch_max_bouts': 0,
-            # Zone-entry epochs: minimum time the animal must remain in the
-            # target zone from the entry onward. 0 = detection thresholds only.
-            'zone_entry_min_dwell_sec': 0.0,
+            # Minimum bout length an epoch must have to be analysed. For a
+            # zone entry it is the time the animal must remain in the target
+            # zone from the entry onward; for a scored behavior it is the
+            # bout's own start-to-end duration, which needs boutframes with end
+            # frames. 0 = detection thresholds only.
+            'epoch_min_bout_sec': 0.0,
             # Plot axis ranges
             'freq_xmin': 0.0, 'freq_xmax': 3.0,
             'coh_ymin': 0.0, 'coh_ymax': 1.0,
@@ -7014,6 +7155,19 @@ class FPAnalysisGUI:
         ttk.Entry(max_bouts_frame, textvariable=self.viz_max_bouts_var, width=8).pack(side='left')
         ttk.Label(max_bouts_frame, text='(number or "all")', foreground='gray',
                   font=('Segoe UI', 8)).pack(side='left', padx=(4, 0))
+        # Row order for heatmaps and export columns -- see BOUT_ORDER_CHOICES.
+        ttk.Label(bouts_box, text="Order bouts by:").grid(row=2, column=0, sticky='w',
+                                                          pady=(4, 0))
+        self.viz_bout_order_var = tk.StringVar(value=BOUT_ORDER_BY_SUBJECT)
+        ttk.Combobox(bouts_box, textvariable=self.viz_bout_order_var, state='readonly',
+                     values=BOUT_ORDER_CHOICES, width=16).grid(
+                         row=2, column=1, sticky='w', padx=(4, 0), pady=(4, 0))
+        ttk.Label(bouts_box,
+                  text='"Bout number" groups bout 1 of every subject, then bout 2, '
+                       '... Ignored when averaging within subject.',
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').grid(
+                      row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
         # Bouts Overlay behaviour picker. None -> follow the Behavior dropdown
         # (single behavior); otherwise a set of names chosen in the pop-up.
@@ -7358,23 +7512,25 @@ class FPAnalysisGUI:
         ttk.Entry(bout_params_frame, textvariable=self.bout_epoch_max_bouts_var,
                   width=8).grid(row=3, column=1, sticky='w', padx=3, pady=3)
 
-        # Zone-entry epochs only: an entry whose window outlives the visit is
-        # measuring coherence in whatever zone the animal moved to next, so the
-        # post window is the value that actually keeps an epoch honest.
-        ttk.Label(bout_params_frame, text="Min time in zone (s):").grid(
+        # An epoch whose window outlives the behavior is measuring coherence in
+        # whatever the animal did next, so the post window is the value that
+        # actually keeps an epoch honest. Applies to both onset sources: time in
+        # zone for an entry, start-to-end duration for a scored bout.
+        ttk.Label(bout_params_frame, text="Min bout length (s):").grid(
             row=4, column=0, sticky='w', padx=3, pady=3)
-        self.zone_entry_min_dwell_var = tk.StringVar(
-            value=str(self.conn_params.get('zone_entry_min_dwell_sec', 0.0)))
-        ttk.Entry(bout_params_frame, textvariable=self.zone_entry_min_dwell_var,
+        self.epoch_min_bout_var = tk.StringVar(
+            value=str(self.conn_params.get('epoch_min_bout_sec', 0.0)))
+        ttk.Entry(bout_params_frame, textvariable=self.epoch_min_bout_var,
                   width=8).grid(row=4, column=1, sticky='w', padx=3, pady=3)
         ttk.Button(bout_params_frame, text="= post window",
                    style='Compact.TButton',
-                   command=lambda: self.zone_entry_min_dwell_var.set(
+                   command=lambda: self.epoch_min_bout_var.set(
                        self.bout_epoch_post_var.get())).grid(row=4, column=2, padx=3)
         ttk.Label(bout_params_frame,
-                  text="Zone entries only — drops entries the animal left too soon. "
-                       "0 = use the detection thresholds alone.",
-                  foreground='gray', font=('Segoe UI', 8)).grid(
+                  text="Drops epochs that ended too soon — time in zone for a zone "
+                       "entry, bout duration for a\nscored behavior (needs boutframes "
+                       "with end frames). 0 = use the detection thresholds alone.",
+                  foreground='gray', font=('Segoe UI', 8), justify='left').grid(
             row=5, column=0, columnspan=3, sticky='w', padx=3, pady=(0, 3))
 
         bout_btns = ttk.Frame(bout_tab)
@@ -7430,7 +7586,7 @@ class FPAnalysisGUI:
         ttk.Button(self._grp_bout_params_row, text="\u21ba Refresh",
                    command=self._refresh_epoch_behavior_list_beg).pack(side='left', padx=3)
         ttk.Label(self._grp_bout_params_row,
-                  text="Pre/post window and min time in zone are set in the By Bout tab.",
+                  text="Pre/post window and min bout length are set in the By Bout tab.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(320), justify='left').pack(side='left', padx=8)
 
@@ -8679,7 +8835,7 @@ class FPAnalysisGUI:
         _pd     = self.processed_data
         _cp     = dict(self.conn_params)
         # Read on the main thread: a Tk variable must not be touched from the worker.
-        _min_dwell = self._epoch_min_dwell_sec()
+        _min_bout = self._epoch_min_bout_sec()
 
         def _worker(q):
             done = 0
@@ -8702,7 +8858,7 @@ class FPAnalysisGUI:
                     data = _pd[subj]
 
                     onset_frames = self._resolve_epoch_onsets(
-                        subj, data, behavior, min_dwell_sec=_min_dwell,
+                        subj, data, behavior, min_bout_sec=_min_bout,
                         boutframes_file=(boutframes_file if _use_file_fallback else ''),
                         log=lambda m: q.put(('log', m)))
                     if not onset_frames:
@@ -9352,7 +9508,7 @@ class FPAnalysisGUI:
             [0.9839, 0.9874, 0.7013], [1.0000, 1.0000, 0.8510],
         ]
         parula = LinearSegmentedColormap.from_list('parula', _parula_colors, N=256)
-        _min_dwell = self._epoch_min_dwell_sec()
+        _min_bout = self._epoch_min_bout_sec()
 
         def _epoch_spectrogram_for_subjects(subject_list):
             """Compute grand-mean CWT coherence matrix across all subjects in the list."""
@@ -9363,7 +9519,7 @@ class FPAnalysisGUI:
                 if data is None:
                     continue
                 onset_frames = self._resolve_epoch_onsets(
-                    subject, data, behavior, min_dwell_sec=_min_dwell)
+                    subject, data, behavior, min_bout_sec=_min_bout)
                 if not onset_frames:
                     continue
 
@@ -10086,16 +10242,94 @@ class FPAnalysisGUI:
         return (self._entry_frames_to_signal_index(subject, data, kept, log=log),
                 n_detected, n_rejected)
 
+    @staticmethod
+    def _bout_lengths(onsets, durations=None, end_frames=None):
+        """Per-bout length in photometry samples, row-aligned to ``onsets``.
+
+        Returns None when the behavior carries no end frames at all, which is
+        how a caller tells "this file cannot measure bout length" (start-only
+        boutframes) from "this one bout has no scored end" (NaN in the list).
+        """
+        n = len(onsets or [])
+        if durations is not None:
+            src = list(durations)
+        elif end_frames is not None:
+            src = [(float(e) - float(s))
+                   if (e is not None and s is not None) else np.nan
+                   for s, e in zip(onsets or [], end_frames)]
+        else:
+            return None
+        out = []
+        for i in range(n):
+            try:
+                out.append(float(src[i]))
+            except (IndexError, TypeError, ValueError):
+                out.append(np.nan)
+        return out
+
+    def _filter_onsets_by_bout_length(self, subject, data, behavior, onsets,
+                                      lengths, min_bout_sec, log=None):
+        """Drop scored bouts shorter than ``min_bout_sec``, returning onsets.
+
+        The zone-entry filter measures how long the animal stayed in the zone;
+        the equivalent question for a scored bout is its own start-to-end
+        duration, so both arms of an epoch analysis honour the same field.
+        ``lengths`` is filtered alongside ``onsets`` rather than after they are
+        coerced to ints, because coercion drops rows and would otherwise pair a
+        bout with the next bout's duration.  A start-only file has no lengths to
+        measure, so there the filter cannot apply and the onsets come back
+        untouched rather than all rejected.
+        """
+        def _log(msg):
+            (log or self.log_message)(msg)
+
+        if min_bout_sec <= 0:
+            return self._as_onset_indices(onsets)
+        if lengths is None:
+            _log(f"  {subject}: '{behavior}' has no bout end frames - "
+                 f"minimum bout length not applied")
+            return self._as_onset_indices(onsets)
+
+        fps = self.get_fps(data) or 0
+        if not fps:
+            _log(f"  {subject}: no sampling rate - minimum bout length not applied")
+            return self._as_onset_indices(onsets)
+        min_samples = min_bout_sec * float(fps)
+
+        kept, n_short, n_unscored = [], 0, 0
+        for o, length in zip(onsets or [], lengths):
+            try:
+                ov = float(o)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(ov):
+                continue
+            if np.isnan(length):
+                n_unscored += 1
+                continue
+            if length < min_samples:
+                n_short += 1
+                continue
+            kept.append(int(round(ov)))
+
+        n_dropped = n_short + n_unscored
+        if n_dropped:
+            _log(f"  {subject}: {n_dropped}/{n_dropped + len(kept)} '{behavior}' "
+                 f"bouts dropped (under {min_bout_sec:g} s long"
+                 + (f"; {n_unscored} with no scored end" if n_unscored else "") + ")")
+        return kept
+
     def _resolve_epoch_onsets(self, subject, data, behavior,
-                              min_dwell_sec=0.0, boutframes_file=None, log=None):
+                              min_bout_sec=0.0, boutframes_file=None, log=None):
         """Onset frames for a coherence epoch analysis, from either source.
 
         ``behavior`` is a scored behavior name, or a 'Zone: ...' pseudo-behavior
         naming one of the maze's zone entry types.  Scored behaviors come from
         the stored bouts, falling back to the boutframes workbook; zone entries
-        come from the stored ``entry_frames`` with the minimum-time-in-zone
-        filter applied.  Every coherence entry point resolves onsets through
-        here so all of them accept zone entries and agree on what they mean.
+        come from the stored ``entry_frames``.  Both arms apply the same minimum
+        bout length -- time in zone for an entry, start-to-end duration for a
+        scored bout.  Every coherence entry point resolves onsets through here
+        so all of them accept zone entries and agree on what they mean.
         """
         def _log(msg):
             (log or self.log_message)(msg)
@@ -10103,38 +10337,61 @@ class FPAnalysisGUI:
         entry_key = self._zone_entry_epoch_key(behavior)
         if entry_key is not None:
             onsets, _n, _rej = self._resolve_zone_entry_onsets(
-                subject, data, entry_key, min_dwell_sec=min_dwell_sec, log=log)
+                subject, data, entry_key, min_dwell_sec=min_bout_sec, log=log)
             return onsets
 
         stored_bouts = data.get('bouts', {}) or {}
         beh_key = behavior if behavior in stored_bouts else next(
             (k for k in stored_bouts if str(k).lower() == str(behavior).lower()), None)
         if beh_key is not None and 'onset_frames' in (stored_bouts.get(beh_key) or {}):
-            return self._as_onset_indices(stored_bouts[beh_key]['onset_frames'])
+            entry = stored_bouts[beh_key] or {}
+            frames = entry.get('onset_frames')
+            return self._filter_onsets_by_bout_length(
+                subject, data, behavior, frames,
+                self._bout_lengths(frames, entry.get('durations'),
+                                   entry.get('end_frames')),
+                min_bout_sec, log=log)
 
         if boutframes_file is None:
             boutframes_file = self.boutframes_path_var.get()
         if boutframes_file and os.path.exists(boutframes_file):
             try:
                 df_b = self.read_boutframes_sheet(boutframes_file, subject)
-                cols_ci = {str(c).lower(): c for c in df_b.columns}
-                bcol = cols_ci.get(str(behavior).lower())
-                if bcol:
-                    raw_f = (pd.to_numeric(df_b[bcol], errors='coerce')
-                             .dropna().to_numpy(dtype=float))
+                # Parsed through the shared reader so a 'Behavior__start' /
+                # 'Behavior__end' pair resolves under its base name and brings
+                # its end frames with it; the raw column lookup saw neither.
+                parsed, _has_end = self._parse_boutframes_dataframe(df_b)
+                match = next(
+                    (b for b in parsed
+                     if str(b[0]).strip().lower() == str(behavior).strip().lower()),
+                    None)
+                if match is not None:
+                    _name, raw_start, raw_end = match
                     # Same conversion as extract_bouts, so an epoch lands where
                     # the bout analysis tab puts the same bout.
-                    raw_f = self._transform_boutframe_values(raw_f, subject, as_int=True)
+                    starts = self._transform_boutframe_values(raw_start, subject,
+                                                              as_int=True)
+                    ends = (None if raw_end is None else
+                            self._transform_boutframe_values(raw_end, subject,
+                                                             as_int=False))
                     _excl = int(self.params.get('exclude_frames_before', 0))
-                    return self._as_onset_indices(raw_f[raw_f >= _excl].tolist())
+                    _keep = starts >= _excl
+                    starts = starts[_keep]
+                    if ends is not None:
+                        ends = ends[_keep]
+                    lengths = (None if ends is None
+                               else (ends - starts.astype(float)).tolist())
+                    return self._filter_onsets_by_bout_length(
+                        subject, data, behavior, starts.tolist(), lengths,
+                        min_bout_sec, log=log)
             except Exception as exc:
                 _log(f"  {subject}: could not read boutframes ({exc})")
         return []
 
-    def _epoch_min_dwell_sec(self):
-        """The 'Min time in zone' field, or 0 when blank / invalid."""
+    def _epoch_min_bout_sec(self):
+        """The 'Min bout length' field, or 0 when blank / invalid."""
         try:
-            v = float(self.zone_entry_min_dwell_var.get())
+            v = float(self.epoch_min_bout_var.get())
         except (AttributeError, ValueError, TypeError):
             return 0.0
         return max(0.0, v)
@@ -10204,7 +10461,10 @@ class FPAnalysisGUI:
                 "Pre/post seconds must be > 0 and max bouts must be >= 0.")
             return
         self.conn_params['bout_epoch_max_bouts'] = max_bouts
-        self.conn_params['zone_entry_min_dwell_sec'] = self._epoch_min_dwell_sec()
+        # Read once, on the main thread: a Tk variable must not be touched
+        # from the worker.
+        _min_bout = self._epoch_min_bout_sec()
+        self.conn_params['epoch_min_bout_sec'] = _min_bout
 
         # boutframes_file is only needed as a fallback for legacy data that was
         # processed before onset_frames were stored in processed_data.
@@ -10250,23 +10510,24 @@ class FPAnalysisGUI:
         total = len(subjects)
 
         _is_zone = self._zone_entry_epoch_key(behavior) is not None
+        _len_label = "min time in zone" if _is_zone else "min bout length"
         self.log_message(
             f"Bout epoch coherence — behavior='{behavior}', "
             f"pre={pre_sec}s, post={post_sec}s, max_bouts={max_bouts if max_bouts else 'all'}, method={coh_method}"
-            + (f", min time in zone={self._epoch_min_dwell_sec():g}s" if _is_zone else ""))
-        if _is_zone and self._epoch_min_dwell_sec() < post_sec:
+            + (f", {_len_label}={_min_bout:g}s" if _min_bout > 0 else ""))
+        if 0 < _min_bout < post_sec:
+            _tail = ("the animal has left the zone" if _is_zone
+                     else "the bout has ended")
             self.log_message(
-                f"    Note: min time in zone ({self._epoch_min_dwell_sec():g}s) is shorter than the "
-                f"post window ({post_sec}s), so some epochs continue after the animal has left "
-                f"the zone. Click '= post window' to require the whole epoch be spent in zone.")
+                f"    Note: {_len_label} ({_min_bout:g}s) is shorter than the "
+                f"post window ({post_sec}s), so some epochs continue after {_tail}. "
+                f"Click '= post window' to require the whole epoch fall inside it.")
 
         # Capture conn_params snapshot for thread safety
         _conn_params        = dict(self.conn_params)
         _use_excl           = self.use_exclusions_conn.get()
         _processed_data     = self.processed_data
         _subject_to_group_c = dict(_subject_to_group)  # thread-safe copy
-        # Read on the main thread: a Tk variable must not be touched from the worker.
-        _min_dwell          = self._epoch_min_dwell_sec()
 
         def _worker(q):
             n_processed = 0
@@ -10283,7 +10544,7 @@ class FPAnalysisGUI:
                 data = _processed_data[subject]
 
                 onset_frames = self._resolve_epoch_onsets(
-                    subject, data, behavior, min_dwell_sec=_min_dwell,
+                    subject, data, behavior, min_bout_sec=_min_bout,
                     boutframes_file=(boutframes_file if _use_file_fallback else ''),
                     log=lambda m: q.put(('log', m)))
                 if not onset_frames:
@@ -10389,7 +10650,7 @@ class FPAnalysisGUI:
                     'pre_sec':        pre_sec,
                     'post_sec':       post_sec,
                     'is_zone_entry':  _is_zone,
-                    'min_dwell_sec':  _min_dwell if _is_zone else 0.0,
+                    'min_bout_sec':   _min_bout,
                     'ch1': ch1, 'ch2': ch2,
                     'pre_freqs':      pre_freqs,
                     'post_freqs':     post_freqs,
@@ -10411,7 +10672,7 @@ class FPAnalysisGUI:
             status = (f"{n_processed} subject(s) processed. "
                       f"Behavior: '{behavior}', pre={pre_sec}s, post={post_sec}s, "
                       f"max bouts={max_bouts if max_bouts else 'all'}"
-                      + (f", min time in zone={_min_dwell:g}s" if _is_zone else "") + ".  "
+                      + (f", {_len_label}={_min_bout:g}s" if _min_bout > 0 else "") + ".  "
                       f"Click '\U0001f4ca Plot' to visualize.")
             self.bout_epoch_status_var.set(status)
             self.log_message(f"Bout epoch coherence complete. {n_processed} subject(s).")
@@ -10602,14 +10863,15 @@ class FPAnalysisGUI:
             ax1.set_title('\u0394 Coherence per Subject', fontsize=11, fontweight='bold')
             ax1.grid(True, axis='y', alpha=0.3)
 
-        _dwell_note = (f"  |  min in zone: {r0.get('min_dwell_sec', 0.0):g}s"
-                       if r0.get('is_zone_entry') and r0.get('min_dwell_sec', 0.0) > 0
+        _len_note = (f"  |  {'min in zone' if r0.get('is_zone_entry') else 'min bout'}: "
+                       f"{r0.get('min_bout_sec', 0.0):g}s"
+                       if r0.get('min_bout_sec', 0.0) > 0
                        else "")
         fig.suptitle(
             f"Bout Epoch Coherence  {r0['ch1']} \u2194 {r0['ch2']}  |  "
             f"Behavior: {r0['behavior']}  |  "
             f"Method: {self.conn_params.get('coherence_method', 'Welch')}"
-            + _dwell_note,
+            + _len_note,
             fontsize=11, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.94])
 
@@ -10751,7 +11013,7 @@ class FPAnalysisGUI:
                 continue
 
             onset_frames = self._resolve_epoch_onsets(
-                subject, data, behavior, min_dwell_sec=self._epoch_min_dwell_sec())
+                subject, data, behavior, min_bout_sec=self._epoch_min_bout_sec())
             if not onset_frames:
                 self.log_message(
                     f"  Epoch spectrogram: no onsets found for {subject} / '{behavior}'")
@@ -11230,8 +11492,9 @@ class FPAnalysisGUI:
             }
 
         r0 = next(iter(results.values()))
-        dwell = (f"; min time in zone {r0.get('min_dwell_sec', 0):g}s"
-                 if r0.get('is_zone_entry') and r0.get('min_dwell_sec', 0) > 0 else '')
+        dwell = (f"; {'min time in zone' if r0.get('is_zone_entry') else 'min bout length'} "
+                 f"{r0.get('min_bout_sec', 0):g}s"
+                 if r0.get('min_bout_sec', 0) > 0 else '')
         meta = self._coh_meta_common(
             r0['ch1'], r0['ch2'],
             self.conn_params.get('coherence_method', 'Welch'), {
@@ -11310,7 +11573,7 @@ class FPAnalysisGUI:
                     'Pre_sec':               r['pre_sec'],
                     'Post_sec':              r['post_sec'],
                     'Zone_Entry':            bool(r.get('is_zone_entry', False)),
-                    'Min_Time_In_Zone_sec':  r.get('min_dwell_sec', 0.0),
+                    'Min_Bout_Length_sec':   r.get('min_bout_sec', 0.0),
                     'Frequency_Hz':          round(float(freq),   6),
                     'Baseline_Coherence':    round(float(pre_c),  6),
                     'Baseline_SEM':          round(float(pre_sem),6),
@@ -14431,6 +14694,55 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — The zone editor keeps the arena tiled while an edge is dragged. Zone
+    templates are stored as a tiling: every boundary appears twice, once as one
+    zone's max and once as its neighbour's min. Only the edge under the pointer
+    used to move, so dragging the OFT centre opened a gap between it and the
+    surrounding edge zones — and a position sample landing in that gap belongs to
+    no zone at all. Both halves of a shared boundary now move together, with a
+    "Sticky edges" toggle (remembered between sessions, and editable in Edit
+    Processing Parameters) for zone sets that are deliberately not a tiling.
+  • New — Whole zones can be dragged, not only resized. The middle of a zone is a
+    move handle, the pointer shows which handle it is about to grab, and a click
+    that lands on nothing no longer leaves the previous handle armed — which is
+    what made the next mouse move silently resize whatever had been dragged last.
+  • New — "Compare Across Bouts" can order bout rows and export columns by bout
+    number instead of by subject. The default keeps every bout of one subject
+    together with subjects blocked by group, which reads one animal at a time;
+    "Order bouts by: Bout number" instead puts bout 1 of every subject side by
+    side, then bout 2, and so on, which is how a within-session drift is read
+    across a whole cohort. Heatmaps gain per-ordinal row blocks and labels, the
+    wide-format export reorders its columns to match, and averaging within
+    subject — which leaves no ordinal to block on — keeps the original layout.
+  • New — The Coherence tab's minimum epoch length applies to scored behaviors,
+    not only zone entries. A two second bout of grooming measured with a ten
+    second post window is mostly coherence in whatever the animal did next, the
+    same objection that the minimum-time-in-zone filter answers for an entry. The
+    field now reads a bout's own start-to-end duration, which requires boutframes
+    carrying END frames; a start-only file has no length to measure, so there the
+    onsets pass through untouched rather than all being rejected, and the log
+    says so. The setting is saved with the project and reported in the exports.
+  • Fix — A click in the zone editor now selects the zone drawn under the pointer.
+    TRACY runs DPI-aware, so Tk's pixels are physical device pixels; matplotlib's
+    Tk backend assumes otherwise and re-rendered the figure 1.5x larger than its
+    widget at 150% Windows scaling. The arena was cropped at the right and bottom
+    edges while every click was still multiplied by that 1.5 — on a 150% display,
+    clicking the middle of the OFT arena selected edge_left, and clicking a
+    corner zone selected nothing at all.
+  • Fix — The edge grab distance is a constant ~8 screen pixels rather than 10% of
+    each zone's own size, which made a thin zone nearly impossible to grab while
+    a large one grabbed an edge from several centimetres away. Corners beat
+    edges and edges beat interiors, so a boundary shared by two zones is grabbed
+    as a boundary instead of selecting whichever zone came first in the
+    dictionary, and a small zone nested inside a large one stays reachable.
+  • Fix — The zone editor's drag options and instructions no longer fall off the
+    bottom of a short window: a figure canvas asks for its full figsize in pixels,
+    which on a scaled display is taller than the editor window itself. Loading a
+    template now also updates the maze width field, which kept the previous
+    template's value.
+
+Version 1.18.0  •  September 1, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Zone entries can drive the Coherence tab. Every epoch analysis there
     needs a list of onsets to centre a pre/post window on, and only scored
@@ -31691,6 +32003,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             show_g1 = self.show_g1.get()
             
             all_data = []
+            # Bout ordinal per wide-format column name, so the bout columns can
+            # be re-blocked by bout number at assembly time. Column names embed
+            # the subject, so one flat map serves every per-subject dict.
+            bout_col_ordinals = {}
             
             # Special handling for Signal Integrity export (both multi-subject and single-subject)
             if "Signal Integrity" in plot_type:
@@ -31970,6 +32286,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                                     # store raw array (will be padded later when combining)
                                     subject_behavior_channel_bouts[col_name] = np.asarray(bout)
+                                    bout_col_ordinals[col_name] = bout_idx + 1
                             
                             if subject_behavior_channel_bouts:
                                 # Tag with behavior name AND the actual channel designation.
@@ -32231,6 +32548,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                     subject_bouts[col_name] = bout
+                                    bout_col_ordinals[col_name] = bout_idx + 1
                         
                         # G1 bouts
                         if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)) and zone_bouts.get('G1'):
@@ -32254,6 +32572,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                     subject_bouts[col_name] = bout
+                                    bout_col_ordinals[col_name] = bout_idx + 1
                     
                     # Store the bouts for this subject
                     if subject_bouts:
@@ -32343,14 +32662,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         
                         # Combine all bouts for this behavior-channel
                         combined_dict = {'time_from_onset_s': time_axis}
-                        for bout_dict in bout_dicts:
-                            for col_name, bout in bout_dict.items():
-                                if len(bout) < max_length:
-                                    padded_bout = np.full(max_length, np.nan)
-                                    padded_bout[:len(bout)] = bout
-                                    combined_dict[col_name] = padded_bout
-                                else:
-                                    combined_dict[col_name] = bout
+                        for col_name, bout in self._ordered_bout_columns(
+                                bout_dicts, bout_col_ordinals):
+                            if len(bout) < max_length:
+                                padded_bout = np.full(max_length, np.nan)
+                                padded_bout[:len(bout)] = bout
+                                combined_dict[col_name] = padded_bout
+                            else:
+                                combined_dict[col_name] = bout
                         
                         combined_df = pd.DataFrame(combined_dict)
                         combined_df.to_csv(behavior_channel_filename, index=False)
@@ -32367,7 +32686,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                        f"Data exported successfully to {len(exported_files)} file(s):\n\n{file_list}\n\n"
                                        f"Plot type: {plot_type}\n"
                                        f"Exclusions applied: {self.use_exclusions_viz.get()}\n"
-                                       f"Max bouts/subject: {self.viz_max_bouts_var.get()}")
+                                       f"Max bouts/subject: {self.viz_max_bouts_var.get()}\n"
+                                       f"Column order: {self.viz_bout_order_var.get()}")
                 elif "Zone Entry Bouts" in plot_type and all(isinstance(d, dict) for d in all_data):
                     # Wide format for zone entry bouts
                     # Combine all subject bouts into a single DataFrame
@@ -32382,15 +32702,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     
                     # Combine all bouts into one DataFrame with time as first column
                     combined_dict = {'time_from_entry_s': time_axis}
-                    for subject_dict in all_data:
-                        for col_name, bout in subject_dict.items():
-                            # Pad shorter bouts with NaN
-                            if len(bout) < max_length:
-                                padded_bout = np.full(max_length, np.nan)
-                                padded_bout[:len(bout)] = bout
-                                combined_dict[col_name] = padded_bout
-                            else:
-                                combined_dict[col_name] = bout
+                    for col_name, bout in self._ordered_bout_columns(
+                            all_data, bout_col_ordinals):
+                        # Pad shorter bouts with NaN
+                        if len(bout) < max_length:
+                            padded_bout = np.full(max_length, np.nan)
+                            padded_bout[:len(bout)] = bout
+                            combined_dict[col_name] = padded_bout
+                        else:
+                            combined_dict[col_name] = bout
                     
                     combined_df = pd.DataFrame(combined_dict)
                     combined_df.to_csv(filename, index=False)
@@ -32404,7 +32724,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                        f"Total rows: {len(combined_df):,}\n"
                                        f"Total bouts: {num_cols}\n"
                                        f"Plot type: {plot_type}\n"
-                                       f"Max bouts/subject: {self.viz_max_bouts_var.get()}")
+                                       f"Max bouts/subject: {self.viz_max_bouts_var.get()}\n"
+                                       f"Column order: {self.viz_bout_order_var.get()}")
                 elif "Zone Averages" in plot_type or "Distance from Center" in plot_type or "Position Heatmap" in plot_type or "Out/Back" in plot_type:
                     # These plot types are already in the correct wide/horizontal format
                     # Just concatenate all dataframes and export
@@ -33603,9 +33924,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Get max bouts limit
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
         
-        # Collect all bouts across subjects
+        # Collect all bouts across subjects. The ordinal lists stay parallel so
+        # the rows can be re-blocked by bout number below.
         all_g0_bouts = []
         all_g1_bouts = []
+        g0_ordinals = []
+        g1_ordinals = []
         
         for subject in subjects:
             data = self.processed_data[subject]
@@ -33648,11 +33972,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             else:
                 # Use all bouts (original behavior), realigned to current window
                 if show_g0 and subject_has_g0 and bout_data['G0']:
-                    all_g0_bouts.extend(self._entry_channel_bouts(bout_data, 'G0', max_bouts))
+                    subject_g0 = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
+                    all_g0_bouts.extend(subject_g0)
+                    g0_ordinals.extend(range(1, len(subject_g0) + 1))
 
                 if show_g1 and subject_has_g1 and bout_data['G1']:
-                    all_g1_bouts.extend(self._entry_channel_bouts(bout_data, 'G1', max_bouts))
-        
+                    subject_g1 = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
+                    all_g1_bouts.extend(subject_g1)
+                    g1_ordinals.extend(range(1, len(subject_g1) + 1))
+
+        # Re-block the pooled rows by entry ordinal when asked, so entry 1 of
+        # every subject sits together. Averaging within subject collapses the
+        # ordinal away, so that combination keeps the acquisition order.
+        rows_by_number = self._bout_order_by_number() and not average_within_subject
+        g0_ticks = g0_tick_labels = g0_blocks = None
+        g1_ticks = g1_tick_labels = g1_blocks = None
+        if rows_by_number:
+            if all_g0_bouts:
+                (all_g0_bouts, g0_ticks, g0_tick_labels,
+                 g0_blocks) = self._bout_number_blocks(list(zip(g0_ordinals, all_g0_bouts)))
+            if all_g1_bouts:
+                (all_g1_bouts, g1_ticks, g1_tick_labels,
+                 g1_blocks) = self._bout_number_blocks(list(zip(g1_ordinals, all_g1_bouts)))
+
         n_plots = (1 if all_g0_bouts else 0) + (1 if all_g1_bouts else 0)
         if n_plots == 0:
             fig.text(0.5, 0.5, 'No data to display',
@@ -33703,8 +34045,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                vmin=vmin, vmax=vmax, interpolation='nearest')
             self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            ax_heat.set_ylabel('Bout/Subject #' if average_within_subject else 'Bout #')
-            ax_heat.set_title('G0 Heatmap')
+            if average_within_subject:
+                ax_heat.set_ylabel('Bout/Subject #')
+            else:
+                ax_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
+                                   else 'Bout #')
+            ax_heat.set_title('G0 Heatmap (by bout number)' if rows_by_number
+                              else 'G0 Heatmap')
+            self._label_bout_number_blocks(ax_heat, g0_ticks, g0_tick_labels,
+                                           g0_blocks, len(all_g0_bouts))
             plt.colorbar(im, ax=ax_heat, label='Z-score')
         
         # Plot G1 - Trace and Heatmap
@@ -33746,8 +34095,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                vmin=vmin, vmax=vmax, interpolation='nearest')
             self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            ax_heat.set_ylabel('Bout/Subject #' if average_within_subject else 'Bout #')
-            ax_heat.set_title('G1 Heatmap')
+            if average_within_subject:
+                ax_heat.set_ylabel('Bout/Subject #')
+            else:
+                ax_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
+                                   else 'Bout #')
+            ax_heat.set_title('G1 Heatmap (by bout number)' if rows_by_number
+                              else 'G1 Heatmap')
+            self._label_bout_number_blocks(ax_heat, g1_ticks, g1_tick_labels,
+                                           g1_blocks, len(all_g1_bouts))
             plt.colorbar(im, ax=ax_heat, label='Z-score')
         
         fig.tight_layout()
@@ -34959,6 +35315,74 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     fontsize=14, fontweight='bold', y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.96])
     
+    def _bout_order_by_number(self):
+        """True when bout rows/columns should be blocked by bout ordinal.
+
+        Read through getattr so headless shells and projects saved before the
+        option existed fall back to the historical group/subject layout."""
+        var = getattr(self, 'viz_bout_order_var', None)
+        if var is None:
+            return False
+        try:
+            return var.get() == BOUT_ORDER_BY_NUMBER
+        except Exception:
+            return False
+
+    def _bout_number_blocks(self, records):
+        """Regroup ``(ordinal, trace)`` records into blocks of equal bout number.
+
+        Records arrive in group/subject order; Python's stable sort keeps that
+        order inside each ordinal, so bout 1 of every subject lands together in
+        the incoming group order, then bout 2, and so on. Returns
+        (rows, ytick_positions, ytick_labels, block_row_counts) in the same
+        shape the by-subject layout returns, so callers draw dividers and tick
+        labels the same way either way."""
+        rows = []
+        ytick_positions = []
+        ytick_labels = []
+        block_row_counts = []
+        for ordinal in sorted({int(o) for o, _ in records}):
+            block = [tr for o, tr in records if int(o) == ordinal]
+            if not block:
+                continue
+            block_start = len(rows)
+            rows.extend(block)
+            ytick_positions.append((block_start + len(rows) - 1) / 2)
+            ytick_labels.append(f'Bout {ordinal}')
+            block_row_counts.append(len(block))
+        return rows, ytick_positions, ytick_labels, block_row_counts
+
+    def _ordered_bout_columns(self, bout_dicts, ordinals):
+        """Flatten per-subject wide-format bout dicts into ordered (name, trace) pairs.
+
+        The dicts arrive one per subject in group order, each holding that
+        subject's bouts, which is the default column layout. With the "Bout
+        number" order selected the columns are instead blocked by bout ordinal
+        -- every subject's bout 1, then every bout 2 -- keeping the incoming
+        group/subject order inside each block (Python's sort is stable).
+        Subject averages carry no ordinal and sort to the front together."""
+        pairs = [(name, trace)
+                 for bout_dict in bout_dicts
+                 for name, trace in bout_dict.items()]
+        if self._bout_order_by_number():
+            pairs.sort(key=lambda nt: ordinals.get(nt[0], 0))
+        return pairs
+
+    def _label_bout_number_blocks(self, ax, ticks, labels, block_sizes, n_rows):
+        """Tick and divide a pooled heatmap whose rows were blocked by bout number.
+
+        No-op when the rows are in the default group/subject order (the callers
+        pass None), so the pooled heatmaps keep their bare "Bout #" axis."""
+        if not ticks or not labels:
+            return
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(labels, fontsize=7)
+        current_row = 0
+        for size in block_sizes or []:
+            current_row += size
+            if 0 < current_row < n_rows:
+                ax.axhline(current_row, color='white', linestyle='-', linewidth=2)
+
     def _build_group_heatmap_rows(self, channel, group_names, subject_order,
                                   subject_bouts, subject_bout_rows,
                                   average_within_subject):
@@ -34967,8 +35391,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         When average_within_subject is True, each subject contributes one row
         (its bout average). When False, every individual bout is its own row,
         but the y-axis is still labelled once per subject (at the centre of
-        that subject's block of rows). Returns
-        (rows, ytick_positions, ytick_labels, group_row_counts)."""
+        that subject's block of rows). With the "Bout number" order selected
+        those same bout rows are instead blocked by bout ordinal, labelled
+        "Bout 1", "Bout 2", ...; averaging within subject leaves no ordinal to
+        block on, so that combination keeps the group/subject layout. Returns
+        (rows, ytick_positions, ytick_labels, block_row_counts)."""
+        by_number = self._bout_order_by_number() and not average_within_subject
+        if by_number:
+            records = []
+            for group_name in group_names:
+                for group, subject in subject_order:
+                    if group != group_name:
+                        continue
+                    bouts = subject_bout_rows.get((group, subject, channel), [])
+                    for ordinal, bout in enumerate(bouts, 1):
+                        records.append((ordinal, bout))
+            return self._bout_number_blocks(records)
+
         rows = []
         ytick_positions = []
         ytick_labels = []
@@ -35006,6 +35445,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fps = self.get_fps()
         prebout = self.params['preboutframes']
         average_within_subject = self.viz_average_within_subject.get()
+        # Heatmap rows: blocked by group/subject, or by bout ordinal. Averaging
+        # within subject collapses the ordinal away, so it wins over the choice.
+        rows_by_number = self._bout_order_by_number() and not average_within_subject
+        heat_order_note = ', by bout number' if rows_by_number else ''
 
         # Resolve the two plot slots from the channel checkboxes so the selected
         # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
@@ -35198,13 +35641,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         vmin=vmin, vmax=vmax, interpolation='nearest')
                     self.draw_zero_line(ax1_heat)
                     ax1_heat.set_xlabel('Time from bout onset (s)')
-                    ax1_heat.set_ylabel('Subject (by group)')
+                    ax1_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
+                                       else 'Subject (by group)')
                     ax1_heat.set_title(f'{label_a} Heatmap' if average_within_subject
-                                       else f'{label_a} Heatmap (All Bouts)')
+                                       else f'{label_a} Heatmap (All Bouts{heat_order_note})')
                     ax1_heat.set_yticks(ytick_positions)
                     ax1_heat.set_yticklabels(ytick_labels, fontsize=7)
 
-                    # Add group dividers between each group's block of rows
+                    # Divide the row blocks -- one block per group, or per bout
+                    # ordinal when the rows are ordered by bout number.
                     current_row = 0
                     for group_count in group_row_counts:
                         if group_count > 0:
@@ -35268,13 +35713,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         vmin=vmin, vmax=vmax, interpolation='nearest')
                     self.draw_zero_line(ax2_heat)
                     ax2_heat.set_xlabel('Time from bout onset (s)')
-                    ax2_heat.set_ylabel('Subject (by group)')
+                    ax2_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
+                                       else 'Subject (by group)')
                     ax2_heat.set_title(f'{label_b} Heatmap' if average_within_subject
-                                       else f'{label_b} Heatmap (All Bouts)')
+                                       else f'{label_b} Heatmap (All Bouts{heat_order_note})')
                     ax2_heat.set_yticks(ytick_positions)
                     ax2_heat.set_yticklabels(ytick_labels, fontsize=7)
 
-                    # Add group dividers between each group's block of rows
+                    # Divide the row blocks -- one block per group, or per bout
+                    # ordinal when the rows are ordered by bout number.
                     current_row = 0
                     for group_count in group_row_counts:
                         if group_count > 0:
@@ -35307,9 +35754,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
             subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
 
-        # Collect bouts from all subjects
+        # Collect bouts from all subjects. The ordinal lists stay parallel to
+        # the bout lists so the rows can be re-blocked by bout number below.
         all_g0_bouts = []
         all_g1_bouts = []
+        g0_ordinals = []
+        g1_ordinals = []
         subject_labels = []
         
         for subject in subjects:
@@ -35360,8 +35810,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                     if bouts_g0:
                         all_g0_bouts.extend(bouts_g0)
+                        g0_ordinals.extend(range(1, len(bouts_g0) + 1))
                     if bouts_g1:
                         all_g1_bouts.extend(bouts_g1)
+                        g1_ordinals.extend(range(1, len(bouts_g1) + 1))
                 
                 subject_labels.append(subject)
         
@@ -35372,7 +35824,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         fps = self.get_fps()
         prebout = self.params['preboutframes']
-        
+
+        # Re-block the pooled rows by bout ordinal when asked, so bout 1 of every
+        # subject sits together. Averaging within subject leaves one row per
+        # subject and no ordinal, so it keeps the acquisition order.
+        rows_by_number = self._bout_order_by_number() and not average_within_subject
+        g0_ticks = g0_tick_labels = g0_blocks = None
+        g1_ticks = g1_tick_labels = g1_blocks = None
+        if rows_by_number:
+            if all_g0_bouts:
+                (all_g0_bouts, g0_ticks, g0_tick_labels,
+                 g0_blocks) = self._bout_number_blocks(list(zip(g0_ordinals, all_g0_bouts)))
+            if all_g1_bouts:
+                (all_g1_bouts, g1_ticks, g1_tick_labels,
+                 g1_blocks) = self._bout_number_blocks(list(zip(g1_ordinals, all_g1_bouts)))
+
         # Determine layout based on what data exists
         if all_g0_bouts and all_g1_bouts:
             # Both channels have data - use 2x2 grid: G0 traces, G1 traces, G0 heatmap, G1 heatmap
@@ -35436,8 +35902,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for i, bout in enumerate(all_g0_bouts):
                 heatmap_data[i, :len(bout)] = bout
             
-            heatmap_ylabel = "Subject #" if average_within_subject else "Bout #"
-            heatmap_title_suffix = " (Averaged Within Subject)" if average_within_subject else " (All Bouts)"
+            if average_within_subject:
+                heatmap_ylabel = "Subject #"
+                heatmap_title_suffix = " (Averaged Within Subject)"
+            elif rows_by_number:
+                heatmap_ylabel = "Bout number (all subjects)"
+                heatmap_title_suffix = " (All Bouts, by bout number)"
+            else:
+                heatmap_ylabel = "Bout #"
+                heatmap_title_suffix = " (All Bouts)"
             
             cmap = self.get_heatmap_colormap()
             vmin, vmax = self.get_heatmap_range()
@@ -35448,6 +35921,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax3.set_xlabel('Time from bout onset (s)')
             ax3.set_ylabel(heatmap_ylabel)
             ax3.set_title(f'{label_a} Heatmap{heatmap_title_suffix}')
+            self._label_bout_number_blocks(ax3, g0_ticks, g0_tick_labels, g0_blocks,
+                                           len(all_g0_bouts))
             plt.colorbar(im, ax=ax3, label='Z-score')
         
         # Plot G1 traces and heatmap
@@ -35494,8 +35969,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for i, bout in enumerate(all_g1_bouts):
                 heatmap_data[i, :len(bout)] = bout
             
-            heatmap_ylabel = "Subject #" if average_within_subject else "Bout #"
-            heatmap_title_suffix = " (Averaged Within Subject)" if average_within_subject else " (All Bouts)"
+            if average_within_subject:
+                heatmap_ylabel = "Subject #"
+                heatmap_title_suffix = " (Averaged Within Subject)"
+            elif rows_by_number:
+                heatmap_ylabel = "Bout number (all subjects)"
+                heatmap_title_suffix = " (All Bouts, by bout number)"
+            else:
+                heatmap_ylabel = "Bout #"
+                heatmap_title_suffix = " (All Bouts)"
             
             cmap = self.get_heatmap_colormap()
             vmin, vmax = self.get_heatmap_range()
@@ -35506,6 +35988,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax4.set_xlabel('Time from bout onset (s)')
             ax4.set_ylabel(heatmap_ylabel)
             ax4.set_title(f'{label_b} Heatmap{heatmap_title_suffix}')
+            self._label_bout_number_blocks(ax4, g1_ticks, g1_tick_labels, g1_blocks,
+                                           len(all_g1_bouts))
             plt.colorbar(im, ax=ax4, label='Z-score')
         
         fig.tight_layout()
@@ -40086,6 +40570,8 @@ cat("OK\n")
                 '470nm (G0) Included': self.show_470.get(),
                 '570nm (G1) Included': self.show_570.get(),
                 'Max Bouts/Subject': self.viz_max_bouts_var.get(),
+                'Bout Column Order': (BOUT_ORDER_BY_NUMBER if self._bout_order_by_number()
+                                      else BOUT_ORDER_BY_SUBJECT),
             })
             if self.use_exclusions_viz.get() and self.exclusions:
                 excluded_info = []
