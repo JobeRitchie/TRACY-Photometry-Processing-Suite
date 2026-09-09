@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.19.0"
-APP_VERSION_DATE = "September 2, 2026"
+APP_VERSION = "1.20.0"
+APP_VERSION_DATE = "September 9, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -3071,6 +3071,33 @@ class FPAnalysisGUI:
             except Exception:
                 pass
 
+    def bind_scroll_viewport(self, canvas, inner, win_id, pin_width=True):
+        """Keep `canvas`'s scroll region matched to whatever `inner` now holds.
+
+        A canvas window item given an explicit height stops tracking the frame
+        it holds, so content that grows afterwards -- a subject list rebuilt for
+        a bigger project, a taller notebook page -- never fires the <Configure>
+        that would extend the scroll region, and the overflow is unreachable
+        with no scrollbar offering to reach it. The returned callable re-measures
+        on demand and is also stored as the canvas's `_resync_content`, which is
+        what _resync_scroll_regions() calls.
+        """
+        def _sync(_event=None):
+            try:
+                if pin_width:
+                    canvas.itemconfigure(win_id, width=canvas.winfo_width())
+                canvas.itemconfigure(
+                    win_id,
+                    height=max(inner.winfo_reqheight(), canvas.winfo_height()))
+                canvas.configure(scrollregion=canvas.bbox('all'))
+            except tk.TclError:
+                pass
+
+        inner.bind('<Configure>', _sync)
+        canvas.bind('<Configure>', _sync)
+        canvas._resync_content = _sync
+        return _sync
+
     def make_scrollable(self, parent, fit_width=False, width=None):
         """Wrap `parent` in a scrolling viewport and return the inner frame.
 
@@ -3468,6 +3495,14 @@ class FPAnalysisGUI:
             want = max(page.winfo_reqheight(), self.ui_px(60))
             if abs(self._wrap_px(nb.cget('height')) - want) > 2:
                 nb.configure(height=want)
+                # The pane just changed height inside a scroll viewport whose
+                # window item is pinned, so no <Configure> reaches it. Left
+                # unmeasured, the taller pages (Animals & Sessions, Session
+                # Start/End) run several hundred pixels past a scroll region
+                # that still describes the shortest page.
+                sync = getattr(self, '_processing_scroll_sync', None)
+                if sync is not None:
+                    self.root.after_idle(sync)
         except (tk.TclError, KeyError):
             return
 
@@ -4521,11 +4556,6 @@ class FPAnalysisGUI:
         scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
         proc_win = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
@@ -4536,10 +4566,11 @@ class FPAnalysisGUI:
         # Pin the content to the viewport width. There is no horizontal
         # scrollbar here, so anything a wide child pushes past the right edge is
         # simply unreachable; keeping the content at the viewport width makes
-        # every `fill='x'` row reflow to the window instead.
-        canvas.bind('<Configure>',
-                    lambda e: canvas.itemconfigure(proc_win, width=e.width),
-                    add='+')
+        # every `fill='x'` row reflow to the window instead. The same handler
+        # re-measures the height, which is what lets the advanced notebook's
+        # taller pages (Animals & Sessions, Session Start/End) be scrolled to.
+        self._processing_scroll_sync = self.bind_scroll_viewport(
+            canvas, scrollable_frame, proc_win)
         
         self._register_tab_mousewheel(tab, canvas, scrollable_frame)
         
@@ -5523,18 +5554,13 @@ class FPAnalysisGUI:
         canvas = tk.Canvas(tab, highlightthickness=0)
         scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
         window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         # A canvas window keeps its requested size, so without this the grid of
         # subjects stops at whatever it asked for and leaves the rest of the tab
         # empty -- with the assignment buttons clipped at that edge. Height only
         # grows to fill; past that the canvas scrolls as before.
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
-            window_id, width=e.width,
-            height=max(e.height, scrollable_frame.winfo_reqheight())))
+        self._factors_scroll_sync = self.bind_scroll_viewport(
+            canvas, scrollable_frame, window_id)
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -5745,6 +5771,10 @@ class FPAnalysisGUI:
         """Rebuild the factor list, the level list and the assignment grid."""
         if not hasattr(self, 'factor_tree'):
             return
+        # The grid grows a row per subject, which the pinned viewport misses.
+        _resync = getattr(self, '_factors_scroll_sync', None)
+        if _resync is not None:
+            self.root.after_idle(_resync)
         # The rows are about to be deleted out from under any open cell editor.
         self._end_factor_cell_edit(commit=False)
         subjects = sorted(self.processed_data.keys())
@@ -6844,12 +6874,16 @@ class FPAnalysisGUI:
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
         self.exclusions_frame = ttk.Frame(canvas)
         
-        self.exclusions_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=self.exclusions_frame, anchor="nw")
+        excl_win = canvas.create_window((0, 0), window=self.exclusions_frame, anchor="nw")
+        # The row per subject is rebuilt in place whenever a project is loaded
+        # or the list refreshed, and a project can carry ninety of them; without
+        # a re-measure the scroll region keeps the height the list had when the
+        # viewport was first laid out and everything past it is unreachable.
+        self._exclusions_scroll_sync = self.bind_scroll_viewport(
+            canvas, self.exclusions_frame, excl_win)
+        self._exclusions_canvas = canvas
+        # Wider window, more subject columns.
+        canvas.bind('<Configure>', lambda _e: self._reflow_exclusion_rows(), add='+')
         canvas.configure(yscrollcommand=scrollbar.set)
         
         canvas.pack(side="left", fill="both", expand=True)
@@ -7181,6 +7215,12 @@ class FPAnalysisGUI:
         self.viz_overlay_behaviors_label = ttk.Label(
             overlay_box, text="(follows dropdown)", foreground='gray', font=('Segoe UI', 8))
         self.viz_overlay_behaviors_label.grid(row=1, column=0, columnspan=2, sticky='w')
+        # Contextual on purpose: this cluster is only shown for Bouts Overlay,
+        # and the workbook it writes only describes that plot.
+        ttk.Button(overlay_box, text="Export Overlay Data (xlsx)…",
+                   style='Compact.TButton',
+                   command=self.export_bouts_overlay_workbook).grid(
+                       row=2, column=0, columnspan=2, sticky='w', pady=(4, 0))
 
         # Always-on tail: exclusions and the advanced settings window.
         misc_box = cluster('misc', always=True)
@@ -14673,6 +14713,10 @@ Tips:
 • Drag the divider on split tabs (e.g. Spike Analysis) to resize panes.
 • 'Export Plot' saves PNG/TIFF at 600 dpi, or PDF/SVG/EPS as true vector —
   pick a vector format for Prism or Illustrator so it never pixelates.
+• On a Bouts Overlay, 'Export Overlay Data (xlsx)' writes the graph itself as
+  numbers: the trace, a ribbon column per behavior, a highlight column per
+  channel x behavior, and a sheet listing every bout's frames and times. Its
+  README sheet says which columns to paste for each kind of Prism graph.
 • The System Check tab confirms all dependencies are installed.
 """),
             ("Support", f"""
@@ -14694,6 +14738,55 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — A Bouts Overlay can be exported as a graphing workbook. "Export Plot
+    Data" wrote the plain z-scored session and dropped every bout marker, so the
+    one thing the plot is for — signal with the scored behavior on it — had to be
+    rebuilt by hand in Prism. "Export Overlay Data (xlsx)" now writes the graph
+    itself as numbers: a Trace sheet carrying the trace, a ribbon column per
+    behavior and a highlight column per channel × behavior; a Ribbon_steps sheet
+    giving each bout its own two-point column so a connecting line cannot bridge
+    between bouts; a Bouts sheet listing every bout's adjusted frames, raw video
+    frames and times; and a README naming which columns to paste for each kind of
+    graph. The spans it writes are the same spans the plot shades — both read one
+    shared routine — so the file and the figure cannot disagree.
+  • New — The Data Exclusions tab flows its subject rows into as many columns as
+    the window is wide. A row is about a fifth of a maximised window, so a
+    ninety-subject project showed roughly twenty-five of them down one column
+    with three quarters of the width empty. Extra columns appear only once the
+    list actually overflows, and the subjects still read in order down each
+    column.
+  • Fix — Whole-folder processing finds the TTL/DigitalIOs companion whose index
+    differs from the FPData file's. The name was built by copying the FPData
+    file's own trailing suffix, so BG21FPData.csv looked for BG21TTL.csv, missed
+    BG21TTL0.csv sitting beside it, and reported "no TTL/DigitalIOs file" — the
+    same pair that worked in single-file mode, where the file is browsed to by
+    hand. Lookup now tries the literal swap first, then any TTL/DigitalIOs file
+    carrying the same subject prefix with an arbitrary index, and the FPData
+    browse button auto-fills the field the same way.
+  • Fix — Scrolling tabs reach content that grew after they were laid out. A
+    canvas window item given an explicit height stops tracking the frame it
+    holds, so a subject list rebuilt for a bigger project, or a taller advanced
+    settings page, ran past a scroll region still describing the shortest one —
+    unreachable, with no scrollbar offering to reach it. The Processing,
+    Factors and Data Exclusions viewports now re-measure on demand.
+  • Fix — "Binned Progression" no longer drops whole groups. A bout that
+    realignment padded with NaN — clipped at the recording edge, or extracted
+    with a shorter window — made peak, mean and AUC return NaN for that bout,
+    which poisoned its bin mean and every other bin of that subject. The metrics
+    are NaN-aware now, and AUC integrates the samples that exist at their true
+    spacing rather than scoring a padded window as a short one. A subject whose
+    group could not be resolved also gets its own "Unassigned" series instead of
+    being averaged into whichever group sorted first.
+  • Fix — "Export Plot Data" says why it found nothing. The graphs draw from the
+    synchronized behavior matrix while that export reads the per-wavelength
+    arrays and keeps each channel only at its own wavelength, so it can come up
+    empty on a subject whose plot looks full. The warning now names the gate per
+    subject and channel — which arrays exist, what wavelength each designation
+    resolves to, which boxes are unticked, what is excluded — and points at the
+    overlay export, which is not subject to those gates.
+
+Version 1.19.0  •  September 2, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — The zone editor keeps the arena tiled while an edge is dragged. Zone
     templates are stored as a tiling: every boundary appears twice, once as one
@@ -15920,9 +16013,17 @@ Version 1.0.0
             subject_id = self.extract_subject_id(basename, fpdata_pattern, fpdata_suffix)
             if subject_id:
                 self.subject_id_var.set(subject_id)
-                
-                # Try to find corresponding timestamp file using configured patterns
+
                 folder = os.path.dirname(filename)
+
+                # Auto-fill the TTL/DigitalIOs companion the same way batch mode
+                # finds it, so single-file runs don't need a manual browse.
+                ttl_path, _ttl_kind = self._find_ttl_companion(
+                    folder, basename, subject_id)
+                if ttl_path:
+                    self.ttl_path_var.set(ttl_path)
+
+                # Try to find corresponding timestamp file using configured patterns
                 timestamp_patterns = self._timestamp_patterns()
                 timestamp_suffix = self.params.get('timestamp_suffix', '0.csv')
                 
@@ -19741,6 +19842,53 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message(f"  ✗ Error processing {subject_id}: {str(e)}")
             self.log_message(_tb.format_exc())
 
+    def _find_ttl_companion(self, folder, fpdata_file, subject_id, all_files=None):
+        """Locate the TTL / DigitalIOs file belonging to one FPData file.
+
+        Real folders pair BG21FPData.csv with BG21TTL0.csv, so the companion's
+        trailing index is not necessarily the FPData file's own suffix.  Try the
+        literal swap first (DG27FPDATA0.csv -> DG27TTL0.csv), then fall back to
+        any TTL/DigitalIOs file carrying the same subject prefix with an
+        arbitrary index.  Returns (path, kind) or (None, None).
+        """
+        if all_files is None:
+            try:
+                all_files = os.listdir(folder)
+            except OSError:
+                return None, None
+
+        fpdata_pattern = (self.params.get('fpdata_pattern', 'FPData') or '').lower()
+        fpdata_suffix = self.params.get('fpdata_suffix', '0.csv')
+
+        prefixes = []
+        pat_idx = fpdata_file.lower().find(fpdata_pattern) if fpdata_pattern else -1
+        if pat_idx >= 0:
+            prefix = fpdata_file[:pat_idx]
+            actual_suffix = fpdata_file[pat_idx + len(fpdata_pattern):]
+            prefixes.append(prefix)
+            exact = [prefix + kind + actual_suffix for kind in ('TTL', 'DigitalIOs')]
+        else:
+            exact = [fpdata_file.replace(fpdata_suffix, kind + fpdata_suffix)
+                     for kind in ('TTL', 'DigitalIOs')]
+        if subject_id and subject_id not in prefixes:
+            prefixes.append(subject_id)
+
+        for name in exact:
+            path = os.path.join(folder, name)
+            if os.path.exists(path):
+                return path, ('DigitalIOs' if 'digitalios' in name.lower() else 'TTL')
+
+        # No literal match: accept any index (and optional separator) between the
+        # subject prefix and .csv, e.g. BG21FPData.csv -> BG21TTL0.csv.
+        for kind in ('TTL', 'DigitalIOs'):
+            for prefix in prefixes:
+                rx = re.compile(r'^' + re.escape(prefix) + r'[_\-]?' + kind
+                                + r'[_\-]?\d*\.csv$', re.IGNORECASE)
+                for f in sorted(all_files):
+                    if rx.match(f):
+                        return os.path.join(folder, f), kind
+        return None, None
+
     def process_batch(self):
         """Process all subjects in a folder"""
         folder = self.batch_folder_var.get()
@@ -19809,44 +19957,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.log_message(f"  Processing {subject_id} (no timestamp file found - skipping behavior sync)")
                 self.processing_summary['missing_behavior'].append(subject_id)
             
-            # Check for TTL file (e.g., M1_FPData.csv -> M1_TTL.csv)
-            # OR DigitalIOs file (e.g., DRN1DigitalIOs0.csv)
-            # Derive the actual suffix from the fpdata filename itself so that
-            # filenames like M1_FPData.csv (no numeric suffix before .csv) are
-            # handled correctly alongside legacy names like DG27FPDATA0.csv.
+            # Check for the TTL / DigitalIOs companion (M1_FPData.csv ->
+            # M1_TTL.csv, BG21FPData.csv -> BG21TTL0.csv, DRN1DigitalIOs0.csv).
+            ttl_file_path, ttl_kind = self._find_ttl_companion(
+                folder, fpdata_file, subject_id, all_files)
 
-            # First try TTL format
-            if fpdata_pattern in fpdata_file.lower():
-                # Find where the pattern appears in the filename
-                pat_idx = fpdata_file.lower().find(fpdata_pattern)
-                # Everything after the pattern in the real filename IS the suffix
-                actual_suffix = fpdata_file[pat_idx + len(fpdata_pattern):]
-                ttl_file_name = fpdata_file[:pat_idx] + 'TTL' + actual_suffix
-            else:
-                # Fallback: just replace suffix
-                ttl_file_name = fpdata_file.replace(fpdata_suffix, 'TTL' + fpdata_suffix)
-            
-            ttl_file_path = os.path.join(folder, ttl_file_name)
-            
-            # If TTL file doesn't exist, try DigitalIOs format
-            if not os.path.exists(ttl_file_path):
-                if fpdata_pattern in fpdata_file.lower():
-                    pat_idx = fpdata_file.lower().find(fpdata_pattern)
-                    actual_suffix = fpdata_file[pat_idx + len(fpdata_pattern):]
-                    digitalios_file_name = fpdata_file[:pat_idx] + 'DigitalIOs' + actual_suffix
-                else:
-                    digitalios_file_name = fpdata_file.replace(fpdata_suffix, 'DigitalIOs' + fpdata_suffix)
-                
-                digitalios_file_path = os.path.join(folder, digitalios_file_name)
-                if os.path.exists(digitalios_file_path):
-                    self.ttl_path_var.set(digitalios_file_path)
-                    self.log_message(f"  Found DigitalIOs file: {digitalios_file_name}")
-                else:
-                    self.ttl_path_var.set('')
-                    self.processing_summary['missing_ttl'].append(subject_id)
-            else:
+            if ttl_file_path:
                 self.ttl_path_var.set(ttl_file_path)
-                self.log_message(f"  Found TTL file: {ttl_file_name}")
+                self.log_message(
+                    f"  Found {ttl_kind} file: {os.path.basename(ttl_file_path)}")
+            else:
+                self.ttl_path_var.set('')
+                self.processing_summary['missing_ttl'].append(subject_id)
             
             self.root.update_idletasks()  # Allow GUI to update
             
@@ -27597,6 +27719,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             widget.destroy()
         
         self.exclusion_vars = {}
+        # The rows below change how tall the content is, and the viewport holding
+        # it cannot notice on its own (see bind_scroll_viewport).
+        _resync = getattr(self, '_exclusions_scroll_sync', None)
+        if _resync is not None:
+            self.root.after_idle(_resync)
         
         if not self.processed_data:
             no_data_label = ttk.Label(self.exclusions_frame, 
@@ -27605,17 +27732,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             no_data_label.pack(pady=20)
             return
         
-        # Header row
+        # One caption rather than a column header row: the subjects below flow
+        # into as many columns as the window is wide, so a header pinned to the
+        # first column would sit over only a fraction of them.
         header_frame = ttk.Frame(self.exclusions_frame)
-        header_frame.pack(fill='x', padx=5, pady=(5, 10))
-        
-        ttk.Label(header_frame, text="Subject", font=('Segoe UI', 10, 'bold'), 
-                 width=15).grid(row=0, column=0, sticky='w', padx=5)
-        ttk.Label(header_frame, text="Exclude Channels (check to exclude):", 
-                 font=('Segoe UI', 10, 'bold')).grid(row=0, column=1, sticky='w', padx=20)
-        ttk.Label(header_frame, text="Behavioral Data:", 
-                 font=('Segoe UI', 10, 'bold')).grid(row=0, column=2, sticky='w', padx=20)
-        
+        header_frame.pack(fill='x', padx=5, pady=(5, 8))
+        ttk.Label(header_frame,
+                  text="Check a channel to exclude it for that subject; "
+                       "Behavior excludes its scored behavior.",
+                  font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=5)
+
+        # Rows live in their own grid so they can be re-flowed into a different
+        # number of columns when the window is resized, without rebuilding them.
+        grid_host = ttk.Frame(self.exclusions_frame)
+        grid_host.pack(fill='both', expand=True)
+        self._exclusion_grid_host = grid_host
+        self._exclusion_row_frames = []
+        self._exclusion_grid_cols = None   # forces the first layout below
+
         # A valid channel designation is a G/R prefix followed by a region index
         # (e.g. G0, G1, R2, R4, R5). Validate by shape rather than a fixed list so
         # higher-numbered red channels (R3/R4/R5...) are not silently dropped.
@@ -27665,9 +27799,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Default fallback
                 available_channels = ['G0', 'G1']
             
-            # Create row frame
-            row_frame = ttk.Frame(self.exclusions_frame)
-            row_frame.pack(fill='x', padx=5, pady=2)
+            # Create row frame (placed by _reflow_exclusion_rows below)
+            row_frame = ttk.Frame(grid_host)
+            self._exclusion_row_frames.append(row_frame)
             
             # Subject label
             ttk.Label(row_frame, text=subject, font=('Segoe UI', 9), 
@@ -27700,6 +27834,67 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             behavior_cb = ttk.Checkbutton(behavioral_frame, text="Exclude", variable=behavior_var,
                                 command=lambda s=subject: self.toggle_exclusion(s, 'Behavior'))
             behavior_cb.pack(side='left')
+
+        self._reflow_exclusion_rows()
+
+    def _reflow_exclusion_rows(self, _event=None):
+        """Lay the subject rows out in as many columns as the tab is wide.
+
+        A row is about a fifth of a maximised window, so a single column showed
+        ~25 of a ninety-subject project and left the rest behind a long scroll
+        with three quarters of the width empty.
+        """
+        rows = getattr(self, '_exclusion_row_frames', None)
+        host = getattr(self, '_exclusion_grid_host', None)
+        if not rows or host is None:
+            return
+        # update_idletasks() below settles the geometry this handler was called
+        # from, which can call it straight back in.
+        if getattr(self, '_exclusion_reflow_busy', False):
+            return
+        self._exclusion_reflow_busy = True
+        try:
+            if not host.winfo_exists():
+                return
+            # winfo_width() is 1 until the tab has been mapped; fall back to the
+            # notebook's width so the first layout is not stuck at one column.
+            width = host.winfo_width()
+            if width <= 1:
+                width = self.project_notebook.winfo_width()
+            host.update_idletasks()
+            row_w = max((r.winfo_reqwidth() for r in rows), default=0) + self.ui_px(20)
+            if row_w <= 0:
+                return
+            fits_wide = max(1, min(len(rows), int(width // row_w) or 1))
+            # Only spread into extra columns once the list runs past the bottom:
+            # a short project reads better as one tall column than as five short
+            # ones, and the columns stay as few as the overflow requires.
+            row_h = max((r.winfo_reqheight() for r in rows), default=0) + self.ui_px(4)
+            # The caption sits above the grid inside the same viewport, so the
+            # height a column may use is what is left under it -- measuring
+            # against the whole canvas asks for one row per column too many and
+            # leaves the last row just off the bottom.
+            canvas = getattr(self, '_exclusions_canvas', host)
+            view_h = canvas.winfo_height() - max(host.winfo_y(), 0)
+            per_col = max(1, int(view_h // row_h)) if row_h > 0 else len(rows)
+            n_cols = max(1, min(fits_wide, -(-len(rows) // per_col)))
+            if getattr(self, '_exclusion_grid_cols', None) == n_cols:
+                return
+            self._exclusion_grid_cols = n_cols
+            # Column-major: reading down a column keeps the subjects in order.
+            n_rows = -(-len(rows) // n_cols)
+            for idx, frame in enumerate(rows):
+                frame.grid(row=idx % n_rows, column=idx // n_rows,
+                           sticky='w', padx=(0, self.ui_px(12)), pady=2)
+            for col in range(n_cols):
+                host.grid_columnconfigure(col, weight=0)
+        except tk.TclError:
+            return
+        finally:
+            self._exclusion_reflow_busy = False
+        resync = getattr(self, '_exclusions_scroll_sync', None)
+        if resync is not None:
+            self.root.after_idle(resync)
     
     def toggle_exclusion(self, subject, channel):
         """Toggle exclusion state for a subject/channel combination"""
@@ -31461,12 +31656,125 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         covered = (beh_ts >= fp_lo - tol) & (beh_ts <= fp_hi + tol)
         return covered if covered.any() else None
 
+    def _bout_overlay_spans(self, data, subject):
+        """Behavior -> ``[(start, end_or_None), ...]`` spans in beh_synced rows.
+
+        Prefers the scaled onset/end frames stored on processed_data and falls
+        back to parsing the boutframes file (start/end aware) through the same
+        transform extract_bouts applies.  Which behaviors come back follows the
+        overlay's own selection: the "Select Behaviors..." set when one is
+        chosen, otherwise the Behavior dropdown when it names a scored
+        behavior, otherwise all of them.
+
+        Lives apart from the plot because the workbook export needs the same
+        answer; a second copy of this resolution is how an exported file starts
+        disagreeing with the graph it came from.
+        """
+        boutframes_file = self.boutframes_path_var.get()
+        stored_bouts = data.get('bouts', {}) or {}
+        selected_behavior = self.behavior_var.get().strip()
+
+        # Determine the candidate behaviors, ignoring bookkeeping keys.
+        if stored_bouts:
+            candidates = [b for b in stored_bouts if not str(b).startswith('_')]
+        elif boutframes_file and os.path.exists(boutframes_file) and subject:
+            parsed, _ = self._parse_boutframes_dataframe(
+                self.read_boutframes_sheet(boutframes_file, subject))
+            candidates = [name for (name, _s, _e) in parsed]
+        else:
+            candidates = []
+
+        chosen = getattr(self, 'viz_overlay_behaviors', None)
+        if chosen:
+            behaviors_to_plot = [b for b in candidates if b in chosen]
+        elif selected_behavior and selected_behavior in candidates:
+            behaviors_to_plot = [selected_behavior]
+        else:
+            behaviors_to_plot = candidates
+
+        behavior_spans = {}
+        for behavior in behaviors_to_plot:
+            starts, ends = None, None
+            entry = stored_bouts.get(behavior) if isinstance(stored_bouts, dict) else None
+            if isinstance(entry, dict) and 'onset_frames' in entry:
+                starts = np.asarray(entry.get('onset_frames') or [], dtype=float)
+                ef = entry.get('end_frames')
+                ends = np.asarray(ef, dtype=float) if ef is not None else None
+            elif boutframes_file and os.path.exists(boutframes_file) and subject:
+                parsed, _ = self._parse_boutframes_dataframe(
+                    self.read_boutframes_sheet(boutframes_file, subject))
+                match = next(((s, e) for (nm, s, e) in parsed if nm == behavior), None)
+                if match is None:
+                    continue
+                raw_s, raw_e = match
+                starts = self._transform_boutframe_values(raw_s, subject, as_int=False).astype(float)
+                ends = (self._transform_boutframe_values(raw_e, subject, as_int=False).astype(float)
+                        if raw_e is not None else None)
+
+            if starts is None or starts.size == 0:
+                continue
+
+            spans = []
+            for j, s in enumerate(starts):
+                e = None
+                if ends is not None and j < len(ends) and not np.isnan(ends[j]):
+                    e = float(ends[j])
+                spans.append((float(s), e))
+            behavior_spans[behavior] = spans
+
+        return behavior_spans
+
+    @staticmethod
+    def _overlay_span_rows(start, end, n_frames):
+        """Inclusive ``(first_row, last_row)`` a bout span covers, or ``None``.
+
+        Mirrors the clamping plot_bouts_overlay shades with, so an exported
+        ribbon column covers exactly the rows the highlight does.  A bout with
+        no end (or an end at/behind its start) marks the single onset row --
+        the discrete form of the bold onset line the plot draws.
+        """
+        if start >= n_frames or (end is not None and end < 0):
+            return None
+        lo = int(np.floor(max(0.0, float(start))))
+        if end is None or end <= start:
+            return lo, lo
+        hi = int(np.ceil(min(float(n_frames - 1), float(end))))
+        return lo, max(lo, hi)
+
+    def _beh_row_seconds(self, subject, data, beh=None):
+        """Seconds from session start for every beh_synced row.
+
+        Reads the elapsed-minutes column the sync writes rather than assuming a
+        rate, because on the acquisition-position path the rows are video
+        frames.  Rows the sync left blank (the uncovered head, say) are filled
+        from the measured row rate: Prism drops a whole row whose X cell is
+        empty, which would take the trace with it.
+        """
+        beh = data.get('beh_synced') if beh is None else beh
+        n = len(beh)
+        rate = float(self._beh_row_rate(subject, data)) or 1.0
+        idx = np.arange(n, dtype=float)
+        kb = self._beh_kin_base(self._beh_channel_count(data))
+        if beh.ndim == 2 and beh.shape[1] > kb:
+            el = np.asarray(beh[:, kb], dtype=float) * 60.0     # elapsed is minutes
+            ok = np.flatnonzero(np.isfinite(el))
+            if len(ok) > 1:
+                out = el.copy()
+                bad = ~np.isfinite(el)
+                if bad.any():
+                    out[bad] = el[ok[0]] + (idx[bad] - ok[0]) / rate
+                return out
+        return idx / rate
+
     def plot_bouts_overlay(self, fig, data, subject):
         """Plot z-scored signal with bout markers"""
         if 'beh_synced' not in data:
             messagebox.showinfo("Info", "No behavior data available for this subject")
             return
         beh = data['beh_synced']
+        # The workbook export covers the subject on screen, and the plot is
+        # the only place that resolves which one that is.
+        self._overlay_export_subject = subject
 
         # Get selected channels
         sel_chs = self.get_selected_viz_channels(data)
@@ -31528,64 +31836,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax.axvspan(lo - 0.5, hi + 0.5, facecolor='#d9d9d9',
                                alpha=0.45, linewidth=0, zorder=0)
 
-        # Build behavior -> list of (start, end_or_None) spans.  Prefer the
-        # scaled onset/end frames stored on processed_data; fall back to parsing
-        # the boutframes file (start/end aware) and applying the same transform.
-        boutframes_file = self.boutframes_path_var.get()
-        stored_bouts = data.get('bouts', {}) or {}
-        selected_behavior = self.behavior_var.get().strip()
-
-        behavior_spans = {}  # behavior name -> [(start, end_or_None), ...]
+        # Behavior -> [(start, end_or_None)] spans, in beh_synced row space.
+        # Shared with the workbook export so the file and the graph can never
+        # disagree about which behaviors are marked or where.
+        behavior_spans = {}
         try:
-            # Determine the candidate behaviors, ignoring bookkeeping keys.
-            if stored_bouts:
-                candidates = [b for b in stored_bouts if not str(b).startswith('_')]
-            elif boutframes_file and os.path.exists(boutframes_file) and subject:
-                parsed, _ = self._parse_boutframes_dataframe(
-                    self.read_boutframes_sheet(boutframes_file, subject))
-                candidates = [name for (name, _s, _e) in parsed]
-            else:
-                candidates = []
-
-            # If the user picked an explicit behavior set via the pop-up selector,
-            # honor it (preserving candidate order); otherwise honor a single
-            # dropdown selection when it matches, else show all behaviors.
-            chosen = getattr(self, 'viz_overlay_behaviors', None)
-            if chosen:
-                behaviors_to_plot = [b for b in candidates if b in chosen]
-            elif selected_behavior and selected_behavior in candidates:
-                behaviors_to_plot = [selected_behavior]
-            else:
-                behaviors_to_plot = candidates
-
-            for behavior in behaviors_to_plot:
-                starts, ends = None, None
-                entry = stored_bouts.get(behavior) if isinstance(stored_bouts, dict) else None
-                if isinstance(entry, dict) and 'onset_frames' in entry:
-                    starts = np.asarray(entry.get('onset_frames') or [], dtype=float)
-                    ef = entry.get('end_frames')
-                    ends = np.asarray(ef, dtype=float) if ef is not None else None
-                elif boutframes_file and os.path.exists(boutframes_file) and subject:
-                    parsed, _ = self._parse_boutframes_dataframe(
-                        self.read_boutframes_sheet(boutframes_file, subject))
-                    match = next(((s, e) for (nm, s, e) in parsed if nm == behavior), None)
-                    if match is None:
-                        continue
-                    raw_s, raw_e = match
-                    starts = self._transform_boutframe_values(raw_s, subject, as_int=False).astype(float)
-                    ends = (self._transform_boutframe_values(raw_e, subject, as_int=False).astype(float)
-                            if raw_e is not None else None)
-
-                if starts is None or starts.size == 0:
-                    continue
-
-                spans = []
-                for j, s in enumerate(starts):
-                    e = None
-                    if ends is not None and j < len(ends) and not np.isnan(ends[j]):
-                        e = float(ends[j])
-                    spans.append((float(s), e))
-                behavior_spans[behavior] = spans
+            behavior_spans = self._bout_overlay_spans(data, subject)
         except Exception as e:
             axes[0].text(0.5, 0.95, f'Could not load bouts: {str(e)}',
                          transform=axes[0].transAxes, ha='center', va='top',
@@ -31891,6 +32147,308 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             messagebox.showerror("Export Error", f"Failed to export z-score traces:\n{str(e)}")
             self.log_message(f"Error exporting z-score traces: {str(e)}")
 
+    # ------------------------------------------------------------------ #
+    #  Bouts Overlay -> graphing workbook                                 #
+    # ------------------------------------------------------------------ #
+    #  Prism reads a rectangle: one X column with Y columns beside it.  An
+    #  overlay is a trace plus a set of spans, and a span has no single right
+    #  shape on an XY graph -- a raster under the trace and a coloured segment
+    #  on it are both what people draw.  So the Trace sheet carries every shape
+    #  side by side, and the Bouts sheet lists the spans themselves for anyone
+    #  drawing the shading by hand.  One subject per file: bout frames are
+    #  per-subject, so a ribbon column can only line up with one subject's rows.
+    def export_bouts_overlay_workbook(self):
+        """Export the plotted subject's Bouts Overlay as a graphing workbook."""
+        subject = getattr(self, '_overlay_export_subject', None)
+        if subject not in self.processed_data:
+            subject = None
+        if subject is None:
+            # Nothing plotted yet (or the project was reloaded under it): fall
+            # back to the Visualization selection, which is what Generate Plot
+            # would draw.
+            try:
+                names = [self.viz_subject_listbox.get(i)
+                         for i in self.viz_subject_listbox.curselection()]
+            except Exception:
+                names = []
+            names = [s for s in names if s in self.processed_data]
+            subject = names[0] if names else None
+        if subject is None:
+            messagebox.showwarning(
+                "No Subject",
+                "Generate a Bouts Overlay first, or select a processed subject in\n"
+                "the Visualization list. This export covers the subject on screen.")
+            return
+
+        data = self.processed_data[subject]
+        beh = data.get('beh_synced')
+        if not isinstance(beh, np.ndarray) or beh.ndim != 2 or beh.shape[0] == 0:
+            messagebox.showwarning(
+                "No Data", f"{subject} has no synchronized behavior data to export.")
+            return
+
+        sel_chs = [ch for ch in self.get_selected_viz_channels(data)
+                   if 6 + ch < beh.shape[1]]
+        if not sel_chs:
+            messagebox.showwarning(
+                "No Channels",
+                "Tick at least one channel that exists in this subject's data.")
+            return
+
+        try:
+            behavior_spans = self._bout_overlay_spans(data, subject)
+        except Exception as e:
+            messagebox.showerror("Export Error",
+                                 f"Could not read the bouts for {subject}:\n{e}")
+            self.log_message(f"Bouts overlay export: could not read bouts for {subject}: {e}")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile=f"{subject}_bouts_overlay.xlsx",
+            title="Export Bouts Overlay Data")
+        if not filename:
+            return
+
+        n_frames = beh.shape[0]
+        time_s = self._beh_row_seconds(subject, data, beh)
+        rate = float(self._beh_row_rate(subject, data)) or 1.0
+
+        # Uncovered rows stay blank, exactly as the plot blanks them: filling
+        # them would put a fabricated flat line under a bout marker.
+        covered = self._photometry_coverage_mask(data, beh)
+        blank = covered is not None and not covered.all()
+
+        traces = []                      # [(label, signal), ...] in plot order
+        used = set()
+        for ch in sel_chs:
+            label = self.get_channel_name(data, ch) or f'Ch{ch}'
+            if label in used:            # two slots sharing a designation
+                label = f'{label}_slot{ch}'
+            used.add(label)
+            sig = np.asarray(self._apply_visualizer_smoothing(beh[:, 6 + ch]), dtype=float)
+            if blank:
+                sig = np.where(covered, sig, np.nan)
+            traces.append((label, sig))
+
+        finite = np.concatenate([s[np.isfinite(s)] for _l, s in traces] or [np.array([])])
+        y_lo = float(finite.min()) if finite.size else 0.0
+        y_hi = float(finite.max()) if finite.size else 1.0
+        # Ribbons stack below the data so they read as an event raster rather
+        # than as signal; the step is a fraction of the range so it stays
+        # sensible whether the trace spans 2 z or 20.
+        step = max((y_hi - y_lo) * 0.06, 0.2)
+
+        def _t(frame):
+            """Session seconds for a (fractional, possibly out-of-range) row."""
+            if frame is None or not np.isfinite(frame):
+                return np.nan
+            if frame < 0:
+                return float(time_s[0] + frame / rate)
+            if frame > n_frames - 1:
+                return float(time_s[-1] + (frame - (n_frames - 1)) / rate)
+            return float(np.interp(frame, np.arange(n_frames), time_s))
+
+        cols = {
+            'Time_s': time_s,
+            'Time_min': time_s / 60.0,
+            'Frame': np.arange(n_frames, dtype=float),
+        }
+        for label, sig in traces:
+            cols[f'{label}_z'] = sig
+        if blank:
+            cols['Photometry_covered'] = covered.astype(float)
+
+        ribbon_cols, highlight_cols = {}, {}
+        ribbon_levels = {}
+        bout_rows = []
+        # (time_s, column, level) for the Ribbon_steps sheet. A ribbon column on
+        # the Trace sheet is blank between bouts, and Prism joins the points on
+        # either side of a blank -- one continuous ribbon from the first bout to
+        # the last. Giving every bout its own two-point column leaves a line
+        # with nothing to bridge.
+        step_points = []
+        for i, (behavior, spans) in enumerate(behavior_spans.items()):
+            level = round(y_lo - step * (i + 1), 3)
+            ribbon_levels[behavior] = level
+            ribbon = np.full(n_frames, np.nan)
+            highlights = {label: np.full(n_frames, np.nan) for label, _s in traces}
+
+            starts = np.array([s for s, _e in spans], dtype=float)
+            ends = np.array([e if e is not None else np.nan for _s, e in spans], dtype=float)
+            try:
+                # Raw video frames too, so a row can be checked against the
+                # scoring workbook without redoing the transform by hand.
+                v_starts = self._inverse_transform_boutframe_values(starts, subject, as_int=False)
+                v_ends = self._inverse_transform_boutframe_values(ends, subject, as_int=False)
+            except Exception:
+                v_starts = np.full(len(spans), np.nan)
+                v_ends = np.full(len(spans), np.nan)
+
+            for n, (s, e) in enumerate(spans, start=1):
+                rows = self._overlay_span_rows(s, e, n_frames)
+                end_f = float(e) if e is not None else np.nan
+                if rows is not None:
+                    lo, hi = rows
+                    ribbon[lo:hi + 1] = level
+                    for label, sig in traces:
+                        highlights[label][lo:hi + 1] = sig[lo:hi + 1]
+                    col = f'{behavior}_b{n}'
+                    t0 = _t(float(s))
+                    t1 = _t(end_f) if np.isfinite(end_f) else t0
+                    step_points.append((t0, col, level))
+                    if t1 > t0:
+                        step_points.append((t1, col, level))
+                bout_rows.append({
+                    'Subject': subject,
+                    'Behavior': behavior,
+                    'Bout': n,
+                    'Onset_frame': float(s),
+                    'Onset_s': _t(float(s)),
+                    'End_frame': end_f,
+                    'End_s': _t(end_f),
+                    'Duration_frames': (end_f - float(s)) if np.isfinite(end_f) else np.nan,
+                    'Duration_s': (_t(end_f) - _t(float(s))) if np.isfinite(end_f) else np.nan,
+                    'Onset_video_frame': float(v_starts[n - 1]) if n - 1 < len(v_starts) else np.nan,
+                    'End_video_frame': float(v_ends[n - 1]) if n - 1 < len(v_ends) else np.nan,
+                    'Ribbon_level': level,
+                    'On_trace': 'yes' if rows is not None else 'no',
+                })
+
+            ribbon_cols[f'{behavior}_ribbon'] = ribbon
+            for label, _s in traces:
+                highlight_cols[f'{label}_{behavior}'] = highlights[label]
+
+        cols.update(ribbon_cols)
+        cols.update(highlight_cols)
+        trace_df = pd.DataFrame(cols)
+
+        bout_columns = ['Subject', 'Behavior', 'Bout', 'Onset_frame', 'Onset_s',
+                        'End_frame', 'End_s', 'Duration_frames', 'Duration_s',
+                        'Onset_video_frame', 'End_video_frame', 'Ribbon_level',
+                        'On_trace']
+        bouts_df = pd.DataFrame(bout_rows, columns=bout_columns)
+
+        # One column per bout, two rows each, sorted by time so X ascends.
+        step_names = []
+        for _t0, col, _lvl in step_points:
+            if col not in step_names:
+                step_names.append(col)
+        steps_df = pd.DataFrame(np.nan, index=range(len(step_points)),
+                                columns=['Time_s'] + step_names)
+        for r, (t0, col, lvl) in enumerate(sorted(step_points, key=lambda p: p[0])):
+            steps_df.iat[r, 0] = t0
+            steps_df.iat[r, steps_df.columns.get_loc(col)] = lvl
+
+        readme_df = pd.DataFrame({
+            f'Bouts Overlay export - {subject}':
+                self._bouts_overlay_readme(subject, traces, ribbon_levels,
+                                           blank, n_frames, rate, len(bout_rows))})
+
+        try:
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                readme_df.to_excel(writer, sheet_name='README', index=False)
+                trace_df.to_excel(writer, sheet_name='Trace', index=False)
+                steps_df.to_excel(writer, sheet_name='Ribbon_steps', index=False)
+                bouts_df.to_excel(writer, sheet_name='Bouts', index=False)
+                try:
+                    writer.sheets['README'].column_dimensions['A'].width = 100
+                except Exception:
+                    pass        # cosmetic only
+        except Exception as e:
+            messagebox.showerror("Export Error",
+                                 f"Failed to write the overlay workbook:\n{e}")
+            self.log_message(f"Error exporting bouts overlay for {subject}: {e}")
+            return
+
+        behaviors = ', '.join(behavior_spans) if behavior_spans else 'none'
+        messagebox.showinfo(
+            "Export Complete",
+            f"Bouts overlay for {subject} exported to:\n{filename}\n\n"
+            f"Trace: {n_frames} rows x {len(trace_df.columns)} columns\n"
+            f"Bouts: {len(bout_rows)} bout(s) across {len(behavior_spans)} behavior(s)\n"
+            f"Behaviors: {behaviors}\n\n"
+            "The README sheet says which columns to paste for each kind of graph.")
+        self.log_message(
+            f"Exported bouts overlay for {subject} to {filename} "
+            f"({n_frames} rows, {len(traces)} channel(s), {len(bout_rows)} bouts: {behaviors})")
+
+    def _bouts_overlay_readme(self, subject, traces, ribbon_levels,
+                              blank, n_frames, rate, n_bouts):
+        """The README sheet's lines: what each column is, and how to paste it.
+
+        Spelled out rather than left implicit because this sheet is meant to
+        leave the app -- whoever opens it in Prism next may not have TRACY in
+        front of them.
+        """
+        import datetime
+        ch_list = ', '.join(f'{label}_z' for label, _s in traces)
+        beh_list = ', '.join(f'{b} (ribbon at {lvl:g})'
+                             for b, lvl in ribbon_levels.items()) or 'none'
+        bf = self.boutframes_path_var.get() or '(not set)'
+        lines = [
+            f'Generated by TRACY {APP_VERSION} on '
+            f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+            f'Subject: {subject}   Rows: {n_frames}   Row rate: {rate:g} Hz   '
+            f'Bouts: {n_bouts}',
+            f'Channels: {ch_list}',
+            f'Behaviours: {beh_list}',
+            f'Boutframes file: {bf}',
+            '',
+            'SHEETS',
+            '  Trace         one row per behavior frame, in the row space the overlay plots.',
+            '  Ribbon_steps  two rows per bout (start, end), one column per bout, so each',
+            '                bout is its own dataset and a line cannot bridge between them.',
+            '  Bouts         one row per scored bout: adjusted frames, video frames, times.',
+            '',
+            'TRACE SHEET COLUMNS',
+            '  Time_s / Time_min   session time, from the synchronized elapsed clock.',
+            '  Frame               row number - the x axis the Bouts Overlay draws against.',
+            '  <Ch>_z              z-scored signal, exactly as plotted.',
+            '  <Behavior>_ribbon   a constant level while that behavior is on, blank otherwise.',
+            "  <Ch>_<Behavior>     that channel's trace inside the bouts only, blank outside.",
+        ]
+        if blank:
+            lines += [
+                '  Photometry_covered  1 where the recording covers the row, 0 where it does',
+                '                      not; those rows are blank in every trace column.',
+            ]
+        lines += [
+            '',
+            'IN PRISM',
+            '  Event ribbons under the trace:',
+            '    New XY table, then paste Time_s + the <Ch>_z columns + the <Behavior>_ribbon',
+            '    columns as one block. Format each ribbon as SYMBOLS ONLY, no connecting',
+            '    line: a small filled square reads as a solid bar, and symbols cannot bridge',
+            '    a gap. A connecting line CAN - Prism joins the points on either side of a',
+            '    blank cell, which draws one ribbon from the first bout to the last.',
+            '    A behavior scored without end frames marks a single point per bout, which',
+            '    symbols show and a line never would.',
+            '  Event ribbons as real lines:',
+            '    Use the Ribbon_steps sheet instead. Each bout is its own two-point column',
+            '    (its start and its end), so a line has nothing to bridge. Paste Time_s plus',
+            '    the columns for the behaviors you want and format them as thick lines.',
+            '  Coloured bouts sitting on the trace:',
+            "    Paste Time_s, then the <Ch>_z column, then that channel's <Ch>_<Behavior>",
+            '    columns. The highlights overdraw the trace exactly where the shading is.',
+            '  Shading drawn by hand:',
+            '    Use the Bouts sheet Onset_s / End_s (or Onset_frame / End_frame) directly.',
+            '',
+            'NOTES',
+            '  Frames here are photometry-adjusted rows, not raw video frames: they carry the',
+            '    FPS scaling, the manual and per-subject shift, and the recording-start offset.',
+            '    Onset_video_frame / End_video_frame back-calculate the raw scoring numbers;',
+            '    where the video and photometry rates differ they land within a frame or two',
+            '    of the workbook value, because the adjusted frame is a whole sample.',
+            '  A blank cell means no data, not zero - leave it blank in Prism.',
+            '  Behaviours follow the overlay\'s own selection ("Select Behaviors...", or the',
+            '    Behavior dropdown when no set is chosen).',
+            '  On_trace = no marks a bout that falls outside the recorded rows; the plot does',
+            '    not draw it either.',
+        ]
+        return lines
+
     def export_plot(self):
         """Save the current visualization figure at publication resolution.
 
@@ -31934,6 +32492,46 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 f"({int(w_in * PLOT_EXPORT_DPI)} x {int(h_in * PLOT_EXPORT_DPI)} px "
                 f"@ {PLOT_EXPORT_DPI} dpi)")
     
+    def _explain_empty_plot_export(self, subjects, data_key, show_470, show_570):
+        """Why the plot-data export found nothing, named gate by gate.
+
+        The graphs draw from the synchronized behavior matrix; this export walks
+        the per-wavelength arrays and keeps a channel only at the wavelength its
+        designation resolves to.  Those are different gates, so "no data" here
+        can be true while the plot on screen is visibly full -- and the bare
+        message left nobody anything to act on.
+        """
+        data_key = data_key or 'zscore'
+        lines = []
+        if not show_470 and not show_570:
+            lines.append('Both wavelength boxes (470nm and 570nm) are unticked.')
+        for subject in list(subjects)[:8]:
+            data = self.processed_data.get(subject) or {}
+            have = [wl for wl in ('470', '570') if f'{data_key}_{wl}' in data]
+            bits = [f"{subject}: {data_key} arrays = " + (', '.join(have) or 'NONE')]
+            sel = self.get_selected_viz_channels(data)
+            if not sel:
+                bits.append('no channels ticked')
+            for ch in sel:
+                why = []
+                try:
+                    wl = self.resolve_channel_wavelength(data, ch)
+                    name = self.get_channel_name(data, ch)
+                except Exception:
+                    wl, name = None, f'Ch{ch}'
+                if str(wl) not in have:
+                    why.append(f'no {data_key}_{wl} array')
+                if (wl == 470 and not show_470) or (wl == 570 and not show_570):
+                    why.append(f'{wl}nm unticked')
+                try:
+                    if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch, data):
+                        why.append('excluded')
+                except Exception:
+                    pass
+                bits.append(f"{name} reads as {wl}nm - " + ('; '.join(why) or 'usable'))
+            lines.append(' | '.join(bits))
+        return '\n'.join(lines)
+
     def export_plot_data(self):
         """Export currently plotted data to CSV, respecting all selected options"""
         # Get selected subjects or groups
@@ -32186,6 +32784,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 return
             # ─────────────────────────────────────────────────────────────────────────
 
+            data_key = None
             for subject in valid_subjects:
                 data = self.processed_data[subject]
                 
@@ -32821,7 +33420,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         else:
                             messagebox.showwarning("No Data", "No data available for the selected channels/wavelengths.")
             else:
-                messagebox.showwarning("No Data", "No data available for the selected channels/wavelengths.")
+                why = self._explain_empty_plot_export(
+                    valid_subjects, data_key, show_470, show_570)
+                self.log_message("Plot data export found nothing:\n" + why)
+                messagebox.showwarning(
+                    "No Data",
+                    "No data available for the selected channels/wavelengths.\n\n"
+                    "The graphs draw from the synchronized behavior matrix, while "
+                    "this export reads the per-wavelength arrays and keeps each "
+                    "channel only at its own wavelength — so it can come up "
+                    "empty on a subject whose plot looks fine. What it found:\n\n"
+                    + why +
+                    "\n\nFor a Bouts Overlay, 'Export Overlay Data (xlsx)' reads "
+                    "the same matrix the plot does and is not subject to this.")
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export data:\n{str(e)}")
@@ -41968,21 +42579,40 @@ cat("OK\n")
                 we = min(len(bout), onset + win_end_samples)
                 if we <= ws:
                     continue
-                wd = bout[ws:we]
+                # NaN-aware, like every other bout plot.  Realignment pads a
+                # bout that was clipped at the recording edge (or extracted with
+                # a shorter window) out to the full axis with NaN, and a single
+                # padded sample inside the window made np.max/np.mean/trapz
+                # return NaN for that bout -- which then poisoned the whole bin
+                # mean, and with it every bin of that subject.  A group whose
+                # subjects all had one such bout dropped out of the figure
+                # entirely while the others drew normally.
+                wd = np.asarray(bout[ws:we], dtype=float)
+                good = np.isfinite(wd)
+                if not good.any():
+                    continue
+                wd_good = wd[good]
                 if bin_idx not in bin_accum:
                     bin_accum[bin_idx] = {m: [] for m in METRICS}
-                bin_accum[bin_idx]['peak'].append(float(np.max(wd)))
-                bin_accum[bin_idx]['avg'].append(float(np.mean(wd)))
-                bin_accum[bin_idx]['auc'].append(float(self._trapz_compat(wd) / fps))
+                bin_accum[bin_idx]['peak'].append(float(np.max(wd_good)))
+                bin_accum[bin_idx]['avg'].append(float(np.mean(wd_good)))
+                # Integrate over the samples that exist, at their true spacing,
+                # so a partially padded window is not scored as a short one.
+                bin_accum[bin_idx]['auc'].append(
+                    float(self._trapz_compat(wd_good, x=np.flatnonzero(good) / fps))
+                    if wd_good.size > 1 else 0.0)
 
             if not bin_accum:
                 continue
 
             subject_bin_data[subject] = {}
             for bin_idx, mdata in bin_accum.items():
-                subject_bin_data[subject][bin_idx] = {
-                    m: float(np.mean(mdata[m])) for m in METRICS if mdata[m]
-                }
+                vals = {}
+                for m in METRICS:
+                    finite = [v for v in mdata[m] if np.isfinite(v)]
+                    if finite:
+                        vals[m] = float(np.mean(finite))
+                subject_bin_data[subject][bin_idx] = vals
                 all_bin_indices.add(bin_idx)
 
         if not subject_bin_data:
@@ -42010,7 +42640,14 @@ cat("OK\n")
         for subject, bin_data in subject_bin_data.items():
             grp = subject_to_group.get(subject, 'All') if group_mode else 'All'
             if grp not in group_series:
-                grp = groups_present[0]
+                # A subject the caller could not place must not be folded into
+                # whichever series happens to sort first -- that silently
+                # averaged it into another group's line.  Give it its own.
+                grp = 'Unassigned'
+                if grp not in group_series:
+                    group_series[grp] = {b: {m: [] for m in METRICS}
+                                         for b in sorted_bins}
+                    groups_present.append(grp)
             for bin_idx in sorted_bins:
                 if bin_idx in bin_data:
                     for m in METRICS:
