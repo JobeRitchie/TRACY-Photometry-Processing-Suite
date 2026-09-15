@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.20.0"
-APP_VERSION_DATE = "September 9, 2026"
+APP_VERSION = "1.20.1"
+APP_VERSION_DATE = "September 15, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -338,6 +338,45 @@ def natural_sort_key(text):
         # numbers sort before text at the same position.
         key.append((0, int(part), '') if part.isdigit() else (1, 0, part.lower()))
     return key
+
+
+_EXCEL_SIGNATURES = (
+    (b'PK\x03\x04', 'xlsx'),                          # Office Open XML (a zip)
+    (b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1', 'xls'),     # legacy OLE2 workbook
+)
+
+
+def excel_format_of(path):
+    """Return 'xlsx' or 'xls' if *path* is an Excel workbook, else None.
+
+    Decided by the file's leading bytes, not its extension: a Bonsai CSV that
+    was opened in Excel and re-saved as a workbook keeps its ``.csv`` name, and
+    pandas' CSV parser then fails on the zip bytes with a UnicodeDecodeError.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            head = fh.read(8)
+    except OSError:
+        return None
+    for signature, kind in _EXCEL_SIGNATURES:
+        if head.startswith(signature):
+            return kind
+    return None
+
+
+def read_table(path, **kwargs):
+    """``pd.read_csv`` that also reads Excel workbooks saved under a .csv name.
+
+    Only ``header`` and ``nrows`` are passed through for workbooks; the first
+    sheet is read, which is where a re-saved CSV's single sheet lands.
+    """
+    kind = excel_format_of(path)
+    if kind is None:
+        return pd.read_csv(path, **kwargs)
+    excel_kwargs = {k: kwargs[k] for k in ('header', 'nrows') if k in kwargs}
+    return pd.read_excel(path, sheet_name=0,
+                         engine='openpyxl' if kind == 'xlsx' else None,
+                         **excel_kwargs)
 
 
 def levels_from_ids(subject_ids, pattern):
@@ -14739,6 +14778,15 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix — Raw files that are Excel workbooks under a .csv name now load. A Bonsai
+    CSV opened in Excel and saved as a workbook keeps its .csv name, and reading
+    it as text failed with "'utf-8' codec can't decode bytes". FPData, position/
+    timestamp, ABEL position and TTL files are now identified by their leading
+    bytes rather than their extension; a workbook is read as one, and the log
+    notes that the file was re-saved from Excel.
+
+Version 1.20.0  •  September 9, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — A Bouts Overlay can be exported as a graphing workbook. "Export Plot
     Data" wrote the plain z-scored session and dropped every bout marker, so the
     one thing the plot is for — signal with the scored behavior on it — had to be
@@ -20429,7 +20477,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         cross-check the configured video frame rate -- the actual alignment goes
         through the frame numbers, so a missing timestamp column is survivable.
         """
-        df = pd.read_csv(path)
+        df = read_table(path)
         cols = {str(c).strip().lower(): c for c in df.columns}
 
         def _col(name, fallback_idx):
@@ -20476,8 +20524,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.log_message(f"  Loading FP data...")
         self.root.update_idletasks()  # Allow GUI to update
 
+        fp_excel = excel_format_of(fpdata_file)
+        if fp_excel:
+            self.log_message(
+                f"  Note: {os.path.basename(fpdata_file)} is an Excel workbook "
+                f"(.{fp_excel}) with a .csv name -- reading it as a workbook. "
+                f"This usually means the file was re-saved from Excel.")
+
         # Read first row to detect whether file contains a textual header
-        first_row = pd.read_csv(fpdata_file, nrows=1, header=None)
+        first_row = read_table(fpdata_file, nrows=1, header=None)
         has_text_header = False
         for val in first_row.iloc[0].tolist():
             try:
@@ -20487,9 +20542,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 break
 
         if has_text_header:
-            df_fp = pd.read_csv(fpdata_file, header=0)
+            df_fp = read_table(fpdata_file, header=0)
         else:
-            df_fp = pd.read_csv(fpdata_file, header=None)
+            df_fp = read_table(fpdata_file, header=None)
 
         fp_raw = df_fp.values
 
@@ -20626,7 +20681,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             self.processing_summary['no_position_data'].append(subject_id)
                 else:
                     # First, detect if file has a text header or starts with numeric data
-                    first_row = pd.read_csv(computerts_file, nrows=1, header=None)
+                    first_row = read_table(computerts_file, nrows=1, header=None)
                     has_text_header = False
                     for val in first_row.iloc[0].tolist():
                         try:
@@ -20639,7 +20694,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if has_text_header is None:
                     pass  # ABEL file, already parsed above
                 elif has_text_header:
-                    df_beh = pd.read_csv(computerts_file, header=0)
+                    df_beh = read_table(computerts_file, header=0)
                     cols = list(df_beh.columns)
                     cols_lower = [str(c).lower() for c in cols]
 
@@ -20717,7 +20772,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # columns by content rather than by count: blank/sparse trailing
                     # columns must not be mistaken for real X/Y (which previously
                     # crashed calibration on ComputerTS timestamp-only files).
-                    df_beh = pd.read_csv(computerts_file, header=None)
+                    df_beh = read_table(computerts_file, header=None)
                     beh_data = df_beh.apply(pd.to_numeric, errors='coerce').values
                     beh_raw, has_position, info = self._standardize_behavior_array(beh_data)
 
@@ -24621,7 +24676,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         try:
             # Load file and check format
             # First try with header to detect DigitalIOs format
-            ttl_data_with_header = pd.read_csv(ttl_file)
+            ttl_data_with_header = read_table(ttl_file)
             
             # Detect file format
             is_digitalios = False
@@ -24664,7 +24719,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 
             else:
                 # Original TTL format: timestamp in column 0, no header.
-                ttl_data = pd.read_csv(ttl_file, header=None)
+                ttl_data = read_table(ttl_file, header=None)
                 ttl_timestamps = ttl_data.iloc[:, 0].values
 
                 # How the rows map to bouts is controlled by the 'ttl_format'
