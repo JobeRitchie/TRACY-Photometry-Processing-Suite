@@ -617,9 +617,9 @@ class TestStartOffsetUsesRelativeTimestamp:
 
     def test_bouts_land_in_range_through_full_transform(self):
         app = self._app(self._raw(48592.0334))
-        app.params.update({'auto_scale_boutframes': True,
+        app.params.update({'boutframe_fps_scaling': 'on',
                            'boutframes_video_fps': 30.0,
-                           'precut_correct_boutframes': True,
+                           'boutframe_start_correction': 'on',
                            'boutframe_manual_shift': 0})
         app.per_subject_boutframe_shifts = {}
         frames = np.array([1600, 3316, 4927, 9203, 15065], dtype=float)
@@ -627,6 +627,116 @@ class TestStartOffsetUsesRelativeTimestamp:
         expected = np.round(frames / 30.0 * 19.9349 - 1200 // 2).astype(int)
         assert np.max(np.abs(idx - expected)) <= 2
         assert (idx >= 0).all()
+
+
+
+# ---------------------------------------------------------------------------
+# Automatic recording-start correction.
+#
+# Bouts are sliced from beh_synced.  With a behavior/position file its rows are
+# video frames already matched to the photometry by clock, so shifting by the
+# start offset misplaces every bout (measured: startle landed 2.5 s late).
+# Without one, rows are photometry samples starting after the trim, and the
+# shift is required.  'auto' must tell the two apart, including for projects
+# saved before the timeline was recorded.
+# ---------------------------------------------------------------------------
+
+class TestAutoStartCorrection:
+
+    @staticmethod
+    def _app(mode='auto', **subject):
+        import fp_analysis_gui as G
+        app = object.__new__(G.FPAnalysisGUI)
+        app.params = {'precut': 100, 'boutframe_start_correction': mode,
+                      'boutframe_fps_scaling': 'off', 'boutframes_video_fps': 30.0,
+                      'boutframe_manual_shift': 0}
+        app.per_subject_boutframe_shifts = {}
+        app.detected_photometry_fps = 30.0
+        app.processed_data = {'S1': dict({'photometry_fps': 30.0, 'n_led_states': 2,
+                                          'start_offset_samples': 50}, **subject)}
+        return app
+
+    @staticmethod
+    def _grids(n=500):
+        zs = np.column_stack([np.arange(n) / 1800.0, 1000.0 + np.arange(n) / 30.0,
+                              np.zeros(n)])
+        synthetic = np.column_stack([np.arange(n), zs[:, 1], np.zeros((n, 6))])
+        # A behavior file starts before the photometry and runs on its own frames.
+        m = n + 120
+        video = np.column_stack([np.arange(m), 995.0 + np.arange(m) / 30.0,
+                                 np.zeros((m, 6))])
+        return zs, synthetic, video
+
+    def test_recorded_timeline_decides(self):
+        assert self._app(bout_timeline='photometry')._boutframe_start_correction('S1')
+        assert not self._app(bout_timeline='video')._boutframe_start_correction('S1')
+
+    def test_legacy_project_classified_from_data(self):
+        zs, synthetic, video = self._grids()
+        app = self._app(zscore=zs, beh_synced=synthetic)
+        assert app._bout_timeline('S1') == 'photometry'
+        app = self._app(zscore=zs, beh_synced=video)
+        assert app._bout_timeline('S1') == 'video'
+
+    def test_same_length_behavior_grid_is_still_video(self):
+        zs, _, video = self._grids()
+        app = self._app(zscore=zs, beh_synced=video[:len(zs)])
+        assert app._bout_timeline('S1') == 'video'
+
+    def test_override_forces_either_way(self):
+        assert self._app('on', bout_timeline='video')._boutframe_start_correction('S1')
+        assert not self._app('off', bout_timeline='photometry')._boutframe_start_correction('S1')
+
+    def test_transform_shifts_only_on_photometry_grid(self):
+        frames = np.array([600, 1200, 3000], dtype=float)
+        on_photo = self._app(bout_timeline='photometry')._transform_boutframe_values(frames, 'S1')
+        on_video = self._app(bout_timeline='video')._transform_boutframe_values(frames, 'S1')
+        assert (on_photo == frames - 50).all()
+        assert (on_video == frames).all()
+
+    def test_inverse_round_trips_on_both_grids(self):
+        frames = np.array([600, 1200, 3000], dtype=float)
+        for tl in ('photometry', 'video'):
+            app = self._app(bout_timeline=tl)
+            fwd = app._transform_boutframe_values(frames, 'S1', as_int=False)
+            assert np.allclose(app._inverse_transform_boutframe_values(fwd, 'S1', as_int=False),
+                               frames)
+
+
+
+class TestAutoFpsScaling:
+    """Video frames -> photometry samples only on the photometry grid.
+
+    On a behavior file's grid rows are video frames, so rescaling compresses
+    every boutframe (20 Hz startle lost over half its evoked response).
+    """
+
+    @staticmethod
+    def _app(mode='auto', timeline='photometry', fs=20.0):
+        import fp_analysis_gui as G
+        app = object.__new__(G.FPAnalysisGUI)
+        app.params = {'precut': 0, 'boutframe_fps_scaling': mode,
+                      'boutframe_start_correction': 'off',
+                      'boutframes_video_fps': 30.0, 'boutframe_manual_shift': 0}
+        app.per_subject_boutframe_shifts = {}
+        app.detected_photometry_fps = fs
+        app.processed_data = {'S1': {'photometry_fps': fs, 'bout_timeline': timeline}}
+        return app
+
+    def test_scales_on_photometry_grid_only(self):
+        frames = np.array([300, 3000, 9000], dtype=float)
+        photo = self._app()._transform_boutframe_values(frames, 'S1')
+        video = self._app(timeline='video')._transform_boutframe_values(frames, 'S1')
+        assert (photo == np.round(frames * 20 / 30)).all()
+        assert (video == frames).all()
+
+    def test_override_forces_either_way(self):
+        assert self._app('on', 'video')._boutframe_fps_scaling('S1')
+        assert not self._app('off', 'photometry')._boutframe_fps_scaling('S1')
+
+    def test_legacy_boolean_values_still_read(self):
+        assert self._app(True, 'video')._boutframe_fps_scaling('S1')
+        assert not self._app(False, 'photometry')._boutframe_fps_scaling('S1')
 
 
 if __name__ == "__main__":

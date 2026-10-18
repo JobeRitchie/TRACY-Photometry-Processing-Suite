@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.20.1"
-APP_VERSION_DATE = "September 15, 2026"
+APP_VERSION = "1.21.0"
+APP_VERSION_DATE = "October 18, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -607,9 +607,12 @@ PARAM_GROUPS = [
         ("Video / photometry alignment",
          "How boutframe numbers become photometry sample indices.", [
             ('boutframes_video_fps', "Source video FPS", ""),
-            ('auto_scale_boutframes', "Scale video frames to samples",
-             "True / False - a unit conversion, normally on"),
-            ('precut_correct_boutframes', "Shift for precut trim", "True / False"),
+            ('boutframe_fps_scaling', "Video FPS -> photometry FPS scaling",
+             "auto (recommended) | on | off. Auto applies it only to subjects "
+             "without a behavior/position file; override if bouts drift over the session"),
+            ('boutframe_start_correction', "Recording-start correction",
+             "auto (recommended) | on | off. Auto applies it only to subjects "
+             "without a behavior/position file; override if bouts look shifted"),
             ('boutframe_manual_shift', "Manual shift (frames)",
              "Positive = later, negative = earlier"),
             ('ttl_format', "Raw TTL file format",
@@ -696,6 +699,11 @@ PARAM_GROUPS = [
 BOUT_ORDER_BY_SUBJECT = "Group, then subject"
 BOUT_ORDER_BY_NUMBER = "Bout number"
 BOUT_ORDER_CHOICES = [BOUT_ORDER_BY_SUBJECT, BOUT_ORDER_BY_NUMBER]
+
+# User-facing CSV exports carry a UTF-8 byte-order mark so Excel and Prism
+# decode non-ASCII labels (e.g. the ' × ' in factor-combination group names)
+# instead of falling back to the ANSI code page and showing "Ã—".
+EXPORT_CSV_ENCODING = 'utf-8-sig'
 
 
 # Which option clusters each plot type actually uses. Kept as a table rather
@@ -2087,12 +2095,16 @@ class FPAnalysisGUI:
             # with.
             'series_factor': GROUP_FACTOR,
             'boutframes_video_fps': 30,  # Frame rate of source video used to create boutframes
-            # Boutframes are video frames; signals are indexed in photometry
-            # samples.  This is a unit conversion, not a preference, so it is on
-            # by default — with it off, indices are stretched by
-            # video_fps/photometry_fps and late bouts fall off the recording.
-            'auto_scale_boutframes': True,
-            'precut_correct_boutframes': True,  # Shift boutframes onto the analysed signal's origin (recording start + precut trim)
+            # Whether boutframes are converted from video frames to photometry
+            # samples (x photometry_fps / video_fps).  Like the start correction
+            # it depends on the grid bouts are sliced from, so 'auto' decides per
+            # subject (see _boutframe_fps_scaling); 'on' / 'off' force it.
+            'boutframe_fps_scaling': 'auto',
+            # Whether boutframes are shifted back by the offset between video
+            # frame 0 and the first analysed photometry sample.  'auto' decides
+            # per subject from the timeline its bouts are sliced from (see
+            # _boutframe_start_correction); 'on' / 'off' force it for everyone.
+            'boutframe_start_correction': 'auto',
             'boutframe_manual_shift': 0,  # Manual frame shift applied after scaling (positive = shift forward, negative = shift backward)
             # How rows in a raw TTL file (timestamp,value — no header) map to bouts:
             #   'pairs_start'    = onset/offset pairs; keep onsets only (rows 0,2,4…) → start-only bouts [LEGACY DEFAULT]
@@ -2218,8 +2230,6 @@ class FPAnalysisGUI:
         # Detected photometry frame rate (populated automatically during processing)
         self.detected_photometry_fps = None
         self._mixed_fps_warned = False  # log the mixed-rate warning only once per session
-        self.auto_scale_boutframes_var = tk.BooleanVar(value=True)
-        self.precut_correct_boutframes_var = tk.BooleanVar(value=True)
         self.session_bounds_enabled_var = tk.BooleanVar(value=True)
         self.boutframes_video_fps_var = tk.StringVar(value='30')
         self.boutframe_manual_shift_var = tk.StringVar(value='0')
@@ -3958,6 +3968,9 @@ class FPAnalysisGUI:
                        "after the end frame is dropped: the photometry, the position track, and any bouts\n"
                        "scored there.  Frames are converted to the recording's own sampling rate, so the\n"
                        "same number means the same moment on every rig.\n"
+                       "To cut the end without looking up each file's length, enter a Trim end count "
+                       "instead: that many frames are dropped from the end of the photometry recording "
+                       "(Total frames).  An End frame and a Trim end replace each other.\n"
                        "Leave a cell at 0 for no bound at that end.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(700), justify='left').pack(anchor='w', pady=(0, 5))
@@ -3978,6 +3991,8 @@ class FPAnalysisGUI:
         btn_row.pack(fill='x', pady=(0, 4))
         ttk.Button(btn_row, text="Populate Subjects", style='Compact.TButton',
                    command=self._populate_session_bounds).pack(side='left', padx=(0, 4))
+        ttk.Button(btn_row, text="Measure Lengths", style='Compact.TButton',
+                   command=self._measure_session_lengths).pack(side='left', padx=(0, 4))
         ttk.Button(btn_row, text="Import from File...", style='Compact.TButton',
                    command=self._import_session_bounds_file).pack(side='left', padx=(0, 4))
         ttk.Button(btn_row, text="Paste from Clipboard", style='Compact.TButton',
@@ -3991,7 +4006,7 @@ class FPAnalysisGUI:
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill='both', expand=True, pady=(0, 4))
-        cols = ('subject', 'start', 'start_s', 'end', 'end_s', 'status')
+        cols = ('subject', 'start', 'start_s', 'end', 'trim', 'end_s', 'total', 'status')
         self.session_bounds_tree = ttk.Treeview(tree_frame, columns=cols, show='headings',
                                                 height=14, selectmode='browse')
         for key, text, width, anchor in (
@@ -3999,14 +4014,22 @@ class FPAnalysisGUI:
                 ('start',    'Start frame',   100, 'center'),
                 ('start_s',  'Start (s)',      80, 'center'),
                 ('end',      'End frame',     100, 'center'),
+                ('trim',     'Trim end',       90, 'center'),
                 ('end_s',    'End (s)',        80, 'center'),
+                ('total',    'Total frames',  100, 'center'),
                 ('status',   'Processed as',  220, 'w')):
             self.session_bounds_tree.heading(key, text=text)
+            # Never narrower than the heading text as actually rendered, which a
+            # fixed width cannot promise under every display scaling.
+            try:
+                head_px = tkfont.nametofont('TkHeadingFont').measure(text) + self.ui_px(16)
+            except Exception:
+                head_px = 0
             # Only the note column stretches: letting Subject absorb the slack
-            # pushes the four numeric columns to the far right of a wide window,
+            # pushes the numeric columns to the far right of a wide window,
             # away from the ID they belong to.
-            self.session_bounds_tree.column(key, width=self.ui_px(width), anchor=anchor,
-                                            stretch=(key == 'status'))
+            self.session_bounds_tree.column(key, width=max(self.ui_px(width), head_px),
+                                            anchor=anchor, stretch=(key == 'status'))
         sb_vsb = ttk.Scrollbar(tree_frame, orient='vertical',
                                command=self.session_bounds_tree.yview)
         self.session_bounds_tree.configure(yscrollcommand=sb_vsb.set)
@@ -4019,9 +4042,14 @@ class FPAnalysisGUI:
         self._session_bounds_inline_entry = None
 
         ttk.Label(frame,
-                  text="Double-click a Start frame or End frame cell to edit it; Tab moves down the "
-                       "column.  'Import from File...' reads an Excel/CSV sheet with a subject-ID column "
-                       "and a start (and optionally end) frame column, matching IDs case-insensitively.",
+                  text="Double-click a Start frame, End frame or Trim end cell to edit it; Tab moves "
+                       "down the column.  A negative End frame (-1000) is read as a Trim end.  "
+                       "Total frames is the photometry length in video frames; it fills in when a "
+                       "subject is processed, or for every file at once with 'Measure Lengths'.  "
+                       "An End frame in (brackets) is worked out from the trim.  "
+                       "'Import from File...' reads an Excel/CSV sheet with a subject-ID column "
+                       "and a start (and optionally end or trim) frame column, matching IDs "
+                       "case-insensitively.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(700), justify='left').pack(anchor='w')
 
@@ -4042,10 +4070,21 @@ class FPAnalysisGUI:
         return store
 
     def _set_session_bound(self, subject, key, value):
-        """Write one bound (key 'start' or 'end') for *subject*, in video frames."""
+        """Write one bound (key 'start', 'end' or 'trim_end') for *subject*, in video frames.
+
+        An end frame and an end trim are two ways of saying the same thing, so
+        setting either clears the other; a negative end is read as a trim.
+        """
         store = self._session_bounds_store()
-        rec = store.setdefault(str(subject), {'start': 0, 'end': 0})
-        rec[key] = max(0, int(value))
+        rec = store.setdefault(str(subject), {'start': 0, 'end': 0, 'trim_end': 0})
+        value = int(value)
+        if key == 'end' and value < 0:
+            key, value = 'trim_end', -value
+        rec[key] = max(0, value)
+        if key == 'end' and rec[key]:
+            rec['trim_end'] = 0
+        elif key == 'trim_end' and rec[key]:
+            rec['end'] = 0
 
     def _on_session_bounds_toggled(self):
         self.params['session_bounds_enabled'] = bool(self.session_bounds_enabled_var.get())
@@ -4061,21 +4100,94 @@ class FPAnalysisGUI:
         subjects = list(self.processed_data.keys())
         if subjects:
             return sorted(subjects, key=str)
+        return sorted(self._raw_files_by_subject(), key=str)
+
+    def _raw_files_by_subject(self):
+        """``{subject_id: raw FPData path}`` for the selected data folder."""
         folder = ''
         for var in ('batch_folder_var', 'fpdata_path_var'):
             v = getattr(self, var, None)
             if v is not None and v.get():
                 folder = v.get()
                 break
+        found = {}
         if folder and os.path.isdir(folder):
             pattern = str(self.params.get('fpdata_pattern', 'FPData')).lower()
             suffix = self.params.get('fpdata_suffix', '.csv')
-            found = []
             for f in sorted(os.listdir(folder)):
                 if pattern in f.lower() and f.lower().endswith('.csv'):
-                    found.append(self.extract_subject_id(f, pattern, suffix))
-            return sorted(set(found), key=str)
-        return []
+                    found.setdefault(self.extract_subject_id(f, pattern, suffix),
+                                     os.path.join(folder, f))
+        return found
+
+    @staticmethod
+    def _measure_raw_file_seconds(path):
+        """Photometry length of one raw file in seconds, read the way processing reads it.
+
+        Only the acquisition clock (column 1) is needed, so a CSV is read for
+        that column alone -- measuring a whole cohort would otherwise mean
+        loading every channel of every file.
+        """
+        first = read_table(path, nrows=1, header=None)
+        has_header = False
+        for val in first.iloc[0].tolist():
+            try:
+                float(val)
+            except (TypeError, ValueError):
+                has_header = True
+                break
+        df = read_table(path, header=0 if has_header else None, usecols=[1])
+        # Workbooks ignore usecols and come back whole.
+        col = df.iloc[:, 0] if df.shape[1] == 1 else df.iloc[:, 1]
+        ts = pd.to_numeric(col, errors='coerce').to_numpy(dtype=float)
+        return FPAnalysisGUI._raw_recording_seconds(np.column_stack([ts, ts]))
+
+    def _measure_session_lengths(self):
+        """Measure every raw file's photometry length so Total frames is filled in."""
+        files = self._raw_files_by_subject()
+        if not files:
+            messagebox.showinfo(
+                "Measure Lengths",
+                "No raw files found. Select the data folder on the Processing tab first.")
+            return
+        lengths = self.params.get('session_recording_seconds')
+        if not isinstance(lengths, dict):
+            lengths = {}
+            self.params['session_recording_seconds'] = lengths
+        failed = []
+        try:
+            self.root.config(cursor='watch')
+        except Exception:
+            pass
+        try:
+            for i, (subj, path) in enumerate(sorted(files.items())):
+                if hasattr(self, 'session_bounds_status'):
+                    self.session_bounds_status.config(
+                        text=f"Measuring {i + 1}/{len(files)}: {os.path.basename(path)}",
+                        foreground='gray')
+                    self.root.update_idletasks()
+                try:
+                    secs = self._measure_raw_file_seconds(path)
+                except Exception:
+                    secs = None
+                if secs is None:
+                    failed.append(str(subj))
+                else:
+                    lengths[str(subj)] = secs
+        finally:
+            try:
+                self.root.config(cursor='')
+            except Exception:
+                pass
+        self._refresh_session_bounds_list()
+        n_ok = len(files) - len(failed)
+        self.log_message(f"  Measured photometry length for {n_ok} of {len(files)} raw file(s).")
+        if failed:
+            shown = ', '.join(failed[:12]) + ('...' if len(failed) > 12 else '')
+            messagebox.showwarning(
+                "Measure Lengths",
+                f"Could not read a usable clock from {len(failed)} file(s): {shown}\n\n"
+                f"A Trim end on these subjects still applies once they are processed.")
 
     def _refresh_session_bounds_list(self):
         """Repopulate the bounds table from params, with a per-row processed-as note."""
@@ -4101,31 +4213,47 @@ class FPAnalysisGUI:
             rec = store.get(str(subj)) or {}
             start = int(rec.get('start', 0) or 0)
             end = int(rec.get('end', 0) or 0)
+            trim = 0 if end else int(rec.get('trim_end', 0) or 0)
+            total = self._recording_total_frames(subj)
+            # The end frame the trim works out to, None while the length is unknown.
+            eff_end = end
+            if trim:
+                eff_end = (total - 1 - trim) if total else None
             data = self.processed_data.get(subj)
             if str(subj) not in known:
                 status = 'ID not in this project'
+            elif eff_end is None:
+                status = 'length unknown - Measure Lengths'
+            elif trim and eff_end <= start:
+                status = 'trim leaves nothing - ignored'
             elif data is None:
                 status = 'not processed yet'
             else:
                 was = data.get('session_bound_frames')
                 if was is None:
                     status = 'processed before bounds existed'
-                    if start or end:
+                    if start or eff_end:
                         n_stale += 1
                 else:
                     w_start, w_end = int(was[0] or 0), int(was[1] or 0)
-                    if (w_start, w_end) == (start, end):
+                    if (w_start, w_end) == (start, eff_end):
                         status = 'matches processed data'
                     else:
                         status = 'processed as %d-%s - reprocess' % (
                             w_start, w_end or 'end')
                         n_stale += 1
+            if trim:
+                end_cell = '(%d)' % eff_end if eff_end else '-'
+            else:
+                end_cell = end
             tree.insert('', 'end', values=(
                 subj,
                 start,
                 ('%.1f' % (start / vfps)) if start else '-',
-                end,
-                ('%.1f' % (end / vfps)) if end else '-',
+                end_cell,
+                trim,
+                ('%.1f' % (eff_end / vfps)) if eff_end else '-',
+                total if total else '-',
                 status))
 
         if hasattr(self, 'session_bounds_status'):
@@ -4140,7 +4268,8 @@ class FPAnalysisGUI:
                     foreground='#a05000')
             else:
                 n_set = sum(1 for r in store.values()
-                            if (r or {}).get('start') or (r or {}).get('end'))
+                            if (r or {}).get('start') or (r or {}).get('end')
+                            or (r or {}).get('trim_end'))
                 self.session_bounds_status.config(
                     text=f"{n_set} subject(s) bounded @ {vfps:g} fps video.",
                     foreground='gray')
@@ -4156,12 +4285,12 @@ class FPAnalysisGUI:
             return
         store = self._session_bounds_store()
         for subj in subjects:
-            store.setdefault(str(subj), {'start': 0, 'end': 0})
+            store.setdefault(str(subj), {'start': 0, 'end': 0, 'trim_end': 0})
         self._refresh_session_bounds_list()
 
     # -- Inline cell editing -----------------------------------------
 
-    _SESSION_BOUND_COLUMNS = {'#2': 'start', '#4': 'end'}
+    _SESSION_BOUND_COLUMNS = {'#2': 'start', '#4': 'end', '#5': 'trim_end'}
 
     def _on_session_bounds_double_click(self, event):
         tree = self.session_bounds_tree
@@ -4222,7 +4351,9 @@ class FPAnalysisGUI:
         if save and hasattr(self, 'session_bounds_tree') \
                 and self.session_bounds_tree.exists(item):
             try:
-                val = max(0, int(float(var.get())))
+                # Negative only means something in End frame (a trim), which
+                # _set_session_bound handles; elsewhere it is clamped to 0.
+                val = int(float(var.get()))
             except (ValueError, TypeError):
                 val = None
             if val is not None:
@@ -4249,20 +4380,34 @@ class FPAnalysisGUI:
         """
         norm = {c: str(c).strip().lower() for c in columns}
         id_col = start_col = end_col = None
+        trim_col = FPAnalysisGUI._match_trim_column(columns)
         for c, low in norm.items():
-            if 'frame' not in low:
+            if 'frame' not in low or c == trim_col:
                 continue
             if start_col is None and 'start' in low:
                 start_col = c
             elif end_col is None and ('end' in low or 'stop' in low):
                 end_col = c
         for c, low in norm.items():
-            if c in (start_col, end_col):
+            if c in (start_col, end_col, trim_col):
                 continue
             if any(k in low for k in ('animal', 'subject', 'id', 'mouse')):
                 id_col = c
                 break
         return id_col, start_col, end_col
+
+    @staticmethod
+    def _match_trim_column(columns):
+        """The 'frames to drop from the end' column, e.g. 'Trim End Frames', or None.
+
+        Found before the end-frame match so a 'trim end frames' header is not
+        read as an absolute end frame.
+        """
+        for c in columns:
+            low = str(c).strip().lower()
+            if 'frame' in low and ('trim' in low or 'chop' in low):
+                return c
+        return None
 
     def _import_session_bounds_file(self):
         """Read subject bounds from an Excel/CSV sheet, matching IDs to this project."""
@@ -4281,19 +4426,22 @@ class FPAnalysisGUI:
         chosen = None
         for df in frames:
             id_col, start_col, end_col = self._match_bounds_columns(df.columns)
-            if id_col is not None and (start_col is not None or end_col is not None):
-                chosen = (df, id_col, start_col, end_col)
+            trim_col = self._match_trim_column(df.columns)
+            if id_col is not None and (start_col is not None or end_col is not None
+                                       or trim_col is not None):
+                chosen = (df, id_col, start_col, end_col, trim_col)
                 break
         if chosen is None:
             messagebox.showerror(
                 "Import failed",
                 "No usable columns found.\n\nThe sheet needs a subject/animal ID column "
-                "and at least one column whose name contains both 'start' (or 'end') "
-                "and 'frame'.")
+                "and at least one column whose name contains both 'start' (or 'end', "
+                "or 'trim') and 'frame'.")
             return
 
-        df, id_col, start_col, end_col = chosen
-        applied, unmatched, skipped = self._apply_bounds_table(df, id_col, start_col, end_col)
+        df, id_col, start_col, end_col, trim_col = chosen
+        applied, unmatched, skipped = self._apply_bounds_table(
+            df, id_col, start_col, end_col, trim_col)
 
         self._refresh_session_bounds_list()
         store = self._session_bounds_store()
@@ -4307,7 +4455,8 @@ class FPAnalysisGUI:
                        f"ignored: {shown}")
         no_bounds = [str(s) for s in self._known_subject_ids()
                      if not (store.get(str(s)) or {}).get('start')
-                     and not (store.get(str(s)) or {}).get('end')]
+                     and not (store.get(str(s)) or {}).get('end')
+                     and not (store.get(str(s)) or {}).get('trim_end')]
         if no_bounds:
             shown = ', '.join(no_bounds[:12]) + ('...' if len(no_bounds) > 12 else '')
             msg.append(f"\n{len(no_bounds)} subject(s) in the project got no bounds "
@@ -4340,23 +4489,26 @@ class FPAnalysisGUI:
                     candidates.append(shifted)
         return candidates
 
-    def _apply_bounds_table(self, df, id_col, start_col, end_col):
+    def _apply_bounds_table(self, df, id_col, start_col, end_col, trim_col=None):
         """Write one parsed bounds table into params.
 
+        A negative end frame is read as a trim, the same as in the table.
         Returns ``(applied, unmatched, skipped)``.
         """
         known = {str(s).lower(): str(s) for s in self._known_subject_ids()}
         store = self._session_bounds_store()
         applied, unmatched, skipped = [], [], 0
 
-        def _frames(row, col):
+        def _frames(row, col, signed=False):
             if col is None:
                 return 0
             try:
                 v = float(row[col])
             except (TypeError, ValueError):
                 return 0
-            return 0 if not np.isfinite(v) or v < 0 else int(round(v))
+            if not np.isfinite(v) or (v < 0 and not signed):
+                return 0
+            return int(round(v))
 
         for _, row in df.iterrows():
             raw_id = row[id_col]
@@ -4365,8 +4517,13 @@ class FPAnalysisGUI:
             sid = str(raw_id).strip()
             if not sid:
                 continue
-            start, end = _frames(row, start_col), _frames(row, end_col)
-            if not start and not end:
+            start, end = _frames(row, start_col), _frames(row, end_col, signed=True)
+            trim = _frames(row, trim_col)
+            if end < 0:
+                end, trim = 0, -end
+            if end:
+                trim = 0
+            if not start and not end and not trim:
                 skipped += 1
                 continue
             # Store under the project's own casing, so the key is the subject ID
@@ -4375,7 +4532,7 @@ class FPAnalysisGUI:
             if target is None:
                 unmatched.append(sid)
                 continue
-            store[target] = {'start': start, 'end': end}
+            store[target] = {'start': start, 'end': end, 'trim_end': trim}
             applied.append(target)
         return applied, unmatched, skipped
 
@@ -4399,12 +4556,14 @@ class FPAnalysisGUI:
             messagebox.showwarning("Paste", "Clipboard holds no rows.")
             return
 
-        def _num(tok):
+        def _num(tok, signed=False):
             try:
                 v = float(str(tok).strip())
             except (TypeError, ValueError):
                 return None
-            return None if not np.isfinite(v) or v < 0 else int(round(v))
+            if not np.isfinite(v) or (v < 0 and not signed):
+                return None
+            return int(round(v))
 
         known = {str(s).lower(): str(s) for s in self._known_subject_ids()}
         store = self._session_bounds_store()
@@ -4414,9 +4573,10 @@ class FPAnalysisGUI:
         if by_name:
             for r in by_name:
                 target = known[str(r[0]).strip().lower()]
-                start = _num(r[1]) or 0
-                end = (_num(r[2]) or 0) if len(r) >= 3 else 0
-                store[target] = {'start': start, 'end': end}
+                store[target] = {'start': _num(r[1]) or 0, 'end': 0, 'trim_end': 0}
+                if len(r) >= 3:
+                    # A negative end is a trim, as in the table.
+                    self._set_session_bound(target, 'end', _num(r[2], signed=True) or 0)
                 applied += 1
         else:
             tree = self.session_bounds_tree
@@ -4435,11 +4595,11 @@ class FPAnalysisGUI:
                 start = _num(r[0])
                 if start is None:
                     continue
-                end = _num(r[1]) if len(r) >= 2 else None
-                rec = store.setdefault(str(subject), {'start': 0, 'end': 0})
+                end = _num(r[1], signed=True) if len(r) >= 2 else None
+                rec = store.setdefault(str(subject), {'start': 0, 'end': 0, 'trim_end': 0})
                 rec['start'] = start
                 if end is not None:
-                    rec['end'] = end
+                    self._set_session_bound(subject, 'end', end)
                 applied += 1
 
         self._refresh_session_bounds_list()
@@ -4450,12 +4610,18 @@ class FPAnalysisGUI:
                 "rows of 'Subject<TAB>start<TAB>end'.")
 
     def _copy_session_bounds_to_clipboard(self):
-        """Copy the table as tab-separated Subject/start/end rows."""
+        """Copy the table as tab-separated Subject/start/end rows.
+
+        A trim is written as a negative end frame, which pastes back as a trim.
+        """
         store = self._session_bounds_store()
         lines = ['Subject\tStartFrame\tEndFrame']
-        lines += [f"{subj}\t{int((rec or {}).get('start', 0) or 0)}"
-                  f"\t{int((rec or {}).get('end', 0) or 0)}"
-                  for subj, rec in sorted(store.items())]
+        for subj, rec in sorted(store.items()):
+            rec = rec or {}
+            end = int(rec.get('end', 0) or 0)
+            if not end:
+                end = -int(rec.get('trim_end', 0) or 0)
+            lines.append(f"{subj}\t{int(rec.get('start', 0) or 0)}\t{end}")
         self.root.clipboard_clear()
         self.root.clipboard_append('\n'.join(lines))
 
@@ -4677,13 +4843,10 @@ class FPAnalysisGUI:
             wraplength=self.ui_px(620), justify='left')
         self.boutframes_layout_label.grid(row=3, column=1, columnspan=2, sticky='w', pady=(0, 4))
 
-        # Boutframes FPS scaling
+        # Boutframes source video rate (scaling to photometry FPS is automatic)
         boutframes_scale_frame = ttk.Frame(input_frame)
         boutframes_scale_frame.grid(row=4, column=0, columnspan=3, sticky='w', pady=(0, 4))
-        ttk.Checkbutton(boutframes_scale_frame,
-                        text="Auto-scale boutframes to photometry FPS during processing",
-                        variable=self.auto_scale_boutframes_var).pack(side='left', padx=(0, 12))
-        ttk.Label(boutframes_scale_frame, text="Video FPS:").pack(side='left', padx=(0, 4))
+        ttk.Label(boutframes_scale_frame, text="Boutframes video FPS:").pack(side='left', padx=(0, 4))
         ttk.Entry(boutframes_scale_frame, textvariable=self.boutframes_video_fps_var, width=7).pack(side='left', padx=(0, 10))
         self.detected_fps_label = ttk.Label(boutframes_scale_frame,
                                             text="Photometry FPS: (not yet detected)",
@@ -4699,17 +4862,6 @@ class FPAnalysisGUI:
         ttk.Entry(boutframes_shift_row, textvariable=self.boutframe_manual_shift_var, width=8).pack(side='left', padx=(0, 4))
         ttk.Label(boutframes_shift_row, text="frames (±, applied after scaling)",
                   foreground='gray', font=('Segoe UI', 8)).pack(side='left')
-
-        # Precut boutframe correction
-        boutframes_precut_row = ttk.Frame(input_frame)
-        boutframes_precut_row.grid(row=6, column=0, columnspan=3, sticky='ew', pady=(0, 4))
-        ttk.Checkbutton(boutframes_precut_row,
-                        text="Correct boutframes for precut (subtract precut ÷ n_LED_states offset)",
-                        variable=self.precut_correct_boutframes_var).pack(anchor='w')
-        ttk.Label(boutframes_precut_row,
-                  text="Enable when boutframes were scored from the full FP recording (includes pre-session frames).",
-                  foreground='gray', font=('Segoe UI', 8),
-                  wraplength=self.ui_px(700), justify='left').pack(anchor='w', padx=(self.ui_px(18), 0))
 
         # TTL/DigitalIOs file
         ttk.Label(input_frame, text="TTL/DigitalIOs File (optional):").grid(row=7, column=0, sticky='w', pady=2)
@@ -5175,7 +5327,7 @@ class FPAnalysisGUI:
 
         # Instruction label
         ttk.Label(shifts_tab,
-                  text="Per-subject frame shift applied after global shift/scaling, before precut correction.  "
+                  text="Per-subject frame shift applied after global shift/scaling, before the recording-start correction.  "
                        "Positive = forward (later), Negative = backward (earlier).  "
                        "Click the Shift cell to edit; Tab moves to the next row.",
                   foreground='gray', wraplength=self.ui_px(700)).pack(anchor='w', padx=10, pady=(8, 4))
@@ -7108,7 +7260,8 @@ class FPAnalysisGUI:
                    command=self.apply_integrity_threshold_to_exclusions).pack(side='left', padx=(6, 0))
         ttk.Label(integ_box,
                   text="Applies to the current selection only. Channels scoring below "
-                       "the threshold are added to the Exclusions tab.",
+                       "the threshold are added to the Exclusions tab. A clear "
+                       "event-locked response at the bouts raises a channel's score.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(250), justify='left').grid(
                       row=5, column=0, columnspan=2, sticky='w', pady=(2, 0))
@@ -8807,8 +8960,8 @@ class FPAnalysisGUI:
         band_path = filepath
         freq_path = filepath.replace('.csv', '_per_frequency.csv')
 
-        pd.DataFrame(rows).to_csv(band_path, index=False)
-        pd.DataFrame(freq_rows).to_csv(freq_path, index=False)
+        pd.DataFrame(rows).to_csv(band_path, index=False, encoding=EXPORT_CSV_ENCODING)
+        pd.DataFrame(freq_rows).to_csv(freq_path, index=False, encoding=EXPORT_CSV_ENCODING)
 
         self.log_message(f"Group coherence exported: {band_path}")
         messagebox.showinfo("Export Complete",
@@ -9835,8 +9988,8 @@ class FPAnalysisGUI:
 
         band_path = filepath
         freq_path = filepath.replace('.csv', '_per_frequency.csv')
-        pd.DataFrame(band_rows).to_csv(band_path, index=False)
-        pd.DataFrame(freq_rows).to_csv(freq_path, index=False)
+        pd.DataFrame(band_rows).to_csv(band_path, index=False, encoding=EXPORT_CSV_ENCODING)
+        pd.DataFrame(freq_rows).to_csv(freq_path, index=False, encoding=EXPORT_CSV_ENCODING)
         self.log_message(f"Bout-epoch group data exported: {band_path}")
         messagebox.showinfo("Export Complete",
             f"Band summary:      {band_path}\nPer-frequency: {freq_path}")
@@ -11660,7 +11813,7 @@ class FPAnalysisGUI:
                     'PostOnset_SEM':         round(float(post_sem),6),
                 })
 
-        pd.DataFrame(rows).to_csv(filepath, index=False)
+        pd.DataFrame(rows).to_csv(filepath, index=False, encoding=EXPORT_CSV_ENCODING)
         self.log_message(f"Bout epoch coherence exported to: {filepath}")
         messagebox.showinfo("Export Complete", f"Data saved to:\n{filepath}")
 
@@ -13623,7 +13776,7 @@ class FPAnalysisGUI:
             
             # Convert to DataFrame and save
             df = pd.DataFrame(rows)
-            df.to_csv(filepath, index=False)
+            df.to_csv(filepath, index=False, encoding=EXPORT_CSV_ENCODING)
             
             # Add metadata to CSV file
             self._add_metadata_comment_to_csv(filepath, self._create_export_metadata('spike'))
@@ -13806,7 +13959,7 @@ class FPAnalysisGUI:
             
             # Convert to DataFrame and save
             df = pd.DataFrame(rows)
-            df.to_csv(filepath, index=False)
+            df.to_csv(filepath, index=False, encoding=EXPORT_CSV_ENCODING)
             
             # Add metadata to CSV file
             self._add_metadata_comment_to_csv(filepath, self._create_export_metadata('spike'))
@@ -14777,6 +14930,39 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Signal Integrity now weighs event-locked signal. Each channel's bouts
+    are tested against the same onsets shifted to random points in the recording
+    (corrected for the number of behaviours tested); a clear response raises the
+    score to at least 70, rising to 90, and never lowers it. Channels on rigs
+    whose 415 tracks 470 closely (r ~0.99) were all pinned at 42.9 even when they
+    responded at every bout. A response counts as movement only when 415 responds
+    as strongly or the channel is tangled. The table adds Recording and Events
+    columns (* = raised by events), the single-subject view adds the mean bout
+    response with 415 overlaid, and the export and auto-exclude show both.
+  • New — Sparse fast GCaMP transients count as signal. Spikes that return to
+    baseline within 1-2 s read as noise to the slow/fast and high-frequency
+    measures; upward spikes that clearly outnumber downward ones (noise crosses
+    both ways equally) now credit Dynamics and Noise. Counts appear in the
+    dashboard and export.
+  • Change — Behaviour no longer counts against a recording. Sustained shifts
+    that start at a bout are not penalised, and negative skew on a channel with
+    a credited response is not read as dropouts.
+  • Fix — Recordings with no 415 nm channel stored the signal in its place and
+    scored 12.5 as a "perfect tangle"; they are now assessed as a sensor.
+  • New — Session bounds take a "Trim end": frames counted back from the end of
+    the photometry recording (a negative End frame is read as a trim). "Measure
+    Lengths" reads each raw file's photometry length so trims resolve before
+    processing, and imports accept a trim column.
+  • Change — Recording-start boutframe correction and boutframe FPS scaling are
+    auto / on / off. Auto applies the start correction only when bouts are cut
+    from the photometry grid; with a behavior/position file the rows are already
+    clock-matched video frames, and shifting them put startle 2.5 s late.
+  • Fix — Bouts resampled onto a different-rate axis keep their edge points
+    instead of leaving the first/last sample blank.
+  • Fix — The launcher finds a working Python instead of trusting "python" on PATH.
+
+Version 1.20.1  •  September 15, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — Raw files that are Excel workbooks under a .csv name now load. A Bonsai
     CSV opened in Excel and saved as a workbook keeps its .csv name, and reading
@@ -16520,6 +16706,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # against a different origin than they were extracted on.
                     'start_trim_rows': data.get('start_trim_rows'),
                     'start_offset_samples': data.get('start_offset_samples'),
+                    # Which grid bouts are sliced from, which decides whether
+                    # the recording-start correction applies (auto mode).
+                    'bout_timeline': data.get('bout_timeline'),
                     # The session bounds in force when it was processed, so the
                     # UI can say when the current settings no longer match.
                     'session_bound_frames': data.get('session_bound_frames'),
@@ -17018,15 +17207,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.baseline_frames_var.set(
                     f"{float(self.params.get('baseline_seconds', 0.0) or 0.0):g}")
 
-            # Boutframes FPS-scaling UI vars (same load-side sync so these
-            # checkboxes don't revert to their build-time defaults on reopen).
-            if hasattr(self, 'auto_scale_boutframes_var'):
-                self.auto_scale_boutframes_var.set(bool(self.params.get('auto_scale_boutframes', False)))
-            if hasattr(self, 'precut_correct_boutframes_var'):
-                self.precut_correct_boutframes_var.set(bool(self.params.get('precut_correct_boutframes', True)))
             self.params['session_bounds_frames'] = {
                 str(k): {'start': int(float((v or {}).get('start', 0) or 0)),
-                         'end': int(float((v or {}).get('end', 0) or 0))}
+                         'end': int(float((v or {}).get('end', 0) or 0)),
+                         'trim_end': int(float((v or {}).get('trim_end', 0) or 0))}
                 for k, v in (self.params.get('session_bounds_frames') or {}).items()
                 if isinstance(v, dict)
             }
@@ -17200,6 +17384,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 stored_off = metadata.get('start_offset_samples')
                                 if stored_off is not None:
                                     subject_data['start_offset_samples'] = int(stored_off)
+                                if metadata.get('bout_timeline') in ('photometry', 'video'):
+                                    subject_data['bout_timeline'] = metadata['bout_timeline']
                                 stored_bounds = metadata.get('session_bound_frames')
                                 if stored_bounds is not None:
                                     subject_data['session_bound_frames'] = list(stored_bounds)
@@ -18212,6 +18398,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         'processing_smoothing_method': ['butterworth', 'savgol', 'rolling'],
         'boutframe_processing_style': ['onset', 'whole', 'offset'],
         'ttl_format': ['pairs_start', 'single', 'pairs_startend'],
+        'boutframe_fps_scaling': ['auto', 'on', 'off'],
+        'boutframe_start_correction': ['auto', 'on', 'off'],
         'decay_strictness': ['strict', 'balanced', 'permissive'],
         'y_calibration_method': ['legacy', 'normalize_y_min', 'independent_y_scale'],
         'maze_type': ['EPM', 'EPM_Complex', 'OFT', 'Custom Arena'],
@@ -18534,9 +18722,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.params['ttl_format'] = self._ttl_format_labels.get(
                 self.ttl_format_var.get(), 'pairs_start')
 
-        # Update boutframes FPS scaling settings
-        self.params['auto_scale_boutframes'] = self.auto_scale_boutframes_var.get()
-        self.params['precut_correct_boutframes'] = self.precut_correct_boutframes_var.get()
         if hasattr(self, 'session_bounds_enabled_var'):
             self.params['session_bounds_enabled'] = bool(self.session_bounds_enabled_var.get())
         try:
@@ -20805,15 +20990,30 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # happen here, because pixel->cm calibration is fitted to the observed X
         # range: a few seconds of the animal being carried past the camera
         # rescales the entire session.
+        # The full photometry length, measured before any trimming, is what an
+        # end trim ("drop the last N frames") counts back from.  It is resolved
+        # once here so the position track and the signal are cut at the same
+        # frame, and remembered so the bounds table can show it.
+        _rec_seconds = self._raw_recording_seconds(fp_raw)
+        _total_frames = self._recording_total_frames(subject_id, _rec_seconds)
+        result['recording_seconds'] = _rec_seconds
+        if _rec_seconds is not None:
+            _lengths = self.params.get('session_recording_seconds')
+            if not isinstance(_lengths, dict):
+                _lengths = {}
+                self.params['session_recording_seconds'] = _lengths
+            _lengths[str(subject_id)] = _rec_seconds
         if beh_raw is not None and len(beh_raw):
-            _keep = self._apply_session_bounds_to_frames(subject_id, beh_raw[:, 0])
+            _keep = self._apply_session_bounds_to_frames(subject_id, beh_raw[:, 0],
+                                                         _total_frames)
             if not _keep.all():
                 _n_drop = int((~_keep).sum())
                 if _keep.any():
                     beh_raw = beh_raw[_keep]
                     if abel_position is not None:
                         _af, _ax, _ay, _afps = abel_position
-                        _am = self._apply_session_bounds_to_frames(subject_id, _af)
+                        _am = self._apply_session_bounds_to_frames(subject_id, _af,
+                                                                   _total_frames)
                         abel_position = (_af[_am], _ax[_am], _ay[_am], _afps)
                     self.log_message(
                         f"  Session bounds dropped {_n_drop} position frame(s) outside "
@@ -20841,8 +21041,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # length cap, so "600 s" means 600 s of real session instead of 600 s
         # counted from whatever the rig recorded while the animal was still in
         # the experimenter's hand.
-        _start_row, _end_row = self._session_bound_rows(subject_id, fp_raw, precut)
-        _sb_start, _sb_end = self._subject_session_bounds(subject_id)
+        _start_row, _end_row = self._session_bound_rows(subject_id, fp_raw, precut,
+                                                        _total_frames)
+        _sb_start, _sb_end = self._subject_session_bounds(subject_id, _total_frames)
         _n_raw_before = len(fp_raw)
         fp_raw = fp_raw[_start_row:_end_row, :]
         # The rows actually dropped from the head -- not the precut setting --
@@ -20855,6 +21056,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             _vfps = float(self.params.get('boutframes_video_fps', 30) or 30)
             _end_txt = (f"end frame {_sb_end} ({_sb_end / _vfps:.1f} s)"
                         if _sb_end is not None else "end of recording")
+            _trim_n = self._session_end_trim(subject_id)
+            if _sb_end is not None and _trim_n and _total_frames:
+                _end_txt += (f" = last {_trim_n} of {_total_frames} "
+                             f"photometry frames trimmed")
             self.log_message(
                 f"  Session bounds: start frame {_sb_start} "
                 f"({_sb_start / _vfps:.1f} s) to {_end_txt} @ {_vfps:g} fps video — "
@@ -21157,14 +21362,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     'start_offset_samples', _seed.get('start_offset_samples'))
                 _seed['num_photometry_channels'] = result.get(
                     'num_photometry_channels', _seed.get('num_photometry_channels'))
+                # An ABEL track is resampled onto the photometry grid.
+                _seed['bout_timeline'] = 'photometry'
                 self.processed_data[subject_id] = _seed
 
                 _af, _ax, _ay, _afps = abel_position
                 beh_synced, has_position = self.synchronize_abel_position(
                     subject_id, result['zscore'], _af, _ax, _ay, file_fps=_afps)
+                result['bout_timeline'] = 'photometry'
             else:
                 self.log_message(f"  Synchronizing with behavior data...")
                 beh_synced = self.synchronize_behavior(result['zscore'], beh_raw, has_position)
+                # One row per behavior-file (video) frame, photometry matched by clock.
+                result['bout_timeline'] = 'video'
             result['beh_synced'] = beh_synced
             result['has_position'] = has_position
             
@@ -21269,6 +21479,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             
             result['beh_synced'] = beh_synced
             result['has_position'] = False
+            result['bout_timeline'] = 'photometry'
             self.log_message(f"  Created synthetic behavior timeline with {n_frames} frames ({num_photo_channels} photometry channels)")
         
         # Handle TTL/DigitalIOs file processing (works with or without behavior data)
@@ -21390,6 +21601,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             _temp['n_led_states'] = result.get('n_led_states', _temp.get('n_led_states', 1))
             _temp['photometry_fps'] = result.get('photometry_fps', _temp.get('photometry_fps'))
             _temp['num_photometry_channels'] = result.get('num_photometry_channels', _temp.get('num_photometry_channels'))
+            _temp['bout_timeline'] = result.get('bout_timeline', _temp.get('bout_timeline'))
             if result.get('channel_names'):
                 _temp['channel_names'] = result['channel_names']
             self.processed_data[subject_id] = _temp
@@ -22147,7 +22359,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             beh[covered, 3] = np.interp(vid_frames[covered], f_sorted, y_sorted)
 
         offset = (self._photometry_start_offset_samples(subject_id)
-                  if self.params.get('precut_correct_boutframes', True) else 0)
+                  if self._boutframe_start_correction(subject_id) else 0)
         self.log_message(
             f"    Sync mode: ABEL POSITION (video frames -> photometry samples, the same "
             f"transform boutframes use). Recording-start offset {offset} sample(s); "
@@ -23758,7 +23970,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not use_bins:
             # No time bins - export as-is (vertical format)
             df = pd.DataFrame(results_to_export)
-            df.to_csv(filename, index=False)
+            df.to_csv(filename, index=False, encoding=EXPORT_CSV_ENCODING)
         else:
             # Time bins used - reorganize to horizontal format (bins as columns)
             # Group data by subject
@@ -23813,7 +24025,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     rows.append(row_data)
             
             df = pd.DataFrame(rows)
-            df.to_csv(filename, index=False)
+            df.to_csv(filename, index=False, encoding=EXPORT_CSV_ENCODING)
         
         # Add metadata to CSV file
         metadata = self._create_export_metadata('behavioral')
@@ -25105,7 +25317,75 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 behaviors.append((str(c), start_arr, None))
         return behaviors, has_end_any
 
-    def _subject_session_bounds(self, subject_id):
+    def _session_bound_record(self, subject_id):
+        """The stored bounds dict for *subject_id*, or None."""
+        bounds = self.params.get('session_bounds_frames') or {}
+        rec = bounds.get(str(subject_id))
+        if rec is None:
+            # Subject IDs come from filenames, while bounds are typed or pasted
+            # from a spreadsheet where the case usually differs ('1-F' vs
+            # '1-f').  Matching case-insensitively stops a whole cohort's bounds
+            # from silently doing nothing.
+            low = str(subject_id).lower()
+            for k, v in bounds.items():
+                if str(k).lower() == low:
+                    rec = v
+                    break
+        return rec
+
+    def _session_end_trim(self, subject_id):
+        """Frames to drop from the end of *subject_id*'s recording (0 = none).
+
+        An explicit end frame wins, so this is 0 whenever one is set.
+        """
+        rec = self._session_bound_record(subject_id)
+        if not isinstance(rec, dict):
+            return 0
+        try:
+            if int(float(rec.get('end', 0) or 0)) > 0:
+                return 0
+            return max(0, int(float(rec.get('trim_end', 0) or 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _raw_recording_seconds(fp_raw):
+        """Seconds from the first to the last raw row, or None if the clock is unusable."""
+        try:
+            ts = np.asarray(fp_raw, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if ts.ndim != 2 or ts.shape[1] < 2 or ts.shape[0] < 2:
+            return None
+        elapsed = ts[:, 1] - ts[0, 1]
+        if not np.all(np.isfinite(elapsed)) or elapsed[-1] <= 0:
+            return None
+        return float(elapsed[-1])
+
+    def _recording_total_frames(self, subject_id, seconds=None):
+        """Length of *subject_id*'s photometry recording in video frames, or None.
+
+        Counted on the photometry clock, whose first row is video frame 0 (the
+        convention every frame<->sample conversion here rests on), so frame
+        ``total - 1`` is the last one with signal under it.  The video may run
+        longer or shorter; an end trim is deliberately relative to the signal.
+        """
+        if seconds is None:
+            store = self.params.get('session_recording_seconds') or {}
+            seconds = store.get(str(subject_id))
+            if seconds is None:
+                low = str(subject_id).lower()
+                seconds = next((v for k, v in store.items() if str(k).lower() == low), None)
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return None
+        vfps = float(self.params.get('boutframes_video_fps', 30) or 30)
+        if not np.isfinite(seconds) or seconds <= 0 or vfps <= 0:
+            return None
+        return int(np.floor(seconds * vfps + 1e-6)) + 1
+
+    def _subject_session_bounds(self, subject_id, total_frames=None):
         """Real start / end of *subject_id*'s session, in VIDEO frames.
 
         Rigs are started before the animal is in the apparatus and stopped after
@@ -25120,22 +25400,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         arrive in, because that is the number an experimenter can read off the
         video.  ``0`` at either end means "no bound".
 
+        The end can instead be given as ``trim_end``, a count of frames to drop
+        from the end of the photometry recording, so nobody has to look up each
+        file's length first.  It resolves against *total_frames* (the
+        recording's length in video frames, measured from the raw clock) or,
+        when that is not passed, the length last measured for this subject.
+
         Returns ``(start_frame, end_frame)``; *end_frame* is None when unset.
         """
         if not self.params.get('session_bounds_enabled', True):
             return 0, None
-        bounds = self.params.get('session_bounds_frames') or {}
-        rec = bounds.get(str(subject_id))
-        if rec is None:
-            # Subject IDs come from filenames, while bounds are typed or pasted
-            # from a spreadsheet where the case usually differs ('1-F' vs
-            # '1-f').  Matching case-insensitively stops a whole cohort's bounds
-            # from silently doing nothing.
-            low = str(subject_id).lower()
-            for k, v in bounds.items():
-                if str(k).lower() == low:
-                    rec = v
-                    break
+        rec = self._session_bound_record(subject_id)
         if not isinstance(rec, dict):
             return 0, None
 
@@ -25147,6 +25422,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         start = _int('start')
         end = _int('end')
+        trim = _int('trim_end')
+        if not end and trim:
+            if total_frames is None:
+                total_frames = self._recording_total_frames(subject_id)
+            if total_frames is None:
+                self.log_message(
+                    f"  Session end trim for {subject_id} not applied: the recording's "
+                    f"length is not known yet.")
+                return start, None
+            # Frames are numbered from 0, so the last one is total - 1.
+            end = int(total_frames) - 1 - trim
+            if end <= start:
+                self.log_message(
+                    f"  Session bounds for {subject_id} ignored: trimming {trim} frames "
+                    f"from a {int(total_frames)}-frame recording leaves nothing after "
+                    f"start frame {start}.")
+                return 0, None
+            return start, end
         if end and end <= start:
             # An end at or before the start would empty the recording. Refusing
             # it here beats producing a zero-length subject that fails much
@@ -25157,7 +25450,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return 0, None
         return start, (end or None)
 
-    def _session_bound_rows(self, subject_id, fp_raw, precut):
+    def _session_bound_rows(self, subject_id, fp_raw, precut, total_frames=None):
         """Raw-row slice bounds for *subject_id*'s real session.
 
         The bounds are video frames; the raw file is a row-interleaved stream of
@@ -25175,7 +25468,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         later, never earlier.
         """
         start_row, end_row = max(0, int(precut)), len(fp_raw)
-        start_frame, end_frame = self._subject_session_bounds(subject_id)
+        start_frame, end_frame = self._subject_session_bounds(subject_id, total_frames)
         if not start_frame and end_frame is None:
             return start_row, end_row
 
@@ -25218,7 +25511,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 end_row = min(end_row, int(over[0]))
         return start_row, max(start_row, end_row)
 
-    def _apply_session_bounds_to_frames(self, subject_id, frame_col):
+    def _apply_session_bounds_to_frames(self, subject_id, frame_col, total_frames=None):
         """Boolean mask of the behavior rows inside *subject_id*'s session bounds.
 
         Position files are numbered in the same video frames as the bounds, so
@@ -25227,7 +25520,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         signal behind them) is what keeps the out-of-arena head and tail out of
         the pixel->cm calibration.
         """
-        start_frame, end_frame = self._subject_session_bounds(subject_id)
+        start_frame, end_frame = self._subject_session_bounds(subject_id, total_frames)
         frames = np.asarray(frame_col, dtype=float)
         keep = np.ones(frames.shape, dtype=bool)
         if start_frame:
@@ -25235,6 +25528,79 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if end_frame is not None:
             keep &= ~(frames > end_frame)
         return keep
+
+    def _bout_timeline(self, subject_id):
+        """Which grid *subject_id*'s bouts are sliced from: 'photometry' or 'video'.
+
+        extract_bouts indexes ``beh_synced`` rows.  With a behavior / position /
+        timestamp file those rows ARE the video frames -- synchronize_behavior
+        has already matched each one to the photometry sample at the same clock
+        time -- so a boutframe is used as is.  Without one (the synthetic
+        timeline), or with an ABEL position track, the rows are photometry
+        samples starting at the first sample kept after the trim, so video frame
+        0 sits that many samples before row 0.
+
+        Recorded at processing time; a project saved before that is classified
+        from the data itself: the photometry grid copies the z-score's own
+        timestamps row for row, a behavior file's grid does not.
+        """
+        subject_data = self.processed_data.get(subject_id, {})
+        timeline = subject_data.get('bout_timeline')
+        if timeline in ('photometry', 'video'):
+            return timeline
+        beh = subject_data.get('beh_synced')
+        zs = subject_data.get('zscore')
+        try:
+            beh = np.asarray(beh, dtype=float)
+            zs = np.asarray(zs, dtype=float)
+            if beh.ndim == 2 and zs.ndim == 2 and beh.shape[1] > 1 and zs.shape[1] > 1:
+                same = (len(beh) == len(zs)
+                        and np.allclose(beh[:, 1], zs[:, 1], equal_nan=True))
+                return 'photometry' if same else 'video'
+        except (TypeError, ValueError):
+            pass
+        # Nothing to go on (e.g. mid-processing before the timeline exists):
+        # the photometry grid is what every caller without a behavior file uses.
+        return 'photometry'
+
+    def _boutframe_start_correction(self, subject_id):
+        """Whether boutframes for *subject_id* are shifted by the recording-start offset.
+
+        Only right on the photometry grid.  On a behavior file's video-frame
+        grid the photometry is already time-aligned, so the shift moves every
+        bout early by the offset -- measured on acoustic startle, it put the
+        response 2.5 s late.  The 'boutframe_start_correction' setting can
+        force it on or off for every subject when 'auto' gets a project wrong.
+        """
+        mode = self._boutframe_mode(self.params.get('boutframe_start_correction', 'auto'))
+        if mode != 'auto':
+            return mode == 'on'
+        return self._bout_timeline(subject_id) == 'photometry'
+
+    @staticmethod
+    def _boutframe_mode(value):
+        """'on' / 'off' / 'auto' from a setting, accepting legacy booleans."""
+        mode = str(value).strip().lower()
+        if mode in ('on', 'true', '1', 'yes'):
+            return 'on'
+        if mode in ('off', 'false', '0', 'no'):
+            return 'off'
+        return 'auto'
+
+    def _boutframe_fps_scaling(self, subject_id):
+        """Whether *subject_id*'s boutframes are rescaled from video to photometry FPS.
+
+        Same split as :meth:`_boutframe_start_correction`.  A behavior file's
+        grid has one row per video frame, so boutframes already index it and
+        rescaling compresses them -- measured on 20 Hz startle recordings, it
+        cut the evoked response to well under half.  On the photometry grid
+        the conversion is required: at 20 Hz, 70 of 97 NSF animals aligned only
+        with it.  'boutframe_fps_scaling' forces it on or off for every subject.
+        """
+        mode = self._boutframe_mode(self.params.get('boutframe_fps_scaling', 'auto'))
+        if mode != 'auto':
+            return mode == 'on'
+        return self._bout_timeline(subject_id) == 'photometry'
 
     def _photometry_start_offset_samples(self, subject_id):
         """Samples between video time zero and the first analysed photometry sample.
@@ -25316,7 +25682,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Video frames -> photometry samples.  Rounding is deferred to the end so
         # the rate conversion and the start offset do not each cost half a sample.
-        if self.params.get('auto_scale_boutframes', True):
+        if self._boutframe_fps_scaling(subject_id):
             vfps = float(self.params.get('boutframes_video_fps', 30))
             pfps = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
             if pfps and vfps > 0 and abs(float(pfps) - vfps) > 0.1:
@@ -25330,8 +25696,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if ps:
             frames = frames + ps
 
-        # Recording start: signal sample 0 is not video frame 0.
-        if self.params.get('precut_correct_boutframes', True):
+        # Recording start: on the photometry grid, signal sample 0 is not video
+        # frame 0.  A behavior file's grid is already in video frames.
+        if self._boutframe_start_correction(subject_id):
             off = self._photometry_start_offset_samples(subject_id)
             if off:
                 frames = frames - off
@@ -25356,7 +25723,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subject_data = self.processed_data.get(subject_id, {})
 
         # Undo the recording-start offset (forward subtracted it)
-        if self.params.get('precut_correct_boutframes', True):
+        if self._boutframe_start_correction(subject_id):
             off = self._photometry_start_offset_samples(subject_id)
             if off:
                 frames = frames + off
@@ -25370,7 +25737,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             frames = frames - ms
 
         # Undo the sample-rate conversion
-        if self.params.get('auto_scale_boutframes', True):
+        if self._boutframe_fps_scaling(subject_id):
             vfps = float(self.params.get('boutframes_video_fps', 30))
             pfps = subject_data.get('photometry_fps', getattr(self, 'detected_photometry_fps', None))
             if pfps and vfps > 0 and abs(float(pfps) - vfps) > 0.1:
@@ -25675,12 +26042,22 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             exclude_before = self.params['exclude_frames_before']
             baseline_correct = self.params['baseline_correct_bouts']
 
+            _timeline = self._bout_timeline(subject_id)
+            _modes = [self._boutframe_mode(self.params.get(k, 'auto'))
+                      for k in ('boutframe_fps_scaling', 'boutframe_start_correction')]
+            self.log_message(
+                f"    Bout timeline: {'photometry samples (no behavior file)' if _timeline == 'photometry' else 'video frames (behavior file)'}"
+                f" -> FPS scaling {'ON' if self._boutframe_fps_scaling(subject_id) else 'OFF'}"
+                f" ({'forced' if _modes[0] != 'auto' else 'auto'}),"
+                f" recording-start correction {'ON' if self._boutframe_start_correction(subject_id) else 'OFF'}"
+                f" ({'forced' if _modes[1] != 'auto' else 'auto'})")
+
             # ── Boutframes FPS scaling ──
-            # If the checkbox is enabled, re-map all boutframe numbers from the
+            # When scaling applies to this subject (auto: photometry grid only), re-map all boutframe numbers from the
             # source video frame rate to the photometry sampling rate so that
             # the extracted windows align correctly.
             _scale_factor = 1.0
-            if self.params.get('auto_scale_boutframes', False):
+            if self._boutframe_fps_scaling(subject_id):
                 _video_fps = float(self.params.get('boutframes_video_fps', 30))
                 _photo_fps = getattr(self, 'detected_photometry_fps', None)
                 # Allow per-subject override stored during processing
@@ -25724,7 +26101,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     end_frames = self._transform_boutframe_values(raw_end, subject_id, as_int=False)
 
                 # Log the start offset once per behavior (transform already applied it)
-                if self.params.get('precut_correct_boutframes', True):
+                if self._boutframe_start_correction(subject_id):
                     _start_offset = self._photometry_start_offset_samples(subject_id)
                     if _start_offset > 0:
                         _fs = subject_data.get('photometry_fps') or 0
@@ -25985,9 +26362,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             good = np.isfinite(tr)
             if good.sum() < 2:
                 return np.full(dst_total, np.nan)
-            out = np.interp(t_dst, t_src[good], tr[good], left=np.nan, right=np.nan)
-            # np.interp cannot extrapolate; mark anything outside the stored span.
-            out[(t_dst < t_src[good][0]) | (t_dst > t_src[good][-1])] = np.nan
+            t_good, v_good = t_src[good], tr[good]
+            out = np.interp(t_dst, t_good, v_good, left=v_good[0], right=v_good[-1])
+            # Each sample stands for the half-period either side of it.  Frame
+            # counts are rounded per rate, so a 15.002 Hz window spans
+            # -4.9993..9.932 s while the 20 Hz axis asks for -5.0 and 9.95 s;
+            # those edge points still fall inside the first/last recorded
+            # sample's interval, so hold the edge value there.  Beyond that the
+            # stored window genuinely does not reach, and the point stays blank.
+            half_src = 0.5 / float(src_fs)
+            out[(t_dst < t_good[0] - half_src) | (t_dst > t_good[-1] + half_src)] = np.nan
             return out
 
         out = np.full(dst_total, np.nan)
@@ -27248,7 +27632,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if photo_fps_subj is not None:
             photo_fps = photo_fps_subj
 
-        scale_enabled = self.params.get('auto_scale_boutframes', True)
+        scale_enabled = self._boutframe_fps_scaling(subject)
         if scale_enabled and photo_fps is not None and video_fps > 0 and abs(photo_fps - video_fps) > 0.1:
             scale_factor = photo_fps / video_fps
         else:
@@ -27651,6 +28035,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # auto-exclude — useful when group n is small and a poorer channel is
         # worth keeping.
         candidates = []  # (subject, channel, score, already_excluded)
+        rescued_by_events = set()
         for subject in self._integrity_progress(target_subjects, 'Auto-exclude'):
             data = self.processed_data[subject]
             channel_metrics_list = self.signal_integrity_metrics(subject, data)
@@ -27661,6 +28046,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 score = float(metrics.get('overall_score', 0) or 0)
                 already = channel in self.exclusions.get(subject, [])
                 candidates.append((subject, channel, score, already))
+                if metrics.get('event_rescued'):
+                    rescued_by_events.add((subject, channel))
 
         if not candidates:
             messagebox.showwarning(
@@ -27668,9 +28055,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 "Could not compute integrity scores for the selected groups/subjects.")
             return
 
-        self._show_auto_exclude_confirmation(candidates, threshold, len(target_subjects))
+        self._show_auto_exclude_confirmation(candidates, threshold, len(target_subjects),
+                                             rescued=rescued_by_events)
 
-    def _show_auto_exclude_confirmation(self, candidates, threshold, n_subjects):
+    def _show_auto_exclude_confirmation(self, candidates, threshold, n_subjects, rescued=None):
         """Confirmation window for signal-integrity auto-exclude.
 
         Shows every evaluated subject/channel with its integrity score; channels
@@ -27710,7 +28098,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Label(cols, text="Subject", font=('Segoe UI', 9, 'bold'), width=18).grid(row=0, column=1, sticky='w')
         ttk.Label(cols, text="Channel", font=('Segoe UI', 9, 'bold'), width=8).grid(row=0, column=2, sticky='w')
         ttk.Label(cols, text="Score", font=('Segoe UI', 9, 'bold'), width=8).grid(row=0, column=3, sticky='w')
-        ttk.Label(cols, text="Status", font=('Segoe UI', 9, 'bold'), width=16).grid(row=0, column=4, sticky='w')
+        ttk.Label(cols, text="Status", font=('Segoe UI', 9, 'bold'), width=18).grid(row=0, column=4, sticky='w')
 
         row_vars = []  # (subject, channel, score, tk.BooleanVar, already)
         ordered = sorted(candidates, key=lambda c: (c[3], c[2]))  # not-already first, low score first
@@ -27727,7 +28115,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ttk.Label(cols, text=channel, width=8).grid(row=r, column=2, sticky='w')
             ttk.Label(cols, text=f"{score:.1f}", width=8, foreground=fg).grid(row=r, column=3, sticky='w')
             status = "already excluded" if already else ("below threshold" if flagged else "OK")
-            ttk.Label(cols, text=status, width=16, foreground='#888' if already else fg).grid(
+            if not already and not flagged and (subject, channel) in (rescued or ()):
+                status = "OK (event-locked)"
+            ttk.Label(cols, text=status, width=18, foreground='#888' if already else fg).grid(
                 row=r, column=4, sticky='w')
             row_vars.append((subject, channel, score, var, already))
 
@@ -30726,9 +31116,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         noise_amp = np.std(x - slow)
         sf_snr = float(np.std(slow) / noise_amp) if noise_amp > 0 else 0.0
 
+        # Fast transients. A sharp GCaMP spike that is back at baseline within
+        # ~1-2 s falls mostly in the "fast" band above, and when spikes are
+        # sparse the noise floor dominates the variance too, so both sf_snr and
+        # hf_ratio read such a channel as noise. Noise is symmetric -- it crosses
+        # +4 sigma as often as -4 sigma -- while real transients only go up, so
+        # count both directions on a lightly smoothed, high-passed copy.
+        up = down = 0
+        try:
+            from scipy.signal import find_peaks
+            wl = max(3, int(round(fps * 10)))
+            hp = x - np.convolve(x, np.ones(wl) / wl, mode='same')
+            k = max(1, int(round(fps * 0.2)))
+            xs = np.convolve(hp, np.ones(k) / k, mode='same')
+            sigma = 1.4826 * np.median(np.abs(xs - np.median(xs)))
+            if sigma > 0:
+                dist = max(1, int(round(fps)))
+                up = len(find_peaks(xs, height=4 * sigma, distance=dist)[0])
+                down = len(find_peaks(-xs, height=4 * sigma, distance=dist)[0])
+        except Exception:
+            pass
+
         return dict(snr=snr, sf_snr=sf_snr, hf_ratio=hf_ratio,
                     skew=float(skew(x)), kurt=float(kurtosis(x)),
-                    rng=float(np.max(x) - np.min(x)))
+                    rng=float(np.max(x) - np.min(x)),
+                    transients_up=int(up), transients_down=int(down),
+                    transient_asym=float((up + 1) / (down + 1)))
 
     def calculate_signal_quality_score(self, metrics, sensor=False):
         """
@@ -30795,6 +31208,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         else:
             noise = lin(hf, 1.60, 2.00, 8, 0)
 
+        # Sparse fast transients clearly above the noise floor are real signal
+        # that sf_snr and hf_ratio both miss (see integrity_series_stats). At
+        # least 15 upward spikes and 4x more up than down credits Dynamics and
+        # Noise from 60 (4x) to 100 (10x). Across the FP projects this rule
+        # credited 2 of 54 channels excluded as dead; good channels sit at 10-30x.
+        n_up = metrics.get('transients_up', 0) or 0
+        asym = metrics.get('transient_asym', 1.0) or 1.0
+        transient = None
+        if n_up >= 15 and asym >= 4.0:
+            transient = lin(asym, 4.0, 10.0, 60, 100)
+            dynamics = max(dynamics, transient)
+            noise = max(noise, transient)
+
         # Dropout / spike artifacts: genuine transients are positively skewed, so
         # only penalise NEGATIVE skew (dropouts) and extreme kurtosis paired with
         # non-positive skew (spike artifacts, not real sharp calcium events).
@@ -30835,15 +31261,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                        'dropout': dropout, 'motion': motion}
 
     def compute_channel_integrity(self, signal_raw, iso_raw, time_data, fps,
-                                  sensor=False, zscore_signal=None):
+                                  sensor=False, zscore_signal=None, event_ts=None, fp_ts=None):
         """
         Compute the full signal-integrity metric set + overall score for a single
         fibre channel. Single source of truth for both the single- and
         multi-subject Signal Integrity views, the export, and the auto-exclude.
         """
         from scipy.stats import linregress
+        # A rig with no 415 nm LED stores the signal in the isosbestic slot too.
+        # Regressing a trace on itself reads as a perfect tangle (r = 1, all
+        # variance "motion"), which scored every such channel 12.5; there is no
+        # motion control to judge, so assess it the way sensor mode does.
+        no_iso = bool(np.allclose(np.asarray(signal_raw, dtype=float),
+                                  np.asarray(iso_raw, dtype=float), equal_nan=True))
+        if no_iso:
+            sensor = True
         signal = self.flatten_signal_for_integrity(signal_raw, time_data)
-        isosbestic = self.flatten_signal_for_integrity(iso_raw, time_data)
+        isosbestic = signal if no_iso else self.flatten_signal_for_integrity(iso_raw, time_data)
 
         slope, intercept, _, _, _ = linregress(isosbestic, signal)
         motion_component = slope * isosbestic + intercept
@@ -30867,6 +31301,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Baseline/step shifts: iso reference for GCaMP (motion), signal for sensor
         shift_ref = signal if sensor else isosbestic
         sustained_shifts = self.detect_sustained_shifts(shift_ref, fps=fps)
+        # A shift that starts at a bout is the behaviour's own response (drinking,
+        # approach and the like move the signal for tens of seconds), not a
+        # fibre or connector artifact, so it is counted apart and not penalised.
+        # event_ts are bout-onset timestamps on the fp_ts clock.
+        sustained_shifts, n_locked = self._split_event_locked_shifts(
+            sustained_shifts, event_ts, fp_ts, fps)
 
         metrics = {
             'snr': stats_['snr'],
@@ -30874,18 +31314,299 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'hf_ratio': stats_['hf_ratio'],
             'skew': stats_['skew'],
             'kurt': stats_['kurt'],
+            'transients_up': stats_['transients_up'],
+            'transients_down': stats_['transients_down'],
+            'transient_asym': stats_['transient_asym'],
             'signal_std': float(np.std(signal)),
             'correlation': correlation,
             'var_removed': var_removed,
             'corr_range': stats_['rng'],
             'artifacts_count': int(len(artifacts_signal)),
             'sustained_shifts_count': int(len(sustained_shifts)),
+            'event_locked_shifts_count': int(n_locked),
             'sensor_mode': bool(sensor),
+            'no_isosbestic': no_iso,
         }
         score, components = self.calculate_signal_quality_score(metrics, sensor)
         metrics['overall_score'] = score
         metrics['score_components'] = components
+        # Handed to the event test so it need not flatten 415 a second time;
+        # _extract_signal_integrity_metrics pops it before caching.
+        metrics['_iso_flat'] = None if (no_iso or sensor) else isosbestic
         return metrics
+
+    INTEGRITY_SHIFT_LEAD_S = 15.0    # shift may start up to this long after an onset
+    INTEGRITY_SHIFT_EARLY_S = 5.0    # ... or this long before it (detector resolution)
+
+    def _split_event_locked_shifts(self, shifts, event_ts, fp_ts, fps):
+        """Drop shifts that begin at a bout onset; return (rest, n_dropped)."""
+        if not shifts or event_ts is None or fp_ts is None or len(event_ts) == 0:
+            return list(shifts or []), 0
+        on_idx = np.searchsorted(np.asarray(fp_ts, dtype=float), np.asarray(event_ts, dtype=float))
+        lead = int(round(self.INTEGRITY_SHIFT_LEAD_S * fps))
+        early = int(round(self.INTEGRITY_SHIFT_EARLY_S * fps))
+        rest = [sh for sh in shifts
+                if not np.any((on_idx >= sh[0] - lead) & (on_idx <= sh[0] + early))]
+        return rest, len(shifts) - len(rest)
+
+    def _is_offset_copy(self, behavior, bouts):
+        """True for a behaviour generated from another by a bout offset."""
+        suffixes = tuple('_' + str(o.get('label')) for o in (getattr(self, 'bout_offsets', None) or [])
+                         if isinstance(o, dict) and o.get('label'))
+        b = str(behavior)
+        return bool(suffixes) and b.endswith(suffixes) and b.rsplit('_', 1)[0] in bouts
+
+    def _integrity_onset_timestamps(self, data, ch_idx, ch_name):
+        """beh_synced timestamps of every bout onset on one channel, or None."""
+        beh = data.get('beh_synced')
+        bouts = data.get('bouts')
+        if not isinstance(beh, np.ndarray) or beh.ndim != 2 or not bouts or beh.shape[1] <= 6 + ch_idx:
+            return None
+        x = beh[:, 6 + ch_idx].astype(float)
+        rows = []
+        for behavior, entry in bouts.items():
+            if str(behavior).startswith('_') or not isinstance(entry, dict) or \
+                    self._is_offset_copy(behavior, bouts):
+                continue
+            rows.extend(int(r) for r in self._integrity_bout_onsets(entry, ch_idx, ch_name, x))
+        rows = [r for r in rows if 0 <= r < len(beh)]
+        return beh[rows, 1].astype(float) if rows else None
+
+    # ── Event-locked evidence ────────────────────────────────────────────
+    # The recording score above judges the whole trace. A channel can fail it
+    # (noise-dominated, or a rig whose 415 tracks 470 at r~0.99) and still carry
+    # a clear, repeatable response at every bout -- users were told such
+    # channels were "Bad". These helpers measure that response against a null
+    # built from the same recording, so it can vouch for a channel the trace-
+    # wide score would have thrown away. They only ever RAISE a score: a
+    # channel with no event response is not penalised, because a null response
+    # is a result, not a fault.
+    INTEGRITY_EVENT_MIN_BOUTS = 3
+    INTEGRITY_EVENT_SHUFFLES = 200
+    INTEGRITY_EVENT_Z = 3.0          # corrected z needed to count as a response
+    INTEGRITY_EVENT_PRE_S = 5.0
+    INTEGRITY_EVENT_POST_S = 10.0
+
+    @staticmethod
+    def _integrity_peth_peak(x, onsets, pre, post, smooth_w):
+        """Peak |baseline-subtracted mean trace| after onset, and that trace."""
+        seg = x[onsets[:, None] + np.arange(-pre, post)[None, :]]
+        seg = seg[~np.isnan(seg).any(axis=1)]
+        if len(seg) < 2:
+            return np.nan, None
+        seg = seg - seg[:, :pre].mean(axis=1, keepdims=True)
+        peth = seg.mean(axis=0)
+        if smooth_w > 1:
+            peth = np.convolve(peth, np.ones(smooth_w) / smooth_w, mode='same')
+        return float(np.max(np.abs(peth[pre:]))), peth
+
+    @classmethod
+    def integrity_event_test(cls, x, onsets, pre, post, fs, n_shuffles=None, seed=0):
+        """Is the response at *onsets* bigger than at the same onsets shifted?
+
+        The null shifts the WHOLE onset set by one random lag (circularly), which
+        keeps the bouts' spacing and clustering and the trace's own slow drift,
+        so only the alignment to behaviour is destroyed. Returns the observed
+        peak, its z against the null, and the mean trace. On the labelled
+        control behaviours in the FP projects (Blank startle trials, Random and
+        No Behavior bouts) this z came out N(0, 1) and never reached 4.
+        """
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        onsets = np.asarray(onsets, dtype=int)
+        onsets = onsets[(onsets - pre >= 0) & (onsets + post <= n)]
+        out = {'n': int(len(onsets)), 'peak': np.nan, 'z': np.nan, 'peth': None}
+        if len(onsets) < 2 or n <= 3 * (pre + post):
+            return out
+        smooth_w = max(1, int(round(0.5 * fs)))
+        peak, peth = cls._integrity_peth_peak(x, onsets, pre, post, smooth_w)
+        out.update(peak=peak, peth=peth)
+        if not np.isfinite(peak):
+            return out
+        rng = np.random.default_rng(seed)
+        K = int(n_shuffles or cls.INTEGRITY_EVENT_SHUFFLES)
+        nulls = []
+        for lag in rng.integers(pre + post, n - (pre + post), size=K):
+            o = (onsets + lag) % n
+            o = o[(o - pre >= 0) & (o + post <= n)]
+            if len(o) >= 2:
+                v = cls._integrity_peth_peak(x, o, pre, post, smooth_w)[0]
+                if np.isfinite(v):
+                    nulls.append(v)
+        if len(nulls) >= 20:
+            sd = float(np.std(nulls))
+            if sd > 0:
+                out['z'] = float((peak - np.mean(nulls)) / sd)
+        return out
+
+    @staticmethod
+    def _recover_bout_onsets(x, traces, prebout):
+        """Onset rows of stored bout traces, found by matching them in *x*.
+
+        Projects saved before onsets were persisted keep only the traces. They
+        were cut straight out of this column (minus an optional baseline
+        offset), so their first differences locate them exactly.
+        """
+        dx = np.diff(np.asarray(x, dtype=float))
+        found = set()
+        for tr in traces or []:
+            tr = np.asarray(tr, dtype=float)
+            if len(tr) < 4 or np.isnan(tr).any():
+                continue
+            d = np.diff(tr[:25])
+            for c in np.flatnonzero(np.abs(dx - d[0]) < 1e-7):
+                if c + len(d) <= len(dx) and np.allclose(dx[c:c + len(d)], d, atol=1e-6):
+                    found.add(int(c) + int(prebout))
+                    break
+        return np.array(sorted(found), dtype=int)
+
+    def _integrity_bout_onsets(self, entry, ch_idx, ch_name, x):
+        """Onset rows (into beh_synced) of the bouts kept for one channel."""
+        onsets = entry.get('onset_frames')
+        if onsets is not None and len(onsets):
+            onsets = np.asarray(onsets, dtype=float)
+            kept = entry.get('_kept_indices') or {}
+            idx = kept.get(ch_name, kept.get(f'Ch{ch_idx}'))
+            if idx is not None:
+                onsets = onsets[[i for i in idx if 0 <= i < len(onsets)]]
+            onsets = onsets[np.isfinite(onsets)]
+            return onsets.astype(int)
+        traces = entry.get(f'Ch{ch_idx}') or entry.get(ch_name) or []
+        return self._recover_bout_onsets(x, traces, self._entry_prebout(entry))
+
+    def integrity_event_evidence(self, data, ch_idx, ch_name, iso_flat=None, fp_ts=None,
+                                 r415=None):
+        """Strongest event-locked response on one channel, across its behaviours.
+
+        Tested on the z-scored trace the bout analyses use (beh_synced). The best
+        behaviour's z is Bonferroni-corrected for the number tested, so a project
+        with many behaviours does not find one by chance. When the 415 trace is
+        given (GCaMP mode) the same test is run on it. Real behaviour often moves
+        415 too (blood flow and oxygenation change both wavelengths), and the
+        trace tested has already had 415 regressed out, so a 415 response alone
+        proves nothing. It is called movement only when 415 responds at least as
+        strongly as the signal, or the channel is tangled (|r415| > 0.9) so the
+        regression cannot be trusted to have removed it.
+        Returns None when the subject has no usable bouts.
+        """
+        from scipy.stats import norm
+        beh = data.get('beh_synced')
+        bouts = data.get('bouts')
+        if not isinstance(beh, np.ndarray) or beh.ndim != 2 or not bouts:
+            return None
+        col = 6 + int(ch_idx)
+        if col >= beh.shape[1]:
+            return None
+        x = beh[:, col].astype(float)
+        if np.isfinite(x).sum() < 10:
+            return None
+
+        iso_beh = None
+        if iso_flat is not None and fp_ts is not None and beh.shape[1] > 1:
+            fp_ts = np.asarray(fp_ts, dtype=float)
+            bts = beh[:, 1].astype(float)
+            if len(fp_ts) > 1 and np.all(np.diff(fp_ts) >= 0):
+                pos = np.clip(np.searchsorted(fp_ts, bts), 1, len(fp_ts) - 1)
+                pos = np.where(np.abs(fp_ts[pos - 1] - bts) < np.abs(fp_ts[pos] - bts), pos - 1, pos)
+                iso = np.asarray(iso_flat, dtype=float)
+                sd = np.std(iso)
+                if sd > 0:
+                    iso_beh = (iso - np.mean(iso)) / sd
+                    iso_beh = np.where((bts >= fp_ts[0]) & (bts <= fp_ts[-1]), iso_beh[pos], np.nan)
+
+        tested = []
+        for behavior, entry in bouts.items():
+            if str(behavior).startswith('_') or not isinstance(entry, dict):
+                continue
+            # Behaviours generated by bout offsets are shifted copies of real ones.
+            if self._is_offset_copy(behavior, bouts):
+                continue
+            onsets = self._integrity_bout_onsets(entry, ch_idx, ch_name, x)
+            if len(onsets) < self.INTEGRITY_EVENT_MIN_BOUTS:
+                continue
+            fs = self._entry_fs(entry)
+            pre = int(min(self._entry_prebout(entry), round(self.INTEGRITY_EVENT_PRE_S * fs)))
+            post = int(min(entry.get('_postbout') or self.params.get('postboutframes', 90),
+                           round(self.INTEGRITY_EVENT_POST_S * fs)))
+            if pre < 2 or post < 2:
+                continue
+            seed = (len(x) * 31 + int(ch_idx) * 7 + len(onsets)) % (2 ** 32)
+            r = self.integrity_event_test(x, onsets, pre, post, fs, seed=seed)
+            if r['n'] < self.INTEGRITY_EVENT_MIN_BOUTS or not np.isfinite(r['z']):
+                continue
+            r.update(behavior=str(behavior), pre=pre, fs=fs, onsets=onsets)
+            tested.append(r)
+        if not tested:
+            return None
+
+        best = max(tested, key=lambda r: r['z'])
+        # Capped at p 0.5 so "no evidence" reads as z 0, not -inf.
+        p_adj = min(0.5, float(norm.sf(best['z'])) * len(tested))
+        z_adj = float(norm.isf(max(p_adj, 1e-12)))
+        iso_z = np.nan
+        iso_peth = None
+        if iso_beh is not None:
+            ri = self.integrity_event_test(iso_beh, best['onsets'], best['pre'],
+                                           len(best['peth']) - best['pre'], best['fs'], seed=1)
+            iso_z, iso_peth = ri['z'], ri['peth']
+        tangled = r415 is not None and np.isfinite(r415) and abs(r415) > 0.9
+        motion_locked = bool(np.isfinite(iso_z) and iso_z >= self.INTEGRITY_EVENT_Z
+                             and (tangled or iso_z >= best['z']))
+        return {
+            'behavior': best['behavior'], 'n_bouts': best['n'], 'z': float(best['z']),
+            'z_adj': z_adj, 'n_behaviors': len(tested),
+            'iso_z': float(iso_z) if np.isfinite(iso_z) else None,
+            'motion_locked': motion_locked,
+            'responsive': bool(z_adj >= self.INTEGRITY_EVENT_Z and not motion_locked),
+            'peth': best['peth'], 'iso_peth': iso_peth, 'pre': best['pre'], 'fs': best['fs'],
+            'per_behavior': [(r['behavior'], r['n'], float(r['z'])) for r in tested],
+        }
+
+    @staticmethod
+    def combine_integrity_with_events(recording_score, events):
+        """Final score: the recording score, raised by a credited event response.
+
+        A response at the significance bar (corrected z 3) is worth 70 -- the
+        default auto-exclude threshold -- rising to 90 at z 6. A channel with
+        no bouts, no response, or a response 415 shares keeps its recording
+        score unchanged.
+        """
+        if not events or not events.get('responsive'):
+            return float(recording_score), False
+        t = max(0.0, min(1.0, (events['z_adj'] - 3.0) / 3.0))
+        floor = 70.0 + 20.0 * t
+        if floor > recording_score:
+            return floor, True
+        return float(recording_score), False
+
+    @staticmethod
+    def _integrity_events_cell(events):
+        """Short table text for an event-evidence dict ('—' when untested)."""
+        if not events:
+            return '—'
+        txt = f"{events['z_adj']:.1f}"
+        if events.get('blocked_by_415'):
+            txt += ' 415'
+        return txt
+
+    @staticmethod
+    def integrity_event_summary(events):
+        """One sentence a user can act on, for the dashboard and the export."""
+        if not events:
+            return (f'No behaviour with {FPAnalysisGUI.INTEGRITY_EVENT_MIN_BOUTS}+ bouts; '
+                    'event-locked signal not assessed.')
+        what = (f"{events['behavior']} ({events['n_bouts']} bouts): response z = {events['z_adj']:.1f} "
+                f"vs shuffled onsets")
+        if events['n_behaviors'] > 1:
+            what += f", corrected for {events['n_behaviors']} behaviours"
+        if events.get('blocked_by_415'):
+            return what + (f' -- but 415 responds as strongly (z = {events["iso_z"]:.1f}) or the channel '
+                           'is tangled, so it may be movement; score not raised.')
+        if events['z_adj'] >= FPAnalysisGUI.INTEGRITY_EVENT_Z:
+            also = (f' 415 also responds (z = {events["iso_z"]:.1f}), as real behaviour often does.'
+                    if (events.get('iso_z') or 0) >= FPAnalysisGUI.INTEGRITY_EVENT_Z else '')
+            return what + ' -- clear event-locked signal.' + also
+        return what + ' -- no clear event-locked response.'
 
 
     def plot_signal_integrity_multi(self, fig, subjects_list):
@@ -30920,8 +31641,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Create table data. Columns reflect the rebuilt scoring: the four 0-100
         # sub-scores that drive the overall score, plus artifact/shift counts.
+        # 'Recording' is the trace-wide score; 'Events' the strongest
+        # event-locked response (corrected z vs shuffled onsets); 'Score' is
+        # the recording score raised by a credited response (marked *).
         headers = ['Subject', 'Ch', 'Mode', 'Dynamics', 'Noise', 'Dropout', 'Motion',
-                   'Artifacts', 'Shifts', 'Score', 'Quality']
+                   'Recording', 'Events', 'Score', 'Quality']
         score_col_idx = 9
         quality_col_idx = 10
 
@@ -30936,9 +31660,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             noise = comps.get('noise')
             drop = comps.get('dropout')
             motion = comps.get('motion')
-            artifacts = metrics.get('artifacts_count', 0)
-            sustained_shifts = metrics.get('sustained_shifts_count', 0)
             overall_score = metrics.get('overall_score', 0)
+            recording_score = metrics.get('recording_score', overall_score)
+            rescued = bool(metrics.get('event_rescued'))
 
             # Determine quality rating color
             if overall_score >= 90:
@@ -30956,6 +31680,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             else:
                 score_color = '#DD0000'  # Red
                 quality_text = 'Bad'
+            if rescued:
+                quality_text += '*'
 
             def _fmt(v):
                 return f'{v:.0f}' if v is not None else '—'
@@ -30969,8 +31695,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 _fmt(noise),
                 _fmt(drop),
                 _fmt(motion),
-                f'{artifacts}',
-                f'{sustained_shifts}',
+                f'{recording_score:.1f}',
+                self._integrity_events_cell(metrics.get('events')),
                 f'{overall_score:.1f}',
                 quality_text
             ]
@@ -31052,9 +31778,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             y_pos -= cell_height
         
         # Add legend at bottom
-        legend_y = max(y_pos - 0.03, 0.01)
-        ax.text(0.03, legend_y, 'Sub-scores (0-100, higher=better): Dynamics=real slow signal vs noise | Noise=high-freq cleanliness | Dropout=artifact-free | Motion=415/baseline stability (GCaMP only; — in Sensor mode) | Artifacts/Shifts: counts',
-               fontsize=legend_fontsize, style='italic', transform=ax.transAxes, wrap=True)
+        # Anchored by its top: the legend runs to several lines and would
+        # otherwise grow upward into the last row.
+        legend_y = max(y_pos - 0.01, 0.06)
+        ax.text(0.03, legend_y, 'Sub-scores (0-100, higher=better): Dynamics=real slow signal vs noise | Noise=high-freq cleanliness | Dropout=artifact-free | Motion=415/baseline stability (GCaMP only)\n'
+                'Recording = whole-trace score | Events = strongest bout-locked response, z vs shuffled onsets (corrected for behaviours tested; "415" = not credited: 415 responds as strongly or the channel is tangled; — = under 3 bouts) | * = Score raised by a clear event-locked response',
+               fontsize=legend_fontsize, style='italic', transform=ax.transAxes, wrap=True, va='top')
         
         # Add scroll hint if many entries
         if num_rows > 15:
@@ -31127,7 +31856,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                           and self.integrity_sensor_mode_var.get())
         sensor = bool(sensor)
 
-        key = (str(subject), id(data), sensor)
+        # The event-locked term reads the bouts, and re-extracting them swaps in
+        # a new dict without replacing the subject's data, so it keys too.
+        key = (str(subject), id(data), sensor, id(data.get('bouts')))
         hit = self._integrity_metrics_cache.get(key)
         if hit is not None and hit[0] is data:
             return hit[1]
@@ -31205,12 +31936,45 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if zscore_data is not None and zscore_data.shape[1] > (2 + ch_idx):
                 zsig = zscore_data[:, 2 + ch_idx]
 
+            ch_name = self.get_channel_name(data, ch_idx)
+            try:
+                event_ts = self._integrity_onset_timestamps(data, ch_idx, ch_name)
+            except Exception:
+                event_ts = None
             metrics = self.compute_channel_integrity(
                 signal_raw, isosbestic_raw, time_data, fps,
-                sensor=sensor, zscore_signal=zsig)
-            metrics['channel'] = self.get_channel_name(data, ch_idx)
+                sensor=sensor, zscore_signal=zsig, event_ts=event_ts, fp_ts=fp_data[:, 1])
+            metrics['channel'] = ch_name
             # Back-compat alias: 'cv' historically held the signal std
             metrics['cv'] = metrics['signal_std']
+
+            iso_flat = metrics.pop('_iso_flat', None)
+            try:
+                events = self.integrity_event_evidence(
+                    data, ch_idx, metrics['channel'], iso_flat=iso_flat, fp_ts=fp_data[:, 1],
+                    r415=None if metrics['sensor_mode'] else metrics['correlation'])
+            except Exception as e:
+                self.log_message(f"    Event-locked integrity skipped for {metrics['channel']}: {e}")
+                events = None
+            # Negative skew reads as fibre dropouts, but a channel with a credited
+            # response may simply spend long stretches inhibited. Spike artifacts
+            # are still caught by the kurtosis rule, which the clamp leaves alone.
+            metrics['skew_waived'] = False
+            if events and events.get('responsive') and metrics['skew'] < -0.5:
+                metrics['overall_score'], metrics['score_components'] = \
+                    self.calculate_signal_quality_score(dict(metrics, skew=-0.5),
+                                                        metrics['sensor_mode'])
+                metrics['skew_waived'] = True
+            metrics['recording_score'] = metrics['overall_score']
+            if events:
+                would = self.combine_integrity_with_events(
+                    metrics['recording_score'], dict(events, responsive=True))[0]
+                events['blocked_by_415'] = bool(
+                    events['motion_locked'] and events['z_adj'] >= self.INTEGRITY_EVENT_Z
+                    and would > metrics['recording_score'])
+            metrics['events'] = events
+            metrics['overall_score'], metrics['event_rescued'] = \
+                self.combine_integrity_with_events(metrics['recording_score'], events)
 
             all_channel_metrics.append(metrics)
 
@@ -31322,6 +32086,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # --- Pull the scored numbers ---
         score = chosen.get('overall_score', 0)
+        recording_score = chosen.get('recording_score', score)
+        events = chosen.get('events')
+        rescued = bool(chosen.get('event_rescued'))
         comps = chosen.get('score_components', {}) or {}
         dyn, noise, drop, motion = (comps.get('dynamics'), comps.get('noise'),
                                     comps.get('dropout'), comps.get('motion'))
@@ -31351,8 +32118,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         def _c(v):
             return f'{v:.0f}' if v is not None else '—'
         comp_str = (f"Dynamics {_c(dyn)}   ·   Noise {_c(noise)}   ·   "
-                    f"Dropout {_c(drop)}   ·   Motion {_c(motion)}")
-        ax_head.text(0.5, 0.78, f'Signal Integrity — {subject_name}',
+                    f"Dropout {_c(drop)}   ·   Motion {_c(motion)}   ·   "
+                    f"Recording {recording_score:.0f}   ·   Events {self._integrity_events_cell(events)}")
+        if chosen.get('no_isosbestic'):
+            mode_str = 'No 415nm recorded (assessed as sensor)'
+        ax_head.text(0.5, 1.02, f'Signal Integrity — {subject_name}',
                      ha='center', va='center', fontsize=12, fontweight='bold',
                      color='#333333', transform=ax_head.transAxes)
         ax_head.text(0.5, 0.40,
@@ -31391,7 +32161,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ax_tr.margins(x=0.01)
 
         # =================== Power spectrum ===================
-        ax_psd = fig.add_subplot(gs[2, 0])
+        row3 = gs[2, :].subgridspec(1, 3, wspace=0.28)
+        ax_psd = fig.add_subplot(row3[0, 0])
         try:
             from scipy import signal as scipy_signal
             nperseg = int(min(1024, max(64, len(signal) // 4)))
@@ -31410,7 +32181,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35))
 
         # =================== Amplitude distribution ===================
-        ax_hist = fig.add_subplot(gs[2, 1])
+        ax_hist = fig.add_subplot(row3[0, 1])
         ax_hist.hist(assess, bins=60, color=sig_color, alpha=0.75)
         ax_hist.axvline(float(np.median(assess)), color='k', ls=':', lw=1.2, alpha=0.7)
         ax_hist.set_xlabel('dF/F (%)', fontsize=9)
@@ -31421,6 +32192,30 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      f"skew {chosen.get('skew', 0):+.2f}\nkurtosis {chosen.get('kurt', 0):.1f}",
                      transform=ax_hist.transAxes, fontsize=7.5, va='top', ha='right',
                      bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35))
+
+        # =================== Event-locked response ===================
+        ax_ev = fig.add_subplot(row3[0, 2])
+        if events and events.get('peth') is not None:
+            t_ev = (np.arange(len(events['peth'])) - events['pre']) / float(events['fs'])
+            ax_ev.plot(t_ev, events['peth'], color=sig_color, lw=1.6, label='Signal (z)')
+            if events.get('iso_peth') is not None:
+                ax_ev.plot(t_ev, events['iso_peth'], color='#8B008B', lw=1.0, alpha=0.7,
+                           label='415nm')
+                ax_ev.legend(loc='upper right', fontsize=7, framealpha=0.85)
+            ax_ev.axvline(0, color='k', ls=':', lw=1.0, alpha=0.7)
+            ax_ev.axhline(0, color='gray', ls='--', lw=0.8, alpha=0.6)
+            ax_ev.set_title(f"Event response: {events['behavior']} (n={events['n_bouts']})",
+                            fontsize=9.5, fontweight='bold')
+            ax_ev.text(0.03, 0.95, f"z {events['z_adj']:.1f}"
+                       + (" (415 as strong)" if events.get('blocked_by_415') else ''),
+                       transform=ax_ev.transAxes, fontsize=7.5, va='top', ha='left',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35))
+        else:
+            ax_ev.text(0.5, 0.5, f'No behaviour with\n{self.INTEGRITY_EVENT_MIN_BOUTS}+ bouts',
+                       ha='center', va='center', transform=ax_ev.transAxes, fontsize=9, color='gray')
+            ax_ev.set_title('Event response', fontsize=9.5, fontweight='bold')
+        ax_ev.set_xlabel('Time from onset (s)', fontsize=9)
+        ax_ev.grid(True, alpha=0.3)
 
         # =================== Metrics + interpretation ===================
         ax_txt = fig.add_subplot(gs[3, :])
@@ -31444,6 +32239,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             f"  Slow/fast SNR  : {chosen.get('sf_snr', 0):.2f}    (drives Dynamics)",
             f"  HF noise ratio : {chosen.get('hf_ratio', 0):.2f}    (drives Noise)",
             f"  Transient SNR  : {chosen.get('snr', 0):.2f}",
+            f"  Spikes up/down : {chosen.get('transients_up', 0)} / "
+            f"{chosen.get('transients_down', 0)}  ({chosen.get('transient_asym', 1):.1f}x)",
             f"  Signal std     : {chosen.get('signal_std', 0):.2f}%",
             f"  {corr_line}",
             f"  Artifacts |z|>15: {chosen.get('artifacts_count', 0)}     "
@@ -31471,7 +32268,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             verdict = 'All dimensions look healthy.'
         else:
             verdict = f'Limiting factor: {worst_name} ({worst_val:.0f}) — {reason}.'
-        ax_txt.text(0.0, 0.06, verdict, transform=ax_txt.transAxes,
+        if rescued:
+            verdict = (f'Recording score {recording_score:.0f} ({verdict.rstrip(".")}), raised to '
+                       f'{score:.0f}: the bouts carry a clear event-locked response.')
+        verdict += '\nEvents: ' + self.integrity_event_summary(events)
+        ax_txt.text(0.0, -0.08, verdict, transform=ax_txt.transAxes,
                     fontsize=9, va='bottom', ha='left', style='italic',
                     color=score_color, fontweight='bold')
     
@@ -32689,10 +33490,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             'Signal_Std_Percent': metrics.get('cv', 0),
                             'Skew': metrics.get('skew', 0),
                             'Kurtosis': metrics.get('kurt', 0),
+                            'Transients_Up': metrics.get('transients_up', 0),
+                            'Transients_Down': metrics.get('transients_down', 0),
+                            'Transient_Asymmetry': metrics.get('transient_asym', 1.0),
                             'Corr_Range': metrics.get('corr_range', 0),
                             '415_470_Correlation': metrics.get('correlation', 0),
                             'Artifacts_Count': metrics.get('artifacts_count', 0),
                             'Sustained_Shifts_Count': metrics.get('sustained_shifts_count', 0),
+                            'Recording_Score': metrics.get('recording_score', metrics.get('overall_score', 0)),
+                            'Event_Behavior': (metrics.get('events') or {}).get('behavior'),
+                            'Event_Bouts': (metrics.get('events') or {}).get('n_bouts'),
+                            'Event_Z': (metrics.get('events') or {}).get('z_adj'),
+                            'Event_415_Z': (metrics.get('events') or {}).get('iso_z'),
+                            'Event_Raised_Score': bool(metrics.get('event_rescued')),
+                            'Event_Note': self.integrity_event_summary(metrics.get('events')),
                             'Overall_Score': metrics.get('overall_score', 0)
                         }
 
@@ -32727,16 +33538,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 base_order = ['Subject', 'Channel', 'Mode',
                               'Dynamics_Score', 'Noise_Score', 'Dropout_Score', 'Motion_Score',
                               'SlowFast_SNR', 'HF_Noise_Ratio', 'Transient_SNR',
-                              'Signal_Std_Percent', 'Skew', 'Kurtosis', 'Corr_Range',
+                              'Signal_Std_Percent', 'Skew', 'Kurtosis',
+                              'Transients_Up', 'Transients_Down', 'Transient_Asymmetry', 'Corr_Range',
                               '415_470_Correlation', 'Artifacts_Count',
-                              'Sustained_Shifts_Count', 'Overall_Score', 'Quality']
+                              'Sustained_Shifts_Count', 'Recording_Score',
+                              'Event_Behavior', 'Event_Bouts', 'Event_Z', 'Event_415_Z',
+                              'Event_Raised_Score', 'Event_Note', 'Overall_Score', 'Quality']
                 if 'Group' in df.columns:
                     column_order = ['Group'] + base_order
                 else:
                     column_order = base_order
 
                 df = df[column_order]
-                df.to_csv(filename, index=False)
+                df.to_csv(filename, index=False, encoding=EXPORT_CSV_ENCODING)
                 
                 # Add metadata to CSV file
                 self._add_metadata_comment_to_csv(filename, self._create_export_metadata('plot'))
@@ -32823,7 +33637,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     messagebox.showerror("Error", "No valid position heatmap data found for the selected subjects.")
                     return
 
-                with open(filename, 'w', newline='') as f:
+                with open(filename, 'w', newline='', encoding=EXPORT_CSV_ENCODING) as f:
                     for i, (group_name, n, matrix_df) in enumerate(sections):
                         if i > 0:
                             f.write('\n')
@@ -33326,7 +34140,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 combined_dict[col_name] = bout
                         
                         combined_df = pd.DataFrame(combined_dict)
-                        combined_df.to_csv(behavior_channel_filename, index=False)
+                        combined_df.to_csv(behavior_channel_filename, index=False, encoding=EXPORT_CSV_ENCODING)
                         exported_files.append((behavior, channel, behavior_channel_filename, len(combined_df.columns) - 1))
                     
                     # Add metadata to each behavior-channel file
@@ -33367,7 +34181,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             combined_dict[col_name] = bout
                     
                     combined_df = pd.DataFrame(combined_dict)
-                    combined_df.to_csv(filename, index=False)
+                    combined_df.to_csv(filename, index=False, encoding=EXPORT_CSV_ENCODING)
                     
                     # Add metadata to CSV file
                     self._add_metadata_comment_to_csv(filename, self._create_export_metadata('plot'))
@@ -33384,7 +34198,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     # These plot types are already in the correct wide/horizontal format
                     # Just concatenate all dataframes and export
                     combined_df = pd.concat(all_data, ignore_index=True)
-                    combined_df.to_csv(filename, index=False)
+                    combined_df.to_csv(filename, index=False, encoding=EXPORT_CSV_ENCODING)
                     
                     # Add metadata to CSV file
                     self._add_metadata_comment_to_csv(filename, self._create_export_metadata('plot'))
@@ -33460,7 +34274,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         
                                         # Create final dataframe
                                         combined_df = pd.DataFrame(result_dict)
-                                        combined_df.to_csv(channel_filename, index=False)
+                                        combined_df.to_csv(channel_filename, index=False, encoding=EXPORT_CSV_ENCODING)
                                         # Add metadata to CSV file
                                         self._add_metadata_comment_to_csv(channel_filename, self._create_export_metadata('plot'))
                                         exported_files.append((channel, channel_filename, len(combined_df), len(wide_dict)))
@@ -37070,8 +37884,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
             summary_path = f"{base}_{_safe(behavior)}_{_safe(slot_label)}_boutbins.csv"
             traces_path = f"{base}_{_safe(behavior)}_{_safe(slot_label)}_boutbins_traces.csv"
-            pd.DataFrame(summary).to_csv(summary_path, index=False)
-            pd.DataFrame(traces_out).to_csv(traces_path, index=False)
+            pd.DataFrame(summary).to_csv(summary_path, index=False, encoding=EXPORT_CSV_ENCODING)
+            pd.DataFrame(traces_out).to_csv(traces_path, index=False, encoding=EXPORT_CSV_ENCODING)
             for path in (summary_path, traces_path):
                 self._add_metadata_comment_to_csv(path, metadata)
             exported.append((slot_label, summary_path, traces_path, n_traces))
@@ -40273,7 +41087,7 @@ cat("OK\n")
                 for lev in order}
         df = pd.DataFrame(data, index=subjects)
         df.index.name = 'subject'
-        with open(path, 'w', newline='', encoding='utf-8') as fh:
+        with open(path, 'w', newline='', encoding=EXPORT_CSV_ENCODING) as fh:
             fh.write(f"# {channel}: per-subject signed peak z at FLMM peak time "
                      f"(within significant window); control = {table['ref_level']}\n")
             df.to_csv(fh)
@@ -47754,7 +48568,7 @@ cat("OK\n")
 
             df = pd.DataFrame(rows)
             if path.lower().endswith('.csv'):
-                df.to_csv(path, index=False)
+                df.to_csv(path, index=False, encoding=EXPORT_CSV_ENCODING)
             else:
                 df.to_excel(path, index=False)
 
@@ -50729,7 +51543,7 @@ cat("OK\n")
             if path.lower().endswith(".xlsx"):
                 df.to_excel(path, index=False)
             else:
-                df.to_csv(path, index=False)
+                df.to_csv(path, index=False, encoding=EXPORT_CSV_ENCODING)
             messagebox.showinfo("Exported", f"Saved to:\n{path}")
         except Exception as exc:
             messagebox.showerror("Export Error", f"Could not export:\n{exc}")

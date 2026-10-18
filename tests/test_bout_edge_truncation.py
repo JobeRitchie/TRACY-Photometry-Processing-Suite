@@ -26,8 +26,8 @@ def _app(onsets, ends=None, n_frames=N_FRAMES, nan_span=None):
     app.params = {
         'exclude_frames_before': 0,
         'baseline_correct_bouts': False,
-        'auto_scale_boutframes': False,
-        'precut_correct_boutframes': False,
+        'boutframe_fps_scaling': 'off',
+        'boutframe_start_correction': 'off',
         'preboutframes': PRE,
         'postboutframes': POST,
     }

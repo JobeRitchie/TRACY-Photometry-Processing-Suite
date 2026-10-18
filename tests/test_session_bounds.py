@@ -87,9 +87,9 @@ def _app(bounds=None, max_seconds=0.0, enabled=True, **extra):
         'maxlengthseconds': max_seconds,
         'processing_rolling_avg_enabled': False,
         'boutframes_video_fps': VIDEO_FPS,
-        'auto_scale_boutframes': True,
+        'boutframe_fps_scaling': 'auto',
         'boutframe_manual_shift': 0,
-        'precut_correct_boutframes': True,
+        'boutframe_start_correction': 'auto',
         'abel_position_enabled': True,
         'abel_position_pattern': 'ABELposition',
         'session_bounds_enabled': enabled,
@@ -330,7 +330,8 @@ def test_a_sheet_with_title_rows_above_the_header_still_parses(tmp_path):
             applied, unmatched, skipped = app._apply_bounds_table(
                 df, id_col, start_col, end_col)
             assert sorted(applied) == ['1-51', '1-B']
-            assert app.params['session_bounds_frames']['1-51'] == {'start': 1200, 'end': 0}
+            assert app.params['session_bounds_frames']['1-51'] == {
+                'start': 1200, 'end': 0, 'trim_end': 0}
             return
     pytest.fail("no reading of the sheet produced usable columns")
 
@@ -351,6 +352,90 @@ def _animalposition_csv(tmp_path, n_frames=30000, junk_frames=0, name='raw'):
                   'timestamp': 1000.0 + frames / VIDEO_FPS,
                   'X': x, 'Y': y}).to_csv(path, index=False)
     return str(path)
+
+
+# ── Trim from the end ───────────────────────────────────────────────
+#
+# _raw_csv is 48000 rows at 0.025 s: 1199.975 s, so 36000 video frames (0..35999).
+
+def test_end_trim_drops_that_many_frames_off_the_photometry(tmp_path):
+    fp = _raw_csv(tmp_path)
+    full = _seconds(_run(_app(), 'S', fp))
+    trimmed = _seconds(_run(_app({'S': {'start': 0, 'end': 0, 'trim_end': 9000}}), 'S', fp))
+    assert full - trimmed == pytest.approx(300.0, abs=0.2)
+
+
+def test_end_trim_equals_the_end_frame_it_resolves_to(tmp_path):
+    fp = _raw_csv(tmp_path)
+    by_trim = _run(_app({'S': {'start': 3000, 'end': 0, 'trim_end': 9000}}), 'S', fp)
+    by_end = _run(_app({'S': {'start': 3000, 'end': 36000 - 1 - 9000}}), 'S', fp)
+    assert by_trim['session_bound_frames'] == [3000, 26999]
+    assert np.array_equal(by_trim['zscore'][:, 1], by_end['zscore'][:, 1])
+
+
+def test_end_trim_counts_from_the_photometry_not_the_video(tmp_path):
+    """The video here is 1000 s, the photometry 1200 s: the cut is 300 s before 1200."""
+    fp = _raw_csv(tmp_path)
+    pos = _abel_csv(tmp_path, n_frames=30000)
+    res = _run(_app({'S': {'start': 0, 'end': 0, 'trim_end': 9000}}), 'S', fp, pos)
+    assert res['session_bound_frames'][1] == 26999
+    assert len(res['beh']) == 27000                  # frames 0..26999 kept
+
+
+def test_an_explicit_end_frame_wins_over_a_trim(tmp_path):
+    fp = _raw_csv(tmp_path)
+    res = _run(_app({'S': {'start': 0, 'end': 9000, 'trim_end': 100}}), 'S', fp)
+    assert res['session_bound_frames'] == [0, 9000]
+
+
+def test_a_trim_longer_than_the_recording_is_refused(tmp_path):
+    fp = _raw_csv(tmp_path)
+    full = _seconds(_run(_app(), 'S', fp))
+    bad = _seconds(_run(_app({'S': {'start': 3000, 'end': 0, 'trim_end': 34000}}), 'S', fp))
+    assert bad == pytest.approx(full, abs=0.05)
+
+
+def test_processing_records_the_recording_length(tmp_path):
+    fp = _raw_csv(tmp_path)
+    app = _app()
+    _run(app, 'S', fp)
+    assert app._recording_total_frames('S') == 36000
+    assert app._recording_total_frames('s') == 36000   # same case-insensitivity as bounds
+
+
+def test_measuring_a_file_matches_what_processing_measures(tmp_path):
+    fp = _raw_csv(tmp_path)
+    app = _app()
+    _run(app, 'S', fp)
+    measured = G.FPAnalysisGUI._measure_raw_file_seconds(fp)
+    assert measured == pytest.approx(app.params['session_recording_seconds']['S'])
+
+
+def test_a_negative_end_is_stored_as_a_trim_and_they_replace_each_other():
+    app = _app()
+    app._set_session_bound('S', 'end', 5000)
+    app._set_session_bound('S', 'end', -1000)
+    assert app.params['session_bounds_frames']['S'] == {'start': 0, 'end': 0, 'trim_end': 1000}
+    app._set_session_bound('S', 'end', 7000)
+    assert app.params['session_bounds_frames']['S'] == {'start': 0, 'end': 7000, 'trim_end': 0}
+
+
+def test_a_trim_column_is_not_read_as_an_end_frame():
+    cols = ['Subject', 'Start Frame', 'Trim End Frames']
+    id_col, start_col, end_col = G.FPAnalysisGUI._match_bounds_columns(cols)
+    assert (id_col, start_col, end_col) == ('Subject', 'Start Frame', None)
+    assert G.FPAnalysisGUI._match_trim_column(cols) == 'Trim End Frames'
+
+
+def test_import_reads_trims_from_a_column_or_a_negative_end():
+    app = _app()
+    app.processed_data = {'A': {}, 'B': {}}
+    df = pd.DataFrame({'Subject': ['A', 'B'], 'start_frame': [100, 200],
+                       'end_frame': [-500, None], 'trim end frames': [None, 800]})
+    app._apply_bounds_table(df, 'Subject', 'start_frame', 'end_frame', 'trim end frames')
+    store = app.params['session_bounds_frames']
+    assert store['A'] == {'start': 100, 'end': 0, 'trim_end': 500}
+    assert store['B'] == {'start': 200, 'end': 0, 'trim_end': 800}
 
 
 def test_bounds_also_trim_a_shared_clock_position_file(tmp_path):

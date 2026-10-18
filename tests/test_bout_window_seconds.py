@@ -120,9 +120,30 @@ def test_resampling_does_not_invent_data_beyond_the_stored_window():
                                   src_fs=FAST, dst_fs=SLOW)
 
     t = (np.arange(dst_total) - dst_pre) / SLOW
-    assert np.all(np.isnan(out[t < -1.0]))
-    assert np.all(np.isnan(out[t > 1.0]))
+    # A point within half a source sample of the first/last recorded sample
+    # still belongs to that sample; anything further out is blank.
+    half = 0.5 / FAST
+    assert np.all(np.isnan(out[t < -1.0 - half]))
+    assert np.all(np.isnan(out[t > 1.0 + half]))
     assert np.isfinite(out[np.argmin(np.abs(t))])
+
+
+def test_resampling_keeps_the_edge_points_of_a_matching_window():
+    """15.002 Hz bouts on a 20 Hz axis, same 5 s / 10 s window: frame rounding
+    leaves the stored span at -4.9993..9.932 s, but the axis's first and last
+    points (-5.0, 9.95 s) sit inside the edge samples and must not export
+    blank."""
+    app = _app(rates=(20.0, 15.002))
+    src_fs, dst_fs = 15.002, 20.0
+    src_pre = int(round(5.0 * src_fs))
+    src_total = src_pre + int(round(10.0 * src_fs))
+    trace = np.linspace(1.0, 2.0, src_total)
+    out = app._realign_bout_trace(trace, src_pre, 100, 300,
+                                  src_fs=src_fs, dst_fs=dst_fs)
+
+    assert np.all(np.isfinite(out))
+    assert out[0] == trace[0]
+    assert out[-1] == trace[-1]
 
 
 def test_same_rate_is_left_untouched():

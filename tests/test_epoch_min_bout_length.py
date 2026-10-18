@@ -29,10 +29,10 @@ def _app():
     app.log_message = lambda *a, **k: None
     app.params = {
         'exclude_frames_before': 0,
-        'auto_scale_boutframes': False,
+        'boutframe_fps_scaling': 'off',
         'boutframes_video_fps': FPS,
         'boutframe_manual_shift': 0,
-        'precut_correct_boutframes': False,
+        'boutframe_start_correction': 'off',
     }
     app.per_subject_boutframe_shifts = {}
     app.processed_data = {SUBJECT: {'photometry_fps': FPS, 'bouts': {}}}
