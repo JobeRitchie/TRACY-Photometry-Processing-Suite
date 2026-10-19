@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.21.0"
-APP_VERSION_DATE = "October 18, 2026"
+APP_VERSION = "1.22.0"
+APP_VERSION_DATE = "October 19, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -14931,6 +14931,13 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix — TTL bouts landed late without a behavior file. The recording-start
+    correction shifted TTL events that were already matched by clock, so a
+    response 20 s after a tone showed at ~21.7 s. Reprocess to regenerate the
+    TTL boutframes.
+
+Version 1.21.0  •  October 18, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Signal Integrity now weighs event-locked signal. Each channel's bouts
     are tested against the same onsets shifted to random points in the recording
     (corrected for the number of behaviours tested); a clear response raises the
@@ -21497,6 +21504,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ttl_boutframes = self.convert_ttl_to_boutframes(ttl_file, computer_ts)
             
             if ttl_boutframes is not None and len(ttl_boutframes) > 0:
+                # A TTL frame is a row of beh_synced, matched by clock -- already
+                # the index extract_bouts slices.  Every boutframe consumer runs
+                # the file's numbers through _transform_boutframe_values, which
+                # on the photometry grid subtracts the recording-start offset
+                # and rescales from video FPS: applied to a row, that put a
+                # 20 s fear response 1.7 s late.  Store the TTL in boutframe
+                # coordinates instead so the transform lands it back on its row
+                # under any correction setting, with the shifts still applied.
+                self._seed_bout_transform_state(subject_id, result)
+                ttl_boutframes['Frame'] = np.round(
+                    self._inverse_transform_boutframe_values(
+                        ttl_boutframes['Frame'].to_numpy(dtype=float), subject_id,
+                        shifts=False, rounded=False), 3)
+                if self._boutframe_start_correction(subject_id):
+                    self.log_message(
+                        f"    TTL frames stored in boutframe coordinates (+"
+                        f"{self._photometry_start_offset_samples(subject_id)} samples) so the "
+                        f"recording-start correction does not shift clock-matched events")
                 # Convert TTL events from long (Behavior, Frame) to wide
                 # (behavior -> list of frames) format.
                 ttl_grouped = ttl_boutframes.groupby('Behavior')['Frame'].apply(list).to_dict()
@@ -21592,19 +21617,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Extract bouts if boutframes file is available (from TTL or manually provided)
         if boutframes_file and os.path.exists(boutframes_file):
             self.log_message(f"  Extracting bout-aligned data from: {os.path.basename(boutframes_file)}")
-            # Make n_led_states and photometry_fps available to extract_bouts, which reads
-            # them from self.processed_data[subject_id].  That entry doesn't exist yet during
-            # the initial processing run (it is assigned AFTER this function returns), so we
-            # pre-populate the relevant keys here to avoid the wrong n_led=1 default that
-            # causes a 50-frame precut overcorrection for 2-LED-state recordings.
-            _temp = self.processed_data.get(subject_id, {})
-            _temp['n_led_states'] = result.get('n_led_states', _temp.get('n_led_states', 1))
-            _temp['photometry_fps'] = result.get('photometry_fps', _temp.get('photometry_fps'))
-            _temp['num_photometry_channels'] = result.get('num_photometry_channels', _temp.get('num_photometry_channels'))
-            _temp['bout_timeline'] = result.get('bout_timeline', _temp.get('bout_timeline'))
-            if result.get('channel_names'):
-                _temp['channel_names'] = result['channel_names']
-            self.processed_data[subject_id] = _temp
+            self._seed_bout_transform_state(subject_id, result)
             bout_data = self.extract_bouts(subject_id, beh_synced, boutframes_file)
             result['bouts'] = bout_data
             # Remember the boutframes file this subject's bouts were extracted
@@ -25529,6 +25542,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             keep &= ~(frames > end_frame)
         return keep
 
+    def _seed_bout_transform_state(self, subject_id, result):
+        """Copy what the boutframe transform reads from *result* into processed_data.
+
+        The transform reads n_led_states, photometry_fps, the trim and the
+        timeline from ``self.processed_data[subject_id]``, which process_fp_data
+        only assigns after it returns.  Without this, the n_led=1 default gives
+        a 50-frame precut overcorrection for 2-LED-state recordings.
+        """
+        seed = self.processed_data.get(subject_id, {})
+        seed['n_led_states'] = result.get('n_led_states', seed.get('n_led_states', 1))
+        for key in ('raw', 'photometry_fps', 'num_photometry_channels', 'bout_timeline',
+                    'start_trim_rows', 'start_offset_samples'):
+            seed[key] = result.get(key, seed.get(key))
+        if result.get('channel_names'):
+            seed['channel_names'] = result['channel_names']
+        self.processed_data[subject_id] = seed
+
     def _bout_timeline(self, subject_id):
         """Which grid *subject_id*'s bouts are sliced from: 'photometry' or 'video'.
 
@@ -25708,7 +25738,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return frames.astype(int)
         return frames
 
-    def _inverse_transform_boutframe_values(self, frames, subject_id, as_int=True):
+    def _inverse_transform_boutframe_values(self, frames, subject_id, as_int=True,
+                                            shifts=True, rounded=True):
         """Inverse of :meth:`_transform_boutframe_values`.
 
         Maps photometry-frame numbers back into raw boutframe (video-frame)
@@ -25716,6 +25747,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         and FPS scaling **in reverse order**.  The random-shuffle generator
         places bouts in photometry-frame space (where the extraction window is
         defined) and stores them as raw frames, so it needs this inverse.
+
+        *shifts* False leaves the manual / per-subject shifts in place, so the
+        forward transform still applies them; *rounded* False keeps the exact
+        value, so a forward pass lands back on the same sample at any rate.
         """
         frames = np.asarray(frames, dtype=float)
         if frames.size == 0:
@@ -25729,12 +25764,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 frames = frames + off
 
         # Undo per-subject + manual shift
-        ps = self._get_per_subject_shift(subject_id)
-        if ps:
-            frames = frames - ps
-        ms = int(self.params.get('boutframe_manual_shift', 0))
-        if ms:
-            frames = frames - ms
+        if shifts:
+            ps = self._get_per_subject_shift(subject_id)
+            if ps:
+                frames = frames - ps
+            ms = int(self.params.get('boutframe_manual_shift', 0))
+            if ms:
+                frames = frames - ms
 
         # Undo the sample-rate conversion
         if self._boutframe_fps_scaling(subject_id):
@@ -25743,6 +25779,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if pfps and vfps > 0 and abs(float(pfps) - vfps) > 0.1:
                 frames = frames * (vfps / float(pfps))
 
+        if not rounded:
+            return frames
         if as_int:
             return np.round(frames).astype(int)
         return np.round(frames)
