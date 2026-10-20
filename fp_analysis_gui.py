@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.22.0"
-APP_VERSION_DATE = "October 19, 2026"
+APP_VERSION = "1.23.0"
+APP_VERSION_DATE = "October 20, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -12887,10 +12887,10 @@ class FPAnalysisGUI:
         export_menu.add_command(label="Binned Progression, all behaviors → Excel (current settings)…",
                                 command=self.export_binned_progression_all)
         export_menu.add_separator()
-        export_menu.add_command(label="Time-Course Stats — copy/paste (Prism, Excel)…",
-                                command=self.export_timecourse_flmm)
-        export_menu.add_command(label="Time-Course / Pairwise — full report (PDF)…",
+        export_menu.add_command(label="FLMM plot export (PDF)…",
                                 command=self.export_flmm_report)
+        export_menu.add_command(label="FLMM data export (Excel)…",
+                                command=self.export_flmm_workbook)
         export_mb['menu'] = export_menu
         export_mb.pack(fill='x', pady=(self.ui_px(4), 0))
 
@@ -14930,6 +14930,23 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — "All Behaviors → unified Excel" adds each bout's onset (s) and scored
+    length (s and samples); averaged sheets add the mean bout length. Lengths
+    stay paired with the right bout when earlier bouts were dropped at the
+    recording edge, and are blank for start-only boutframes.
+  • Fix — Bout-order FLMM numbered bouts by list position, so a bout dropped at
+    extraction (window past the recording start) renumbered every later one and
+    the second approach was modeled as bout 1. It now uses the true bout number.
+  • New — Bout-order FLMM plots the observed traces by bout number (mean ± SEM
+    across animals) and reports each group's own slope and mean beside the
+    tested term. Effects read as treatment − control when a control group is
+    recognisable. A time range limits which seconds enter the model.
+  • New — Export ▾ → "FLMM data export (Excel)" saves every model term, the
+    per-bout input matrix, and observed vs model-predicted traces per bout
+    number. The PDF report is now "FLMM plot export (PDF)".
+
+Version 1.22.0  •  October 19, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — TTL bouts landed late without a behavior file. The recording-start
     correction shifted TTL events that were already matched by clock, so a
@@ -38487,6 +38504,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # max-statistic band). Structured so an optional R/fastFMM backend can be
     # slotted into _fit_timecourse later without UI change.
 
+    @staticmethod
+    def _flmm_bout_numbers(entry, channel, n):
+        """1-based bout number of each stored trace for the bout-order covariate.
+
+        A bout dropped at extraction (its window ran past the recording start,
+        a NaN in the window) leaves the stored list shorter than the session's
+        bout sequence, so list position is not bout number: an animal whose
+        first approach came 2 s into the recording had its second approach
+        modeled as bout 1.  ``_kept_indices`` records which bout each trace
+        is; stores extracted before it existed fall back to list position.
+        """
+        kept = entry.get('_kept_indices') if isinstance(entry, dict) else None
+        seq = kept.get(str(channel)) if isinstance(kept, dict) else None
+        if seq is not None and len(seq) == n:
+            return [float(int(i) + 1) for i in seq]
+        return [float(i) for i in range(1, n + 1)]
+
     def _collect_flmm_traces(self, selected_subjects, behavior, channel, subject_to_group,
                              max_bouts=_MAX_BOUTS_UNSET):
         """Gather per-bout peri-event traces + metadata for time-course modeling.
@@ -38508,12 +38542,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if 'bouts' not in data or behavior not in data['bouts']:
                 continue
             entry = data['bouts'][behavior]
+            key = channel
             bouts_data = entry.get(channel, [])
             if not bouts_data:
                 # Backwards compatibility: Ch0<->G0, Ch1<->G1
                 alt = 'G0' if channel == 'Ch0' else 'G1' if channel == 'Ch1' else None
                 if alt:
-                    bouts_data = entry.get(alt, [])
+                    key, bouts_data = alt, entry.get(alt, [])
+            numbers = self._flmm_bout_numbers(entry, key, len(bouts_data))
             if max_bouts is not None:
                 bouts_data = bouts_data[:max_bouts]
             # Realign to current window so subjects/bouts extracted with different
@@ -38522,7 +38558,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
                                                 self._entry_fs(entry))
             grp = subject_to_group.get(subject)
-            for order, bout in enumerate(bouts_data, 1):
+            for order, bout in zip(numbers, bouts_data):
                 arr = np.asarray(bout, dtype=float)
                 if arr.size == 0 or not np.any(np.isfinite(arr)):
                     continue
@@ -38742,6 +38778,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         beta = np.full(L, np.nan)
         se = np.full(L, np.nan)
+        # Every fixed effect and its covariance, so derived terms (each group's
+        # own bout-order slope) can be read off the same fit.
+        betas_all = np.full((p, L), np.nan)
+        cov_all = np.full((L, p, p), np.nan)
         eta = np.full((n, L), np.nan)
         tau2 = np.zeros(L)
         sig2 = np.full(L, np.nan)
@@ -38764,7 +38804,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # smallest finite SE; stop early once a sane (<= SANE_SE) fit is
                 # found. Guards against accepting a "converged" garbage fit.
                 SANE_SE = 1e3
-                best = None  # (se_val, fp, tau2, sig2)
+                best = None  # (se_val, fp, tau2, sig2, cov)
                 for meth in ('bfgs', 'lbfgs', 'cg', 'powell'):
                     try:
                         with warnings.catch_warnings():
@@ -38775,18 +38815,20 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             s_try = float(mdf.bse_fe[coef_idx])
                             t2 = max(float(np.asarray(mdf.cov_re)[0, 0]), 0.0)
                             s2 = float(mdf.scale)
+                            cv = np.asarray(mdf.cov_params(), float)[:p, :p]
                         if (np.all(np.isfinite(fp_try)) and np.isfinite(s_try)
                                 and s_try > 0 and np.isfinite(s2) and s2 > 0):
                             if best is None or s_try < best[0]:
-                                best = (s_try, fp_try, t2, s2)
+                                best = (s_try, fp_try, t2, s2, cv)
                             if s_try <= SANE_SE:
                                 break
                     except Exception:
                         pass
                 if best is not None and best[0] <= SANE_SE:
-                    s_try, fp, t2, s2 = best
+                    s_try, fp, t2, s2, cv = best
                     beta[t], se[t] = fp[coef_idx], s_try
                     tau2[t], sig2[t] = t2, s2
+                    cov_all[t] = cv
             if fp is None:
                 try:
                     with warnings.catch_warnings():
@@ -38794,6 +38836,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         ols = sm.OLS(yt, Xt).fit()
                     fp = np.asarray(ols.params, float)
                     beta[t], se[t] = fp[coef_idx], float(ols.bse[coef_idx])
+                    cov_all[t] = np.asarray(ols.cov_params(), float)
                     tau2[t] = 0.0
                     dof = max(1, int(mask.sum()) - p)
                     sig2[t] = float(np.sum(ols.resid ** 2) / dof)
@@ -38804,6 +38847,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 except Exception:
                     continue
             eta[mask, t] = yt - Xt @ fp   # marginal residuals for the cluster cov
+            betas_all[:, t] = fp
 
         if not use_mixed and reference != 'zero':
             log("FLMM: single subject — random effect dropped (OLS).")
@@ -38811,6 +38855,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'beta': beta, 'se': se, 'n_subjects': n_subjects,
             'X': X, 'subj_codes': subj_codes, 'coef_idx': coef_idx,
             'eta': eta, 'tau2': tau2, 'sig2': sig2,
+            'betas_all': betas_all, 'cov_all': cov_all,
+            'order_center': (float(np.nanmean(orders))
+                             if reference in ('across_bouts', 'interaction') else None),
         }
 
     @staticmethod
@@ -38870,13 +38917,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         out[order] = np.clip(ranked, 0.0, 1.0)
         return out
 
-    def _flmm_gls_cov(self, fit):
+    def _flmm_gls_cov(self, fit, contrast=None):
         """GLS subject-clustered (CR0) covariance of the coefficient function.
 
         a_i(t) = [ inv(X'V(t)^-1 X) X_i' V_i(t)^-1 eta_i(t) ]_k ; Cov = A'A,
         with V_i = sig2 I + tau2 11' (random intercept) inverted via
         Sherman-Morrison. Captures the across-time correlation of beta_hat(t)
         induced by shared subjects/bouts — the input fastFMM uses for its band.
+
+        *contrast* (length-p) bands a linear combination of the coefficients
+        instead of the coefficient of interest.
         """
         X = fit['X']; subj_codes = fit['subj_codes']
         eta = fit['eta']; tau2 = fit['tau2']; sig2 = fit['sig2']
@@ -38884,6 +38934,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         n, L = eta.shape
         p = X.shape[1]
         subs = np.unique(subj_codes)
+        cvec = np.zeros(p)
+        if contrast is None:
+            cvec[coef_idx] = 1.0
+        else:
+            cvec[:] = np.asarray(contrast, float)
         A = np.zeros((len(subs), L))
         for t in range(L):
             s2 = sig2[t]
@@ -38911,7 +38966,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             except Exception:
                 continue
             for idx, Xi_Vinv, et in pieces:
-                A[idx, t] = (B @ (Xi_Vinv @ et))[coef_idx]
+                A[idx, t] = cvec @ (B @ (Xi_Vinv @ et))
         return A.T @ A
 
     def _flmm_python_qn(self, fit, Z, groups, reference, pointwise_only):
@@ -39150,6 +39205,85 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         sig_pt = np.abs(tstat) > 1.96
         sig_sim = np.abs(tstat) > c_star
         return ci_lo, ci_hi, sci_lo, sci_hi, sig_pt, sig_sim
+
+    def _flmm_model_terms(self, fit, reference, groups_present, pointwise_only):
+        """Every readable term of a bout-order model, each with its own bands.
+
+        β(t) alone is a slope, which does not say what the signal looks like at
+        any bout.  This returns the terms needed to read it -- the mean signal
+        at the average bout number, and for the interaction each group's own
+        slope as well as their difference -- as dicts with beta/se/bands/sig.
+        Each is a linear combination of the same per-timepoint fit, and its
+        simultaneous band uses that combination's own GLS covariance.
+        ``tested`` marks the term the analysis was run to test.
+        """
+        if reference not in ('across_bouts', 'interaction'):
+            return []
+        B, C = fit.get('betas_all'), fit.get('cov_all')
+        if B is None or C is None:
+            return []
+        k = fit.get('order_center') or 0.0
+        if reference == 'across_bouts':
+            spec = [('mean', f"Mean signal at bout {k:.1f} (the average bout number)",
+                     [1, 0], False),
+                    ('slope', "Bout-order slope (Δz per bout)", [0, 1], True)]
+        else:
+            ref, oth = (list(groups_present) + ['A', 'B'])[:2]
+            spec = [('slope_ref', f"Bout-order slope, {ref} (Δz per bout)", [0, 0, 1, 0], False),
+                    ('slope_oth', f"Bout-order slope, {oth} (Δz per bout)", [0, 0, 1, 1], False),
+                    ('slope_pooled', "Bout-order slope, both groups pooled (Δz per bout)",
+                     [0, 0, 1, 0.5], False),
+                    ('slope_diff', f"Slope difference ({oth} − {ref})", [0, 0, 0, 1], True),
+                    ('mean_ref', f"Mean signal at bout {k:.1f}, {ref}", [1, 0, 0, 0], False),
+                    ('mean_oth', f"Mean signal at bout {k:.1f}, {oth}", [1, 1, 0, 0], False),
+                    ('group_diff', f"Group difference at bout {k:.1f} ({oth} − {ref})",
+                     [0, 1, 0, 0], False)]
+        terms = []
+        for key, label, c, tested in spec:
+            c = np.asarray(c, float)
+            beta = c @ B
+            with np.errstate(invalid='ignore'):
+                se = np.sqrt(np.einsum('i,tij,j->t', c, C, c))
+            beta_s, se_s = self._flmm_smooth(beta, se)
+            c_star = 1.96
+            if not pointwise_only:
+                try:
+                    cov = self._flmm_gls_cov(fit, contrast=c)
+                    if np.all(np.isfinite(cov)) and np.any(np.diag(cov) > 0):
+                        q = self._flmm_qn_from_cov(cov)
+                        if np.isfinite(q) and q > 0:
+                            c_star = q
+                except Exception:
+                    pass
+            lo, hi, slo, shi, spt, ssim = self._flmm_assemble_bands(beta_s, se_s, c_star)
+            terms.append({'key': key, 'label': label, 'contrast': c, 'tested': tested,
+                          'beta': beta_s, 'se': se_s, 'ci_lo': lo, 'ci_hi': hi,
+                          'sci_lo': slo, 'sci_hi': shi, 'sig_pointwise': spt,
+                          'sig_simultaneous': ssim, 'c_star': c_star})
+        return terms
+
+    # Bout-number bins for the observed-trace panel of a bout-order analysis.
+    _FLMM_BOUT_BINS = ((1, 1), (2, 3), (4, 7), (8, 15), (16, None))
+
+    @staticmethod
+    def _flmm_bout_label(lo, hi):
+        if hi is None:
+            return f"bouts {lo}+"
+        return f"bout {lo}" if lo == hi else f"bouts {lo}–{hi}"
+
+    def _flmm_animal_means(self, Z, subjects, mask):
+        """Mean ± SEM across animals of the bouts in *mask* (each animal averaged
+        first, so an animal with 30 bouts counts once).  Returns (mean, sem, n)."""
+        ids = np.asarray(self._animal_ids_for(subjects, log=lambda *_: None), dtype=object)
+        per = [np.nanmean(Z[mask & (ids == a)], axis=0)
+               for a in sorted(set(ids[mask].tolist()))]
+        if not per:
+            return None, None, 0
+        M = np.vstack(per)
+        n = M.shape[0]
+        mean = np.nanmean(M, axis=0)
+        sem = (np.nanstd(M, axis=0, ddof=1) / np.sqrt(n)) if n > 1 else np.zeros_like(mean)
+        return mean, sem, n
 
     # ----- Optional R / fastFMM backend (exact FUI when R is available) -------
 
@@ -39605,6 +39739,20 @@ cat("OK\n")
         pw_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(dlg, text="Pointwise only (skip simultaneous band — faster)",
                         variable=pw_var).pack(anchor='w', padx=22)
+        # Analysis window: only these seconds enter the model and its bands.
+        _fps = max(1e-9, float(self.get_fps()))
+        pre_s = self.params.get('preboutframes', 0) / _fps
+        post_s = self.params.get('postboutframes', 0) / _fps
+        wf = ttk.Frame(dlg)
+        wf.pack(anchor='w', padx=22, pady=(4, 0))
+        ttk.Label(wf, text="Time range (s from bout onset):").pack(side='left')
+        t0_var = tk.StringVar(value=f"{-pre_s:g}")
+        t1_var = tk.StringVar(value=f"{post_s:g}")
+        ttk.Entry(wf, textvariable=t0_var, width=6).pack(side='left', padx=(6, 2))
+        ttk.Label(wf, text="to").pack(side='left')
+        ttk.Entry(wf, textvariable=t1_var, width=6).pack(side='left', padx=(2, 0))
+        ttk.Label(wf, text=f"  (bout window: {-pre_s:g} to {post_s:g})",
+                  foreground='gray').pack(side='left')
         ttk.Label(dlg, text=("FUI: per-timepoint mixed model (random intercept per subject)\n"
                              "+ simultaneous (multiple-comparison-corrected) band."),
                   foreground='gray', font=('Segoe UI', 8), justify='left').pack(
@@ -39619,6 +39767,15 @@ cat("OK\n")
                 messagebox.showerror("Error", "Select at least 1 channel.", parent=dlg)
                 return
             sel_beh = [b for b in behaviors if beh_vars[b].get()]
+            try:
+                t_range = (float(t0_var.get()), float(t1_var.get()))
+            except ValueError:
+                messagebox.showerror("Error", "Time range must be two numbers.", parent=dlg)
+                return
+            if t_range[1] <= t_range[0]:
+                messagebox.showerror("Error", "Time range end must be after its start.",
+                                     parent=dlg)
+                return
             if ref_var.get() == 'factor':
                 if len(sel_beh) < 2:
                     messagebox.showerror(
@@ -39637,7 +39794,7 @@ cat("OK\n")
                                'engine': engine_var.get(),
                                'ref_behavior': ref_b_var.get(),
                                'comp_behavior': comp_b_var.get(),
-                               'channels': sel_chan}
+                               'channels': sel_chan, 'time_range': t_range}
             dlg.destroy()
 
         ttk.Button(btns, text="Run", command=_ok).pack(side='right', padx=(4, 0))
@@ -40066,7 +40223,8 @@ cat("OK\n")
                     selected_subjects, ch, behavior, behavior_label, reference,
                     model_reference, ref_level, ref_b, comp_behaviors, comp_label,
                     subject_to_group, engine, pointwise_only, max_bouts,
-                    q=q, base=ci / C, span=1.0 / C, use_exclusions=use_exclusions)
+                    q=q, base=ci / C, span=1.0 / C, use_exclusions=use_exclusions,
+                    time_range=choice.get('time_range'))
                 if panel is None:
                     warns.append(warn)
                     continue
@@ -40100,7 +40258,7 @@ cat("OK\n")
                                        ref_level, ref_b, comp_behaviors, comp_label,
                                        subject_to_group, engine, pointwise_only,
                                        max_bouts, q=None, base=0.0, span=1.0,
-                                       use_exclusions=False):
+                                       use_exclusions=False, time_range=None):
         """Worker: fit the single-coefficient time-course model for one channel.
 
         Returns (panel, warn). Runs off the main thread — no Tk access.
@@ -40108,9 +40266,12 @@ cat("OK\n")
         logq = (lambda m: q.put(('log', m))) if q is not None else self.log_message
         prog = (self._phase_progress(q, f"Channel {channel}", base, span)
                 if q is not None else None)
+        excluded_subjects = []
         if use_exclusions:
+            _all = list(selected_subjects)
             selected_subjects = self.get_included_subjects_for_channel(
                 selected_subjects, channel)
+            excluded_subjects = sorted(set(_all) - set(selected_subjects), key=str)
             if not selected_subjects:
                 return None, f"{channel}: all selected subjects are excluded."
 
@@ -40139,11 +40300,32 @@ cat("OK\n")
                 return None, (f"{channel}: between-groups / interaction analysis "
                               f"requires exactly two groups (found "
                               f"{len(groups_present)}).")
+            if model_reference in ('between_groups', 'interaction') and ref_level is None:
+                # Read effects as (treatment − control) when one group is
+                # recognisably the control, not by alphabetical accident.
+                ctrl = [g for g in groups_present
+                        if re.search(r'ctrl|control|\bwt\b|wild|sham|veh|saline',
+                                     str(g), re.I)]
+                if len(ctrl) == 1:
+                    ref_level = ctrl[0]
+                    groups_present = [ctrl[0]] + [g for g in groups_present if g != ctrl[0]]
+
+        fps = self.get_fps()
+        prebout = min(self.params['preboutframes'], L - 1)
+        time_axis = (np.arange(L) - prebout) / fps
+        if time_range is not None:
+            keep = ((time_axis >= time_range[0] - 1e-9)
+                    & (time_axis <= time_range[1] + 1e-9))
+            if keep.sum() < 3:
+                return None, (f"{channel}: the time range {time_range[0]:g} to "
+                              f"{time_range[1]:g} s holds fewer than 3 samples.")
+            Z, time_axis, L = Z[:, keep], time_axis[keep], int(keep.sum())
 
         n_subjects = len(set(subjects.tolist()))
         backend_label = None
         beta_s = se_s = None
         engine_note = None
+        fit = None
         if engine == 'r':
             if prog is not None:
                 prog(0.05, "running R fastFMM…")
@@ -40168,9 +40350,21 @@ cat("OK\n")
         (ci_lo, ci_hi, sci_lo, sci_hi, sig_pt, sig_sim) = self._flmm_assemble_bands(
             beta_s, se_s, c_star)
 
-        fps = self.get_fps()
-        prebout = min(self.params['preboutframes'], L - 1)
-        time_axis = (np.arange(L) - prebout) / fps
+        terms, terms_backend = [], None
+        if model_reference in ('across_bouts', 'interaction'):
+            if fit is None:
+                # fastFMM returns only the tested coefficient; the per-group
+                # slopes and means come from the Python fit of the same model.
+                sub = (None if prog is None else
+                       (lambda f, d: prog(0.5 + 0.4 * f, f"per-group terms (Python): {d}")))
+                fit = self._fit_timecourse(Z, subjects, groups, orders, model_reference,
+                                           ref_level=ref_level, progress=sub, log=logq)
+            if prog is not None:
+                prog(0.92, "simultaneous bands for each model term…")
+            terms = self._flmm_model_terms(fit, model_reference, groups_present,
+                                           pointwise_only)
+            terms_backend = "Python FUI (GLS coefficient covariance)"
+
         return {
             'channel': channel, 'time': time_axis, 'beta': beta_s, 'se': se_s,
             'ci_lo': ci_lo, 'ci_hi': ci_hi, 'sci_lo': sci_lo, 'sci_hi': sci_hi,
@@ -40179,13 +40373,19 @@ cat("OK\n")
             'c_star': c_star, 'pointwise_only': pointwise_only,
             'backend': backend_label, 'Z': Z, 'groups': groups,
             'groups_present': groups_present, 'n_subjects': n_subjects,
-            'engine_note': engine_note,
+            'engine_note': engine_note, 'subjects': subjects, 'orders': orders,
+            'terms': terms, 'terms_backend': terms_backend,
+            'order_center': (fit or {}).get('order_center'),
+            'use_exclusions': bool(use_exclusions),
+            'excluded_subjects': excluded_subjects,
         }, None
 
     def _build_flmm_timecourse_store(self, panels, order):
         """Wrap per-channel time-course panels in the shared panel-store shape."""
         def make_fig(key):
             p = panels[key]
+            if p.get('terms'):
+                return self._build_flmm_order_figure(p)
             return self._build_flmm_figure(
                 p['Z'], p['groups'], p['time'], p['reference'], p['beta'],
                 p['ci_lo'], p['ci_hi'], p['sci_lo'], p['sci_hi'],
@@ -40194,11 +40394,12 @@ cat("OK\n")
 
         def make_lines(key):
             p = panels[key]
-            return self._flmm_stats_lines(
+            lines = self._flmm_stats_lines(
                 p['reference'], p['behavior'], p['channel'], p['Z'],
                 p['n_subjects'], p['groups_present'], p['time'],
                 p['sig_simultaneous'], p['sig_pointwise'], p['c_star'],
                 p['pointwise_only'], p['backend'])
+            return lines + self._flmm_term_lines(p)
 
         first = panels[order[0]]
         store = {
@@ -40279,6 +40480,109 @@ cat("OK\n")
         ax_bot.set_ylabel(eff_labels.get(reference, 'β(t)'))
         ax_bot.legend(fontsize=8, loc='best')
         ax_bot.grid(True, alpha=0.3)
+        fig.tight_layout()
+        return fig
+
+    def _flmm_order_bins(self, panel):
+        """[(label, lo, hi)] of the bout-number bins that hold any bout."""
+        orders = np.asarray(panel['orders'], float)
+        out = []
+        for lo, hi in self._FLMM_BOUT_BINS:
+            m = (orders >= lo) & ((orders <= hi) if hi is not None else True)
+            if np.any(m):
+                out.append((self._flmm_bout_label(lo, hi), lo, hi))
+        return out
+
+    def _build_flmm_order_figure(self, panel):
+        """Bout-order figure: observed traces by bout number, then the model terms.
+
+        Top: the bouts the model saw, binned by bout number, each animal
+        averaged first and the band SEM across animals -- one row per group
+        for the interaction.  Below: each group's bout-order slope, and for the
+        interaction the slope difference that is tested.
+        """
+        Z, time_axis = panel['Z'], panel['time']
+        orders = np.asarray(panel['orders'], float)
+        subjects, groups = panel['subjects'], panel['groups']
+        inter = panel['reference'] == 'interaction'
+        gp = list(panel['groups_present']) if inter else [None]
+        terms = {t['key']: t for t in panel['terms']}
+        bins = self._flmm_order_bins(panel)
+        cmap = matplotlib.colormaps['viridis']
+        bin_colors = [cmap(0.9 * i / max(1, len(bins) - 1)) for i in range(len(bins))]
+        GCOL = ['#1E88E5', '#E53935']
+
+        n_rows = len(gp) + (2 if inter else 1)
+        fig = Figure(figsize=(7.0, 2.3 * n_rows), dpi=100)
+        axes = [fig.add_subplot(n_rows, 1, i + 1) for i in range(n_rows)]
+        for a in axes[1:]:
+            a.sharex(axes[0])
+
+        for gi, g in enumerate(gp):
+            ax = axes[gi]
+            gmask = np.ones(len(orders), bool) if g is None else (groups == g)
+            for (lab, lo, hi), col in zip(bins, bin_colors):
+                m = gmask & (orders >= lo) & ((orders <= hi) if hi is not None else True)
+                mean, sem, n = self._flmm_animal_means(Z, subjects, m)
+                if mean is None:
+                    continue
+                ax.plot(time_axis, mean, color=col, lw=1.6, label=f'{lab} (n={n})')
+                ax.fill_between(time_axis, mean - sem, mean + sem, color=col, alpha=0.15)
+            ax.axvline(0, color='r', ls='--', lw=1.2)
+            ax.axhline(0, color='k', lw=0.6, alpha=0.4)
+            ax.set_ylabel(f'{panel["channel"]} z')
+            ttl = f'{g}: observed, by bout number' if g else 'Observed, by bout number'
+            ax.set_title(ttl, fontsize=9, loc='left')
+            ax.legend(fontsize=7, loc='upper left', ncol=2,
+                      title='n = animals; band = SEM across animals', title_fontsize=6)
+            ax.grid(True, alpha=0.3)
+
+        def _term(ax, t, color, sim=True):
+            if sim and not panel['pointwise_only']:
+                ax.fill_between(time_axis, t['sci_lo'], t['sci_hi'], color=color, alpha=0.12)
+            ax.fill_between(time_axis, t['ci_lo'], t['ci_hi'], color=color, alpha=0.25)
+            ax.plot(time_axis, t['beta'], color=color, lw=2, label=t['label'])
+
+        ax = axes[len(gp)]
+        if inter:
+            _term(ax, terms['slope_ref'], GCOL[0], sim=False)
+            _term(ax, terms['slope_oth'], GCOL[1], sim=False)
+            pooled = terms['slope_pooled']
+            ax.plot(time_axis, pooled['beta'], color='k', lw=1.4, ls='--',
+                    label=pooled['label'])
+            psig = (pooled['sig_pointwise'] if panel['pointwise_only']
+                    else pooled['sig_simultaneous'])
+            if np.any(psig):
+                ymin, ymax = ax.get_ylim()
+                ax.fill_between(time_axis, ymin, ymax, where=psig, color='#B2DFDB',
+                                alpha=0.35, step='mid', label='pooled slope significant')
+                ax.set_ylim(ymin, ymax)
+            ax.set_title('Bout-order slope per group (pointwise 95%) and pooled',
+                         fontsize=9, loc='left')
+        else:
+            _term(ax, terms['slope'], '#0D47A1')
+        tested = next(t for t in panel['terms'] if t['tested'])
+        a = axes[-1]
+        if inter:
+            _term(a, tested, '#6A1B9A')
+            a.set_title('Tested: does the bout-order effect differ between groups?',
+                        fontsize=9, loc='left')
+        sig = tested['sig_pointwise'] if panel['pointwise_only'] else tested['sig_simultaneous']
+        if np.any(sig):
+            ymin, ymax = a.get_ylim()
+            a.fill_between(time_axis, ymin, ymax, where=sig, color='#FFEB3B', alpha=0.3,
+                           step='mid', label='significant ('
+                           + ('pointwise' if panel['pointwise_only'] else 'simultaneous') + ')')
+            a.set_ylim(ymin, ymax)
+        for a in axes[len(gp):]:
+            a.axvline(0, color='r', ls='--', lw=1.2)
+            a.axhline(0, color='k', lw=0.8, alpha=0.6)
+            a.set_ylabel('Δz per bout')
+            a.legend(fontsize=7, loc='upper left')
+            a.grid(True, alpha=0.3)
+        axes[-1].set_xlabel('Time from bout onset (s)')
+        fig.suptitle(f'{panel["channel"]}: {panel["behavior"]} — bout-order FLMM',
+                     fontweight='bold', fontsize=10)
         fig.tight_layout()
         return fig
 
@@ -41687,6 +41991,33 @@ cat("OK\n")
         lines += self._flmm_method_citations()
         return lines
 
+    def _flmm_term_lines(self, panel):
+        """Readout of every bout-order model term, with how to read it."""
+        terms = panel.get('terms') or []
+        if not terms:
+            return []
+        orders = np.asarray(panel['orders'], float)
+        band = 'pointwise' if panel['pointwise_only'] else 'simultaneous'
+        lines = ["", "-" * 70, "BOUT-ORDER MODEL TERMS", "-" * 70,
+                 f"Bout number = the bout's place in that session's sequence "
+                 f"({int(orders.min())}–{int(orders.max())}); bouts dropped at extraction",
+                 "keep their number, so the next bout is not renumbered.",
+                 f"Bout number is centered at {panel.get('order_center') or 0:.2f} "
+                 "(the average), so 'mean signal' terms are",
+                 "the model's signal at that bout and slopes are Δz per one more bout.",
+                 "Predicted signal at bout k = mean term + slope × (k − center).",
+                 f"Terms engine: {panel.get('terms_backend') or '—'}", ""]
+        for t in terms:
+            sig = t['sig_pointwise'] if panel['pointwise_only'] else t['sig_simultaneous']
+            wins = self._flmm_mask_windows(sig, panel['time'])
+            ws = "; ".join(f"{a:+.2f}→{z:+.2f} s" for a, z in wins) or "none"
+            pk = int(np.nanargmax(np.abs(t['beta'])))
+            lines.append(f"{'* ' if t['tested'] else '  '}{t['label']}")
+            lines.append(f"      peak {t['beta'][pk]:+.4f} at {panel['time'][pk]:+.2f} s; "
+                         f"significant ({band}): {ws}")
+        lines.append("  (* = the term this analysis tests)")
+        return lines
+
     def _report_flmm_stats(self, reference, behavior, channel, Z, n_subjects,
                            groups_present, time_axis, sig_sim, sig_pt, c_star,
                            pointwise_only, backend_label=None):
@@ -41822,6 +42153,217 @@ cat("OK\n")
             "Copied",
             f"Time-course stats ({d['reference']}, {d['behavior']}; {chans}) "
             f"copied to clipboard.\nPaste into Excel or Prism.")
+
+    def _flmm_workbook_frames(self, d):
+        """Sheets of the time-course workbook as ``{name: DataFrame}``.
+
+        README says what was fit and how to read it; Model_terms holds every term's
+        β(t) and bands; Input_bouts is exactly the matrix the model saw, one
+        row per bout with its subject, animal, group and bout number; for a
+        bout-order model Observed_mean_per_bout and Model_fit_per_bout put the data and
+        the fitted model side by side at each bout number.
+        """
+        import pandas as pd
+        order = d.get('order') or []
+        plist = [d['panels'][k] for k in order]
+        eff, traces, obs, pred = [], [], [], []
+        for p in plist:
+            ch, time = p['channel'], np.asarray(p['time'], float)
+            terms = p.get('terms') or [{
+                'label': self._FLMM_REFERENCE_TITLES.get(p['reference'], p['reference']),
+                'tested': True, **{k: p[k] for k in (
+                    'beta', 'se', 'ci_lo', 'ci_hi', 'sci_lo', 'sci_hi',
+                    'sig_pointwise', 'sig_simultaneous')}}]
+            for t in terms:
+                eff.append(pd.DataFrame({
+                    'Channel': ch, 'Term': t['label'], 'Tested': int(bool(t['tested'])),
+                    'Time_s': time, 'beta': t['beta'], 'SE': t['se'],
+                    'CI_lo': t['ci_lo'], 'CI_hi': t['ci_hi'],
+                    'simCI_lo': t['sci_lo'], 'simCI_hi': t['sci_hi'],
+                    'sig_pointwise': np.asarray(t['sig_pointwise']).astype(int),
+                    'sig_simultaneous': np.asarray(t['sig_simultaneous']).astype(int)}))
+            Z = np.asarray(p['Z'], float)
+            subj = p.get('subjects')
+            if subj is None:
+                continue
+            tcols = [f"{x:.4f}" for x in time]
+            meta = pd.DataFrame({
+                'Channel': ch, 'Subject': [str(s) for s in subj],
+                'Animal': self._animal_ids_for(subj, log=lambda *_: None),
+                'Group': [('' if g is None else str(g)) for g in p['groups']],
+                'Bout_number': np.asarray(p['orders'], float).astype(int)})
+            traces.append(pd.concat([meta, pd.DataFrame(Z, columns=tcols)], axis=1))
+            if not p.get('terms'):
+                continue
+            tm = {t['key']: t for t in p['terms']}
+            orders = np.asarray(p['orders'], float)
+            inter = p['reference'] == 'interaction'
+            gsets = ([(g, p['groups'] == g) for g in p['groups_present']] if inter
+                     else [('all', np.ones(len(orders), bool))])
+            center = p.get('order_center') or 0.0
+            for gi, (g, gm) in enumerate(gsets):
+                for k in range(1, int(orders.max()) + 1):
+                    mean, sem, n = self._flmm_animal_means(Z, subj, gm & (orders == k))
+                    if mean is not None:
+                        for stat, row in (('mean', mean), ('sem', sem)):
+                            obs.append([ch, g, k, stat, n] + list(row))
+                    if inter:
+                        mt, st = tm['mean_ref' if gi == 0 else 'mean_oth'], \
+                            tm['slope_ref' if gi == 0 else 'slope_oth']
+                    else:
+                        mt, st = tm['mean'], tm['slope']
+                    pred.append([ch, g, k] + list(mt['beta'] + st['beta'] * (k - center)))
+        sheets = {}
+        first = plist[0]
+        readme = [
+            f"FLMM time-course export — {first['behavior']}",
+            f"Analysis : {self._FLMM_REFERENCE_TITLES.get(first['reference'], first['reference'])}",
+            f"Channels : {', '.join(order)}",
+            f"Engine   : {first.get('backend')}",
+            f"Bands    : {'pointwise 95% only' if first['pointwise_only'] else 'pointwise 95% + simultaneous 95%'}",
+            "",
+        ]
+        if 'use_exclusions' in first:
+            readme.append("Exclusions: " + (
+                "APPLIED (Apply exclusions was ticked)" if first['use_exclusions']
+                else "not applied (every selected subject used on every channel)"))
+        for p in plist:
+            readme.append(f"{p['channel']}: {p['Z'].shape[0]} bouts, {p['n_subjects']} "
+                          f"subject(s), groups: {', '.join(map(str, p['groups_present'])) or '—'}")
+            if p.get('use_exclusions'):
+                ex = p.get('excluded_subjects') or []
+                readme.append(f"    excluded on {p['channel']} ({len(ex)}): "
+                              + (', '.join(map(str, ex)) if ex else 'none'))
+        readme += ["", "SHEETS",
+                   "Model_terms — one block per model term: beta(t), SE, 95% pointwise CI, "
+                   "95% simultaneous band, significance flags.",
+                   "           Tested = 1 marks the term the analysis was run to test.",
+                   "           β(t) is smoothed (FUI step 2); the plot's lower panel(s) draw "
+                   "exactly these columns.",
+                   "Input_bouts — every bout that entered the model (one row each), with "
+                   "subject, animal (the random-intercept unit), group",
+                   "           and bout number; columns are seconds from onset.  All channels "
+                   "are cut to the shortest bout so they share one time axis."]
+        if obs:
+            readme += [
+                "Observed_mean_per_bout — mean and SEM across animals at each bout number "
+                "(each animal contributes its own bout k).",
+                "Model_fit_per_bout — the model's signal at bout k: mean term + slope × "
+                "(k − center).  Compare to Observed_mean_per_bout.",
+                "",
+                "READING A BOUT-ORDER MODEL",
+                "Bout number is the bout's place in that session's sequence. A bout dropped "
+                "at extraction (window past the recording",
+                "edge, NaN in the window) keeps its number, so later bouts are not renumbered.",
+                f"Bout number is centered at its average ({first.get('order_center') or 0:.2f}), "
+                "so the 'Mean signal' term is the signal at that",
+                "bout and each slope is the change in z per one more bout.  A negative "
+                "slope = the response shrinks over bouts.",
+                "Interaction: each group's own slope, and the tested 'Slope difference' "
+                "(does bout order matter differently by group).",
+                "The model is linear in bout number; check Observed_mean_per_bout for curvature "
+                "(e.g. only bout 1 differs) before reading a slope as a trend."]
+        readme += [
+            "", "GLOSSARY",
+            "FLMM — functional linear mixed model: a mixed model fit separately at every",
+            "        time point of the bout window, so the result is a curve over time.",
+            "FUI — fast univariate inference, the FLMM method used here (Cui et al. 2022).",
+            "β(t) ('beta of t') — the model's estimate of one quantity at time t; the",
+            "        'beta' column.  What it measures depends on the Term: a signal level",
+            "        in z, a difference between groups in z, or a slope in z per bout.",
+            "Slope (bout order) — how much the z-score changes per one more bout, at",
+            "        that time point.  Negative = the response gets smaller over bouts.",
+            "Random intercept — each animal gets its own baseline level, so animals",
+            "        with many bouts do not dominate and bouts are not treated as",
+            "        independent.",
+            "Bout number — the bout's position in that session (1 = first bout).",
+            "Centered — bout numbers are measured from their average, so 'Mean signal'",
+            "        terms are the signal at the average bout number.",
+            "Pooled slope — the average of the two groups' slopes: is there a bout-order",
+            "        effect overall, regardless of group?",
+            "Slope difference — group B's slope minus group A's: does bout order matter",
+            "        differently between the groups?  This is the interaction test.",
+            "SE — standard error of β(t).",
+            "Pointwise 95% CI — the range for β at a single time point considered alone.",
+            "Simultaneous 95% band — a wider band that holds for the whole curve at once,",
+            "        correcting for testing every time point; a window is significant",
+            "        where this band excludes 0.",
+            "c* — the multiplier that sets the simultaneous band width (1.96 = pointwise).",
+            "z-score — the photometry signal in standard deviations from baseline.",
+            "SEM — standard error of the mean across animals.",
+            "", "HOW THE SHEETS FIT TOGETHER",
+            "1. Input_bouts is the raw material: every bout that went into the model.",
+            "2. Model_terms is the statistics: what the model estimated from those bouts,",
+            "   at every time point.  Filter the Term column to one term to plot it.",
+            "3. Observed_mean_per_bout / Model_fit_per_bout show the same thing as signal",
+            "   traces: the data at bout 1, 2, 3 ... next to what the fitted line predicts.",
+            "",
+            "COLUMNS IN Model_terms",
+            "Term       — which quantity this row block describes (see its name).",
+            "Tested     — 1 = the term this analysis tests; 0 = shown to help read it.",
+            "Time_s     — seconds from bout onset.",
+            "beta       — the estimate at that time (z, or z per bout for a slope).",
+            "SE         — its standard error.",
+            "CI_lo/hi   — 95% confidence interval at that one time point.",
+            "simCI_lo/hi — 95% band for the whole curve at once (corrects for testing",
+            "             every time point); use this one to call a window significant.",
+            "sig_pointwise / sig_simultaneous — 1 where the matching interval excludes 0.",
+            "",
+            "COLUMNS IN THE PER-BOUT SHEETS",
+            "Group, Bout_number — which bouts the row averages; Stat = mean or sem;",
+            "n_animals — animals with that bout number; the numbered columns are",
+            "seconds from onset."]
+        sheets['README'] = pd.DataFrame({'FLMM time-course export': readme})
+        sheets['Model_terms'] = pd.concat(eff, ignore_index=True)
+        if traces:
+            sheets['Input_bouts'] = pd.concat(traces, ignore_index=True)
+        tcols = [f"{x:.4f}" for x in np.asarray(first['time'], float)]
+        if obs:
+            sheets['Observed_mean_per_bout'] = pd.DataFrame(
+                obs, columns=['Channel', 'Group', 'Bout_number', 'Stat', 'n_animals'] + tcols)
+            sheets['Model_fit_per_bout'] = pd.DataFrame(
+                pred, columns=['Channel', 'Group', 'Bout_number'] + tcols)
+        return sheets
+
+    def export_flmm_workbook(self):
+        """Save the last FLMM time-course result as an Excel workbook."""
+        d = getattr(self, 'flmm_timecourse_data', None)
+        if d and d.get('kind') != 'timecourse':
+            # Factor / pairwise results have no workbook layout: copy their table.
+            self.export_timecourse_flmm()
+            return
+        if not d:
+            messagebox.showinfo(
+                "No Data",
+                "Run Plot ▾ → Time-Course Statistics (FLMM-style)… with a single-model "
+                "analysis (signal ≠ 0, across bouts, between groups, across-bouts × group "
+                "or a behavior contrast) first.\n\nFactor and pairwise results export via "
+                "copy/paste or the PDF report.")
+            return
+        import pandas as pd
+        default = (f"FLMM {d['behavior']} {d['reference']}.xlsx"
+                   .replace('/', '-').replace('\\', '-'))
+        path = filedialog.asksaveasfilename(
+            title="Export FLMM Workbook", defaultextension=".xlsx",
+            initialfile=default, filetypes=[("Excel workbook", "*.xlsx")])
+        if not path:
+            return
+        try:
+            sheets = self._flmm_workbook_frames(d)
+            with pd.ExcelWriter(path, engine='openpyxl') as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, sheet_name=name, index=False)
+                try:
+                    writer.sheets['README'].column_dimensions['A'].width = 110
+                except Exception:
+                    pass        # cosmetic only
+        except Exception as e:
+            import traceback
+            self.log_message(f"FLMM workbook export failed: {e}\n{traceback.format_exc()}")
+            messagebox.showerror("Export failed", f"Could not write the workbook:\n{e}")
+            return
+        self.log_message(f"FLMM workbook saved ({', '.join(sheets)}): {path}")
+        messagebox.showinfo("Workbook saved", f"FLMM workbook written:\n{path}")
 
     # ---------------------- FLMM PDF report export ----------------------------
 
@@ -45331,6 +45873,8 @@ cat("OK\n")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export metrics:\n{str(e)}")
 
+    BOUT_LENGTH_KEY = '_bout_length_s'
+
     def _compute_bout_metrics_for(self, behavior, channel, selected_subjects,
                                   subject_to_group, window_start_sec, window_end_sec,
                                   metric_specs, max_bouts, auc_mode):
@@ -45340,13 +45884,22 @@ cat("OK\n")
         to the UI, so it can be reused to export every behavior at once.
 
         Returns (by_subject, rows, columns, total_bouts):
-          by_subject  : {subject: {metric_key: [values]}} (NaNs omitted)
+          by_subject  : {subject: {metric_key: [values]}} (NaNs omitted); also
+                        carries BOUT_LENGTH_KEY, each bout's scored length in s
           rows        : list of dict rows (one per bout) for an individual-bout sheet
           columns     : ordered column labels for those rows
           total_bouts : number of bouts processed
+
+        Each row also carries the bout's onset time and scored length.  Those
+        are read through ``_kept_indices`` because a bout dropped at the
+        recording edge (or rejected on this channel) leaves the trace list
+        shorter than onset_frames/durations; pairing by trace index would hand
+        every later bout its neighbour's length.  Length is blank for
+        start-only boutframes, which carry no end to measure.
         """
         has_group = bool(subject_to_group)
         columns = (['Group'] if has_group else []) + ['Subject', 'Behavior', 'Channel', 'Bout #']
+        columns += ['Onset (s)', 'Bout Length (s)', 'Bout Length (samples)']
         columns += [label for _, label in metric_specs]
 
         by_subject = {}
@@ -45366,7 +45919,14 @@ cat("OK\n")
             if max_bouts is not None:
                 bouts_data = bouts_data[:max_bouts]
 
+            entry = data['bouts'][behavior]
+            onsets = entry.get('onset_frames') or []
+            lengths = self._bout_lengths(onsets, entry.get('durations'),
+                                         entry.get('end_frames'))
+            entry_fs = self._entry_fs(entry)
+
             subj_store = by_subject.setdefault(subject, {key: [] for key, _ in metric_specs})
+            subj_store.setdefault(self.BOUT_LENGTH_KEY, [])
 
             for bout_idx, bout in enumerate(bouts_data):
                 if len(bout) == 0:
@@ -45384,6 +45944,21 @@ cat("OK\n")
                 row['Behavior'] = behavior
                 row['Channel'] = channel
                 row['Bout #'] = bout_idx + 1
+
+                onset_s = length_s = length_n = np.nan
+                frame_idx = self._original_bout_index(entry, channel, bout_idx, len(onsets))
+                if frame_idx is not None and entry_fs:
+                    try:
+                        onset_s = float(onsets[frame_idx]) / entry_fs
+                    except (TypeError, ValueError):
+                        pass
+                    if lengths is not None and not np.isnan(lengths[frame_idx]):
+                        length_n = lengths[frame_idx]
+                        length_s = length_n / entry_fs
+                        subj_store[self.BOUT_LENGTH_KEY].append(length_s)
+                row['Onset (s)'] = onset_s
+                row['Bout Length (s)'] = length_s
+                row['Bout Length (samples)'] = length_n
 
                 for key, label in metric_specs:
                     val = np.nan
@@ -45561,6 +46136,8 @@ cat("OK\n")
                         row['Subject']  = subject
                         row['Behavior'] = behavior
                         row['Channel']  = channel
+                        lens = by_subject[subject].get(self.BOUT_LENGTH_KEY, [])
+                        row['Mean Bout Length (s)'] = float(np.mean(lens)) if lens else np.nan
                         n = 0
                         for key, label in metric_specs:
                             vals = np.array(by_subject[subject].get(key, []), dtype=float)

@@ -40,7 +40,10 @@ Version 1.2.2.
   multiple-comparison-corrected *simultaneous* confidence bands, so you can see
   *when* an effect is significant. Reference points: signal ≠ 0, across bouts,
   between groups, and bout-order × group. (Bout Analysis tab → **Plot ▾ →
-  Time-Course Statistics (FLMM-style)**.)
+  Time-Course Statistics (FLMM-style)**.) Bout-order models plot the observed
+  traces by bout number and report each group's own slope beside the tested
+  term; **Export ▾ → Time-Course Stats — workbook** saves every term, the
+  per-bout input matrix, and observed vs model-predicted traces per bout number.
 - **Coherence / connectivity** — spectral coherence between channels (Morlet
   wavelet or Welch): static, sliding, bout-epoch, and group comparisons.
 - **Spike analysis** — MAD-based detection of calcium transients with rate,
