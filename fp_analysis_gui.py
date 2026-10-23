@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.25.0"
+APP_VERSION = "1.26.0"
 APP_VERSION_DATE = "October 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -15434,6 +15434,22 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Detection Settings show only the chosen method's options. MAD keeps
+    threshold, prominence and per-subject/whole-dataset MAD; Mirror-FDR shows
+    its FDR target, baseline window and burst-aware switch. Width and interval
+    filters apply to both.
+  • New — The Mirror-FDR baseline window is adjustable (default 20 s). Make it
+    several times longer than the slowest transient.
+  • New — Burst-aware scoring, on by default, counts an event that starts while
+    the previous one is still decaying. On test recordings it finds 84% of
+    slow-decay events instead of 72%. Live channels typically report ~25% more
+    events than with 1.25.0; turn it off for strict single-event counts.
+  • Change — The default Mirror-FDR target is now 10% (was 5%). It finds more
+    small events and GRAB-NE startle responses (31% of trials, was 19%); dead fibres
+    still read ~0.3 events/min. Projects that saved 5% keep it.
+
+Version 1.25.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Spike Analysis offers Mirror-FDR detection beside the MAD threshold.
     Downward excursions serve as the noise null: each recording's threshold is
