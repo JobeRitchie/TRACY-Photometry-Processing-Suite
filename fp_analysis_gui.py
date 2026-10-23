@@ -675,6 +675,7 @@ PARAM_GROUPS = [
             ('spike_method', "Detection method", "mad or mirror_fdr"),
             ('spike_fdr_q', "Mirror-FDR target", "0.10 = at most 10% noise-like detections"),
             ('spike_baseline_window_s', "Mirror-FDR baseline window (s)", "20 s is the validated default"),
+            ('spike_smoothing_ms', "Mirror-FDR smoothing (ms)", "Gaussian SD before scoring; 0 = none"),
             ('spike_burst_aware', "Mirror-FDR burst-aware scoring", "True counts events starting on a previous event's decay"),
         ]),
     ]),
@@ -2198,6 +2199,7 @@ class FPAnalysisGUI:
             'spike_method': 'mad',       # 'mad' (global median + k*MAD) or 'mirror_fdr'
             'spike_fdr_q': 0.10,         # Mirror-FDR target; 0.10 chosen by the Oct 2026 sweep
             'spike_baseline_window_s': 20.0,  # Mirror-FDR running-median baseline window (s)
+            'spike_smoothing_ms': 70.0,  # Mirror-FDR Gaussian smoothing SD (ms); 0 = none
             'spike_burst_aware': True,   # Mirror-FDR: score by rise from the preceding trough (Oct 2026 sweep)
             # Open arm entry detection parameters (EPM)
             'min_open_arm_duration': 2.0,  # Minimum time in seconds in open arm to count as valid entry
@@ -13163,6 +13165,11 @@ class FPAnalysisGUI:
                "Running median the baseline and noise are measured from. Make it "
                "several times longer than your slowest transient; 20 s is the "
                "validated default.")
+        self.spike_smoothing_var = tk.StringVar(
+            value=str(self.params.get('spike_smoothing_ms', 70.0)))
+        _param(fdr, "Smoothing (ms):", self.spike_smoothing_var,
+               "Gaussian SD applied before scoring, on top of any processing "
+               "low-pass. Lower keeps sharper peaks; 0 turns it off.")
         self.spike_burst_aware_var = tk.BooleanVar(
             value=bool(self.params.get('spike_burst_aware', True)))
         ttk.Checkbutton(fdr, text="Burst-aware (separate overlapping events)",
@@ -13341,10 +13348,13 @@ class FPAnalysisGUI:
                 'spike_fdr_q': float(self.spike_fdr_q_var.get()),
                 'spike_baseline_window_s': float(self.spike_baseline_window_var.get()),
                 'spike_burst_aware': bool(self.spike_burst_aware_var.get()),
+                'spike_smoothing_ms': float(self.spike_smoothing_var.get()),
                 'spike_method': self.spike_method_var.get(),
             }
             if not 0 < new['spike_fdr_q'] < 1:
                 raise ValueError("Mirror-FDR target must be between 0 and 1")
+            if not 0 <= new['spike_smoothing_ms'] <= 500:
+                raise ValueError("Smoothing must be between 0 and 500 ms")
             if new['spike_baseline_window_s'] < 2:
                 raise ValueError("Baseline window must be at least 2 s")
         except ValueError as e:
@@ -13522,8 +13532,22 @@ class FPAnalysisGUI:
         t = time_s / scale
 
         mean_width, _, _ = self.get_trace_styling()
-        ax.plot(t[in_win], signal[in_win], color='#2e86c1', linewidth=min(mean_width, 1.0),
-                alpha=0.9, label='Signal')
+        # Mirror-FDR scores a lightly smoothed copy of the signal; drawing the
+        # raw trace as the main line made peaks whose single-frame tips cross
+        # the threshold look missed. Show the scored trace, raw faint behind.
+        scored = result.get('smoothed')
+        if (result.get('method') == 'mirror_fdr' and scored is not None
+                and len(scored) == len(signal)):
+            ax.plot(t[in_win], signal[in_win], color='#2e86c1',
+                    linewidth=min(mean_width, 0.8), alpha=0.25, label='Raw signal')
+            shown = np.asarray(scored, float)
+            ax.plot(t[in_win], shown[in_win], color='#1b4f72',
+                    linewidth=min(mean_width, 1.0), alpha=0.95,
+                    label='Smoothed (scored by detector)')
+        else:
+            shown = signal
+            ax.plot(t[in_win], signal[in_win], color='#2e86c1',
+                    linewidth=min(mean_width, 1.0), alpha=0.9, label='Signal')
 
         thr = result.get('threshold_value', np.nan)
         mad = result.get('mad', np.nan)
@@ -13563,7 +13587,7 @@ class FPAnalysisGUI:
         if len(idx_win):
             label = (f'Transients ({len(idx_win)} shown of {total}, {rate:.2f}/min)'
                      if len(idx_win) != total else f'Transients (n={total}, {rate:.2f}/min)')
-            ax.scatter(t[idx_win], signal[idx_win], color='red', s=40, marker='v',
+            ax.scatter(t[idx_win], shown[idx_win], color='red', s=40, marker='v',
                        edgecolors='darkred', linewidth=0.7, zorder=5, label=label)
         else:
             ax.text(0.99, 0.97, 'No transients in view' if total else 'No transients detected',
@@ -20415,12 +20439,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             x = x.copy()
             x[~ok] = np.interp(np.flatnonzero(~ok), np.flatnonzero(ok), x[ok])
 
-        s = gaussian_filter1d(x, max(0.5, 0.07 * fps))
+        # Light Gaussian smoothing before scoring; it stacks on any processing
+        # low-pass, so it is adjustable and 0 turns it off.
+        sm = float(self.params.get('spike_smoothing_ms', 70.0)) / 1000.0
+        s = gaussian_filter1d(x, sm * fps) if sm * fps >= 0.25 else x.copy()
         win_s = float(self.params.get('spike_baseline_window_s', 20.0))
         baseline = self._mirror_fdr_baseline(s, fps, win_s)
         h = s - baseline
         sd = self._negative_half_sd(h)
-        empty.update(noise_sd=sd, baseline=baseline)
+        empty.update(noise_sd=sd, baseline=baseline, smoothed=s)
 
         burst_aware = bool(self.params.get('spike_burst_aware', True))
 
@@ -20485,6 +20512,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'fdr': fdr,
             'noise_sd': sd,
             'baseline': baseline,
+            'smoothed': s,
             'method': 'mirror_fdr',
         }
 

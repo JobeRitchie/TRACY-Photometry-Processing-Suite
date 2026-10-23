@@ -135,3 +135,11 @@ def test_burst_aware_does_not_split_single_slow_events(seed):
     x, peaks = _decay_events([(t, 8.0) for t in np.arange(10, 590, 10.0)], td=4.0, seed=seed)
     app = _app(); app.params['spike_burst_aware'] = True
     assert len(app.detect_spikes(x, FS)['spike_indices']) <= 1.1 * len(peaks)
+
+
+def test_smoothing_is_adjustable_and_zero_turns_it_off():
+    x = _noise(seed=6)
+    off = _app(); off.params['spike_smoothing_ms'] = 0
+    on = _app(); on.params['spike_smoothing_ms'] = 70
+    assert np.allclose(off.detect_spikes(x, FS)['smoothed'], x)
+    assert np.std(on.detect_spikes(x, FS)['smoothed']) < 0.5 * np.std(x)
