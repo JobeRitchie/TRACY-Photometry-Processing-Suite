@@ -673,7 +673,9 @@ PARAM_GROUPS = [
             ('spike_max_width', "Max width (frames)", ""),
             ('spike_min_interval', "Min interval between events (frames)", ""),
             ('spike_method', "Detection method", "mad or mirror_fdr"),
-            ('spike_fdr_q', "Mirror-FDR target", "0.05 = at most 5% noise-like detections"),
+            ('spike_fdr_q', "Mirror-FDR target", "0.10 = at most 10% noise-like detections"),
+            ('spike_baseline_window_s', "Mirror-FDR baseline window (s)", "20 s is the validated default"),
+            ('spike_burst_aware', "Mirror-FDR burst-aware scoring", "True counts events starting on a previous event's decay"),
         ]),
     ]),
 
@@ -2194,7 +2196,9 @@ class FPAnalysisGUI:
             'spike_min_prominence': 0.5, # Minimum prominence in MADs above surrounding baseline
             'spike_min_interval': 10,    # Minimum frames between events (~333ms at 30fps)
             'spike_method': 'mad',       # 'mad' (global median + k*MAD) or 'mirror_fdr'
-            'spike_fdr_q': 0.05,         # Mirror-FDR target: max negative/positive event ratio
+            'spike_fdr_q': 0.10,         # Mirror-FDR target; 0.10 chosen by the Oct 2026 sweep
+            'spike_baseline_window_s': 20.0,  # Mirror-FDR running-median baseline window (s)
+            'spike_burst_aware': True,   # Mirror-FDR: score by rise from the preceding trough (Oct 2026 sweep)
             # Open arm entry detection parameters (EPM)
             'min_open_arm_duration': 2.0,  # Minimum time in seconds in open arm to count as valid entry
             'min_time_between_entries': 3.0,  # Minimum time in seconds between entries to avoid repeats
@@ -13106,48 +13110,38 @@ class FPAnalysisGUI:
         method_frame = ttk.Frame(settings)
         method_frame.pack(fill='x')
         ttk.Radiobutton(method_frame, text="MAD threshold", variable=self.spike_method_var,
-                        value="mad").pack(side='left')
+                        value="mad", command=self._update_spike_method_panels).pack(side='left')
         ttk.Radiobutton(method_frame, text="Mirror-FDR", variable=self.spike_method_var,
-                        value="mirror_fdr").pack(side='left', padx=(self.ui_px(6), 0))
-        ttk.Label(settings,
-                  text="Mirror-FDR sets each recording's threshold where downward "
-                       "excursions (the noise null) are at most the target share of "
-                       "upward ones. Threshold and prominence (MAD) are not used.",
-                  foreground='gray', font=('Segoe UI', 7), justify='left',
-                  wraplength=self.ui_px(240)).pack(anchor='w')
+                        value="mirror_fdr", command=self._update_spike_method_panels).pack(
+            side='left', padx=(self.ui_px(6), 0))
 
-        def _param(label, var, hint):
-            row = ttk.Frame(settings)
+        def _hint(parent, text, **kw):
+            ttk.Label(parent, text=text, foreground='gray', font=('Segoe UI', 7),
+                      justify='left', wraplength=self.ui_px(240), **kw).pack(anchor='w')
+
+        def _param(parent, label, var, hint):
+            row = ttk.Frame(parent)
             row.pack(fill='x', pady=(self.ui_px(2), 0))
             ttk.Label(row, text=label).pack(side='left')
             ttk.Entry(row, textvariable=var, width=8).pack(side='right')
-            ttk.Label(settings, text=hint, foreground='gray',
-                      font=('Segoe UI', 7), justify='left',
-                      wraplength=self.ui_px(240)).pack(anchor='w')
+            _hint(parent, hint)
 
+        # Each method's own settings live in a panel; only the selected one is
+        # shown, so nobody tunes a value the chosen detector ignores. Both sit
+        # in one holder so swapping them keeps their place in the column.
+        panel_holder = ttk.Frame(settings)
+        panel_holder.pack(fill='x')
+
+        mad = self.spike_mad_panel = ttk.Frame(panel_holder)
+        _hint(mad, "One threshold for the whole session: median + k x MAD.")
         self.spike_threshold_var = tk.StringVar(value=str(self.params['spike_threshold_mad']))
-        _param("Threshold (MAD):", self.spike_threshold_var,
+        _param(mad, "Threshold (MAD):", self.spike_threshold_var,
                "MADs above median  (lit: 2.0–3.0)")
-        self.spike_min_width_var = tk.StringVar(value=str(self.params['spike_min_width']))
-        _param("Min width (frames):", self.spike_min_width_var, "(~67ms @ 30fps)")
-        self.spike_max_width_var = tk.StringVar(value=str(self.params['spike_max_width']))
-        _param("Max width (frames):", self.spike_max_width_var,
-               "(~3s @ 30fps, covers GCaMP6s decays)")
         self.spike_prominence_var = tk.StringVar(value=str(self.params['spike_min_prominence']))
-        _param("Min prominence (MAD):", self.spike_prominence_var, "(typical: 0.3–1.0)")
-        self.spike_min_interval_var = tk.StringVar(value=str(self.params['spike_min_interval']))
-        _param("Min interval (frames):", self.spike_min_interval_var, "(~333ms @ 30fps)")
-        self.spike_fdr_q_var = tk.StringVar(value=str(self.params.get('spike_fdr_q', 0.05)))
-        _param("Mirror-FDR target:", self.spike_fdr_q_var,
-               "Max share of detections that match noise (0.05 = 5%)")
-        tk.Label(settings, text="Source: " + self.SPIKE_MIRROR_FDR_SOURCE,
-                 font=('Segoe UI', 7, 'italic'), fg='#555555', justify='left',
-                 wraplength=self.ui_px(240)).pack(anchor='w', pady=(self.ui_px(4), 0))
-
-        ttk.Label(settings, text="MAD calculation:").pack(
-            anchor='w', pady=(self.ui_px(4), 0))
+        _param(mad, "Min prominence (MAD):", self.spike_prominence_var, "(typical: 0.3–1.0)")
+        ttk.Label(mad, text="MAD calculation:").pack(anchor='w', pady=(self.ui_px(4), 0))
         self.spike_mad_mode_var = tk.StringVar(value="per_subject")
-        mad_mode_frame = ttk.Frame(settings)
+        mad_mode_frame = ttk.Frame(mad)
         mad_mode_frame.pack(fill='x')
         ttk.Radiobutton(mad_mode_frame, text="Per subject",
                         variable=self.spike_mad_mode_var, value="per_subject").pack(
@@ -13155,6 +13149,42 @@ class FPAnalysisGUI:
         ttk.Radiobutton(mad_mode_frame, text="Whole dataset",
                         variable=self.spike_mad_mode_var, value="whole_dataset").pack(
             side='left', padx=(self.ui_px(6), 0))
+
+        fdr = self.spike_mirror_panel = ttk.Frame(panel_holder)
+        _hint(fdr, "Each recording's threshold is set where downward excursions "
+                   "(the noise null) are at most the target share of upward ones.")
+        self.spike_fdr_q_var = tk.StringVar(value=str(self.params.get('spike_fdr_q', 0.10)))
+        _param(fdr, "FDR target:", self.spike_fdr_q_var,
+               "Max share of detections that match noise. 0.10 recovers more small or "
+               "overlapping events; 0.05 is stricter.")
+        self.spike_baseline_window_var = tk.StringVar(
+            value=str(self.params.get('spike_baseline_window_s', 20.0)))
+        _param(fdr, "Baseline window (s):", self.spike_baseline_window_var,
+               "Running median the baseline and noise are measured from. Make it "
+               "several times longer than your slowest transient; 20 s is the "
+               "validated default.")
+        self.spike_burst_aware_var = tk.BooleanVar(
+            value=bool(self.params.get('spike_burst_aware', True)))
+        ttk.Checkbutton(fdr, text="Burst-aware (separate overlapping events)",
+                        variable=self.spike_burst_aware_var).pack(
+            anchor='w', pady=(self.ui_px(4), 0))
+        _hint(fdr, "Scores each peak by its rise from the trough before it, so an "
+                   "event that starts while the previous one is still decaying "
+                   "is counted.")
+        ttk.Label(fdr, text=self.SPIKE_MIRROR_FDR_SHORT_SOURCE,
+                  font=('Segoe UI', 7, 'italic'), foreground='#555555', justify='left',
+                  wraplength=self.ui_px(240)).pack(anchor='w', pady=(self.ui_px(4), 0))
+
+        # Event-shape filters apply to both methods.
+        self.spike_min_width_var = tk.StringVar(value=str(self.params['spike_min_width']))
+        _param(settings, "Min width (frames):", self.spike_min_width_var, "(~67ms @ 30fps)")
+        self.spike_max_width_var = tk.StringVar(value=str(self.params['spike_max_width']))
+        _param(settings, "Max width (frames):", self.spike_max_width_var,
+               "(~3s @ 30fps, covers GCaMP6s decays)")
+        self.spike_min_interval_var = tk.StringVar(value=str(self.params['spike_min_interval']))
+        _param(settings, "Min interval (frames):", self.spike_min_interval_var,
+               "(~333ms @ 30fps)")
+        self._update_spike_method_panels()
 
         ttk.Button(settings, text="Apply Parameters",
                    command=self.update_spike_parameters).pack(
@@ -13289,6 +13319,14 @@ class FPAnalysisGUI:
         # Initial population
         self.update_spike_selection_mode()
 
+    def _update_spike_method_panels(self):
+        """Show the settings panel of the selected detection method only."""
+        mirror = self.spike_method_var.get() == 'mirror_fdr'
+        show, hide = ((self.spike_mirror_panel, self.spike_mad_panel) if mirror
+                      else (self.spike_mad_panel, self.spike_mirror_panel))
+        hide.pack_forget()
+        show.pack(fill='x')
+
     def update_spike_parameters(self, quiet=False):
         """Update spike detection parameters from UI.  Returns False when an
         entry is not a number, so callers can stop instead of running on the
@@ -13301,10 +13339,14 @@ class FPAnalysisGUI:
                 'spike_min_prominence': float(self.spike_prominence_var.get()),
                 'spike_min_interval': int(self.spike_min_interval_var.get()),
                 'spike_fdr_q': float(self.spike_fdr_q_var.get()),
+                'spike_baseline_window_s': float(self.spike_baseline_window_var.get()),
+                'spike_burst_aware': bool(self.spike_burst_aware_var.get()),
                 'spike_method': self.spike_method_var.get(),
             }
             if not 0 < new['spike_fdr_q'] < 1:
                 raise ValueError("Mirror-FDR target must be between 0 and 1")
+            if new['spike_baseline_window_s'] < 2:
+                raise ValueError("Baseline window must be at least 2 s")
         except ValueError as e:
             messagebox.showerror("Invalid Input", f"Please enter valid numeric values:\n{str(e)}")
             return False
@@ -13493,7 +13535,7 @@ class FPAnalysisGUI:
             # The mirror-FDR threshold sits a fixed height above a local
             # baseline, so it is a curve, not a horizontal line.
             ax.plot(t[in_win], baseline[in_win], color='gray', linestyle=':',
-                    linewidth=0.9, label='Local baseline (20 s)')
+                    linewidth=0.9, label=f"Local baseline ({self.params.get('spike_baseline_window_s', 20.0):g} s)")
             if not np.isnan(thr):
                 fdr = result.get('fdr', np.nan)
                 sd = result.get('noise_sd', np.nan)
@@ -20270,8 +20312,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         "(2007, Neuron 56:43-57), who counted negative-going transients as an "
         "estimate of false positives and chose the cutoff that kept that ratio "
         "under 5%. TRACY's version applies the ratio per recording, to peaks "
-        "above a local (20 s) baseline, with noise estimated from the half of "
+        "above a local running-median baseline (20 s by default), with noise estimated from the half of "
         "the trace below that baseline.")
+
+    # One-line version for the Spike Analysis settings column.
+    SPIKE_MIRROR_FDR_SHORT_SOURCE = (
+        "Source: adapted from Dombeck et al. (2007), Neuron 56:43-57, who used "
+        "negative-going transients to estimate false positives. TRACY applies "
+        "it per recording, above a local baseline.")
 
     @staticmethod
     def _mirror_fdr_baseline(x, fps, win_s=20.0):
@@ -20330,7 +20378,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         from scipy.signal import find_peaks, peak_widths
         from scipy.ndimage import gaussian_filter1d
 
-        q = float(self.params.get('spike_fdr_q', 0.05))
+        q = float(self.params.get('spike_fdr_q', 0.10))
         min_width = self.params.get('spike_min_width', 2)
         max_width = self.params.get('spike_max_width', 90)
         min_interval = self.params.get('spike_min_interval', 10)
@@ -20352,18 +20400,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             x[~ok] = np.interp(np.flatnonzero(~ok), np.flatnonzero(ok), x[ok])
 
         s = gaussian_filter1d(x, max(0.5, 0.07 * fps))
-        baseline = self._mirror_fdr_baseline(s, fps)
+        win_s = float(self.params.get('spike_baseline_window_s', 20.0))
+        baseline = self._mirror_fdr_baseline(s, fps, win_s)
         h = s - baseline
         sd = self._negative_half_sd(h)
         empty.update(noise_sd=sd, baseline=baseline)
 
+        burst_aware = bool(self.params.get('spike_burst_aware', True))
+
         def candidates(y):
-            # Score = the lesser of height above baseline and prominence, so a
-            # noise bump riding on a large event's decay (high, but barely
-            # above its own trough) is not counted as a second event. The
-            # same rule scores the downward null.
-            pk, props = find_peaks(y, prominence=sd, distance=max(1, int(min_interval)))
-            return pk, np.minimum(y[pk], props['prominences'])
+            # Score = the lesser of height above baseline and how far the peak
+            # rose, so a noise bump riding on a large event's decay (high, but
+            # barely above its own trough) is not counted as a second event.
+            # Prominence measures the rise against the higher of the two
+            # flanking troughs, which cuts short an event whose successor
+            # starts before it has decayed; burst-aware scoring measures the
+            # rise from the trough before the peak only. The same rule scores
+            # the downward null.
+            dist = max(1, int(min_interval))
+            if not burst_aware:
+                pk, props = find_peaks(y, prominence=sd, distance=dist)
+                return pk, np.minimum(y[pk], props['prominences'])
+            # The 1-SD candidate filter must use the left rise too, or the
+            # peaks this mode exists for are dropped before they are scored.
+            pk, props = find_peaks(y, prominence=0, distance=dist)
+            rise = y[pk] - y[props['left_bases']]
+            keep = rise >= sd
+            return pk[keep], np.minimum(y[pk], rise)[keep]
 
         pos_idx, pos = candidates(h)
         _, neg = candidates(-h)

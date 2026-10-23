@@ -89,3 +89,49 @@ def test_mad_method_unchanged_by_default():
 
 def test_source_is_cited():
     assert 'Dombeck' in G.FPAnalysisGUI.SPIKE_MIRROR_FDR_SOURCE
+
+
+def test_baseline_window_is_adjustable():
+    x, _ = _inject(_noise(seed=5), np.arange(10, 590, 6.0), amp=6.0)
+    x += 4.0 * np.sin(np.arange(len(x)) / FS * 2 * np.pi / 60)   # 60 s drift
+    short = _app(); short.params['spike_baseline_window_s'] = 5.0
+    long_ = _app(); long_.params['spike_baseline_window_s'] = 120.0
+    b_short = short.detect_spikes(x, FS)['baseline']
+    b_long = long_.detect_spikes(x, FS)['baseline']
+    # a short window follows the drift, a long one cannot
+    assert np.std(b_short) > 2 * np.std(b_long)
+
+
+def _decay_events(times_amps, td, seed):
+    x = _noise(seed=seed)
+    t = np.arange(0, 6 * td, 1 / FS)
+    k = np.exp(-t / td) - np.exp(-t / 0.1); k /= k.max()
+    peaks = []
+    for t0, a in times_amps:
+        i = int(t0 * FS); seg = k[:len(x) - i]; x[i:i + len(seg)] += a * seg
+        peaks.append(i + int(np.argmax(k)))
+    return x, np.array(peaks)
+
+
+@pytest.mark.parametrize('seed', [0, 1])
+def test_burst_aware_counts_event_cut_short_by_its_successor(seed):
+    # a 6-SD event followed 0.6 s later by a 10-SD one, while it is still decaying
+    starts = np.arange(10, 590, 30.0)
+    pairs = [(t, 6.0) for t in starts] + [(t + 0.6, 10.0) for t in starts]
+    x, peaks = _decay_events(pairs, td=2.0, seed=seed)
+    first = peaks[:len(peaks) // 2]
+    app = _app(); app.params['spike_burst_aware'] = True
+    old = _app(); old.params['spike_burst_aware'] = False
+
+    def found(a):
+        d = np.asarray(a.detect_spikes(x, FS)['spike_indices'])
+        return np.mean([np.any(np.abs(d - p) <= int(0.3 * FS)) for p in first])
+    assert found(app) >= 0.7
+    assert found(app) > found(old) + 0.15
+
+
+@pytest.mark.parametrize('seed', [0, 1])
+def test_burst_aware_does_not_split_single_slow_events(seed):
+    x, peaks = _decay_events([(t, 8.0) for t in np.arange(10, 590, 10.0)], td=4.0, seed=seed)
+    app = _app(); app.params['spike_burst_aware'] = True
+    assert len(app.detect_spikes(x, FS)['spike_indices']) <= 1.1 * len(peaks)
