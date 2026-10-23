@@ -228,6 +228,7 @@ def _zone_app(exclusions, use_exclusions, channel_names=('G0', 'G1')):
         'beh_synced': beh,
         'has_position': True,
         'zscore_470': zscore,
+        'zscore_570': zscore,    # red designations read the 570 matrix
         'channel_names': list(channel_names) if channel_names else None,
     }
     app.processed_data = {'S1': data}
@@ -236,10 +237,13 @@ def _zone_app(exclusions, use_exclusions, channel_names=('G0', 'G1')):
     app.zones = {'centre': {'category': 'centre'}}
     app.classify_zone = lambda x, y: 'centre'
     app.get_fps = lambda *a, **k: 30.0
+    app.log_message = lambda *a, **k: None
+    app.spike_data = {}
     app.get_channel_name = lambda d, i: (
         d['channel_names'][i] if d.get('channel_names') else f'Ch{i}')
     app.detect_spikes = lambda sig, fps, global_mad=None: {
-        'total_spikes': 2, 'spike_indices': [5, 25]}
+        'total_spikes': 2, 'spike_indices': [5, 25],
+        'spike_amplitudes': [2.0, 3.0], 'spike_widths': [4.0, 6.0]}
     return app
 
 
@@ -261,10 +265,20 @@ def test_zone_explicit_use_exclusions_overrides_the_toggle():
 
 
 def test_zone_red_designation_is_excluded_by_its_real_name():
-    """Results stay keyed by slot (G0/G1) -- the filter asks by designation."""
+    """Results are keyed by designation, like the results table they break down."""
     app = _zone_app(exclusions=['R5'], use_exclusions=True,
                     channel_names=('R4', 'R5'))
-    assert set(app.analyze_spikes_by_zone('S1')) == {'G0'}
+    assert set(app.analyze_spikes_by_zone('S1')) == {'R4'}
+
+
+def test_zone_metrics_add_up_to_the_detections():
+    app = _zone_app(exclusions=[], use_exclusions=False)
+    centre = app.analyze_spikes_by_zone('S1')['G0']['centre']
+    assert centre['spike_count'] == 2
+    assert centre['duration_sec'] == pytest.approx(2.0)          # 60 rows @ 30 Hz
+    assert centre['spike_rate_per_min'] == pytest.approx(60.0)
+    assert centre['mean_amplitude'] == pytest.approx(2.5)
+    assert centre['mean_width_ms'] == pytest.approx(5.0 / 30 * 1000)
 
 
 def test_zone_all_channels_excluded_returns_nothing():

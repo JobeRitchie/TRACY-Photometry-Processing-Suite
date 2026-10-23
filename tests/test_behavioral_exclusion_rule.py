@@ -173,6 +173,35 @@ def test_export_matches_the_table(tmp_path, monkeypatch):
     assert sorted(df['Subject']) == table_subjects == ['S1', 'S2']
 
 
+def _export_message(app, path, monkeypatch):
+    shown = []
+    monkeypatch.setattr(G.filedialog, 'asksaveasfilename', lambda **k: str(path))
+    monkeypatch.setattr(G.messagebox, 'showinfo', lambda title, msg: shown.append(msg))
+    app.use_time_bins = _Var(False)
+    app._create_export_metadata = lambda kind: {}
+    app._add_metadata_comment_to_csv = lambda fn, md: None
+    app.export_behavioral_metrics()
+    return shown[0]
+
+
+def test_export_message_counts_subjects_dropped_at_calculation(tmp_path, monkeypatch):
+    """Calculate drops excluded subjects before they reach behavioral_results,
+    so the export's own filter removes nothing; the message said 0 excluded."""
+    app = _app({'S2': ['Behavior']},
+               results=[{'Subject': 'S1', 'Open_Arms': 1.0},
+                        {'Subject': 'S3', 'Open_Arms': 3.0}])
+    app.behavioral_excluded_subjects = ['S2']
+    msg = _export_message(app, tmp_path / 'beh.csv', monkeypatch)
+    assert 'Exclusions applied: 1 subject(s) excluded (S2)' in msg
+
+
+def test_export_message_counts_subjects_excluded_after_calculation(tmp_path, monkeypatch):
+    app = _app({'S2': ['Behavior']})
+    app.behavioral_excluded_subjects = []
+    msg = _export_message(app, tmp_path / 'beh.csv', monkeypatch)
+    assert 'Exclusions applied: 1 subject(s) excluded (S2)' in msg
+
+
 def test_table_export_and_plot_agree_on_n():
     """One subject with an unrelated photometry exclusion, one behavioral."""
     app = _app({'S2': ['G1'], 'S3': ['Behavior']})

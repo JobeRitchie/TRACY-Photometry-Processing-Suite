@@ -166,6 +166,27 @@ def test_epm_complex_cascades_to_distal_zones():
     assert editor.zones['open_distal_up']['y_max'] == pytest.approx(76.0)
 
 
+def test_epm_complex_centre_move_carries_distal_arms():
+    """Distal arms touch only the proximal arms, never the centre; the shared
+    boundary has to be followed through the proximal zone to reach them."""
+    editor = _arm_drag(_editor('EPM_Complex'), 'center', 'move')
+    editor._apply_zone_move(0.0, 3.0)
+    for arm in ('closed_proximal_left', 'closed_distal_left',
+                'closed_proximal_right', 'closed_distal_right'):
+        assert editor.zones[arm]['y_min'] == pytest.approx(33.0), arm
+        assert editor.zones[arm]['y_max'] == pytest.approx(49.0), arm
+
+    editor = _arm_drag(_editor('EPM_Complex'), 'center', 'move')
+    editor._apply_zone_move(4.0, 0.0)
+    for arm in ('open_proximal_up', 'open_distal_up',
+                'open_proximal_down', 'open_distal_down'):
+        assert editor.zones[arm]['x_min'] == pytest.approx(34.0), arm
+        assert editor.zones[arm]['x_max'] == pytest.approx(50.0), arm
+    # The outer ends of the arms stay at the arena wall.
+    assert editor.zones['open_distal_up']['y_max'] == pytest.approx(76.0)
+    assert editor.zones['closed_distal_left']['x_min'] == pytest.approx(0.0)
+
+
 # -- clamping -----------------------------------------------------------
 
 

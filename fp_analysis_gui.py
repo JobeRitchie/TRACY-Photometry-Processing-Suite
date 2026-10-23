@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.23.0"
-APP_VERSION_DATE = "October 20, 2026"
+APP_VERSION = "1.24.0"
+APP_VERSION_DATE = "October 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -1307,6 +1307,24 @@ class ZoneEditor:
 
     def _sticky_partners(self, zone_name, edge_key):
         """Edges of other zones sitting on this zone's edge_key boundary.
+
+        The boundary is followed through each partner in turn, so a chain of
+        zones along one line moves as a unit: the EPM_Complex centre's y edges
+        reach the distal closed arms through the proximal ones, which are the
+        only zones the centre itself touches."""
+        found = []
+        seen = {(zone_name, edge_key)}
+        frontier = [(zone_name, edge_key)]
+        while frontier:
+            for partner in self._direct_sticky_partners(*frontier.pop()):
+                if partner not in seen:
+                    seen.add(partner)
+                    found.append(partner)
+                    frontier.append(partner)
+        return found
+
+    def _direct_sticky_partners(self, zone_name, edge_key):
+        """Edges of other zones on this boundary that adjoin this zone.
 
         A neighbour only counts if it also adjoins this zone along the other
         axis (overlapping it or touching it), so a zone that happens to line up
@@ -13020,9 +13038,11 @@ class FPAnalysisGUI:
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Spike Analysis")
 
-        # Spike graphs open in their own windows (Visualize Spike Data / Analyze
-        # Spikes by Zone), matching how the other analysis tabs plot, so the
-        # Output zone holds the results table rather than a figure.
+        # Summary graphs open in their own windows (Visualize Spike Data /
+        # Analyze Spikes by Zone). The Output zone holds the representative
+        # trace -- signal, threshold and detected transients -- above the
+        # results table, because judging the threshold against a real trace is
+        # the only way to know the detection settings are sound.
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
             settings_title="Detection Settings")
@@ -13150,9 +13170,60 @@ class FPAnalysisGUI:
                 ("Visualize Spike Data", self.visualize_spike_data),
                 ("Analyze Spikes by Zone", self.visualize_spikes_by_zone),
                 ("Spikes by Bout Phase", self.analyze_spikes_by_bout_phase),
-                ("Export Results", self.export_spike_results)):
+                ("Export Results", self.export_spike_results),
+                ("Export for Prism (CSV)", self.export_spike_prism)):
             ttk.Button(actions, text=text, command=command).pack(
                 fill='x', pady=(0, self.ui_px(4)))
+
+        # ── Output: representative trace ─────────────────────────────────────
+        trace_frame = ttk.LabelFrame(output, text="Representative Trace", padding=5)
+        trace_frame.pack(fill='x', pady=(0, self.ui_px(6)))
+
+        trace_ctrl = ttk.Frame(trace_frame)
+        trace_ctrl.pack(fill='x')
+        ttk.Label(trace_ctrl, text="Subject:").pack(side='left')
+        self.spike_trace_subject_var = tk.StringVar()
+        self.spike_trace_subject_combo = ttk.Combobox(
+            trace_ctrl, textvariable=self.spike_trace_subject_var,
+            state='readonly', width=18)
+        self.spike_trace_subject_combo.pack(side='left', padx=(self.ui_px(3), 0))
+        self.spike_trace_subject_combo.bind(
+            '<<ComboboxSelected>>', self._on_spike_trace_subject_changed)
+        ttk.Label(trace_ctrl, text="Channel:").pack(side='left', padx=(self.ui_px(8), 0))
+        self.spike_trace_channel_var = tk.StringVar()
+        self.spike_trace_channel_combo = ttk.Combobox(
+            trace_ctrl, textvariable=self.spike_trace_channel_var,
+            state='readonly', width=6)
+        self.spike_trace_channel_combo.pack(side='left', padx=(self.ui_px(3), 0))
+        ttk.Label(trace_ctrl, text="Start (s):").pack(side='left', padx=(self.ui_px(8), 0))
+        self.spike_trace_start_var = tk.StringVar(value="0")
+        ttk.Entry(trace_ctrl, textvariable=self.spike_trace_start_var,
+                  width=7).pack(side='left', padx=(self.ui_px(3), 0))
+        ttk.Label(trace_ctrl, text="Length (s):").pack(side='left', padx=(self.ui_px(8), 0))
+        # Blank means the whole session.
+        self.spike_trace_length_var = tk.StringVar(value="")
+        ttk.Entry(trace_ctrl, textvariable=self.spike_trace_length_var,
+                  width=7).pack(side='left', padx=(self.ui_px(3), 0))
+
+        trace_btns = ttk.Frame(trace_frame)
+        trace_btns.pack(fill='x', pady=(self.ui_px(4), 0))
+        ttk.Button(trace_btns, text="Plot Trace", style='Compact.TButton',
+                   command=self.plot_spike_trace).pack(side='left')
+        ttk.Button(trace_btns, text="Export Trace for Prism (CSV)",
+                   style='Compact.TButton',
+                   command=self.export_spike_trace_prism).pack(
+            side='left', padx=(self.ui_px(6), 0))
+        ttk.Label(trace_btns, text="Uses the parameters as entered; blank length = whole session",
+                  foreground='gray', font=('Segoe UI', 8)).pack(
+            side='left', padx=(self.ui_px(8), 0))
+
+        self.spike_trace_plot_host = ttk.Frame(trace_frame)
+        self.spike_trace_plot_host.pack(fill='x', pady=(self.ui_px(4), 0))
+        ttk.Label(self.spike_trace_plot_host,
+                  text="Pick a subject and channel, then Plot Trace "
+                       "(drawn automatically after Run Spike Analysis).",
+                  foreground='gray', font=('Segoe UI', 9, 'italic')).pack(
+            pady=self.ui_px(10))
 
         # ── Output: results table ────────────────────────────────────────────
         results_frame = ttk.LabelFrame(output, text="Spike Analysis Results", padding=5)
@@ -13193,17 +13264,26 @@ class FPAnalysisGUI:
         # Initial population
         self.update_spike_selection_mode()
 
-    def update_spike_parameters(self):
-        """Update spike detection parameters from UI"""
+    def update_spike_parameters(self, quiet=False):
+        """Update spike detection parameters from UI.  Returns False when an
+        entry is not a number, so callers can stop instead of running on the
+        previous values."""
         try:
-            self.params['spike_threshold_mad'] = float(self.spike_threshold_var.get())
-            self.params['spike_min_width'] = int(self.spike_min_width_var.get())
-            self.params['spike_max_width'] = int(self.spike_max_width_var.get())
-            self.params['spike_min_prominence'] = float(self.spike_prominence_var.get())
-            self.params['spike_min_interval'] = int(self.spike_min_interval_var.get())
-            self.log_message("Transient detection parameters updated")
+            new = {
+                'spike_threshold_mad': float(self.spike_threshold_var.get()),
+                'spike_min_width': int(self.spike_min_width_var.get()),
+                'spike_max_width': int(self.spike_max_width_var.get()),
+                'spike_min_prominence': float(self.spike_prominence_var.get()),
+                'spike_min_interval': int(self.spike_min_interval_var.get()),
+            }
         except ValueError as e:
             messagebox.showerror("Invalid Input", f"Please enter valid numeric values:\n{str(e)}")
+            return False
+        changed = any(self.params.get(k) != v for k, v in new.items())
+        self.params.update(new)
+        if changed or not quiet:
+            self.log_message("Transient detection parameters updated")
+        return True
 
     def _rebuild_spike_channel_checkboxes(self, channel_names):
         """Rebuild the channel checkbox widgets from a list of channel name strings."""
@@ -13232,6 +13312,257 @@ class FPAnalysisGUI:
             key=lambda x: (x[0].upper(), int(x[1:]) if x[1:].isdigit() else 0)
         )
         self._rebuild_spike_channel_checkboxes(sorted_chs)
+        self._populate_spike_trace_subjects()
+
+    def _populate_spike_trace_subjects(self):
+        """Fill the representative-trace subject list from the loaded data."""
+        combo = getattr(self, 'spike_trace_subject_combo', None)
+        if combo is None:
+            return
+        subjects = sorted(self.processed_data.keys())
+        combo['values'] = subjects
+        if self.spike_trace_subject_var.get() not in subjects:
+            self.spike_trace_subject_var.set(subjects[0] if subjects else '')
+        self._on_spike_trace_subject_changed()
+
+    def _on_spike_trace_subject_changed(self, event=None):
+        """List the chosen subject's channels in the trace channel box."""
+        combo = getattr(self, 'spike_trace_channel_combo', None)
+        if combo is None:
+            return
+        data = self.processed_data.get(self.spike_trace_subject_var.get())
+        channels = ([self.get_channel_name(data, i)
+                     for i in range(self.get_num_channels(data))]
+                    if data is not None else [])
+        combo['values'] = channels
+        if self.spike_trace_channel_var.get() not in channels:
+            active = [ch for ch in channels
+                      if ch in self.spike_channel_vars and self.spike_channel_vars[ch].get()]
+            pick = active or channels
+            self.spike_trace_channel_var.set(pick[0] if pick else '')
+
+    def _spike_signal(self, data, ch_idx):
+        """``(signal, kind)`` the detector runs on: corrected, else dF/F, else
+        z-score.  ``(None, None)`` when the channel has none of them."""
+        for kind in ('corrected', 'dff', 'zscore'):
+            sig = self.get_channel_signal(data, ch_idx, kind=kind)
+            if sig is not None and len(sig) > 0:
+                return sig, kind
+        return None, None
+
+    def _spike_global_mads(self, subjects, active_channels, use_excl):
+        """``{channel: MAD}`` pooled over *subjects* for "Whole dataset" mode.
+
+        A channel excluded from the run must not set its threshold, so with
+        exclusions on those slots are left out of the pool.
+        """
+        ch_signals = {}
+        for subject in subjects:
+            data = self.processed_data.get(subject)
+            if data is None:
+                continue
+            for i in range(self.get_num_channels(data)):
+                ch = self.get_channel_name(data, i)
+                if ch not in active_channels:
+                    continue
+                if use_excl and self.is_channel_slot_excluded(subject, i, data):
+                    continue
+                sig, _kind = self._spike_signal(data, i)
+                if sig is not None:
+                    ch_signals.setdefault(ch, []).append(sig[~np.isnan(sig)])
+        global_mads = {}
+        for ch, arrays in ch_signals.items():
+            combined = np.concatenate(arrays)
+            global_mads[ch] = np.median(np.abs(combined - np.median(combined)))
+        return global_mads
+
+    def _spike_trace_window(self):
+        """``(start_s, end_s)`` from the trace window boxes; end ``None`` means
+        to the end of the session."""
+        try:
+            start = max(0.0, float(self.spike_trace_start_var.get() or 0))
+        except ValueError:
+            start = 0.0
+        try:
+            length = float(self.spike_trace_length_var.get())
+        except ValueError:
+            length = 0.0
+        return start, (start + length if length > 0 else None)
+
+    def _compute_spike_trace(self):
+        """Run detection on the representative-trace subject/channel exactly as
+        Run Spike Analysis would with the parameters now entered.
+
+        Returns a dict (subject, channel, signal, kind, fps, result, start,
+        end, excluded) or ``None`` after telling the user what is missing.
+        """
+        if not self.update_spike_parameters(quiet=True):
+            return None
+        subject = self.spike_trace_subject_var.get()
+        ch_name = self.spike_trace_channel_var.get()
+        data = self.processed_data.get(subject)
+        if data is None:
+            messagebox.showinfo("No Subject", "Pick a subject for the representative trace.")
+            return None
+        ch_idx = next((i for i in range(self.get_num_channels(data))
+                       if self.get_channel_name(data, i) == ch_name), None)
+        if ch_idx is None:
+            messagebox.showinfo("No Channel", f"{subject} has no channel '{ch_name}'.")
+            return None
+        signal, kind = self._spike_signal(data, ch_idx)
+        if signal is None:
+            messagebox.showinfo("No Signal", f"No processed signal for {subject} / {ch_name}.")
+            return None
+
+        use_excl = bool(self.use_exclusions_spike.get())
+        global_mad = None
+        if self.spike_mad_mode_var.get() == "whole_dataset":
+            # Pool over the same subjects a run would: the current selection,
+            # or every loaded subject when nothing is selected.
+            pool = self._spike_selected_subjects() or set(self.processed_data)
+            pool = sorted(set(pool) | {subject})
+            global_mad = self._spike_global_mads(pool, {ch_name}, use_excl).get(ch_name)
+
+        fps = self.get_fps(subject)
+        result = self.detect_spikes(signal, fps, global_mad=global_mad)
+        start, end = self._spike_trace_window()
+        return {
+            'subject': subject, 'channel': ch_name, 'signal': np.asarray(signal, float),
+            'kind': kind, 'fps': fps, 'result': result, 'start': start, 'end': end,
+            'excluded': use_excl and self.is_channel_slot_excluded(subject, ch_idx, data),
+        }
+
+    def _draw_spike_trace(self, ax, signal, fps, result, title, kind='corrected',
+                          start=0.0, end=None):
+        """Draw *signal* with the detection threshold, median baseline and the
+        detected transients, limited to ``[start, end)`` seconds."""
+        signal = np.asarray(signal, float)
+        time_s = np.arange(len(signal)) / fps
+        end = time_s[-1] + 1.0 / fps if (end is None and len(time_s)) else end
+        in_win = (time_s >= start) & (time_s < end) if end is not None else np.ones(len(signal), bool)
+        if not in_win.any():
+            ax.text(0.5, 0.5, f'No data between {start:g} s and {end:g} s',
+                    ha='center', va='center', transform=ax.transAxes, color='gray')
+            ax.set_title(title, fontsize=11, fontweight='bold')
+            return
+        # Minutes read better than thousands of seconds on a whole session.
+        span = time_s[in_win][-1] - time_s[in_win][0]
+        scale, unit = (60.0, 'min') if span > 300 else (1.0, 's')
+        t = time_s / scale
+
+        mean_width, _, _ = self.get_trace_styling()
+        ax.plot(t[in_win], signal[in_win], color='#2e86c1', linewidth=min(mean_width, 1.0),
+                alpha=0.9, label='Signal')
+
+        thr = result.get('threshold_value', np.nan)
+        mad = result.get('mad', np.nan)
+        thr_mad = self.params.get('spike_threshold_mad', np.nan)
+        if not np.isnan(thr):
+            ax.axhline(thr, color='darkorange', linestyle='--', linewidth=1.2,
+                       label=f'Threshold {thr:.3f} ({thr_mad:g} x MAD)')
+        valid = signal[~np.isnan(signal)]
+        if len(valid):
+            ax.axhline(np.median(valid), color='gray', linestyle=':', linewidth=0.9,
+                       label='Median baseline')
+
+        idx = np.asarray(result.get('spike_indices', []), dtype=int)
+        idx = idx[(idx >= 0) & (idx < len(signal))]
+        idx_win = idx[in_win[idx]] if len(idx) else idx
+        total = int(result.get('total_spikes', len(idx)))
+        rate = result.get('spike_rate_per_min', 0.0)
+        if len(idx_win):
+            label = (f'Transients ({len(idx_win)} shown of {total}, {rate:.2f}/min)'
+                     if len(idx_win) != total else f'Transients (n={total}, {rate:.2f}/min)')
+            ax.scatter(t[idx_win], signal[idx_win], color='red', s=40, marker='v',
+                       edgecolors='darkred', linewidth=0.7, zorder=5, label=label)
+        else:
+            ax.text(0.99, 0.97, 'No transients in view' if total else 'No transients detected',
+                    ha='right', va='top', transform=ax.transAxes, fontsize=8, color='red',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='#ffe0e0', alpha=0.8))
+        if not np.isnan(mad):
+            ax.text(0.01, 0.97, f'MAD = {mad:.4f}', ha='left', va='top',
+                    transform=ax.transAxes, fontsize=8, color='dimgray')
+
+        ylabel = {'corrected': 'dF/F (corrected)', 'dff': 'dF/F', 'zscore': 'Z-score'}
+        ax.set_xlabel(f'Time ({unit})')
+        ax.set_ylabel(ylabel.get(kind, 'Signal'))
+        ax.set_xlim(t[in_win][0], t[in_win][-1])
+        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.legend(fontsize=8, loc='upper right', framealpha=0.85)
+
+    def plot_spike_trace(self):
+        """Draw the representative trace in the tab with the current settings."""
+        trace = self._compute_spike_trace()
+        if trace is None:
+            return
+        host = self.spike_trace_plot_host
+        for w in host.winfo_children():
+            w.destroy()
+        fig = Figure(figsize=(9, 3.4), dpi=100)
+        ax = fig.add_subplot(111)
+        title = f"{trace['subject']}  ·  {trace['channel']}"
+        if trace['excluded']:
+            title += "  (excluded on the Exclusions tab)"
+        self._draw_spike_trace(ax, trace['signal'], trace['fps'], trace['result'], title,
+                               kind=trace['kind'], start=trace['start'], end=trace['end'])
+        fig.tight_layout()
+        self._embed_plot_canvas(fig, host)
+
+    def export_spike_trace_prism(self):
+        """Save the representative trace as an XY table for GraphPad Prism.
+
+        Column A is time (X); the Y columns are the signal, the threshold and
+        median baseline (constant, so Prism draws them as lines) and the
+        transient peaks, blank except on the frames where one was detected so
+        Prism plots them as markers on the trace.
+        """
+        trace = self._compute_spike_trace()
+        if trace is None:
+            return
+        signal, fps, result = trace['signal'], trace['fps'], trace['result']
+        time_s = np.arange(len(signal)) / fps
+        end = trace['end'] if trace['end'] is not None else np.inf
+        in_win = (time_s >= trace['start']) & (time_s < end)
+        if not in_win.any():
+            messagebox.showinfo("Empty Window", "No frames fall inside the chosen start/length.")
+            return
+
+        peaks = np.full(len(signal), np.nan)
+        idx = np.asarray(result.get('spike_indices', []), dtype=int)
+        idx = idx[(idx >= 0) & (idx < len(signal))]
+        peaks[idx] = signal[idx]
+        valid = signal[~np.isnan(signal)]
+        unit = {'zscore': 'Z-score'}.get(trace['kind'], 'dF/F')
+        ch = trace['channel']
+        df = pd.DataFrame({
+            'Time (s)': np.round(time_s[in_win], 4),
+            f'{ch} signal ({unit})': signal[in_win],
+            'Threshold': result.get('threshold_value', np.nan),
+            'Median baseline': np.median(valid) if len(valid) else np.nan,
+            'Transient peak': peaks[in_win],
+        })
+
+        win = (f"_{trace['start']:g}-{trace['end']:g}s" if trace['end'] is not None
+               else "")
+        filepath = filedialog.asksaveasfilename(
+            title="Export Representative Trace for Prism",
+            defaultextension=".csv",
+            initialfile=f"{trace['subject']}_{ch}_trace{win}_prism.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not filepath:
+            return
+        try:
+            df.to_csv(filepath, index=False, na_rep='', encoding=EXPORT_CSV_ENCODING)
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export trace:\n{e}")
+            return
+        n_peaks = int(np.isfinite(df['Transient peak']).sum())
+        self.log_message(f"Representative trace exported to: {filepath}")
+        messagebox.showinfo(
+            "Export Complete",
+            f"Trace exported to:\n{filepath}\n\n{len(df)} frames, {n_peaks} transient(s).\n\n"
+            "In Prism: New XY table, then File > Import (or paste). "
+            "Column A is X; plot the signal as a line and 'Transient peak' as symbols.")
 
     def update_spike_selection_mode(self):
         """Re-list the subject pool, show or hide the facet column, then refresh
@@ -13340,6 +13671,10 @@ class FPAnalysisGUI:
         if not selected_items:
             messagebox.showwarning("No Selection", "Please select at least one subject or group")
             return
+        # Run on the parameters as entered, not whatever was last Applied, so
+        # the table always matches the representative trace.
+        if hasattr(self, 'spike_threshold_var') and not self.update_spike_parameters(quiet=True):
+            return
 
         # Clear previous results
         for item in self.spike_tree.get_children():
@@ -13387,34 +13722,18 @@ class FPAnalysisGUI:
 
         fps = self.get_fps()
         mad_mode = self.spike_mad_mode_var.get()
+        # Remembered so plots and exports can tell when the toggle has moved
+        # since this run (see _spike_results_in_sync).
+        self._spike_run_use_excl = bool(use_excl)
 
         # Calculate whole-dataset MAD per channel if requested
         global_mads = {}  # {ch_name: mad_value}
 
         if mad_mode == "whole_dataset":
             self.log_message("Calculating whole-dataset MAD per channel...")
-            ch_signals = {}  # {ch_name: [arrays]}
-            for subject in subjects_to_analyze:
-                if subject not in self.processed_data:
-                    continue
-                data = self.processed_data[subject]
-                n = self.get_num_channels(data)
-                for i in range(n):
-                    ch = self.get_channel_name(data, i)
-                    if ch not in active_channels:
-                        continue
-                    # A channel excluded below must not set the threshold above.
-                    if use_excl and self.is_channel_slot_excluded(subject, i, data):
-                        continue
-                    for kind in ('corrected', 'dff', 'zscore'):
-                        sig = self.get_channel_signal(data, i, kind=kind)
-                        if sig is not None and sig.size > 0:
-                            ch_signals.setdefault(ch, []).append(sig[~np.isnan(sig)])
-                            break
-            for ch, arrays in ch_signals.items():
-                combined = np.concatenate(arrays)
-                mad = np.median(np.abs(combined - np.median(combined)))
-                global_mads[ch] = mad
+            global_mads = self._spike_global_mads(subjects_to_analyze, active_channels,
+                                                  use_excl)
+            for ch, mad in global_mads.items():
                 self.log_message(f"  {ch} whole-dataset MAD: {mad:.4f}")
 
         # Analyze each subject
@@ -13449,7 +13768,42 @@ class FPAnalysisGUI:
                 ))
 
         self.log_message(f"Spike analysis completed for {len(subjects_to_analyze)} subject(s)")
-    
+
+        # Show a representative trace with the run: keep the user's pick when it
+        # was analyzed, otherwise the first analyzed subject.
+        if self.spike_results and hasattr(self, 'spike_trace_subject_var'):
+            if self.spike_trace_subject_var.get() not in self.spike_results:
+                self.spike_trace_subject_var.set(sorted(self.spike_results)[0])
+            self._on_spike_trace_subject_changed()
+            try:
+                self.plot_spike_trace()
+            except Exception as e:
+                self.log_message(f"Representative trace not drawn: {e}")
+
+    def _spike_results_in_sync(self):
+        """True when the stored results still match the "Apply exclusions" box.
+
+        The run drops excluded channels, but the exports (and the zone and
+        bout-phase passes) filter again with whatever the box says now. Ticking
+        it after a run therefore left Visualize Spike Data showing every
+        channel while Export Results dropped the excluded ones, so the plotted
+        group means and the exported values disagreed. Offer to re-run instead
+        of producing outputs that contradict each other.
+        """
+        ran = getattr(self, '_spike_run_use_excl', None)
+        var = getattr(self, 'use_exclusions_spike', None)
+        now = bool(var.get()) if var is not None else ran
+        if ran is None or ran == now:
+            return True
+        if messagebox.askyesno(
+                "Re-run Spike Analysis?",
+                f"'Apply exclusions' was {'on' if ran else 'off'} for the last run and is "
+                f"now {'on' if now else 'off'}, so plots and exports would not match the "
+                f"results table.\n\nRe-run the analysis with the current setting?"):
+            self.run_spike_analysis()
+            return bool(self.spike_results)
+        return False
+
     def copy_spike_selection(self):
         """Copy selected rows from spike results table"""
         selected_items = self.spike_tree.selection()
@@ -13475,6 +13829,8 @@ class FPAnalysisGUI:
         """Export spike analysis results with multiple export options"""
         if not self.spike_results:
             messagebox.showinfo("No Data", "No spike analysis results to export")
+            return
+        if not self._spike_results_in_sync():
             return
         
         if not self.current_project:
@@ -13645,6 +14001,230 @@ class FPAnalysisGUI:
             self.log_message(f"Error exporting spike summary: {str(e)}")
 
     
+    # (result key, file/column label) for the Prism column tables.
+    SPIKE_PRISM_METRICS = (
+        ('spike_rate_per_min', 'Transient rate (per min)'),
+        ('total_spikes', 'Total transients'),
+        ('mean_amplitude', 'Mean amplitude'),
+        ('mean_width_ms', 'Mean width (ms)'),
+    )
+
+    @staticmethod
+    def _prism_column_table(columns):
+        """``{column: [values]}`` -> DataFrame padded with blanks, the shape a
+        Prism Column (or Grouped) table imports as-is."""
+        return pd.DataFrame({k: pd.Series(v, dtype=float) for k, v in columns.items()})
+
+    def _spike_two_factor_layout(self, subjects):
+        """``(row_factor, col_factor, row_levels, col_levels, {subject: (row, col)})``
+        when the Group-mode facet splits on exactly two factors, else ``None``.
+
+        The first split factor becomes Prism's rows and the second its column
+        groups, in the project's level order, so a Treatment x Sex run lands in
+        the table a two-way ANOVA reads without being rearranged by hand.
+        """
+        if self.spike_mode_var.get() != "Group" or not subjects:
+            return None
+        control = getattr(self, 'facet_controls', {}).get('spike')
+        selections = control.selections() if control is not None else {}
+        if not selections:
+            return None
+        subjects = list(subjects)
+        _labels, split = self.facet(subjects, selections)
+        if len(split) != 2:
+            return None
+        universe = self._factor_universe(subjects)
+        assign = self.get_subject_factors(universe)
+        order_map = self.params.get('factor_level_order') or {}
+        levels = [factor_levels(subjects, assign, f, order_map.get(f)) for f in split]
+        cells = {s: tuple(assign.get(s, {}).get(f) or FACTOR_UNASSIGNED for f in split)
+                 for s in subjects}
+        return split[0], split[1], levels[0], levels[1], cells
+
+    @staticmethod
+    def _prism_grouped_table(row_factor, row_levels, col_levels, values):
+        """Rows = *row_levels*, one block of replicate sub-columns per column
+        level (headed by that level), as a Prism Grouped table imports.
+
+        *values* maps ``(row, col)`` to the subjects' values; short cells are
+        padded with blanks.
+        """
+        width = {c: max([len(values.get((r, c), [])) for r in row_levels] + [0])
+                 for c in col_levels}
+        cols = [c for c in col_levels if width[c]]
+        header = [row_factor] + [c for c in cols for _ in range(width[c])]
+        rows = []
+        for r in row_levels:
+            row = [r]
+            for c in cols:
+                v = list(values.get((r, c), []))
+                row += v + [np.nan] * (width[c] - len(v))
+            rows.append(row)
+        return pd.DataFrame(rows, columns=header)
+
+    def export_spike_prism(self):
+        """Write the spike results as CSVs that open directly in GraphPad Prism.
+
+        One file per metric, laid out as a Prism Column table: one column per
+        group (per group and channel when several channels are on), one row
+        per subject, blank cells where a column runs out and for missing
+        values. ``by_subject.csv`` says which subject is in which row, and when
+        zone results exist, one Grouped-table file per metric has zones as rows
+        and each group's subjects as replicate sub-columns. No comment or
+        metadata lines go into the tables, since Prism would import them as
+        data; the detection settings are written to a separate text file.
+        """
+        if not self.spike_results:
+            messagebox.showinfo("No Data", "Please run spike analysis first")
+            return
+        if not self._spike_results_in_sync():
+            return
+        folder = filedialog.askdirectory(title="Choose a folder for the Prism CSV files")
+        if not folder:
+            return
+
+        active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
+        group_mode = self.spike_mode_var.get() == "Group"
+        subject_to_group = self._spike_subject_to_series()
+        default_group = "Ungrouped" if subject_to_group else "All subjects"
+        series_order = (self._spike_series()[0] if group_mode
+                        else sorted(set(subject_to_group.values())))
+
+        # Long table first: it is both the key to the column tables and a
+        # complete record of every value they contain.
+        long_rows = []
+        for subject in sorted(self._spike_results_for_selection()):
+            excluded = (self.exclusions.get(subject, [])
+                        if self.use_exclusions_spike.get() else [])
+            fps = float(self.get_fps(subject))
+            for ch in self._spike_export_channels(subject, active_channels, excluded):
+                r = self.spike_data[subject][ch]
+                mw = r.get('mean_width', np.nan)
+                long_rows.append({
+                    'Subject': subject,
+                    'Group': subject_to_group.get(subject, default_group),
+                    'Channel': ch,
+                    'spike_rate_per_min': round(float(r.get('spike_rate_per_min', np.nan)), 3),
+                    'total_spikes': r.get('total_spikes', 0),
+                    'mean_amplitude': round(float(r.get('mean_amplitude', np.nan)), 4),
+                    'mean_width_ms': round(mw / fps * 1000.0, 1) if fps else np.nan,
+                })
+        if not long_rows:
+            messagebox.showwarning("No Data", "Nothing to export for the current "
+                                              "selection and channels.")
+            return
+
+        groups = [g for g in series_order if any(r['Group'] == g for r in long_rows)]
+        groups += [g for g in dict.fromkeys(r['Group'] for r in long_rows) if g not in groups]
+        channels = sorted({r['Channel'] for r in long_rows},
+                          key=lambda x: (str(x)[0].upper(),
+                                         int(str(x)[1:]) if str(x)[1:].isdigit() else 0))
+        multi_ch = len(channels) > 1
+
+        def col_name(group, ch):
+            return f"{group} ({ch})" if multi_ch else str(group)
+
+        prefix = f"{self.current_project or 'TRACY'}_spikes_prism"
+        written = []
+        try:
+            for key, label in self.SPIKE_PRISM_METRICS:
+                cols = {}
+                for ch in channels:
+                    for g in groups:
+                        cols[col_name(g, ch)] = [r[key] for r in long_rows
+                                                 if r['Group'] == g and r['Channel'] == ch]
+                cols = {k: v for k, v in cols.items() if v}
+                fname = os.path.join(folder, f"{prefix}_{label.split(' (')[0].replace(' ', '_')}.csv")
+                self._prism_column_table(cols).to_csv(
+                    fname, index=False, na_rep='', encoding=EXPORT_CSV_ENCODING)
+                written.append(fname)
+
+            # Two split factors: also write each metric as a Grouped table.
+            layout = self._spike_two_factor_layout(
+                list(dict.fromkeys(r['Subject'] for r in long_rows)))
+            if layout is not None:
+                row_f, col_f, row_lv, col_lv, cells = layout
+                for key, label in self.SPIKE_PRISM_METRICS:
+                    for ch in channels:
+                        values = {}
+                        for r in long_rows:
+                            if r['Channel'] == ch:
+                                values.setdefault(cells[r['Subject']], []).append(r[key])
+                        if not values:
+                            continue
+                        tag = label.split(' (')[0].replace(' ', '_')
+                        fname = os.path.join(
+                            folder, f"{prefix}_grouped_{tag}"
+                            + (f"_{ch}" if multi_ch else "") + ".csv")
+                        self._prism_grouped_table(row_f, row_lv, col_lv, values).to_csv(
+                            fname, index=False, na_rep='', encoding=EXPORT_CSV_ENCODING)
+                        written.append(fname)
+
+            key_df = pd.DataFrame(long_rows).rename(columns=dict(self.SPIKE_PRISM_METRICS))
+            if layout is not None:
+                key_df.insert(2, layout[0], [layout[4][s][0] for s in key_df['Subject']])
+                key_df.insert(3, layout[1], [layout[4][s][1] for s in key_df['Subject']])
+            fname = os.path.join(folder, f"{prefix}_by_subject.csv")
+            key_df.to_csv(fname, index=False, na_rep='', encoding=EXPORT_CSV_ENCODING)
+            written.append(fname)
+
+            # Zone metrics as Prism Grouped tables, when position data allows.
+            zone_subjects = [s for s in dict.fromkeys(r['Subject'] for r in long_rows)
+                             if self.processed_data.get(s, {}).get('has_position', False)]
+            if zone_subjects:
+                self.spike_zone_results = {}
+                for s in zone_subjects:
+                    zres = self.analyze_spikes_by_zone(s)
+                    if zres:
+                        self.spike_zone_results[s] = zres
+            if zone_subjects and self.spike_zone_results:
+                categories, table = self._spike_zone_table()
+                for key, ylabel, _title in self.SPIKE_ZONE_METRICS:
+                    for ch in channels:
+                        header, cols = ['Zone'], []
+                        for g in groups:
+                            for s in sorted(table):
+                                if (subject_to_group.get(s, default_group) == g
+                                        and ch in table[s]
+                                        and any(r['Subject'] == s and r['Channel'] == ch
+                                                for r in long_rows)):
+                                    header.append(f"{g}: {s}")
+                                    cols.append([table[s][ch][c][key] for c in categories])
+                        if not cols:
+                            continue
+                        df = pd.DataFrame(np.round(np.array(cols, dtype=float).T, 4),
+                                          columns=header[1:])
+                        df.insert(0, 'Zone', categories)
+                        tag = ylabel.split(' (')[0].replace(' ', '_').replace('/', 'per')
+                        fname = os.path.join(
+                            folder, f"{prefix}_zone_{tag}" + (f"_{ch}" if multi_ch else "")
+                            + ".csv")
+                        df.to_csv(fname, index=False, na_rep='', encoding=EXPORT_CSV_ENCODING)
+                        written.append(fname)
+
+            meta = self._create_export_metadata('spike')
+            fname = os.path.join(folder, f"{prefix}_settings.txt")
+            with open(fname, 'w', encoding='utf-8') as f:
+                for k, v in meta.items():
+                    f.write(f"{k}: {v}\n")
+            written.append(fname)
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export Prism files:\n{e}")
+            self.log_message(f"Error exporting Prism spike files: {e}")
+            return
+
+        self.log_message(f"Prism spike files exported to: {folder}")
+        messagebox.showinfo(
+            "Export Complete",
+            f"{len(written)} files written to:\n{folder}\n\n"
+            "Metric files: Prism Column table (one column per group, one row per "
+            "subject). Zone files: Prism Grouped table (zones as rows, each "
+            "group's subjects as replicates). The by_subject file lists which "
+            "subject is in which row."
+            + ("\n\nSplit by two factors: the 'grouped' files are Prism Grouped "
+               "tables (first factor as rows, second as column groups, subjects as "
+               "replicates), ready for a two-way ANOVA." if layout is not None else ""))
+
     def _spike_export_channels(self, subject, active_channels, excluded_channels):
         """Channel designations to export for one subject, in checkbox order.
 
@@ -13820,139 +14400,47 @@ class FPAnalysisGUI:
             # Restrict to the current subject/group selection.
             sel_results = self._spike_results_for_selection()
 
-            # First pass: collect all unique zones across all subjects
-            all_zones = set()
-            subject_zone_data = {}
-
+            # Same per-zone pass the plot uses, so the file and the figure agree
+            # and every channel gets rate, amplitude and width per zone.
+            self.spike_zone_results = {}
             for subject in sel_results.keys():
-                # Apply exclusions if enabled
                 excluded_channels = (self.exclusions.get(subject, [])
                                      if self.use_exclusions_spike.get() else [])
-                # Skip subject if nothing is left to export for them
                 if not self._spike_export_channels(subject, active_channels, excluded_channels):
                     continue
-
-                if subject not in self.spike_data or subject not in self.processed_data:
-                    continue
-
-                data = self.processed_data[subject]
-
-                # Check if behavioral data exists
-                if 'beh_synced' not in data:
-                    self.log_message(f"Warning: No behavioral data for {subject}, skipping zone-binned export")
-                    continue
-                
-                # Check if position data exists (required for zone classification)
-                if not data.get('has_position', False):
-                    self.log_message(f"Warning: No position data for {subject}, skipping zone-binned export")
-                    continue
-                
-                beh_synced = data['beh_synced']
-                
-                # Calculate zone classifications from X/Y coordinates
-                zone_classifications = []
-                for i in range(len(beh_synced)):
-                    x = beh_synced[i, 2]
-                    y = beh_synced[i, 3]
-                    if not (np.isnan(x) or np.isnan(y)):
-                        zone_classifications.append(self.classify_zone(x, y))
-                    else:
-                        zone_classifications.append('unknown')
-                
-                zone_classifications = np.array(zone_classifications)
-                unique_zones = np.unique(zone_classifications[zone_classifications != 'unknown'])
-                
-                all_zones.update(unique_zones)
-                subject_zone_data[subject] = {
-                    'zone_classifications': zone_classifications,
-                    'zones': unique_zones
-                }
-            
-            if len(all_zones) == 0:
-                messagebox.showwarning("No Data", "No zone-binned data to export. Ensure subjects have behavioral data processed.")
-                return
-            
-            # Group zones by removing directional suffixes (_left, _right, _up, _down)
-            # to average them like in zone averages export
-            base_zones = set()
-            zone_to_base = {}
-            for zone in all_zones:
-                # Determine the base zone name (without directional suffix)
-                if zone == 'center':
-                    base_zone = 'center'
-                elif '_left' in zone or '_right' in zone:
-                    base_zone = zone.replace('_left', '').replace('_right', '')
-                elif '_up' in zone or '_down' in zone:
-                    base_zone = zone.replace('_up', '').replace('_down', '')
+                zres = self.analyze_spikes_by_zone(subject)
+                if zres:
+                    self.spike_zone_results[subject] = zres
                 else:
-                    base_zone = zone
-                
-                base_zones.add(base_zone)
-                zone_to_base[zone] = base_zone
-            
-            # Sort base zones for consistent column ordering
-            base_zones = sorted(base_zones)
-            
-            # Build rows with zones as columns
-            rows = []
+                    self.log_message(f"Warning: No position data for {subject}, "
+                                     f"skipping zone-binned export")
+            if not self.spike_zone_results:
+                messagebox.showwarning("No Data", "No zone-binned data to export. Ensure "
+                                                  "subjects have behavioral data processed.")
+                return
+            base_zones, table = self._spike_zone_table()
 
-            for subject in sel_results.keys():
-                # Apply exclusions again
+            rows = []
+            for subject, per_ch in table.items():
                 excluded_channels = (self.exclusions.get(subject, [])
                                      if self.use_exclusions_spike.get() else [])
-
-                group_name = subject_to_group.get(subject, "N/A")
-                
-                if subject not in subject_zone_data:
-                    continue
-                
-                zone_data = subject_zone_data[subject]
-                zone_classifications = zone_data['zone_classifications']
-                
-                # Process each channel
                 for channel in self._spike_export_channels(subject, active_channels,
                                                           excluded_channels):
-
-                    spike_indices = self.spike_data[subject][channel].get('spike_indices', np.array([]))
-                    
-                    # Create row data
-                    row_data = {
-                        'subject': subject,
-                        'group': group_name,
-                        'channel': channel
-                    }
-                    
-                    # Calculate spike rate for each base zone (averaged across directional variants)
-                    for base_zone in base_zones:
-                        # Find all actual zones that map to this base zone
-                        matching_zones = [z for z in all_zones if zone_to_base.get(z) == base_zone]
-                        
-                        total_frames = 0
-                        total_spikes = 0
-                        
-                        for zone in matching_zones:
-                            # Find frames where animal was in this zone
-                            zone_mask = zone_classifications == zone
-                            zone_frames = np.sum(zone_mask)
-                            total_frames += zone_frames
-                            
-                            # Count spikes that occurred during frames in this zone
-                            if len(spike_indices) > 0:
-                                for spike_frame in spike_indices:
-                                    if spike_frame < len(zone_classifications) and zone_classifications[int(spike_frame)] == zone:
-                                        total_spikes += 1
-                        
-                        # Calculate combined spike rate across all directional variants
-                        zone_duration_min = total_frames / fps / 60.0
-                        spike_rate = total_spikes / zone_duration_min if zone_duration_min > 0 else 0.0
-                        
-                        # Add as columns: zone name with rate
-                        safe_zone = str(base_zone).replace(' ', '_')
-                        row_data[f'{safe_zone}_rate_per_min'] = round(spike_rate, 3)
-                        row_data[f'{safe_zone}_time_min'] = round(zone_duration_min, 3)
-                    
+                    if channel not in per_ch:
+                        continue
+                    row_data = {'subject': subject,
+                                'group': subject_to_group.get(subject, "N/A"),
+                                'channel': channel}
+                    for zone in base_zones:
+                        m = per_ch[channel][zone]
+                        z = str(zone).replace(' ', '_')
+                        row_data[f'{z}_rate_per_min'] = round(m['spike_rate_per_min'], 3)
+                        row_data[f'{z}_n_transients'] = m['spike_count']
+                        row_data[f'{z}_mean_amplitude'] = round(m['mean_amplitude'], 4)
+                        row_data[f'{z}_mean_width_ms'] = round(m['mean_width_ms'], 2)
+                        row_data[f'{z}_time_min'] = round(m['duration_sec'] / 60.0, 3)
                     rows.append(row_data)
-            
+
             if len(rows) == 0:
                 messagebox.showwarning("No Data", "No zone-binned data to export.")
                 return
@@ -13979,6 +14467,8 @@ class FPAnalysisGUI:
         """Open visualization window for spike data"""
         if not self.spike_results:
             messagebox.showinfo("No Data", "Please run spike analysis first")
+            return
+        if not self._spike_results_in_sync():
             return
         
         # Create figure
@@ -14124,92 +14614,31 @@ class FPAnalysisGUI:
         if not channels_to_plot:
             channels_to_plot = list(spike_data.keys())  # fallback: show everything
 
-        # Build time axis from any available processed array (col 0 = elapsed time)
-        time_arr = None
-        for tkey in ['zscore_470', 'zscore_570', 'zscore', 'corrected_470', 'corrected_570',
-                     'corrected', 'dff_470', 'dff_570', 'dff', 'data']:
-            if tkey in data and isinstance(data[tkey], np.ndarray) and data[tkey].shape[1] > 0:
-                time_arr = data[tkey][:, 0]
-                break
-        if time_arr is None:
-            fig.text(0.5, 0.5, 'No time data available for this subject', ha='center', va='center')
-            return
-
-        time_min = time_arr
-
-        # Build channel-name → index map so we can fetch the signal
+        # Build channel-name -> index map so we can fetch the signal
         n_channels      = self.get_num_channels(data)
         ch_name_to_idx  = {self.get_channel_name(data, i): i for i in range(n_channels)}
+        fps = self.get_fps(subject)
 
-        COLORS     = ['#2196F3', '#4CAF50', '#F44336', '#FF9800', '#9C27B0', '#00BCD4']
-        DOT_COLORS = ['red', 'red', 'red', 'red', 'red', 'red']
-
+        # Drawn by the same routine as the tab's representative trace. Time is
+        # rebuilt from the frame index at the detector's fps, the clock the
+        # spike times were computed on; the processed time column is not, so
+        # markers plotted against it drifted off their peaks.
         n_plots = len(channels_to_plot)
-        if n_plots == 0:
-            fig.text(0.5, 0.5, 'No channel data to display', ha='center', va='center')
-            return
-
-        mean_width, _, _ = self.get_trace_styling()
-
         for plot_idx, ch_name in enumerate(channels_to_plot, start=1):
-            ch_idx = ch_name_to_idx.get(ch_name)
-            if ch_idx is None:
-                # Try to match by index fallback (Ch0 -> 0, G0 -> 0, etc.)
-                ch_idx = 0
-            color = COLORS[plot_idx - 1] if (plot_idx - 1) < len(COLORS) else '#2196F3'
-
             ax = fig.add_subplot(n_plots, 1, plot_idx)
-
-            # Fetch signal: prefer corrected → dff → zscore
-            trace = None
-            for kind in ('corrected', 'dff', 'zscore'):
-                trace = self.get_channel_signal(data, ch_idx, kind=kind)
-                if trace is not None:
-                    break
-
+            ch_idx = ch_name_to_idx.get(ch_name)
+            trace, kind = (self._spike_signal(data, ch_idx) if ch_idx is not None
+                           else (None, None))
             if trace is None:
                 ax.text(0.5, 0.5, f'No signal for {ch_name}', transform=ax.transAxes,
                         ha='center', va='center')
                 ax.set_title(f'{subject} — {ch_name}', fontsize=12, fontweight='bold')
                 continue
-
-            # Trim to shorter length in case arrays differ slightly
-            n = min(len(time_min), len(trace))
-            ax.plot(time_min[:n], trace[:n], color=color, linewidth=mean_width, alpha=0.7,
-                    label=f'{ch_name} Signal')
-
-            ch_data         = spike_data[ch_name]
-            threshold_value = ch_data.get('threshold_value', np.nan)
-            spike_indices   = ch_data.get('spike_indices', np.array([]))
-            spike_times_sec = ch_data.get('spike_times',   np.array([]))
-            spike_rate      = ch_data.get('spike_rate_per_min', 0.0)
-            total_spikes    = ch_data.get('total_spikes', 0)
-
-            if not np.isnan(threshold_value):
-                ax.axhline(threshold_value, color='orange', linestyle='--', linewidth=1,
-                           alpha=0.8, label=f'Threshold ({threshold_value:.2f})')
-
-            if len(spike_indices) > 0:
-                spike_times_min = spike_times_sec / 60.0
-                # Guard against out-of-bounds indices
-                valid_mask    = spike_indices < len(trace)
-                valid_indices = spike_indices[valid_mask]
-                valid_times   = spike_times_min[valid_mask]
-                spike_values  = trace[valid_indices]
-                ax.scatter(valid_times, spike_values, color='red', s=60, marker='v',
-                           edgecolors='darkred', linewidth=0.8, alpha=0.9, zorder=5,
-                           label=f'Transients (n={total_spikes})')
-
-            ax.set_xlabel('Time (min)', fontsize=11)
-            ax.set_ylabel('dF/F', fontsize=11)
-            ax.set_title(f'{subject} — {ch_name}  (rate: {spike_rate:.2f}/min)', fontsize=12,
-                         fontweight='bold')
-            ax.legend(loc='upper right', fontsize=9)
-            ax.grid(True, alpha=0.3)
-            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+            self._draw_spike_trace(ax, trace, fps, spike_data[ch_name],
+                                   f'{subject} — {ch_name}', kind=kind)
 
         fig.tight_layout()
-    
+
     def analyze_spikes_by_bout_phase(self):
         """Compare transient rate in the pre / during / post windows around a
         behavior's bouts, per group.  Answers "does firing change before vs.
@@ -14218,40 +14647,50 @@ class FPAnalysisGUI:
         if not self.spike_data:
             messagebox.showinfo("No Data", "Please run spike analysis first.")
             return
+        if not self._spike_results_in_sync():
+            return
 
         sel_subjects = list(self._spike_results_for_selection().keys())
         if not sel_subjects:
             messagebox.showinfo("No Selection", "Select subjects/groups and run spike analysis.")
             return
 
-        # Behaviors available across the selection.
+        # Behaviors available across the selection, then the maze's zone entry
+        # types ('Zone: ...'), offered the same way the coherence epochs are.
         behaviors = set()
         for s in sel_subjects:
             behaviors.update(self.processed_data.get(s, {}).get('bouts', {}).keys())
-        behaviors = sorted(behaviors)
+        behaviors = sorted(behaviors) + self._available_zone_entry_epochs()
         if not behaviors:
-            messagebox.showinfo("No Bouts", "No extracted bouts found for the selection.\n"
-                                            "Process data with a boutframes file first.")
+            messagebox.showinfo("No Bouts", "No extracted bouts or zone entries found for "
+                                            "the selection.\nProcess data with a boutframes "
+                                            "file or position data first.")
             return
 
         # Small modal: behavior + window length.
         dlg = tk.Toplevel(self.root)
         dlg.title("Spikes by Bout Phase")
         dlg.transient(self.root); dlg.grab_set()
-        self.fit_toplevel(dlg, 340, 200)
+        self.fit_toplevel(dlg, 380, 250)
         frm = ttk.Frame(dlg, padding=14); frm.pack(fill='both', expand=True)
-        ttk.Label(frm, text="Behavior:").grid(row=0, column=0, sticky='w', pady=3)
+        ttk.Label(frm, text="Behavior / zone entry:").grid(row=0, column=0, sticky='w', pady=3)
         beh_var = tk.StringVar(value=behaviors[0])
         ttk.Combobox(frm, textvariable=beh_var, values=behaviors, state='readonly',
-                     width=20).grid(row=0, column=1, pady=3)
+                     width=24).grid(row=0, column=1, pady=3)
         ttk.Label(frm, text="Pre/Post window (s):").grid(row=1, column=0, sticky='w', pady=3)
         win_var = tk.StringVar(value="5")
         ttk.Entry(frm, textvariable=win_var, width=8).grid(row=1, column=1, sticky='w', pady=3)
+        ttk.Label(frm, text="Min time in zone (s):").grid(row=2, column=0, sticky='w', pady=3)
+        dwell_var = tk.StringVar(value="0")
+        ttk.Entry(frm, textvariable=dwell_var, width=8).grid(row=2, column=1, sticky='w', pady=3)
+        ttk.Label(frm, text="Zone entries only; 'During' is the time spent in the zone.",
+                  foreground='gray', font=('Segoe UI', 8)).grid(
+            row=3, column=0, columnspan=2, sticky='w')
         res = {'ok': False}
         def _go():
             res['ok'] = True; dlg.destroy()
-        ttk.Button(frm, text="Analyze", command=_go).grid(row=2, column=0, pady=10)
-        ttk.Button(frm, text="Cancel", command=dlg.destroy).grid(row=2, column=1, sticky='w', pady=10)
+        ttk.Button(frm, text="Analyze", command=_go).grid(row=4, column=0, pady=10)
+        ttk.Button(frm, text="Cancel", command=dlg.destroy).grid(row=4, column=1, sticky='w', pady=10)
         self.root.wait_window(dlg)
         if not res['ok']:
             return
@@ -14263,8 +14702,11 @@ class FPAnalysisGUI:
         except ValueError:
             messagebox.showerror("Error", "Pre/Post window must be a positive number of seconds.")
             return
+        try:
+            min_dwell = max(0.0, float(dwell_var.get() or 0))
+        except ValueError:
+            min_dwell = 0.0
 
-        fps = self.get_fps()
         active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
         apply_excl = self.use_exclusions_spike.get()
         group_mode = self.spike_mode_var.get() == "Group"
@@ -14275,11 +14717,11 @@ class FPAnalysisGUI:
         data = {}
         for subject in sel_subjects:
             sdata = self.spike_data.get(subject, {})
-            entry = self.processed_data.get(subject, {}).get('bouts', {}).get(behavior, {})
-            onsets = entry.get('onset_frames') or []
-            ends = entry.get('end_frames')
-            if not onsets:
+            windows_f = self._spike_bout_windows(subject, behavior, min_dwell)
+            if not windows_f:
                 continue
+            # Spike times are frame / the subject's own fps; use the same clock.
+            fps = self.get_fps(subject)
             group = subject_to_group.get(subject, "Ungrouped") if group_mode else subject
             for ch in sdata:
                 if active_channels and ch not in active_channels:
@@ -14291,16 +14733,9 @@ class FPAnalysisGUI:
                     # still counts as 0 rate; keep going
                     spike_t = np.array([])
                 per_phase = {p: [] for p in phases}  # per-bout rate/min
-                for i, onset_f in enumerate(onsets):
+                for onset_f, end_f in windows_f:
                     onset_s = float(onset_f) / fps
-                    end_s = None
-                    if ends is not None and i < len(ends) and ends[i] is not None:
-                        try:
-                            ev = float(ends[i])
-                            if not np.isnan(ev):
-                                end_s = ev / fps
-                        except (TypeError, ValueError):
-                            end_s = None
+                    end_s = float(end_f) / fps if end_f is not None else None
                     if end_s is None or end_s <= onset_s:
                         end_s = onset_s + win_sec  # fallback "during" when no end frame
                     windows = {
@@ -14367,10 +14802,74 @@ class FPAnalysisGUI:
         fig.tight_layout()
         self._embed_plot_window(fig, f"Spikes by Bout Phase — {behavior}", "1000x650")
 
+    def _spike_bout_windows(self, subject, behavior, min_dwell_sec=0.0):
+        """``[(onset, end_or_None), ...]`` in photometry samples for one subject.
+
+        *behavior* is a scored behavior, or a 'Zone: ...' entry type. A zone
+        entry ends on its last consecutive frame in the target zone, so its
+        'During' phase is the visit itself. Entries are measured on the
+        behavior grid, where the zones live, and each onset/end pair is mapped
+        to the photometry grid together so a dropped frame cannot pair one
+        entry's onset with the next one's end.
+        """
+        data = self.processed_data.get(subject, {})
+        entry_key = self._zone_entry_epoch_key(behavior)
+        if entry_key is None:
+            entry = (data.get('bouts') or {}).get(behavior) or {}
+            onsets = entry.get('onset_frames') or []
+            ends = entry.get('end_frames')
+            out = []
+            for i, onset_f in enumerate(onsets):
+                try:
+                    o = float(onset_f)
+                except (TypeError, ValueError):
+                    continue
+                if np.isnan(o):
+                    continue
+                e = None
+                if ends is not None and i < len(ends) and ends[i] is not None:
+                    try:
+                        ev = float(ends[i])
+                        e = None if np.isnan(ev) else ev
+                    except (TypeError, ValueError):
+                        e = None
+                out.append((o, e))
+            return out
+
+        frames = self._as_onset_indices((data.get('entry_frames') or {}).get(entry_key, []))
+        if not frames:
+            return []
+        targets = self._entry_target_zones(entry_key)
+        labels = self._zone_labels_for(subject, data)
+        if not targets or labels is None:
+            self.log_message(f"  {subject}: no zone geometry behind '{entry_key}'; "
+                             f"skipped for bout-phase spikes")
+            return []
+        min_rows = int(round(min_dwell_sec * self._beh_row_rate(subject, data)))
+        quiet = lambda *_a, **_k: None
+        out, n_short = [], 0
+        for f in frames:
+            if not 0 <= f < len(labels):
+                continue
+            dwell = self._zone_entry_dwell_frames(labels, f, targets)
+            if dwell < max(1, min_rows):
+                n_short += 1
+                continue
+            pair = self._entry_frames_to_signal_index(subject, data, [f, f + dwell - 1],
+                                                      log=quiet)
+            if len(pair) == 2:
+                out.append((pair[0], pair[1] + 1))
+        if n_short and min_dwell_sec > 0:
+            self.log_message(f"  {subject}: {n_short}/{len(frames)} '{entry_key}' entries "
+                             f"dropped (under {min_dwell_sec:g} s in zone)")
+        return out
+
     def visualize_spikes_by_zone(self):
         """Analyze and visualize spike frequency by behavioral zone"""
         if not self.spike_results:
             messagebox.showinfo("No Data", "Please run spike analysis first")
+            return
+        if not self._spike_results_in_sync():
             return
         
         # Get subjects from spike results, restricted to the current selection so
@@ -14416,216 +14915,131 @@ class FPAnalysisGUI:
             return
         
         # Create figure
-        fig = Figure(figsize=(14, 9), dpi=100)
+        fig = Figure(figsize=(14, 10), dpi=100)
 
-        # Plot zone-specific spike rates
+        # Rate, amplitude and width per zone
         self._plot_spike_rates_by_zone(fig)
-        self._embed_plot_window(fig, "Spike Frequency by Zone", "1400x900")
+        self._embed_plot_window(fig, "Spike Metrics by Zone", "1400x950")
     
+    # (key, axis label, title) for each per-zone metric, in plot row order.
+    SPIKE_ZONE_METRICS = (
+        ('spike_rate_per_min', 'Transients / min', 'Rate'),
+        ('mean_amplitude', 'Mean amplitude', 'Amplitude'),
+        ('mean_width_ms', 'Mean width (ms)', 'Width'),
+    )
+
+    def _spike_zone_categories(self):
+        """``(categories, {zone: category})`` for the per-zone spike outputs.
+
+        Sub-zones roll up under their template 'category' (the four OFT
+        corners share 'corner'; the two EPM open arms share 'open'); a zone
+        with no category stands for itself.
+        """
+        cat_of = {}
+        for zone in self.zones.keys():
+            if zone == 'unknown':
+                continue
+            info = self.zones.get(zone)
+            cat = info.get('category') if isinstance(info, dict) else None
+            cat_of[zone] = cat or zone
+        return list(dict.fromkeys(cat_of.values())), cat_of
+
+    def _pool_spike_zone_metrics(self, per_zone, zones, fps):
+        """Pool several zones' metrics as one: total transients over total time,
+        and amplitude / width averaged over every transient in them.
+
+        Pooling replaces the old mean of the sub-zones' rates, which weighted a
+        two-second visit to one corner the same as ten minutes in another.
+        """
+        count = sum(per_zone[z]['spike_count'] for z in zones if z in per_zone)
+        dur = sum(per_zone[z]['duration_sec'] for z in zones if z in per_zone)
+        amps = [a for z in zones if z in per_zone for a in per_zone[z].get('amplitudes', [])]
+        widths = [w for z in zones if z in per_zone for w in per_zone[z].get('widths', [])]
+        mw = float(np.nanmean(widths)) if len(widths) else np.nan
+        return {
+            'spike_count': count,
+            'duration_sec': dur,
+            'spike_rate_per_min': count / dur * 60.0 if dur > 0 else np.nan,
+            'mean_amplitude': float(np.nanmean(amps)) if len(amps) else np.nan,
+            'mean_width_frames': mw,
+            'mean_width_ms': mw / fps * 1000.0 if fps else np.nan,
+        }
+
+    def _spike_zone_table(self):
+        """Per-subject, per-channel, per-category metrics from
+        ``spike_zone_results``: ``{subject: {channel: {category: metrics}}}``."""
+        categories, cat_of = self._spike_zone_categories()
+        out = {}
+        for subject, results in self.spike_zone_results.items():
+            fps = float(self.get_fps(subject))
+            for ch, per_zone in results.items():
+                out.setdefault(subject, {})[ch] = {
+                    cat: self._pool_spike_zone_metrics(
+                        per_zone, [z for z, c in cat_of.items() if c == cat], fps)
+                    for cat in categories}
+        return categories, out
+
     def _plot_spike_rates_by_zone(self, fig):
-        """Plot spike rates by zone for each subject/group"""
-        show_g0 = self.spike_show_g0.get()
-        show_g1 = self.spike_show_g1.get()
+        """Transient rate, amplitude and width by zone: one row per metric, one
+        column per channel; bars are group means +/- SEM over subjects in Group
+        mode, or one bar per subject in Subject mode."""
         group_mode = self.spike_mode_var.get() == "Group"
-        
-        # Get zone names (excluding 'unknown')
-        all_zone_names = [z for z in self.zones.keys() if z != 'unknown']
-        
-        if not all_zone_names:
+        categories, table = self._spike_zone_table()
+        if not categories:
             fig.text(0.5, 0.5, 'No zones defined', ha='center', va='center')
             return
-        
-        # Aggregate sub-zones into their overarching behavioral category so
-        # matching sub-zones roll up under one label instead of being plotted
-        # individually.  This uses each zone's template 'category' (e.g. the four
-        # OFT corners share category 'corner'; the two EPM open arms share
-        # 'open'), which correctly handles OFT/OFT-style mazes where the old
-        # up/down/left/right name-pattern matching left every corner separate.
-        # Falls back to the zone's own name when it has no category (e.g. custom
-        # user zones), so those are still shown individually.
-        def _zone_category(zone):
-            zinfo = self.zones.get(zone)
-            if isinstance(zinfo, dict):
-                cat = zinfo.get('category')
-                if cat:
-                    return cat
-            return zone
-
-        def aggregate_zones(zone_data):
-            """Average each category's sub-zone rates (non-zero values only, so a
-            never-visited sub-zone doesn't drag the mean down)."""
-            from collections import OrderedDict
-            buckets = OrderedDict()
-            for zone in all_zone_names:
-                buckets.setdefault(_zone_category(zone), []).append(zone_data.get(zone, 0))
-            aggregated = OrderedDict()
-            for cat, vals in buckets.items():
-                nonzero = [v for v in vals if v > 0]
-                aggregated[cat] = float(np.mean(nonzero)) if nonzero else 0
-            return aggregated
-        
-        # Get aggregated zone names
-        sample_zone_data = {z: 0 for z in all_zone_names}
-        zone_names = list(aggregate_zones(sample_zone_data).keys())
-        
-        # Organize data by subject/series (facet-aware in Group mode)
-        subject_to_group = self._spike_subject_to_series()
-        
-        # Create subplots
-        n_plots = (1 if show_g0 else 0) + (1 if show_g1 else 0)
-        if n_plots == 0:
+        active = [ch for ch, var in self.spike_channel_vars.items() if var.get()]
+        present = {ch for per in table.values() for ch in per}
+        channels = [ch for ch in active if ch in present] or sorted(present)
+        if not channels:
             fig.text(0.5, 0.5, 'Please select at least one channel', ha='center', va='center')
             return
-        
-        plot_idx = 1
-        
-        # G0 plot
-        if show_g0:
-            ax = fig.add_subplot(1, n_plots, plot_idx)
-            plot_idx += 1
-            
-            if group_mode:
-                # Group by group
-                group_data = {}
-                for subject, results in self.spike_zone_results.items():
-                    if 'G0' not in results:
-                        continue
-                    group = subject_to_group.get(subject, "Ungrouped")
-                    if group not in group_data:
-                        group_data[group] = {zone: [] for zone in zone_names}
-                    
-                    # Aggregate zones for this subject
-                    zone_dict = {z: results['G0'][z]['spike_rate_per_min'] 
-                                if z in results['G0'] else 0 
-                                for z in all_zone_names}
-                    aggregated = aggregate_zones(zone_dict)
-                    
-                    for zone, rate in aggregated.items():
-                        if zone in group_data[group]:
-                            group_data[group][zone].append(rate)
-                
-                # Plot grouped data
-                x = np.arange(len(zone_names))
-                group_width = 0.8 / len(group_data) if group_data else 1
-                colors = plt.cm.Set3(np.linspace(0, 1, len(group_data)))
-                
-                for group_idx, (group_name, zones_data) in enumerate(group_data.items()):
-                    means = [np.mean(zones_data[zone]) if zones_data[zone] else 0 for zone in zone_names]
-                    sems = [np.std(zones_data[zone]) / np.sqrt(len(zones_data[zone])) if len(zones_data[zone]) > 1 else 0 
-                           for zone in zone_names]
-                    
-                    offset = (group_idx - len(group_data)/2 + 0.5) * group_width
-                    ax.bar(x + offset, means, group_width, yerr=sems, label=group_name,
-                          alpha=0.7, capsize=4, color=colors[group_idx], edgecolor='black', linewidth=1)
-                    
-                    # Overlay individual points
-                    for i, zone in enumerate(zone_names):
-                        if zones_data[zone]:
-                            jitter = np.random.normal(0, 0.02, len(zones_data[zone]))
-                            ax.scatter([x[i] + offset] * len(zones_data[zone]) + jitter, zones_data[zone],
-                                     alpha=0.6, s=30, color=colors[group_idx], edgecolors='black', linewidth=0.5, zorder=3)
-            else:
-                # Individual subjects
-                subjects = list(self.spike_zone_results.keys())
-                x = np.arange(len(zone_names))
-                subj_width = 0.8 / len(subjects) if subjects else 1
-                colors = plt.cm.tab20(np.linspace(0, 1, len(subjects)))
-                
-                for subj_idx, subject in enumerate(subjects):
-                    if 'G0' not in self.spike_zone_results[subject]:
-                        continue
-                    
-                    # Aggregate zones for this subject
-                    zone_dict = {z: self.spike_zone_results[subject]['G0'][z]['spike_rate_per_min'] 
-                                if z in self.spike_zone_results[subject]['G0'] else 0 
-                                for z in all_zone_names}
-                    aggregated = aggregate_zones(zone_dict)
-                    rates = [aggregated.get(zone, 0) for zone in zone_names]
-                    
-                    offset = (subj_idx - len(subjects)/2 + 0.5) * subj_width
-                    ax.bar(x + offset, rates, subj_width, label=subject,
-                          alpha=0.7, color=colors[subj_idx], edgecolor='black', linewidth=1)
-            
-            ax.set_xlabel('Zone', fontsize=11)
-            ax.set_ylabel('Spike Rate (per min)', fontsize=11)
-            ax.set_title('G0 Channel - Spike Rate by Zone', fontsize=12, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels(zone_names, rotation=45, ha='right')
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3, axis='y')
-        
-        # G1 plot
-        if show_g1:
-            ax = fig.add_subplot(1, n_plots, plot_idx)
-            
-            if group_mode:
-                group_data = {}
-                for subject, results in self.spike_zone_results.items():
-                    if 'G1' not in results:
-                        continue
-                    group = subject_to_group.get(subject, "Ungrouped")
-                    if group not in group_data:
-                        group_data[group] = {zone: [] for zone in zone_names}
-                    
-                    # Aggregate zones for this subject
-                    zone_dict = {z: results['G1'][z]['spike_rate_per_min'] 
-                                if z in results['G1'] else 0 
-                                for z in all_zone_names}
-                    aggregated = aggregate_zones(zone_dict)
-                    
-                    for zone, rate in aggregated.items():
-                        if zone in group_data[group]:
-                            group_data[group][zone].append(rate)
-                
-                x = np.arange(len(zone_names))
-                group_width = 0.8 / len(group_data) if group_data else 1
-                colors = plt.cm.Set3(np.linspace(0, 1, len(group_data)))
-                
-                for group_idx, (group_name, zones_data) in enumerate(group_data.items()):
-                    means = [np.mean(zones_data[zone]) if zones_data[zone] else 0 for zone in zone_names]
-                    sems = [np.std(zones_data[zone]) / np.sqrt(len(zones_data[zone])) if len(zones_data[zone]) > 1 else 0 
-                           for zone in zone_names]
-                    
-                    offset = (group_idx - len(group_data)/2 + 0.5) * group_width
-                    ax.bar(x + offset, means, group_width, yerr=sems, label=group_name,
-                          alpha=0.7, capsize=4, color=colors[group_idx], edgecolor='black', linewidth=1)
-                    
-                    for i, zone in enumerate(zone_names):
-                        if zones_data[zone]:
-                            jitter = np.random.normal(0, 0.02, len(zones_data[zone]))
-                            ax.scatter([x[i] + offset] * len(zones_data[zone]) + jitter, zones_data[zone],
-                                     alpha=0.6, s=30, color=colors[group_idx], edgecolors='black', linewidth=0.5, zorder=3)
-            else:
-                subjects = list(self.spike_zone_results.keys())
-                x = np.arange(len(zone_names))
-                subj_width = 0.8 / len(subjects) if subjects else 1
-                colors = plt.cm.tab20(np.linspace(0, 1, len(subjects)))
-                
-                for subj_idx, subject in enumerate(subjects):
-                    if 'G1' not in self.spike_zone_results[subject]:
-                        continue
-                    
-                    # Aggregate zones for this subject
-                    zone_dict = {z: self.spike_zone_results[subject]['G1'][z]['spike_rate_per_min'] 
-                                if z in self.spike_zone_results[subject]['G1'] else 0 
-                                for z in all_zone_names}
-                    aggregated = aggregate_zones(zone_dict)
-                    rates = [aggregated.get(zone, 0) for zone in zone_names]
-                    
-                    offset = (subj_idx - len(subjects)/2 + 0.5) * subj_width
-                    ax.bar(x + offset, rates, subj_width, label=subject,
-                          alpha=0.7, color=colors[subj_idx], edgecolor='black', linewidth=1)
-            
-            ax.set_xlabel('Zone', fontsize=11)
-            ax.set_ylabel('Spike Rate (per min)', fontsize=11)
-            ax.set_title('G1 Channel - Spike Rate by Zone', fontsize=12, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels(zone_names, rotation=45, ha='right')
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3, axis='y')
-        
+
+        subject_to_group = self._spike_subject_to_series()
+        series_of = ((lambda s: subject_to_group.get(s, "Ungrouped")) if group_mode
+                     else (lambda s: s))
+        series = list(dict.fromkeys(series_of(s) for s in table))
+        cmap = plt.cm.Set2 if group_mode else plt.cm.tab20
+        colors = cmap(np.linspace(0, 1, max(len(series), 2)))
+        x = np.arange(len(categories))
+        width = 0.8 / max(len(series), 1)
+        n_rows, n_cols = len(self.SPIKE_ZONE_METRICS), len(channels)
+
+        for ci, ch in enumerate(channels):
+            for ri, (key, ylabel, title) in enumerate(self.SPIKE_ZONE_METRICS):
+                ax = fig.add_subplot(n_rows, n_cols, ri * n_cols + ci + 1)
+                for si, name in enumerate(series):
+                    vals = {cat: [table[s][ch][cat][key] for s in table
+                                  if series_of(s) == name and ch in table[s]]
+                            for cat in categories}
+                    means = [np.nanmean(v) if np.isfinite(v).any() else np.nan
+                             for v in (np.asarray(vals[c], float) for c in categories)]
+                    sems = []
+                    for c in categories:
+                        v = np.asarray(vals[c], float)
+                        v = v[np.isfinite(v)]
+                        sems.append(np.std(v) / np.sqrt(len(v)) if len(v) > 1 else 0)
+                    offset = (si - len(series) / 2 + 0.5) * width
+                    ax.bar(x + offset, means, width, yerr=sems if group_mode else None,
+                           capsize=3, color=colors[si], edgecolor='black', linewidth=0.6,
+                           alpha=0.8, label=name)
+                    if group_mode:
+                        for k, c in enumerate(categories):
+                            v = np.asarray(vals[c], float)
+                            v = v[np.isfinite(v)]
+                            if len(v):
+                                ax.scatter(x[k] + offset + np.random.normal(0, 0.02, len(v)), v,
+                                           s=14, color='black', alpha=0.5, zorder=3)
+                ax.set_ylabel(ylabel, fontsize=9)
+                ax.set_title(f'{ch} - {title} by zone', fontsize=10, fontweight='bold')
+                ax.set_xticks(x)
+                ax.set_xticklabels(categories if ri == n_rows - 1 else [],
+                                   rotation=30, ha='right')
+                ax.grid(True, alpha=0.3, axis='y')
+                if ri == 0 and ci == n_cols - 1:
+                    ax.legend(fontsize=7, loc='upper right')
         fig.tight_layout()
-    
+
     def create_info_tab(self):
         """Populate the Info main tab with Overview and Changelog subtabs.
 
@@ -14876,8 +15290,8 @@ Data group:
   out/back movement and more, by subject or group.
 • Coherence — spectral / wavelet coherence and rolling correlation between
   channels, including bout-epoch (peri-event) analyses.
-• Spike Analysis — detect calcium transients; tune parameters with the live
-  preview before running; analyze spikes by zone.
+• Spike Analysis — detect calcium transients; check the threshold on the
+  representative trace; rate, amplitude and width by zone; export for Prism.
 • Bout Analysis — quantify signal around bout onsets/offsets and bout windows.
 • Decision Probability — signal-conditioned probability of behavioral outcomes
   (e.g. explore vs. retreat).
@@ -14901,7 +15315,7 @@ Common issues:
 ✗ NaNs in output — usually a timestamp-synchronization problem between files.
 
 Tips:
-• Use the live preview on Spike Analysis to tune detection before a full run.
+• Use Plot Trace on Spike Analysis to tune detection before a full run.
 • Drag the divider on split tabs (e.g. Spike Analysis) to resize panes.
 • 'Export Plot' saves PNG/TIFF at 600 dpi, or PDF/SVG/EPS as true vector —
   pick a vector format for Prism or Illustrator so it never pixelates.
@@ -14930,6 +15344,35 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Spike Analysis shows a representative trace again (removed in 1.4.0):
+    the signal with the detection threshold, median baseline and every detected
+    transient marked. Pick subject, channel and a time window; it is drawn after
+    each run. "Export Trace for Prism (CSV)" saves it as a Prism XY table.
+  • New — "Export for Prism (CSV)" writes one Column table per metric (rate,
+    count, amplitude, width), per-zone Grouped tables, a by-subject key and the
+    detection settings. A run split by two factors (e.g. Sex × Treatment) also
+    gets Grouped tables with the first factor as rows, ready for two-way ANOVA.
+  • New — Analyze Spikes by Zone reports amplitude and width as well as rate,
+    for every channel. It now uses the run's own detections, so zone counts add
+    up to the results table; it used to re-detect on z-scored G0/G1 only.
+    Sub-zones pool as total transients over total time. The zone-binned export
+    gains count, amplitude and width columns.
+  • New — Spikes by Bout Phase accepts zone entries ("Zone: …") as well as
+    scored behaviors, with a minimum time in zone; "During" is the visit itself.
+  • Fix — Ticking "Apply exclusions" after a spike run left Visualize Spike Data
+    showing every channel while Export Results dropped the excluded ones, so
+    group means disagreed. Plots and exports now offer to re-run first.
+  • Fix — Run Spike Analysis uses the parameters as typed; it previously ran on
+    the last values applied with "Apply Parameters".
+  • Fix — The single-subject spike plot placed markers in seconds on a minutes
+    axis, so they sat off their peaks.
+  • Fix — The Behavioral Data export message reported 0 subjects excluded when
+    the exclusions were applied at calculation; it now names them.
+  • Fix — Moving the centre of an EPM complex layout in the zone editor now
+    carries the distal arms along with the proximal ones.
+
+Version 1.23.0  •  October 20, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — "All Behaviors → unified Excel" adds each bout's onset (s) and scored
     length (s and samples); averaged sheets add the mean bout length. Lengths
@@ -17161,6 +17604,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.processed_data = {}
         self.reset_factors()
         self.behavioral_results = []
+        self.behavioral_excluded_subjects = []
         self.spike_data = {}
         
         project_path = os.path.join(self.project_dir, self.current_project)
@@ -19822,150 +20266,120 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return results if results else None
     
     def analyze_spikes_by_zone(self, subject_id, use_exclusions=None):
-        """Analyze spike frequency by behavioral zone
-        
+        """Transient metrics per behavioral zone, for every analyzed channel.
+
         Args:
             subject_id:     Subject identifier
             use_exclusions: Honour the Exclusions checkboxes.  ``None`` reads the
-                            Spike Analysis tab's "Apply exclusions" toggle.  This
-                            path used to ignore exclusions entirely, so an
-                            excluded channel that the results table and the
-                            exports both dropped was still plotted by zone.
-            
-        Returns:
-            Dictionary with spike rates per zone for each channel
+                            Spike Analysis tab's "Apply exclusions" toggle.
+
+        Uses the detections Run Spike Analysis stored in ``spike_data``, so the
+        zone breakdown adds up to the results table; a subject that was not run
+        is detected here with the same settings.  This used to re-detect on the
+        z-score columns of G0/G1 only, so its counts disagreed with the table
+        and any other channel never appeared.
+
+        Spikes are found on the photometry grid and zones on the behavior grid;
+        each spike is placed in the zone of the behavior row nearest its time,
+        and time in zone is measured at the behavior grid's own rate.
+
+        Returns ``{channel: {zone: metrics}}`` where metrics holds
+        ``spike_count``, ``duration_sec``, ``spike_rate_per_min``,
+        ``mean_amplitude``, ``mean_width_frames``, ``mean_width_ms`` and the
+        per-spike ``amplitudes`` / ``widths`` (frames) used to pool zones later.
+        ``None`` when the subject has no position data or no channel is left.
         """
         if use_exclusions is None:
             var = getattr(self, 'use_exclusions_spike', None)
             use_exclusions = bool(var.get()) if var is not None else False
-        if subject_id not in self.processed_data:
+        data = self.processed_data.get(subject_id)
+        if data is None or not data.get('has_position', False):
             return None
-        
-        data = self.processed_data[subject_id]
-        
-        # Need behavior data with zones
-        if 'beh_synced' not in data or not data.get('has_position', False):
+        labels = self._zone_labels_for(subject_id, data)
+        if labels is None:
             return None
-        
-        fps = self.get_fps(subject_id)
-        beh_synced = data['beh_synced']
-        
-        # Classify all frames into zones
-        zones_per_frame = []
-        for i in range(len(beh_synced)):
-            x = beh_synced[i, 2]
-            y = beh_synced[i, 3]
-            zone = self.classify_zone(x, y)
-            zones_per_frame.append(zone)
-        
-        # Get z-score data
-        if 'zscore_470' in data and data['zscore_470'].shape[1] > 2:
-            zscore_data = data['zscore_470']
-        elif 'zscore' in data and data['zscore'].shape[1] > 2:
-            zscore_data = data['zscore']
-        else:
+
+        detections = (getattr(self, 'spike_data', {}) or {}).get(subject_id)
+        if not detections:
+            detections = self.analyze_spikes_for_subject(
+                subject_id, use_exclusions=use_exclusions) or {}
+        if use_exclusions:
+            slot = {self.get_channel_name(data, i): i
+                    for i in range(self.get_num_channels(data))}
+            detections = {ch: det for ch, det in detections.items()
+                          if not (ch in slot and self.is_channel_slot_excluded(
+                              subject_id, slot[ch], data))}
+        if not detections:
             return None
-        
+
+        fps = float(self.get_fps(subject_id))
+        beh_rate = float(self._beh_row_rate(subject_id, data)) or fps
+        labels_arr = np.asarray(labels, dtype=object)
+        zone_names = [z for z in self.zones.keys() if z != 'unknown'] + ['unknown']
+        durations = {z: float(np.sum(labels_arr == z)) / beh_rate for z in zone_names}
+
         results = {}
-        
-        # Analyze G0 channel.  Ask about the slot, not the literal 'G0': a
-        # recording designated R4/R5 keys its exclusion checkbox by that name.
-        if (zscore_data.shape[1] > 2 and
-                not (use_exclusions and
-                     self.is_channel_slot_excluded(subject_id, 0, data))):
-            g0_signal = zscore_data[:, 2]
-            g0_spikes = self.detect_spikes(g0_signal, fps)
-            
-            if g0_spikes['total_spikes'] > 0:
-                # Categorize spikes by zone
-                zone_spike_counts = {}
-                zone_durations = {}  # in seconds
-                
-                # Initialize counters for all zones
-                for zone_name in self.zones.keys():
-                    zone_spike_counts[zone_name] = 0
-                    zone_durations[zone_name] = 0
-                zone_spike_counts['unknown'] = 0
-                zone_durations['unknown'] = 0
-                
-                # Count frames per zone
-                for zone in zones_per_frame:
-                    if zone in zone_durations:
-                        zone_durations[zone] += 1 / fps
-                
-                # Assign spikes to zones
-                for spike_idx in g0_spikes['spike_indices']:
-                    if spike_idx < len(zones_per_frame):
-                        zone = zones_per_frame[spike_idx]
-                        if zone in zone_spike_counts:
-                            zone_spike_counts[zone] += 1
-                
-                # Calculate spike rates (spikes per minute)
-                zone_spike_rates = {}
-                for zone_name in zone_spike_counts.keys():
-                    if zone_durations[zone_name] > 0:
-                        rate_per_min = (zone_spike_counts[zone_name] / zone_durations[zone_name]) * 60
-                        zone_spike_rates[zone_name] = {
-                            'spike_count': zone_spike_counts[zone_name],
-                            'duration_sec': zone_durations[zone_name],
-                            'spike_rate_per_min': rate_per_min
-                        }
-                    else:
-                        zone_spike_rates[zone_name] = {
-                            'spike_count': 0,
-                            'duration_sec': 0,
-                            'spike_rate_per_min': 0
-                        }
-                
-                results['G0'] = zone_spike_rates
-        
-        # Analyze G1 channel if available
-        if (zscore_data.shape[1] > 3 and
-                not (use_exclusions and
-                     self.is_channel_slot_excluded(subject_id, 1, data))):
-            g1_signal = zscore_data[:, 3]
-            g1_spikes = self.detect_spikes(g1_signal, fps)
-            
-            if g1_spikes['total_spikes'] > 0:
-                zone_spike_counts = {}
-                zone_durations = {}
-                
-                for zone_name in self.zones.keys():
-                    zone_spike_counts[zone_name] = 0
-                    zone_durations[zone_name] = 0
-                zone_spike_counts['unknown'] = 0
-                zone_durations['unknown'] = 0
-                
-                for zone in zones_per_frame:
-                    if zone in zone_durations:
-                        zone_durations[zone] += 1 / fps
-                
-                for spike_idx in g1_spikes['spike_indices']:
-                    if spike_idx < len(zones_per_frame):
-                        zone = zones_per_frame[spike_idx]
-                        if zone in zone_spike_counts:
-                            zone_spike_counts[zone] += 1
-                
-                zone_spike_rates = {}
-                for zone_name in zone_spike_counts.keys():
-                    if zone_durations[zone_name] > 0:
-                        rate_per_min = (zone_spike_counts[zone_name] / zone_durations[zone_name]) * 60
-                        zone_spike_rates[zone_name] = {
-                            'spike_count': zone_spike_counts[zone_name],
-                            'duration_sec': zone_durations[zone_name],
-                            'spike_rate_per_min': rate_per_min
-                        }
-                    else:
-                        zone_spike_rates[zone_name] = {
-                            'spike_count': 0,
-                            'duration_sec': 0,
-                            'spike_rate_per_min': 0
-                        }
-                
-                results['G1'] = zone_spike_rates
-        
-        return results if results else None
-    
+        for ch, det in detections.items():
+            idx = np.asarray(det.get('spike_indices', []), dtype=int)
+            amps = np.asarray(det.get('spike_amplitudes', np.full(len(idx), np.nan)),
+                              dtype=float)
+            widths = np.asarray(det.get('spike_widths', np.full(len(idx), np.nan)),
+                                dtype=float)
+            rows = self._signal_index_to_beh_row(data, idx)
+            spike_zone = np.array([labels[r] if 0 <= r < len(labels) else 'unknown'
+                                   for r in rows], dtype=object)
+            per_zone = {}
+            for z in zone_names:
+                m = spike_zone == z
+                n = int(m.sum())
+                dur = durations[z]
+                z_amps = amps[m] if len(amps) == len(idx) else np.array([])
+                z_widths = widths[m] if len(widths) == len(idx) else np.array([])
+                mw = float(np.nanmean(z_widths)) if len(z_widths) else np.nan
+                per_zone[z] = {
+                    'spike_count': n,
+                    'duration_sec': dur,
+                    'spike_rate_per_min': (n / dur * 60.0) if dur > 0 else np.nan,
+                    'mean_amplitude': float(np.nanmean(z_amps)) if len(z_amps) else np.nan,
+                    'mean_width_frames': mw,
+                    'mean_width_ms': mw / fps * 1000.0 if fps else np.nan,
+                    'amplitudes': z_amps,
+                    'widths': z_widths,
+                }
+            results[ch] = per_zone
+        return results or None
+
+    def _signal_index_to_beh_row(self, data, indices):
+        """Map photometry sample indices onto beh_synced rows (nearest in time).
+
+        The inverse of :meth:`_entry_frames_to_signal_index`: identity when the
+        two grids coincide, otherwise joined on the photometry elapsed time
+        that synchronize_behavior wrote into each behavior row.
+        """
+        idx = np.asarray(indices, dtype=int)
+        beh = data.get('beh_synced')
+        names = self._ordered_channel_names(data)
+        ref = self._get_channel_signal(data, names[0]) if names else None
+        if beh is None or ref is None or len(ref) == len(beh) or not len(idx):
+            return idx
+        kb = self._beh_kin_base(self._beh_channel_count(data))
+        el_photo = self._photometry_elapsed(data)
+        if beh.shape[1] <= kb or el_photo is None:
+            return idx
+        el_beh = np.asarray(beh[:, kb], dtype=float)
+        ok = np.flatnonzero(np.isfinite(el_beh))
+        if not len(ok):
+            return idx
+        order = ok[np.argsort(el_beh[ok], kind='stable')]
+        srt = el_beh[order]
+        t = np.asarray(el_photo, dtype=float)[np.clip(idx, 0, len(el_photo) - 1)]
+        j = np.clip(np.searchsorted(srt, t), 1, len(srt) - 1) if len(srt) > 1 \
+            else np.zeros(len(t), dtype=int)
+        if len(srt) > 1:
+            left_closer = np.abs(srt[j - 1] - t) <= np.abs(srt[j] - t)
+            j = np.where(left_closer, j - 1, j)
+        return order[j]
+
     # ======================== Data Processing ========================
     
     def run_processing(self):
@@ -23614,15 +24028,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             
             # Apply exclusions if enabled
             # Note: Behavioral data typically uses all channels, but we'll filter based on behavioral exclusions
+            # Remembered so the export can report them: these subjects never
+            # reach behavioral_results, so the export's own filter sees none.
+            self.behavioral_excluded_subjects = []
             if self.use_exclusions_behavioral.get():
-                original_count = len(selected_subjects)
-                # Filter subjects based on behavioral data exclusions
+                self.behavioral_excluded_subjects = [
+                    s for s in selected_subjects
+                    if self.is_behavior_excluded(s, use_exclusions=True)]
                 selected_subjects = [s for s in selected_subjects
-                                     if not self.is_behavior_excluded(s, use_exclusions=True)]
+                                     if s not in self.behavioral_excluded_subjects]
                 if not selected_subjects:
                     messagebox.showwarning("All Excluded", "All selected subjects have behavioral data excluded")
                     return
-                excluded_count = original_count - len(selected_subjects)
+                excluded_count = len(self.behavioral_excluded_subjects)
                 if excluded_count > 0:
                     self.log_message(f"Excluded {excluded_count} subject(s) based on behavioral data exclusion settings")
             
@@ -24062,7 +24480,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._add_metadata_comment_to_csv(filename, metadata)
         
         export_format = "time-binned (horizontal)" if use_bins else "flat (vertical)"
-        exclusions_note = f"\nExclusions applied: {len(self.behavioral_results) - len(results_to_export)} results excluded" if self.use_exclusions_behavioral.get() else ""
+        exclusions_note = ""
+        if self.use_exclusions_behavioral.get():
+            # Subjects dropped when the metrics were calculated, plus any whose
+            # exclusion was ticked afterwards and only filtered out here.
+            kept = {r.get('Subject') for r in results_to_export}
+            excluded = list(getattr(self, 'behavioral_excluded_subjects', None) or [])
+            excluded += sorted({r.get('Subject') for r in self.behavioral_results
+                                if r.get('Subject') not in kept} - set(excluded))
+            exclusions_note = f"\nExclusions applied: {len(excluded)} subject(s) excluded"
+            if excluded:
+                exclusions_note += f" ({', '.join(map(str, excluded))})"
         messagebox.showinfo("Export Complete", 
                            f"Behavioral metrics exported to:\n{filename}\n\n"
                            f"Format: {export_format}\n"
