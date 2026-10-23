@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.26.0"
+APP_VERSION = "1.27.0"
 APP_VERSION_DATE = "October 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -15458,6 +15458,15 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Mirror-FDR smoothing is adjustable ("Smoothing (ms)", default 70 ms,
+    0 turns it off). It adds to the processing low-pass filter. Tested down to
+    20 ms rises, 70 ms costs no recall and cuts noise detections, so it stays.
+  • Fix — In Mirror-FDR mode the representative trace now draws the smoothed
+    signal the detector scores, with the raw signal faint behind it. Peaks
+    whose one-frame raw tips crossed the threshold line looked missed.
+
+Version 1.26.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Detection Settings show only the chosen method's options. MAD keeps
     threshold, prominence and per-subject/whole-dataset MAD; Mirror-FDR shows
