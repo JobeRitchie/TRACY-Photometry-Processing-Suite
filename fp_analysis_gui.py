@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.24.0"
+APP_VERSION = "1.25.0"
 APP_VERSION_DATE = "October 23, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -15392,6 +15392,19 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Spike Analysis offers Mirror-FDR detection beside the MAD threshold.
+    Downward excursions serve as the noise null: each recording's threshold is
+    set where they are at most the target share (default 5%) of upward ones,
+    measured above a local 20 s baseline. On pure noise it finds ~0.1 events/min
+    where the MAD threshold finds 12-31, and it separates dead from live fibres
+    (AUC 0.97 vs 0.09). Adapted from Dombeck et al. (2007); the tab cites it.
+  • New — With Mirror-FDR, amplitude is the height above the local baseline,
+    and the representative trace draws that baseline and threshold with the
+    estimated false-detection rate. A channel with nothing that stands out from
+    noise is reported as such. MAD remains the default.
+
+Version 1.24.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Spike Analysis shows a representative trace again (removed in 1.4.0):
     the signal with the detection threshold, median baseline and every detected
