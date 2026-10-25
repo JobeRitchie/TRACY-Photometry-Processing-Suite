@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.27.0"
-APP_VERSION_DATE = "October 23, 2026"
+APP_VERSION = "1.28.0"
+APP_VERSION_DATE = "October 25, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -7363,12 +7363,18 @@ class FPAnalysisGUI:
                    style='Compact.TButton',
                    command=self.apply_viz_outback_threshold).grid(
             row=2, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Button(outback_box, text="Show Velocity Histogram",
+                   style='Compact.TButton',
+                   command=self.show_outback_velocity_histogram).grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(4, 0))
         ttk.Label(outback_box,
                   text="Frames slower than this are ignored. Re-runs Out/Back on "
-                       "processed subjects - no reprocess needed.",
+                       "processed subjects - no reprocess needed. The histogram "
+                       "shows the open-arm velocities the threshold cuts and "
+                       "follows the box as you change it.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(250), justify='left').grid(
-            row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
+            row=4, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
         num_box = cluster('bout_number')
         ttk.Label(num_box, text="Show Bout #:").grid(row=0, column=0, sticky='w')
@@ -13232,6 +13238,7 @@ class FPAnalysisGUI:
                 ("Visualize Spike Data", self.visualize_spike_data),
                 ("Analyze Spikes by Zone", self.visualize_spikes_by_zone),
                 ("Spikes by Bout Phase", self.analyze_spikes_by_bout_phase),
+                ("Spatial Transients...", self.open_spatial_transients),
                 ("Export Results", self.export_spike_results),
                 ("Export for Prism (CSV)", self.export_spike_prism)):
             ttk.Button(actions, text=text, command=command).pack(
@@ -15035,6 +15042,719 @@ class FPAnalysisGUI:
         self._plot_spike_rates_by_zone(fig)
         self._embed_plot_window(fig, "Spike Metrics by Zone", "1400x950")
     
+    # ======================== Spatial Transients ========================
+    #
+    # Where and when transients happen, as an alternative to averaging the
+    # signal by place.  Validated on KORKO EPM and KORKO NSF (Oct 2026):
+    # transient counts per small bin are mostly Poisson noise at ~10/min, and
+    # the rate falls ~3x from rest to running, so every view offers coarse bins,
+    # a speed + time correction and a minimum-transient guard.
+
+    SPATIAL_PLOTS = (
+        ('breakdown', "Rate breakdown (zone / still-moving / time)"),
+        ('distance', "Distance from centre"),
+        ('speed', "Speed tuning"),
+        ('scatter', "Transient scatter (x/y)"),
+        ('trace3d', "3D trace across the maze"),
+    )
+    SPATIAL_METRICS = (
+        ('rate', "Transients / min"),
+        ('active', "Time in transient (%)"),
+        ('amplitude', "Median amplitude"),
+    )
+    SPATIAL_SPEED_EDGES = (0, 1, 2, 4, 6, 9, 13, 20, np.inf)
+
+    def _spatial_opts(self):
+        """Tk variables behind the Spatial Transients window, created once so
+        the settings survive closing and reopening it."""
+        o = getattr(self, '_spatial_vars', None)
+        if o is not None:
+            return o
+        S, D, I, B = tk.StringVar, tk.DoubleVar, tk.IntVar, tk.BooleanVar
+        o = self._spatial_vars = {
+            'plot': S(value='breakdown'), 'metric': S(value='rate'),
+            'min_transients': I(value=20), 'still_cm_s': D(value=2.0),
+            'block_min': D(value=2.0), 'axis': S(value='Euclidean'),
+            'bin_cm': D(value=2.5), 'split_category': B(value=False),
+            'speed_correct': B(value=False), 'relative': B(value=False),
+            'alpha': D(value=0.05), 'size': D(value=6.0), 'color_by': S(value='series'),
+            'show_path': B(value=True), 'normalize': B(value=False),
+            'subject': S(value=''), 'smooth_s': D(value=1.0), 'gain': D(value=3.0),
+            'start_min': D(value=0.0), 'end_min': D(value=0.0), 'cmap': S(value='plasma'),
+        }
+        o['zones'] = {}
+        return o
+
+    def _spatial_zone_filter(self):
+        """Zone categories the user left ticked (all when none are listed)."""
+        cats, _ = self._spike_zone_categories()
+        zv = self._spatial_opts()['zones']
+        return {c for c in cats if zv.get(c) is None or zv[c].get()}
+
+    def _spatial_records(self, channels=None, min_n=None):
+        """Per subject-channel arrays on the behavior grid.
+
+        Uses the detections Run Spike Analysis stored, so counts match the
+        results table.  Each record holds x/y (cm), |x|/|y| from centre,
+        smoothed speed, the row rate, a transient count per row, a
+        time-in-transient mask (peak +/- half its half-height width), the
+        amplitude at each transient row, the zone category per row and the
+        z-score trace.  Channels with fewer transients than the guard are
+        dropped from the maps (their maps are noise) but kept by the rate
+        breakdown, where a near-silent recording is a real data point.
+        """
+        from scipy.ndimage import uniform_filter1d
+        o = self._spatial_opts()
+        if min_n is None:
+            min_n = 0 if o['plot'].get() == 'breakdown' else max(0, int(o['min_transients'].get()))
+        use_excl = self.use_exclusions_spike.get()
+        series_of = self._spike_subject_to_series()
+        group_mode = self.spike_mode_var.get() == "Group"
+        _, cat_of = self._spike_zone_categories()
+        if channels is None:
+            channels = [ch for ch, var in self.spike_channel_vars.items() if var.get()]
+        recs = []
+        for subject, results in sorted(self._spike_results_for_selection().items()):
+            data = self.processed_data.get(subject)
+            if not data or not data.get('has_position', False):
+                continue
+            beh = data.get('beh_synced')
+            if beh is None or beh.shape[1] < 4:
+                continue
+            n_ch = self._beh_channel_count(data)
+            kb = self._beh_kin_base(n_ch)
+            labels = self._zone_labels_for(subject, data)
+            if labels is None:
+                continue
+            hz = float(self._beh_row_rate(subject, data)) or float(self.get_fps(subject))
+            cat = np.array([cat_of.get(z, 'unknown') for z in labels], dtype=object)
+            x = np.asarray(beh[:, 2], float); y = np.asarray(beh[:, 3], float)
+            if beh.shape[1] > kb + 4:
+                dx = np.abs(np.asarray(beh[:, kb + 3], float))
+                dy = np.abs(np.asarray(beh[:, kb + 4], float))
+                vel = np.asarray(beh[:, kb + 1], float)
+            else:
+                dx = np.abs(x - np.nanmedian(x)); dy = np.abs(y - np.nanmedian(y))
+                vel = np.full(len(beh), np.nan)
+            vel = uniform_filter1d(np.nan_to_num(vel), max(1, int(round(hz / 2))))
+            slot = {self.get_channel_name(data, i): i for i in range(self.get_num_channels(data))}
+            fps = float(self.get_fps(subject))
+            for ch in channels:
+                det = results.get(ch)
+                if det is None or ch not in slot:
+                    continue
+                if use_excl and self.is_channel_slot_excluded(subject, slot[ch], data):
+                    continue
+                idx = np.asarray(det.get('spike_indices', []), dtype=int)
+                if len(idx) < min_n:
+                    continue
+                n = len(beh)
+                rows = np.clip(self._signal_index_to_beh_row(data, idx), 0, n - 1) if len(idx) \
+                    else np.array([], dtype=int)
+                ev = np.bincount(rows, minlength=n)[:n].astype(float)
+                amps = np.asarray(det.get('spike_amplitudes', []), float)
+                amp = np.full(n, np.nan)
+                if len(amps) == len(rows):
+                    amp[rows] = amps
+                widths = np.asarray(det.get('spike_widths', []), float)
+                active = np.zeros(n, bool)
+                if len(widths) == len(idx) and len(idx):
+                    half = np.nan_to_num(widths) / 2.0
+                    lo = self._signal_index_to_beh_row(data, np.maximum(idx - half, 0).astype(int))
+                    hi = self._signal_index_to_beh_row(data, (idx + half).astype(int))
+                    for a, b in zip(np.clip(lo, 0, n - 1), np.clip(hi, 0, n - 1)):
+                        active[a:b + 1] = True
+                else:
+                    active[rows] = True
+                zcol = 6 + slot[ch]
+                z = np.asarray(beh[:, zcol], float) if zcol < kb else np.full(n, np.nan)
+                recs.append(dict(
+                    subject=subject, channel=ch, fps=fps, hz=hz,
+                    series=series_of.get(subject, "Ungrouped") if group_mode else subject,
+                    x=x, y=y, dx=dx, dy=dy, vel=vel, ev=ev, active=active, amp=amp,
+                    cat=cat, z=z, n=len(idx)))
+        return recs
+
+    @staticmethod
+    def _poisson_place_effect(y, pos, npos, spd, nspd, tim, ntim, iters=30):
+        """Place effect with speed and session time held fixed.
+
+        rate = a[place] * b[speed] * c[time block], fitted by alternating ratio
+        updates (iterative proportional fitting, the same estimate as a Poisson
+        GLM with three categorical factors).  ``a`` is returned with an
+        occupancy-weighted mean of 1, so 1.5 means 50% more transients there
+        than speed and time alone predict.  A half-count prior keeps empty
+        bins finite.
+        """
+        a = np.ones(npos); b = np.ones(nspd); c = np.ones(ntim)
+        prior = 0.5 * (y.mean() if len(y) else 0.0)
+        for _ in range(iters):
+            a = (np.bincount(pos, y, npos) + prior) / (np.bincount(pos, b[spd] * c[tim], npos) + 0.5)
+            b = np.bincount(spd, y, nspd) / np.maximum(np.bincount(spd, a[pos] * c[tim], nspd), 1e-12)
+            c = np.bincount(tim, y, ntim) / np.maximum(np.bincount(tim, a[pos] * b[spd], ntim), 1e-12)
+        occ = np.bincount(pos, None, npos)
+        return a / max(np.sum(a * occ) / max(occ.sum(), 1), 1e-12)
+
+    def _spatial_cell_metric(self, rec, mask, metric, min_s=3.0):
+        """One metric over the rows in ``mask``; NaN below ``min_s`` seconds."""
+        secs = mask.sum() / rec['hz']
+        if secs < min_s:
+            return np.nan
+        if metric == 'rate':
+            return rec['ev'][mask].sum() / secs * 60.0
+        if metric == 'active':
+            return rec['active'][mask].mean() * 100.0
+        a = rec['amp'][mask]
+        a = a[np.isfinite(a)]
+        return float(np.median(a)) if len(a) >= 3 else np.nan
+
+    def _spatial_breakdown_table(self, recs):
+        """``(columns, {(subject, channel): {column: value}})`` for the rate
+        breakdown: whole session, each zone category, still / moving, each
+        time block, and the same-time-budget rate."""
+        o = self._spatial_opts()
+        metric = o['metric'].get()
+        still_thr = float(o['still_cm_s'].get())
+        block_s = max(10.0, float(o['block_min'].get()) * 60.0)
+        cats, _ = self._spike_zone_categories()
+        keep = self._spatial_zone_filter()
+        cats = [c for c in cats if c in keep]
+        n_blocks = max(1, int(np.ceil(max(len(r['ev']) / r['hz'] for r in recs) / block_s))) if recs else 1
+        cols = ['Session'] + cats + ['Still', 'Moving']
+        cols += [f"{b * block_s / 60:g}-{(b + 1) * block_s / 60:g} min" for b in range(n_blocks)]
+        cols += ['Same time budget']
+        # Pooled time budget over zone x still/moving, shared by every subject,
+        # so a group that sits still more is not credited for it.
+        cells = [(c, s) for c in cats for s in (True, False)]
+        budget = np.zeros(len(cells))
+        for r in recs:
+            still = r['vel'] < still_thr
+            for i, (c, s) in enumerate(cells):
+                budget[i] += np.mean((r['cat'] == c) & (still == s))
+        budget = budget / budget.sum() if budget.sum() > 0 else budget
+        table = {}
+        for r in recs:
+            still = r['vel'] < still_thr
+            inz = np.isin(r['cat'], cats)
+            row = {'Session': self._spatial_cell_metric(r, inz, metric)}
+            for c in cats:
+                row[c] = self._spatial_cell_metric(r, r['cat'] == c, metric)
+            row['Still'] = self._spatial_cell_metric(r, inz & still, metric)
+            row['Moving'] = self._spatial_cell_metric(r, inz & ~still, metric)
+            t = np.arange(len(r['ev'])) / r['hz']
+            for b in range(n_blocks):
+                row[cols[len(cats) + 3 + b]] = self._spatial_cell_metric(
+                    r, inz & (t >= b * block_s) & (t < (b + 1) * block_s), metric)
+            vals = np.array([self._spatial_cell_metric(r, (r['cat'] == c) & (still == s), metric)
+                             for c, s in cells])
+            ok = np.isfinite(vals) & (budget > 0)
+            row['Same time budget'] = (float(np.sum(vals[ok] * budget[ok]) / budget[ok].sum())
+                                       if ok.any() else np.nan)
+            table[(r['subject'], r['channel'])] = row
+        cols = [c for c in cols if any(np.isfinite(row[c]) for row in table.values())]
+        return cols, table
+
+    def _spatial_distance_profiles(self, recs):
+        """``(bin centres, {(subject, channel, category): values})`` of the
+        chosen metric against distance from centre."""
+        o = self._spatial_opts()
+        metric = o['metric'].get()
+        axis = o['axis'].get()
+        bin_cm = max(0.5, float(o['bin_cm'].get()))
+        keep = self._spatial_zone_filter()
+        split = o['split_category'].get()
+        correct = o['speed_correct'].get() and metric == 'rate'
+        relative = o['relative'].get()
+        still_edges = np.asarray(self.SPATIAL_SPEED_EDGES, float)
+        dist_all = []
+        for r in recs:
+            d = {'|X|': r['dx'], '|Y|': r['dy']}.get(axis, np.hypot(r['dx'], r['dy']))
+            dist_all.append(d)
+        dmax = max((np.nanmax(d) for d in dist_all if np.isfinite(d).any()), default=0.0)
+        nb = max(1, int(np.ceil(dmax / bin_cm)))
+        centres = (np.arange(nb) + 0.5) * bin_cm
+        out = {}
+        for r, d in zip(recs, dist_all):
+            ok = np.isfinite(d) & np.isin(r['cat'], list(keep))
+            pos = np.clip((np.nan_to_num(d) // bin_cm).astype(int), 0, nb - 1)
+            groups = sorted(set(r['cat'][ok])) if split else ['all']
+            session_rate = r['ev'].sum() / (len(r['ev']) / r['hz']) * 60.0
+            session_mean = self._spatial_cell_metric(r, np.ones(len(r['ev']), bool), metric)
+            for g in groups:
+                m = ok & (r['cat'] == g) if split else ok
+                vals = np.full(nb, np.nan)
+                if correct and m.sum():
+                    spd = np.clip(np.digitize(r['vel'][m], still_edges) - 1, 0, len(still_edges) - 2)
+                    tim = np.minimum((np.flatnonzero(m) / r['hz'] // 120).astype(int), 4)
+                    eff = self._poisson_place_effect(r['ev'][m], pos[m], nb, spd, len(still_edges) - 1, tim, 5)
+                    vals = eff if relative else eff * session_rate
+                for b in range(nb):
+                    mb = m & (pos == b)
+                    if (mb.sum() / r['hz']) < 3.0:
+                        vals[b] = np.nan
+                    elif not correct:
+                        vals[b] = self._spatial_cell_metric(r, mb, metric)
+                if relative and not correct and np.isfinite(session_mean) and session_mean:
+                    vals = vals / session_mean
+                out[(r['subject'], r['channel'], g)] = vals
+        return centres, out
+
+    def _spatial_speed_profiles(self, recs):
+        """``(bin labels, {(subject, channel): values})`` of the metric by speed."""
+        o = self._spatial_opts()
+        metric = o['metric'].get()
+        keep = self._spatial_zone_filter()
+        edges = np.asarray(self.SPATIAL_SPEED_EDGES, float)
+        labels = [f"{a:g}-{b:g}" if np.isfinite(b) else f">{a:g}" for a, b in zip(edges[:-1], edges[1:])]
+        out = {}
+        for r in recs:
+            inz = np.isin(r['cat'], list(keep))
+            k = np.clip(np.digitize(r['vel'], edges) - 1, 0, len(edges) - 2)
+            vals = np.array([self._spatial_cell_metric(r, inz & (k == b), metric, min_s=5.0)
+                             for b in range(len(labels))])
+            if o['relative'].get():
+                base = self._spatial_cell_metric(r, inz, metric)
+                vals = vals / base if base else vals
+            out[(r['subject'], r['channel'])] = vals
+        return labels, out
+
+    def _spatial_series_colors(self, names):
+        cmap = plt.cm.Set1 if len(names) <= 9 else plt.cm.tab20
+        return {n: cmap(i % cmap.N) for i, n in enumerate(names)}
+
+    def _spatial_metric_label(self):
+        o = self._spatial_opts()
+        label = dict(self.SPATIAL_METRICS)[o['metric'].get()]
+        if o['plot'].get() == 'distance' and o['speed_correct'].get() and o['metric'].get() == 'rate':
+            label += " (speed + time corrected)"
+        if o['relative'].get() and o['plot'].get() in ('distance', 'speed'):
+            label = label.split(' (')[0] + " (x session)"
+        return label
+
+    def _plot_spatial_breakdown(self, fig, recs):
+        """Bars = series mean +/- SEM, dots = animals, one row per channel.
+
+        The view for a difference that holds everywhere: if one group's rate
+        is lower in every zone, at rest and moving, in every time block and
+        after equalising the time budget, the effect is not explained by
+        where the animals went or how much they moved.
+        """
+        cols, table = self._spatial_breakdown_table(recs)
+        channels = list(dict.fromkeys(r['channel'] for r in recs))
+        series = list(dict.fromkeys(r['series'] for r in recs))
+        colors = self._spatial_series_colors(series)
+        ser_of = {(r['subject'], r['channel']): r['series'] for r in recs}
+        rng = np.random.default_rng(0)
+        x = np.arange(len(cols))
+        width = 0.8 / max(len(series), 1)
+        for ci, ch in enumerate(channels):
+            ax = fig.add_subplot(len(channels), 1, ci + 1)
+            for si, s in enumerate(series):
+                keys = [k for k in table if k[1] == ch and ser_of[k] == s]
+                if not keys:
+                    continue
+                M = np.array([[table[k][c] for c in cols] for k in keys], float)
+                n = np.isfinite(M).sum(0)
+                mu = np.where(n > 0, np.nanmean(np.where(np.isfinite(M), M, np.nan), 0), np.nan)
+                sd = np.array([np.nanstd(M[:, j]) if n[j] > 1 else 0.0 for j in range(len(cols))])
+                se = sd / np.sqrt(np.maximum(n, 1))
+                off = (si - len(series) / 2 + 0.5) * width
+                ax.bar(x + off, mu, width * 0.9, yerr=se, capsize=2, color=colors[s],
+                       alpha=0.35, edgecolor=colors[s], linewidth=1.0,
+                       label=f"{s} (n={len(keys)})")
+                for j in range(len(cols)):
+                    v = M[:, j][np.isfinite(M[:, j])]
+                    ax.scatter(x[j] + off + rng.uniform(-width * 0.25, width * 0.25, len(v)), v,
+                               s=10, color=colors[s], edgecolor='white', linewidth=0.3, zorder=3)
+            if len(series) == 2:
+                ymax = ax.get_ylim()[1]
+                for j, c in enumerate(cols):
+                    a = [table[k][c] for k in table if k[1] == ch and ser_of[k] == series[0]]
+                    b = [table[k][c] for k in table if k[1] == ch and ser_of[k] == series[1]]
+                    a = np.asarray(a, float); b = np.asarray(b, float)
+                    a, b = a[np.isfinite(a)], b[np.isfinite(b)]
+                    if len(a) >= 3 and len(b) >= 3:
+                        p = stats.mannwhitneyu(a, b).pvalue
+                        ax.text(j, 1.01, "p<.001" if p < 0.001 else f"p={p:.3f}",
+                                transform=ax.get_xaxis_transform(), ha='center', va='bottom',
+                                fontsize=7, fontweight='bold' if p < 0.05 else 'normal')
+            for sep in (len(cols) - 1 - 0.5, 0.5):
+                ax.axvline(sep, color='0.7', lw=0.6, ls=':')
+            ax.set_xticks(x)
+            ax.set_xticklabels(cols, rotation=30, ha='right', fontsize=8)
+            ax.set_ylabel(self._spatial_metric_label())
+            ax.set_title(f"{ch}: whole session, by zone, still vs moving, by time block", pad=14)
+            ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.005, 1.0), framealpha=0.8)
+        if len(series) == 2:
+            fig.text(0.01, 0.005, "p: Mann-Whitney per column, uncorrected. 'Same time budget' "
+                     "re-weights each animal's zone x still/moving rates to the pooled time budget.",
+                     fontsize=7, color='0.4')
+
+    def _plot_spatial_lines(self, fig, xs, profiles, xlabel, key_fn, title_fn, categorical=False):
+        """Series mean +/- SEM of per-animal profiles, one panel per key."""
+        series_of = {(r['subject'], r['channel']): r['series'] for r in self._spatial_last_recs}
+        panels = list(dict.fromkeys(key_fn(k) for k in profiles))
+        series = list(dict.fromkeys(series_of[(k[0], k[1])] for k in profiles))
+        colors = self._spatial_series_colors(series)
+        ncol = min(3, len(panels)) or 1
+        nrow = int(np.ceil(len(panels) / ncol)) or 1
+        xpos = np.arange(len(xs)) if categorical else np.asarray(xs, float)
+        for pi, panel in enumerate(panels):
+            ax = fig.add_subplot(nrow, ncol, pi + 1)
+            for s in series:
+                ks = [k for k in profiles if key_fn(k) == panel and series_of[(k[0], k[1])] == s]
+                if not ks:
+                    continue
+                M = np.array([profiles[k] for k in ks], float)
+                n = np.isfinite(M).sum(0)
+                mu = np.array([np.nanmean(M[:, j]) if n[j] else np.nan for j in range(M.shape[1])])
+                se = np.array([np.nanstd(M[:, j]) / np.sqrt(n[j]) if n[j] > 1 else 0 for j in range(M.shape[1])])
+                mu[n < min(3, len(ks))] = np.nan
+                ax.plot(xpos, mu, marker='o', ms=3, color=colors[s], label=f"{s} (n={len(ks)})")
+                ax.fill_between(xpos, mu - se, mu + se, color=colors[s], alpha=0.2)
+            if self._spatial_opts()['relative'].get():
+                ax.axhline(1.0, color='0.5', lw=0.6, ls=':')
+            if categorical:
+                ax.set_xticks(xpos); ax.set_xticklabels(xs, rotation=30, ha='right', fontsize=8)
+            ax.set_xlabel(xlabel); ax.set_ylabel(self._spatial_metric_label())
+            ax.set_title(title_fn(panel), fontsize=10)
+            if pi == 0:
+                ax.legend(fontsize=8)
+
+    def _plot_spatial_scatter(self, fig, recs):
+        """One dot per transient at the animal's position; with low opacity
+        the dots build their own heatmap.  'Divide by time spent' turns it
+        into transients per second of occupancy, which removes the share of
+        the picture that is just where the animal sat."""
+        o = self._spatial_opts()
+        channels = list(dict.fromkeys(r['channel'] for r in recs))
+        series = list(dict.fromkeys(r['series'] for r in recs))
+        colors = self._spatial_series_colors(series)
+        cols = len(series) if o['normalize'].get() else 1
+        for ci, ch in enumerate(channels):
+            rs = [r for r in recs if r['channel'] == ch]
+            xs = np.concatenate([r['x'] for r in rs]); ys = np.concatenate([r['y'] for r in rs])
+            ext = (np.nanmin(xs), np.nanmax(xs), np.nanmin(ys), np.nanmax(ys))
+            if o['normalize'].get():
+                for si, s in enumerate(series):
+                    ax = fig.add_subplot(len(channels), cols, ci * cols + si + 1)
+                    e_x = np.linspace(ext[0], ext[1], 41); e_y = np.linspace(ext[2], ext[3], 41)
+                    H = np.zeros((40, 40)); O = np.zeros((40, 40)); tot_ev = tot_s = 0.0
+                    for r in rs:
+                        if r['series'] != s:
+                            continue
+                        ok = np.isfinite(r['x']) & np.isfinite(r['y'])
+                        H += np.histogram2d(r['x'][ok], r['y'][ok], [e_x, e_y], weights=r['ev'][ok])[0]
+                        O += np.histogram2d(r['x'][ok], r['y'][ok], [e_x, e_y])[0] / r['hz']
+                        tot_ev += r['ev'].sum(); tot_s += len(r['ev']) / r['hz']
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        R = (H / O) / (tot_ev / tot_s) if tot_s and tot_ev else H * np.nan
+                    R[O < 3] = np.nan
+                    im = ax.imshow(R.T, origin='lower', extent=ext, cmap=o['cmap'].get(),
+                                   vmin=0, vmax=2, aspect='equal')
+                    fig.colorbar(im, ax=ax, fraction=0.046, label='rate / mean rate')
+                    ax.set_title(f"{ch} {s}: transients / time spent", fontsize=10)
+                    self._spatial_draw_zones(ax)
+                continue
+            ax = fig.add_subplot(len(channels), 1, ci + 1)
+            if o['show_path'].get():
+                for r in rs:
+                    ax.plot(r['x'][::5], r['y'][::5], color='0.6', lw=0.2, alpha=0.3, zorder=1)
+            amps = np.concatenate([r['amp'][r['ev'] > 0] for r in rs]) if rs else np.array([])
+            vmin, vmax = (np.nanpercentile(amps, [5, 95]) if np.isfinite(amps).any() else (0, 1))
+            for r in rs:
+                m = r['ev'] > 0
+                kw = dict(s=float(o['size'].get()), alpha=float(o['alpha'].get()), lw=0, zorder=2)
+                if o['color_by'].get() == 'amplitude':
+                    sc = ax.scatter(r['x'][m], r['y'][m], c=r['amp'][m], cmap=o['cmap'].get(),
+                                    vmin=vmin, vmax=vmax, **kw)
+                else:
+                    ax.scatter(r['x'][m], r['y'][m], color=colors[r['series']], **kw)
+            if o['color_by'].get() == 'amplitude' and rs:
+                cb = fig.colorbar(sc, ax=ax, fraction=0.046, label='amplitude')
+                cb.solids.set_alpha(1)
+            else:
+                for s in series:
+                    ax.scatter([], [], color=colors[s], label=s)
+                ax.legend(fontsize=8, loc='upper right')
+            self._spatial_draw_zones(ax)
+            ax.set_aspect('equal')
+            ax.set_title(f"{ch}: every transient ({int(sum(r['ev'].sum() for r in rs))} from {len(rs)} recordings)")
+
+    def _spatial_draw_zones(self, ax):
+        for name, z in self.zones.items():
+            if not isinstance(z, dict) or 'x_min' not in z:
+                continue
+            ax.add_patch(Rectangle((z['x_min'], z['y_min']), z['x_max'] - z['x_min'],
+                                   z['y_max'] - z['y_min'], fill=False, lw=0.6,
+                                   ec='0.3', alpha=0.6, zorder=4))
+
+    def _plot_spatial_trace3d(self, fig, recs):
+        """The animal's path on the floor, height = heavily smoothed z-score
+        with each transient boosted by ``gain`` x its amplitude, colored by
+        height, so the maze shows where the signal peaks."""
+        from scipy.ndimage import gaussian_filter1d
+        o = self._spatial_opts()
+        sel = o['subject'].get()
+        rs = [r for r in recs if f"{r['subject']} {r['channel']}" == sel] or recs[:1]
+        ax = fig.add_subplot(1, 1, 1, projection='3d')
+        segs_all, vals_all = [], []
+        for r in rs:
+            n = len(r['z'])
+            t0 = int(max(0.0, float(o['start_min'].get())) * 60 * r['hz'])
+            t1 = int(float(o['end_min'].get()) * 60 * r['hz']) or n
+            sl = slice(t0, min(n, t1))
+            sig = max(0.0, float(o['smooth_s'].get())) * r['hz']
+            z = np.nan_to_num(r['z'])
+            base = gaussian_filter1d(z, sig) if sig >= 0.5 else z
+            amp = np.nan_to_num(r['amp'])
+            spread = max(1.0, sig / 2 if sig else r['hz'] / 4)
+            bumps = gaussian_filter1d(amp, spread) * spread * np.sqrt(2 * np.pi)
+            h = base + float(o['gain'].get()) * bumps / (np.nanstd(amp[amp > 0]) or 1.0) * np.nanstd(base)
+            xs, ys, hs = r['x'][sl], r['y'][sl], h[sl]
+            ok = np.isfinite(xs) & np.isfinite(ys)
+            xs, ys, hs = xs[ok], ys[ok], hs[ok]
+            pts = np.column_stack([xs, ys, hs]).reshape(-1, 1, 3)
+            segs_all.append(np.concatenate([pts[:-1], pts[1:]], axis=1))
+            vals_all.append((hs[:-1] + hs[1:]) / 2)
+            m = (r['ev'][sl][ok] > 0)
+            ax.scatter(xs[m], ys[m], hs[m], c=hs[m], cmap=o['cmap'].get(), s=12, depthshade=False)
+        if not segs_all:
+            return
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+        segs = np.concatenate(segs_all); vals = np.concatenate(vals_all)
+        lc = Line3DCollection(segs, cmap=o['cmap'].get(), linewidth=0.8)
+        lc.set_array(vals)
+        lc.set_clim(*np.nanpercentile(vals, [2, 99.5]))
+        ax.add_collection3d(lc)
+        allp = segs.reshape(-1, 3)
+        # Floor = the arena (zone bounds), not this animal's path, so a mouse
+        # that never left the closed arms is not stretched across the plot.
+        boxes = [z for z in self.zones.values() if isinstance(z, dict) and 'x_min' in z]
+        x0 = min([z['x_min'] for z in boxes] + [np.nanmin(allp[:, 0])])
+        x1 = max([z['x_max'] for z in boxes] + [np.nanmax(allp[:, 0])])
+        y0 = min([z['y_min'] for z in boxes] + [np.nanmin(allp[:, 1])])
+        y1 = max([z['y_max'] for z in boxes] + [np.nanmax(allp[:, 1])])
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        ax.set_zlim(np.nanpercentile(allp[:, 2], 0.5), np.nanmax(allp[:, 2]))
+        ax.set_box_aspect((x1 - x0, y1 - y0, 0.6 * max(x1 - x0, y1 - y0)))
+        zmin = ax.get_zlim()[0]
+        for name, zn in self.zones.items():
+            if isinstance(zn, dict) and 'x_min' in zn:
+                xx = [zn['x_min'], zn['x_max'], zn['x_max'], zn['x_min'], zn['x_min']]
+                yy = [zn['y_min'], zn['y_min'], zn['y_max'], zn['y_max'], zn['y_min']]
+                ax.plot(xx, yy, [zmin] * 5, color='0.5', lw=0.6)
+        fig.colorbar(lc, ax=ax, fraction=0.03, pad=0.08, label='smoothed z + boosted transients')
+        ax.set_xlabel('X (cm)'); ax.set_ylabel('Y (cm)'); ax.set_zlabel('signal (a.u.)')
+        ax.set_title(", ".join(f"{r['subject']} {r['channel']}" for r in rs)
+                     + f": {o['smooth_s'].get():g} s smoothing, transients x{o['gain'].get():g}")
+
+    def _spatial_figure(self, recs):
+        """Build the figure for the chosen plot type."""
+        o = self._spatial_opts()
+        kind = o['plot'].get()
+        self._spatial_last_recs = recs
+        channels = list(dict.fromkeys(r['channel'] for r in recs))
+        if kind == 'breakdown':
+            fig = Figure(figsize=(13, 4.2 * len(channels) + 0.6), dpi=100)
+            self._plot_spatial_breakdown(fig, recs)
+        elif kind == 'distance':
+            xs, prof = self._spatial_distance_profiles(recs)
+            split = o['split_category'].get()
+            panels = len(set((k[1], k[2]) for k in prof))
+            fig = Figure(figsize=(13, 3.8 * int(np.ceil(panels / 3)) + 0.6), dpi=100)
+            self._plot_spatial_lines(
+                fig, xs, prof, f"{o['axis'].get()} distance from centre (cm)",
+                key_fn=lambda k: (k[1], k[2]),
+                title_fn=lambda p: f"{p[0]}" + (f": {p[1]}" if split else ""))
+        elif kind == 'speed':
+            xs, prof = self._spatial_speed_profiles(recs)
+            fig = Figure(figsize=(13, 4.2 * int(np.ceil(len(channels) / 3)) + 0.6), dpi=100)
+            self._plot_spatial_lines(fig, xs, prof, "Speed (cm/s)", key_fn=lambda k: k[1],
+                                     title_fn=lambda p: f"{p}: by running speed", categorical=True)
+        elif kind == 'scatter':
+            ncols = len(set(r['series'] for r in recs)) if o['normalize'].get() else 1
+            fig = Figure(figsize=(5.2 * ncols + 1.5, 5.2 * len(channels)), dpi=100)
+            self._plot_spatial_scatter(fig, recs)
+        else:
+            fig = Figure(figsize=(11, 8.5), dpi=100)
+            self._plot_spatial_trace3d(fig, recs)
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+        return fig
+
+    def _spatial_records_or_warn(self):
+        if not self.spike_results:
+            messagebox.showinfo("No Data", "Please run spike analysis first")
+            return None
+        if not self._spike_results_in_sync():
+            return None
+        if not self.zones:
+            messagebox.showinfo("No Zones", "Spatial transient plots need zones (Zones tab).")
+            return None
+        recs = self._spatial_records()
+        if not recs:
+            messagebox.showinfo(
+                "No Data",
+                "No analyzed recording has position data and at least "
+                f"{self._spatial_opts()['min_transients'].get()} transients on a selected channel.")
+            return None
+        return recs
+
+    def plot_spatial_transients(self):
+        recs = self._spatial_records_or_warn()
+        if recs is None:
+            return
+        fig = self._spatial_figure(recs)
+        title = dict(self.SPATIAL_PLOTS)[self._spatial_opts()['plot'].get()]
+        self._embed_plot_window(fig, f"Spatial Transients - {title}")
+
+    def export_spatial_transients_prism(self):
+        """Per-animal values behind the current plot, one column per animal
+        grouped by series, one row per category / bin (Prism grouped table)."""
+        o = self._spatial_opts()
+        kind = o['plot'].get()
+        if kind in ('scatter', 'trace3d'):
+            messagebox.showinfo("Export", "The scatter and 3D views have no table; "
+                                "pick Rate breakdown, Distance or Speed tuning.")
+            return
+        recs = self._spatial_records_or_warn()
+        if recs is None:
+            return
+        self._spatial_last_recs = recs
+        ser_of = {(r['subject'], r['channel']): r['series'] for r in recs}
+        if kind == 'breakdown':
+            rows, table = self._spatial_breakdown_table(recs)
+            cols = {k: [table[k][c] for c in rows] for k in table}
+            col_name = lambda k: (k[1], ser_of[k], k[0])
+        elif kind == 'distance':
+            xs, prof = self._spatial_distance_profiles(recs)
+            rows = [f"{x:g}" for x in xs]
+            cols = prof
+            col_name = lambda k: (f"{k[1]} {k[2]}" if o['split_category'].get() else k[1],
+                                  ser_of[(k[0], k[1])], k[0])
+        else:
+            rows, prof = self._spatial_speed_profiles(recs)
+            cols = prof
+            col_name = lambda k: (k[1], ser_of[k], k[0])
+        path = filedialog.asksaveasfilename(
+            defaultextension='.csv', filetypes=[('CSV', '*.csv')],
+            initialfile=f"spatial_transients_{kind}_{o['metric'].get()}.csv")
+        if not path:
+            return
+        names = sorted(cols, key=lambda k: col_name(k))
+        df = pd.DataFrame({' | '.join(col_name(k)): np.asarray(cols[k], float) for k in names},
+                          index=pd.Index(rows, name=dict(self.SPATIAL_METRICS)[o['metric'].get()]))
+        df.to_csv(path)
+        self.log_message(f"Spatial transients ({kind}) exported to {path}")
+
+    def open_spatial_transients(self):
+        """Options window for the spatial transient plots."""
+        o = self._spatial_opts()
+        win = getattr(self, '_spatial_win', None)
+        if win is not None and win.winfo_exists():
+            win.lift(); return
+        win = self._spatial_win = tk.Toplevel(self.root)
+        win.title("Spatial Transients")
+        pad = self.ui_px(6)
+        body = ttk.Frame(win, padding=pad)
+        body.pack(fill='both', expand=True)
+
+        top = ttk.LabelFrame(body, text="Plot", padding=pad)
+        top.pack(fill='x', pady=(0, pad))
+        for key, text in self.SPATIAL_PLOTS:
+            ttk.Radiobutton(top, text=text, variable=o['plot'], value=key,
+                            command=lambda: show_panel()).pack(anchor='w')
+
+        common = ttk.LabelFrame(body, text="Common", padding=pad)
+        common.pack(fill='x', pady=(0, pad))
+
+        def row(parent, r, label, widget):
+            ttk.Label(parent, text=label).grid(row=r, column=0, sticky='w', padx=(0, pad), pady=(0, 2))
+            widget.grid(row=r, column=1, sticky='w', pady=(0, 2))
+
+        metric_cb = ttk.Combobox(common, state='readonly', width=22,
+                                 values=[t for _, t in self.SPATIAL_METRICS])
+        metric_cb.set(dict(self.SPATIAL_METRICS)[o['metric'].get()])
+        metric_cb.bind('<<ComboboxSelected>>', lambda e: o['metric'].set(
+            {t: k for k, t in self.SPATIAL_METRICS}[metric_cb.get()]))
+        row(common, 0, "Metric", metric_cb)
+        row(common, 1, "Min transients (maps only)", ttk.Spinbox(
+            common, from_=0, to=500, textvariable=o['min_transients'], width=6))
+        row(common, 2, "Still below (cm/s)", ttk.Spinbox(
+            common, from_=0.1, to=20, increment=0.5, textvariable=o['still_cm_s'], width=6))
+        zf = ttk.Frame(common)
+        cats, _ = self._spike_zone_categories()
+        for c in cats:
+            v = o['zones'].setdefault(c, tk.BooleanVar(value=True))
+            ttk.Checkbutton(zf, text=c, variable=v).pack(side='left', padx=(0, pad))
+        row(common, 3, "Include zones", zf)
+
+        panels = {}
+        p = panels['breakdown'] = ttk.LabelFrame(body, text="Rate breakdown", padding=pad)
+        row(p, 0, "Time block (min)", ttk.Spinbox(p, from_=0.5, to=60, increment=0.5,
+                                                  textvariable=o['block_min'], width=6))
+        p = panels['distance'] = ttk.LabelFrame(body, text="Distance from centre", padding=pad)
+        row(p, 0, "Axis", ttk.Combobox(p, textvariable=o['axis'], state='readonly', width=10,
+                                       values=['Euclidean', '|X|', '|Y|']))
+        row(p, 1, "Bin (cm)", ttk.Spinbox(p, from_=0.5, to=20, increment=0.5,
+                                          textvariable=o['bin_cm'], width=6))
+        row(p, 2, "", ttk.Checkbutton(p, text="Split by zone category (e.g. open vs closed arms)",
+                                      variable=o['split_category']))
+        row(p, 3, "", ttk.Checkbutton(p, text="Correct for speed and session time (rate only)",
+                                      variable=o['speed_correct']))
+        row(p, 4, "", ttk.Checkbutton(p, text="Relative to each animal's session value",
+                                      variable=o['relative']))
+        p = panels['speed'] = ttk.LabelFrame(body, text="Speed tuning", padding=pad)
+        row(p, 0, "", ttk.Checkbutton(p, text="Relative to each animal's session value",
+                                      variable=o['relative']))
+        p = panels['scatter'] = ttk.LabelFrame(body, text="Transient scatter", padding=pad)
+        row(p, 0, "Opacity", ttk.Spinbox(p, from_=0.005, to=1, increment=0.01,
+                                         textvariable=o['alpha'], width=6))
+        row(p, 1, "Dot size", ttk.Spinbox(p, from_=1, to=60, increment=1,
+                                          textvariable=o['size'], width=6))
+        row(p, 2, "Colour by", ttk.Combobox(p, textvariable=o['color_by'], state='readonly',
+                                            width=10, values=['series', 'amplitude']))
+        row(p, 3, "", ttk.Checkbutton(p, text="Show path", variable=o['show_path']))
+        row(p, 4, "", ttk.Checkbutton(p, text="Divide by time spent (rate map per series)",
+                                      variable=o['normalize']))
+        p = panels['trace3d'] = ttk.LabelFrame(body, text="3D trace", padding=pad)
+        rec_names = []
+        for s, res in sorted(self.spike_results.items()):
+            rec_names += [f"{s} {ch}" for ch in res]
+        if rec_names and o['subject'].get() not in rec_names:
+            o['subject'].set(rec_names[0])
+        row(p, 0, "Recording", ttk.Combobox(p, textvariable=o['subject'], state='readonly',
+                                            width=18, values=rec_names))
+        row(p, 1, "Smoothing (s)", ttk.Spinbox(p, from_=0, to=30, increment=0.5,
+                                               textvariable=o['smooth_s'], width=6))
+        row(p, 2, "Transient boost (x)", ttk.Spinbox(p, from_=0, to=50, increment=0.5,
+                                                     textvariable=o['gain'], width=6))
+        row(p, 3, "Start (min)", ttk.Spinbox(p, from_=0, to=600, increment=0.5,
+                                             textvariable=o['start_min'], width=6))
+        row(p, 4, "End (min, 0 = end)", ttk.Spinbox(p, from_=0, to=600, increment=0.5,
+                                                    textvariable=o['end_min'], width=6))
+        for key in ('scatter', 'trace3d'):
+            r = len(panels[key].grid_slaves(column=0))
+            row(panels[key], r, "Colour map", ttk.Combobox(
+                panels[key], textvariable=o['cmap'], state='readonly', width=10,
+                values=['plasma', 'viridis', 'magma', 'inferno', 'turbo', 'coolwarm']))
+
+        btns = ttk.Frame(body)
+        btns.pack(side='bottom', fill='x', pady=(pad, 0))
+        ttk.Button(btns, text="Plot", command=self.plot_spatial_transients).pack(
+            side='left', fill='x', expand=True, padx=(0, pad))
+        ttk.Button(btns, text="Export for Prism (CSV)",
+                   command=self.export_spatial_transients_prism).pack(side='left', fill='x', expand=True)
+
+        def show_panel():
+            for k, f in panels.items():
+                f.pack_forget()
+            panels[o['plot'].get()].pack(fill='x', pady=(0, pad))
+        show_panel()
+
     # (key, axis label, title) for each per-zone metric, in plot row order.
     SPIKE_ZONE_METRICS = (
         ('spike_rate_per_min', 'Transients / min', 'Rate'),
@@ -15458,6 +16178,21 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Spatial Transients (Spike Analysis tab) shows where and when
+    transients happen. Rate breakdown compares groups over the whole session,
+    each zone type, still vs moving, each time block and a same-time-budget
+    rate, with one dot per animal. Distance from centre (Euclidean, |X| or
+    |Y|) can include or exclude zone types, split by zone type and correct
+    for speed and session time. Speed tuning, a one-dot-per-transient scatter
+    (or rate map) and a 3D trace of the path with boosted transients round it
+    out. Metrics: transients/min, time in transient, amplitude. Tables export
+    for Prism.
+  • New — Out/Back: "Show Velocity Histogram" plots the outward open-arm
+    velocity the threshold applies to, and the share of frames each threshold
+    keeps, updating as the threshold changes.
+
+Version 1.27.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Mirror-FDR smoothing is adjustable ("Smoothing (ms)", default 70 ms,
     0 turns it off). It adds to the processing low-pass filter. Tested down to
@@ -24142,6 +24877,195 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return entry_frames
     
+    def _outback_open_zones(self):
+        """Zone names Out/Back movement is measured in: every open-arm category
+        ('open', 'open_proximal', 'open_distal')."""
+        return [name for name, zone in self.zones.items()
+                if 'open' in zone.get('category', '')]
+
+    def _outback_outward_velocity(self, beh_synced, zones, open_zones, fps=None):
+        """The open-arm frames Out/Back detection considers, and each one's Y
+        velocity signed so that positive means moving away from the centre.
+
+        Open arms run along Y, so the outward direction flips at the centre
+        line: up is outward in the upper arm, down in the lower one. A frame is
+        Out when this value exceeds the velocity threshold and Back when it is
+        below minus the threshold; everything in between is ignored. Frames on
+        the centre line itself have no outward direction and are left out, as
+        are frames with no Y position. A frame whose previous Y is missing has
+        velocity 0, so it is considered but always falls inside the threshold.
+
+        Returns (frame indices, outward velocity in cm/s), both 1-D arrays.
+        """
+        fps = fps if fps is not None else self.get_fps()
+        y = np.asarray(beh_synced[:, 3], dtype=float)
+        y_velocity = np.zeros(len(y))
+        if len(y) > 1:
+            dy = np.diff(y) * fps
+            y_velocity[1:] = np.where(np.isnan(dy), 0.0, dy)
+
+        center_y = self.params.get('maze_width_cm', 76) / 2
+        open_set = set(open_zones)
+        in_open = np.fromiter((z in open_set for z in zones), dtype=bool,
+                              count=len(zones))
+        keep = in_open & ~np.isnan(y) & (y != center_y)
+        frames = np.flatnonzero(keep)
+        outward = np.where(y[frames] > center_y, y_velocity[frames],
+                           -y_velocity[frames])
+        return frames, outward
+
+    def _classify_position_zones(self, beh):
+        """Zone name for every frame of a position track ('unknown' where the
+        position is missing), as Out/Back detection expects it."""
+        return ['unknown' if (np.isnan(beh[i, 2]) or np.isnan(beh[i, 3]))
+                else self.classify_zone(beh[i, 2], beh[i, 3])
+                for i in range(len(beh))]
+
+    def _outback_velocity_samples(self):
+        """Outward open-arm velocity for every processed subject with position
+        data: {subject: 1-D array in cm/s}. These are exactly the values the
+        Out/Back threshold is compared against, so a histogram of them shows
+        where a threshold would cut."""
+        if self.params.get('maze_type', 'EPM') not in ('EPM', 'EPM_Complex'):
+            return {}
+        open_zones = self._outback_open_zones()
+        if not open_zones:
+            return {}
+        samples = {}
+        for subject, data in self.processed_data.items():
+            beh = data.get('beh_synced')
+            if beh is None or not data.get('has_position', False):
+                continue
+            try:
+                _, outward = self._outback_outward_velocity(
+                    beh, self._classify_position_zones(beh), open_zones,
+                    fps=data.get('photometry_fps'))
+            except Exception as exc:
+                self.log_message(f"  Out/Back velocity failed for {subject}: {exc}")
+                continue
+            if len(outward):
+                samples[subject] = outward
+        return samples
+
+    def show_outback_velocity_histogram(self):
+        """Pop out the distribution of outward open-arm velocity that the
+        Out/Back threshold is applied to, pooled over the processed cohort.
+
+        The left panel is the signed velocity (positive = away from the centre)
+        with the ignored band shaded; the right panel is the share of open-arm
+        frames each threshold would keep. Both follow the threshold box live,
+        so the value can be chosen against the data before it is applied.
+        """
+        maze_type = self.params.get('maze_type', 'EPM')
+        if maze_type not in ('EPM', 'EPM_Complex'):
+            messagebox.showinfo(
+                "Out/Back Not Applicable",
+                f"Out/Back movements are only computed for EPM mazes "
+                f"(current maze type: {maze_type}).")
+            return
+        samples = self._outback_velocity_samples()
+        if not samples:
+            messagebox.showinfo(
+                "No Position Data",
+                "No processed subject has open-arm position data to show.")
+            return
+
+        def _current_threshold():
+            try:
+                value = float(self.viz_outback_vel_var.get())
+            except (AttributeError, ValueError, tk.TclError):
+                value = float(self.params.get('outback_velocity_threshold', 2.0))
+            return max(0.0, value)
+
+        v = np.concatenate(list(samples.values()))
+        speed = np.sort(np.abs(v))
+        # Tracking jumps give a few absurd velocities; bound the view to the
+        # bulk of the data and say how many fell outside it.
+        lim = float(np.percentile(speed, 99.5)) if len(speed) else 1.0
+        lim = max(lim, 2.0 * _current_threshold(), 1.0)
+        n_clipped = int(np.sum(speed > lim))
+
+        fig = Figure(figsize=(10.0, 4.4), dpi=100)
+        ax_h = fig.add_subplot(1, 2, 1)
+        ax_c = fig.add_subplot(1, 2, 2)
+
+        ax_h.hist(np.clip(v, -lim, lim), bins=np.linspace(-lim, lim, 121),
+                  color=self.colors['accent_blue'], alpha=0.85)
+        ax_h.set_xlim(-lim, lim)
+        ax_h.set_xlabel('Outward Y velocity (cm/s)   < Back | Out >')
+        ax_h.set_ylabel('Open-arm frames')
+        ax_h.set_title('Velocity Out/Back is thresholded on')
+        band = [None]
+        lo_line = ax_h.axvline(0, color='#d62728', lw=1.2, ls='--')
+        hi_line = ax_h.axvline(0, color='#d62728', lw=1.2, ls='--')
+        counts_text = ax_h.text(0.02, 0.97, '', transform=ax_h.transAxes,
+                                va='top', ha='left', fontsize=8,
+                                bbox=dict(boxstyle='round', fc='white', alpha=0.85))
+
+        grid = np.linspace(0, lim, 400)
+        kept = 1.0 - np.searchsorted(speed, grid, side='right') / len(speed)
+        ax_c.plot(grid, 100.0 * kept, color=self.colors['accent_blue'])
+        ax_c.set_xlim(0, lim)
+        ax_c.set_ylim(0, 100)
+        ax_c.set_xlabel('Min velocity threshold (cm/s)')
+        ax_c.set_ylabel('Open-arm frames kept as Out or Back (%)')
+        ax_c.set_title('Frames kept vs threshold')
+        thr_line = ax_c.axvline(0, color='#d62728', lw=1.2, ls='--')
+        thr_dot, = ax_c.plot([], [], 'o', color='#d62728')
+
+        clip_note = (f"; {n_clipped:,} beyond +/-{lim:.1f} cm/s drawn at the edges"
+                     if n_clipped else "")
+        fig.suptitle(
+            f"Out/Back velocity  |  {len(samples)} subject(s), {len(v):,} open-arm "
+            f"frames{clip_note}", fontsize=10)
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+        def _redraw(*_):
+            thr = _current_threshold()
+            # Re-created rather than moved: axvspan returns a Polygon on older
+            # matplotlib and a Rectangle on newer, which move differently.
+            if band[0] is not None:
+                band[0].remove()
+            band[0] = ax_h.axvspan(-thr, thr, color='#888888', alpha=0.25, lw=0)
+            lo_line.set_xdata([-thr, -thr])
+            hi_line.set_xdata([thr, thr])
+            n_out = int(np.sum(v > thr))
+            n_back = int(np.sum(v < -thr))
+            n_ign = len(v) - n_out - n_back
+            counts_text.set_text(
+                f"Threshold {thr:g} cm/s\n"
+                f"Out:  {n_out:,} ({100 * n_out / len(v):.1f}%)\n"
+                f"Back: {n_back:,} ({100 * n_back / len(v):.1f}%)\n"
+                f"Ignored: {n_ign:,} ({100 * n_ign / len(v):.1f}%)")
+            thr_line.set_xdata([thr, thr])
+            thr_dot.set_data([min(thr, lim)], [100.0 * (n_out + n_back) / len(v)])
+            canvas.draw_idle()
+
+        win, canvas = self._embed_plot_window(fig, "Out/Back Velocity Distribution")
+        # Fit the window to the figure as rendered: the plot-size setting
+        # rescales it, so a fixed geometry leaves it floating in empty space.
+        # The toolbar strip is the window's first child (_embed_plot_window
+        # packs it before the scroll area); the margin covers the scrollbars.
+        win.update_idletasks()
+        plot = canvas.get_tk_widget()
+        toolbar_h = win.winfo_children()[0].winfo_reqheight()
+        margin = self.ui_px(40)
+        win.geometry(f"{plot.winfo_reqwidth() + margin}x"
+                     f"{plot.winfo_reqheight() + toolbar_h + margin}")
+        _redraw()
+        try:
+            trace_id = self.viz_outback_vel_var.trace_add('write', _redraw)
+        except AttributeError:
+            return
+
+        def _untrace(event):
+            if event.widget is win:
+                try:
+                    self.viz_outback_vel_var.trace_remove('write', trace_id)
+                except tk.TclError:
+                    pass
+        win.bind('<Destroy>', _untrace, add='+')
+
     def calculate_outback_movements(self, beh_synced, zones, n_channels=None, fps=None):
         """Calculate photometry averages for Out and Back movements in open arms
         
@@ -24165,14 +25089,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # For non-EPM mazes, return empty dict
         if maze_type not in ['EPM', 'EPM_Complex']:
             return {}
-        
-        # Get open arm zones
-        open_zones = []
-        for zone_name in self.zones.keys():
-            category = self.zones[zone_name].get('category', '')
-            if 'open' in category:  # Matches 'open', 'open_proximal', 'open_distal'
-                open_zones.append(zone_name)
-        
+
+        open_zones = self._outback_open_zones()
         if not open_zones:
             return {}
         
@@ -24184,49 +25102,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         has_g0 = n_channels >= 1
         has_g1 = n_channels >= 2
 
-        # Calculate velocity in Y-direction (open arms are on Y-axis)
-        # Positive velocity = moving up (positive Y), negative = moving down (negative Y)
-        y_velocity = np.zeros(len(beh_synced))
-        fps = fps if fps is not None else self.get_fps()
-        
-        for i in range(1, len(beh_synced)):
-            if not (np.isnan(beh_synced[i, 3]) or np.isnan(beh_synced[i-1, 3])):
-                y_velocity[i] = (beh_synced[i, 3] - beh_synced[i-1, 3]) * fps  # cm/s
-        
-        # Center position
-        maze_width = self.params.get('maze_width_cm', 76)
-        center_y = maze_width / 2
-        
-        # Collect frames for Out and Back movements
-        out_frames = []
-        back_frames = []
-        
-        for i in range(len(beh_synced)):
-            # Check if in open arm
-            if zones[i] not in open_zones:
-                continue
-            
-            y_pos = beh_synced[i, 3]
-            if np.isnan(y_pos):
-                continue
-            
-            vel_y = y_velocity[i]
-            
-            # Determine if moving Out or Back based on position relative to center
-            # and velocity direction (using velocity threshold from parameters)
-            if y_pos > center_y:
-                # Upper open arm (positive Y)
-                if vel_y > velocity_threshold:  # Moving away from center (positive velocity) - Out
-                    out_frames.append(i)
-                elif vel_y < -velocity_threshold:  # Moving towards center (negative velocity) - Back
-                    back_frames.append(i)
-            elif y_pos < center_y:
-                # Lower open arm (negative Y)
-                if vel_y < -velocity_threshold:  # Moving away from center (negative velocity) - Out
-                    out_frames.append(i)
-                elif vel_y > velocity_threshold:  # Moving towards center (positive velocity) - Back
-                    back_frames.append(i)
-        
+        frames, outward = self._outback_outward_velocity(
+            beh_synced, zones, open_zones, fps=fps)
+        out_frames = frames[outward > velocity_threshold].tolist()
+        back_frames = frames[outward < -velocity_threshold].tolist()
+
         # Calculate averages for Out and Back
         result = {
             'out': {},
@@ -30990,13 +31870,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if beh is None or not data.get('has_position', False):
                 continue
             try:
-                zones = []
-                for i in range(len(beh)):
-                    x, y = beh[i, 2], beh[i, 3]
-                    zones.append('unknown' if (np.isnan(x) or np.isnan(y))
-                                 else self.classify_zone(x, y))
                 outback = self.calculate_outback_movements(
-                    beh, zones, n_channels=self._beh_channel_count(data),
+                    beh, self._classify_position_zones(beh), n_channels=self._beh_channel_count(data),
                     fps=data.get('photometry_fps'))
                 if outback:
                     data['outback'] = outback

@@ -139,3 +139,73 @@ def test_non_epm_maze_updates_nothing_and_keeps_existing_stats():
     app.params['maze_type'] = 'OFT'
     assert app._recompute_outback_all() == 0
     assert app.processed_data['DR22']['outback'] is kept
+
+
+def _legacy_outback_frames(beh, zones, open_zones, threshold, fps, center_y):
+    """The per-frame loop Out/Back detection used before the velocity was
+    factored out, kept here so the refactor is pinned to it frame for frame."""
+    y_velocity = np.zeros(len(beh))
+    for i in range(1, len(beh)):
+        if not (np.isnan(beh[i, 3]) or np.isnan(beh[i - 1, 3])):
+            y_velocity[i] = (beh[i, 3] - beh[i - 1, 3]) * fps
+    out, back = [], []
+    for i in range(len(beh)):
+        if zones[i] not in open_zones or np.isnan(beh[i, 3]):
+            continue
+        y, v = beh[i, 3], y_velocity[i]
+        if y > center_y:
+            if v > threshold:
+                out.append(i)
+            elif v < -threshold:
+                back.append(i)
+        elif y < center_y:
+            if v < -threshold:
+                out.append(i)
+            elif v > threshold:
+                back.append(i)
+    return out, back
+
+
+@pytest.mark.parametrize('flip', [False, True])
+def test_outward_velocity_reproduces_the_legacy_frame_selection(flip):
+    """The histogram and detection share one velocity; it must pick the same
+    Out and Back frames the original loop did, at every threshold.
+
+    DR22 is the only real position track in Examples/, so the second case is
+    that track mirrored in Y and played backwards: each arm and each direction
+    swaps, which drives both branches of the outward sign.
+    """
+    app = _app(2.0)
+    data, zones = _load(app)
+    if flip:
+        beh = data['beh_synced'][::-1].copy()
+        beh[:, 3] = app.params['maze_width_cm'] - beh[:, 3]
+        zones = app._classify_position_zones(beh)
+        data = {'beh_synced': beh}
+    beh = data['beh_synced']
+    open_zones = app._outback_open_zones()
+    frames, outward = app._outback_outward_velocity(beh, zones, open_zones, fps=FPS)
+    center_y = app.params['maze_width_cm'] / 2
+    for threshold in (0.0, 1.0, 2.0, 6.0, 20.0):
+        out, back = _legacy_outback_frames(beh, zones, open_zones, threshold,
+                                           FPS, center_y)
+        assert frames[outward > threshold].tolist() == out, threshold
+        assert frames[outward < -threshold].tolist() == back, threshold
+    assert len(out) + len(back) > 0
+
+
+def test_histogram_samples_are_what_the_threshold_counts():
+    """Every sample in the histogram is a frame detection considered, so
+    thresholding the samples gives the stored Out/Back frame counts."""
+    app = _app(3.0)
+    _load(app)
+    app._recompute_outback_all()
+    samples = app._outback_velocity_samples()
+    assert list(samples) == ['DR22']
+    v = samples['DR22']
+    ob = app.processed_data['DR22']['outback']
+    assert int(np.sum(v > 3.0)) == ob['out']['G0_n']
+    assert int(np.sum(v < -3.0)) == ob['back']['G0_n']
+
+    app.params['maze_type'] = 'OFT'
+    assert app._outback_velocity_samples() == {}
