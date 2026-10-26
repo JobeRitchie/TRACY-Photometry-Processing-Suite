@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.28.0"
-APP_VERSION_DATE = "October 25, 2026"
+APP_VERSION = "1.29.0"
+APP_VERSION_DATE = "October 26, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -162,6 +162,47 @@ def derive_animal_map(subject_ids, pattern=DEFAULT_SESSION_PATTERN, overrides=No
     if not adopted:
         return {sid: (sid, '') for sid in raw}, False
     return raw, True
+
+
+def animal_level_exclusions(exclusions, subject_ids, pattern=DEFAULT_SESSION_PATTERN,
+                            overrides=None, skip=('Behavior',)):
+    """Collapse per-session exclusions to the animal, for carrying to another project.
+
+    Returns ``(carried, partial, sessions)``:
+
+    * ``carried``  -- ``{animal: [channel, ...]}`` for channels excluded on
+      *every* session the animal has.
+    * ``partial``  -- ``{animal: {channel: n_sessions_excluded}}`` for channels
+      excluded on only some of them.  These are not carried: a fiber that was
+      bad on one day but fine on another is a good fiber, and the bad day was
+      the recording, not the implant.
+    * ``sessions`` -- ``{animal: [subject_id, ...]}``.
+
+    ``subject_ids`` should be every recording in the source project, not just
+    the excluded ones -- a session with no exclusions is what makes the others
+    partial.  ``skip`` names pseudo-channels that describe the recording rather
+    than the fiber (the scored behavior), which are never carried.
+    """
+    ids = sorted({str(s) for s in subject_ids} | {str(s) for s in (exclusions or {})})
+    mapping, _ = derive_animal_map(ids, pattern, overrides)
+    sessions = {}
+    for sid in ids:
+        sessions.setdefault(mapping[sid][0], []).append(sid)
+
+    carried, partial = {}, {}
+    for animal, sids in sessions.items():
+        counts = {}
+        for sid in sids:
+            for ch in set((exclusions or {}).get(sid) or []):
+                if ch not in skip:
+                    counts[ch] = counts.get(ch, 0) + 1
+        full = sorted(ch for ch, n in counts.items() if n == len(sids))
+        some = {ch: n for ch, n in counts.items() if n < len(sids)}
+        if full:
+            carried[animal] = full
+        if some:
+            partial[animal] = some
+    return carried, partial, sessions
 
 
 # ── Pooled z-scoring ────────────────────────────────────────────────────────
@@ -2784,10 +2825,12 @@ class FPAnalysisGUI:
         if scale is None or not (0.6 <= scale <= 1.4):
             scale = self._auto_ui_scale()
         self.ui_scale = scale
-        # User plot-size preference (multiplies PLOT_BASE_SCALE in the embed
-        # helper). Clamped to a sane range; default 1.0.
+        # User plot-size preference (see _standard_plot_geometry). Clamped to a
+        # sane range; default 1.0. Stored as 'plot_size': the old 'plot_scale'
+        # was set to compensate for unstandardized figures, and carried over it
+        # made every standardized plot tiny.
         try:
-            ps = float(prefs.get('plot_scale', 1.0))
+            ps = float(prefs.get('plot_size', 1.0))
         except (TypeError, ValueError):
             ps = 1.0
         self.plot_scale = min(3.0, max(0.3, ps))
@@ -2842,7 +2885,7 @@ class FPAnalysisGUI:
             self.plot_scale = min(3.0, max(0.3, float(value)))
         except (TypeError, ValueError):
             return
-        self._save_ui_prefs({'plot_scale': self.plot_scale})
+        self._save_ui_prefs({'plot_size': self.plot_scale})
         try:
             messagebox.showinfo(
                 "Plot Size",
@@ -2932,7 +2975,8 @@ class FPAnalysisGUI:
         # physical measure and so grows with the display DPI -- at 150% it alone
         # would claim ~570 px and the controls column would be twice its
         # intended width. Ask for the width we actually want instead.
-        column = self.make_scrollable(scroll_host, width=self.ui_px(column_px))
+        column = self.make_scrollable(scroll_host, width=self.ui_px(column_px),
+                                      follow_content=True)
 
         selection = ttk.LabelFrame(column, text=selection_title, padding=4)
         selection.pack(fill='x')
@@ -3175,13 +3219,23 @@ class FPAnalysisGUI:
         canvas._resync_content = _sync
         return _sync
 
-    def make_scrollable(self, parent, fit_width=False, width=None):
+    def make_scrollable(self, parent, fit_width=False, width=None,
+                        follow_content=False):
         """Wrap `parent` in a scrolling viewport and return the inner frame.
 
         Content taller than the window stays reachable by scrolling instead of
         being clipped off the bottom of the screen. With `fit_width=True` the
         viewport adopts the natural width of its content (for a fixed-width side
         column); otherwise the content is pinned to the viewport width.
+
+        With `follow_content=True` the content keeps its own requested height
+        instead of being pinned to the viewport's, so controls that appear
+        later (a plot type's options, a subject list filled on load) fire a
+        <Configure> and the scroll region follows them. The control columns
+        need this: their viewport is sized *from* the content, so there is no
+        empty space for a pin to fill, and pinned they kept the height measured
+        at build time -- the new controls were cut off with no scrollbar to
+        reach them until a window resize happened to re-measure.
         """
         outer = ttk.Frame(parent)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -3203,6 +3257,8 @@ class FPAnalysisGUI:
                 # content's natural width or the column collapses to the Tk
                 # default (~238 px) and clips its controls horizontally.
                 canvas.configure(width=inner.winfo_reqwidth())
+            elif follow_content:
+                canvas.itemconfigure(win_id, width=canvas.winfo_width())
             else:
                 # Pin the inner frame to the viewport width so nothing is pushed
                 # horizontally out of view -- and to the viewport HEIGHT while
@@ -3607,29 +3663,33 @@ class FPAnalysisGUI:
                 continue
             if widget.winfo_class() != 'Canvas':
                 continue
-            resync = getattr(widget, '_resync_content', None)
-            if callable(resync):
-                try:
-                    resync()
-                except tk.TclError:
-                    pass
-                continue
+            self._refit_viewport(widget)
+
+    def _refit_viewport(self, canvas):
+        """Re-pin one scroll viewport's content to its current requested size."""
+        resync = getattr(canvas, '_resync_content', None)
+        if callable(resync):
             try:
-                items = widget.find_withtag('all')
-                # One embedded window == a scroll viewport. Anything else is a
-                # drawing canvas (zone editor, plot preview); leave it alone.
-                if len(items) != 1:
-                    continue
-                name = widget.itemcget(items[0], 'window')
-                if not name:
-                    continue
-                inner = widget.nametowidget(name)
-                widget.itemconfigure(
-                    items[0],
-                    height=max(widget.winfo_height(), inner.winfo_reqheight()))
-                widget.configure(scrollregion=widget.bbox('all'))
-            except (tk.TclError, KeyError):
-                continue
+                resync()
+            except tk.TclError:
+                pass
+            return
+        try:
+            items = canvas.find_withtag('all')
+            # One embedded window == a scroll viewport. Anything else is a
+            # drawing canvas (zone editor, plot preview); leave it alone.
+            if len(items) != 1:
+                return
+            name = canvas.itemcget(items[0], 'window')
+            if not name:
+                return
+            inner = canvas.nametowidget(name)
+            canvas.itemconfigure(
+                items[0],
+                height=max(canvas.winfo_height(), inner.winfo_reqheight()))
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        except (tk.TclError, KeyError):
+            return
 
     def _register_tab_mousewheel(self, tab, canvas, content_frame=None):
         """Register a tab-specific mousewheel handler for a scrollable canvas."""
@@ -7081,8 +7141,10 @@ class FPAnalysisGUI:
                   command=self.exclusions_select_all).pack(side='left', padx=5)
         ttk.Button(control_frame, text="✗ Deselect All Channels", 
                   command=self.exclusions_deselect_all).pack(side='left', padx=5)
-        ttk.Button(control_frame, text="💾 Save Exclusions", 
+        ttk.Button(control_frame, text="💾 Save Exclusions",
                   command=self.save_exclusions).pack(side='left', padx=5)
+        ttk.Button(control_frame, text="📂 Import from Project...",
+                  command=self.import_exclusions).pack(side='left', padx=5)
         
         # Subject list with scrollable frame for checkboxes
         list_frame = ttk.LabelFrame(main_container, text="Subject Exclusions", padding=5)
@@ -12900,8 +12962,14 @@ class FPAnalysisGUI:
         plot_menu.add_command(label="Edit Length Bins…",
                               command=self._open_bout_length_bin_editor)
         plot_menu.add_separator()
-        plot_menu.add_command(label="Time-Course Statistics (FLMM-style)…",
-                              command=self.plot_timecourse_flmm)
+        # A cascade rather than two entries: the Plot menu is already at the
+        # screen-height limit above.  Finished FLMM runs stay cached for the
+        # session, so one can be reopened after another plot took the canvas.
+        flmm_menu = tk.Menu(plot_menu, tearoff=0)
+        flmm_menu.configure(
+            postcommand=lambda m=flmm_menu: self._populate_flmm_history_menu(m))
+        plot_menu.add_cascade(label="Time-Course Statistics (FLMM-style)",
+                              menu=flmm_menu)
         plot_mb['menu'] = plot_menu
         plot_mb.pack(fill='x', pady=(self.ui_px(4), 0))
 
@@ -16178,6 +16246,29 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — FLMM runs every ticked behavior at once. Signal ≠ 0, across bouts,
+    between groups and the interaction now fit each ticked behavior × channel
+    in one run; Behavior and Channel dropdowns switch panels, and "Summary of
+    all panels" lists each one's significant windows. Exports gain a Behavior
+    column for these runs.
+  • New — Finished FLMM runs are cached for the session. Plot ▾ →
+    Time-Course Statistics (FLMM-style) now holds "New analysis…" and the 10
+    most recent results, which reopen without refitting after Calculate
+    Metrics or another plot has replaced them.
+  • New — Exclusions tab: "Import from Project..." carries another project's
+    channel exclusions over per animal. A channel comes across only when it
+    was excluded on every day that animal was recorded; behavior exclusions
+    are never carried.
+  • Fix — Plots are fitted to the plot area: text is drawn at one size on
+    every plot, small figures are enlarged and oversized ones shrunk to fit.
+    The plot-size preference is stored afresh ('plot_size'), since the old
+    value compensated for unfitted figures and made fitted plots tiny.
+  • Fix — Control columns grow their scroll area when new controls appear
+    (a plot type's options, a subject list filled on load), so they are no
+    longer cut off until the window is resized.
+
+Version 1.28.0  •  October 25, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Spatial Transients (Spike Analysis tab) shows where and when
     transients happen. Rate breakdown compares groups over the whole session,
@@ -29884,55 +29975,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._exclusion_row_frames = []
         self._exclusion_grid_cols = None   # forces the first layout below
 
-        # A valid channel designation is a G/R prefix followed by a region index
-        # (e.g. G0, G1, R2, R4, R5). Validate by shape rather than a fixed list so
-        # higher-numbered red channels (R3/R4/R5...) are not silently dropped.
-        import re
-        _is_channel = lambda ch: bool(re.match(r'^[GR]\d+$', str(ch)))
-
         # Create row for each subject
         for subject in sorted(self.processed_data.keys()):
-            data = self.processed_data[subject]
+            available_channels = self.exclusion_channels_for(subject)
 
-            # Determine available channels for this subject
-            available_channels = []
-            channel_names = data.get('channel_names') or data.get('channel_name_map', {})
-
-            if isinstance(channel_names, list):
-                available_channels = [ch for ch in channel_names if _is_channel(ch)]
-            elif isinstance(channel_names, dict):
-                # channel_name_map is keyed by column index; preserve column order.
-                try:
-                    ordered = [channel_names[k] for k in sorted(channel_names, key=lambda x: int(x))]
-                except (ValueError, TypeError):
-                    ordered = list(channel_names.values())
-                available_channels = [ch for ch in ordered if _is_channel(ch)]
-            else:
-                # Fallback: assume G0 and G1 if has wavelengths
-                if data.get('has_470'):
-                    available_channels.append('G0')
-                if data.get('has_570'):
-                    available_channels.append('R0')
-                # Try to detect more channels from data shape
-                if 'data' in data:
-                    n_cols = data['data'].shape[1]
-                    n_channels = (n_cols - 2) // 2
-                    if n_channels > 1:
-                        if data.get('has_470'):
-                            for i in range(n_channels):
-                                ch_name = f'G{i}'
-                                if ch_name not in available_channels:
-                                    available_channels.append(ch_name)
-                        if data.get('has_570'):
-                            for i in range(n_channels):
-                                ch_name = f'R{i}'
-                                if ch_name not in available_channels:
-                                    available_channels.append(ch_name)
-            
-            if not available_channels:
-                # Default fallback
-                available_channels = ['G0', 'G1']
-            
             # Create row frame (placed by _reflow_exclusion_rows below)
             row_frame = ttk.Frame(grid_host)
             self._exclusion_row_frames.append(row_frame)
@@ -29970,6 +30016,53 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             behavior_cb.pack(side='left')
 
         self._reflow_exclusion_rows()
+
+    def exclusion_channels_for(self, subject):
+        """Channel designations the Exclusions tab offers a checkbox for."""
+        # A valid channel designation is a G/R prefix followed by a region index
+        # (e.g. G0, G1, R2, R4, R5). Validate by shape rather than a fixed list so
+        # higher-numbered red channels (R3/R4/R5...) are not silently dropped.
+        _is_channel = lambda ch: bool(re.match(r'^[GR]\d+$', str(ch)))
+        data = self.processed_data.get(subject) or {}
+
+        available_channels = []
+        channel_names = data.get('channel_names') or data.get('channel_name_map', {})
+
+        if isinstance(channel_names, list):
+            available_channels = [ch for ch in channel_names if _is_channel(ch)]
+        elif isinstance(channel_names, dict):
+            # channel_name_map is keyed by column index; preserve column order.
+            try:
+                ordered = [channel_names[k] for k in sorted(channel_names, key=lambda x: int(x))]
+            except (ValueError, TypeError):
+                ordered = list(channel_names.values())
+            available_channels = [ch for ch in ordered if _is_channel(ch)]
+        else:
+            # Fallback: assume G0 and G1 if has wavelengths
+            if data.get('has_470'):
+                available_channels.append('G0')
+            if data.get('has_570'):
+                available_channels.append('R0')
+            # Try to detect more channels from data shape
+            if 'data' in data:
+                n_cols = data['data'].shape[1]
+                n_channels = (n_cols - 2) // 2
+                if n_channels > 1:
+                    if data.get('has_470'):
+                        for i in range(n_channels):
+                            ch_name = f'G{i}'
+                            if ch_name not in available_channels:
+                                available_channels.append(ch_name)
+                    if data.get('has_570'):
+                        for i in range(n_channels):
+                            ch_name = f'R{i}'
+                            if ch_name not in available_channels:
+                                available_channels.append(ch_name)
+
+        if not available_channels:
+            # Default fallback
+            available_channels = ['G0', 'G1']
+        return available_channels
 
     def _reflow_exclusion_rows(self, _event=None):
         """Lay the subject rows out in as many columns as the tab is wide.
@@ -30068,7 +30161,163 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         self.save_project()
         messagebox.showinfo("Saved", "Exclusions saved to project.")
-    
+
+    def plan_exclusion_import(self, source):
+        """Work out which of another project's exclusions apply here.
+
+        ``source`` is that project's config (or .tracy) dict.  Exclusions are
+        carried per *animal*: a channel comes across only when the source
+        excluded it on every one of that animal's sessions (see
+        animal_level_exclusions), and it then lands on every session the animal
+        has in this project.  The source's own ID pattern groups its sessions,
+        this project's groups the targets, so the two need not share a naming
+        scheme beyond the animal ID.
+
+        Returns a dict: ``additions`` ``{subject: [channel]}`` (new only),
+        ``carried``, ``partial`` and ``sessions`` from animal_level_exclusions,
+        ``missing_channel`` ``[(subject, channel)]`` the subject has no checkbox
+        for, ``unmatched`` source animals with nothing here, and ``n_behavior``
+        source sessions whose Behavior exclusion was left behind.
+        """
+        params = source.get('parameters') if isinstance(source.get('parameters'), dict) else {}
+        src_pattern = params.get('session_pattern', DEFAULT_SESSION_PATTERN)
+        if src_pattern is None:
+            src_pattern = DEFAULT_SESSION_PATTERN
+        src_excl = source.get('exclusions') or {}
+        src_subjects = source.get('processed_subjects') or []
+        carried, partial, sessions = animal_level_exclusions(
+            src_excl, src_subjects, src_pattern, params.get('animal_overrides') or {},
+            skip=(self.BEHAVIOR_EXCLUSION_KEY,))
+
+        # A source animal is found here by its own name, or by the split of any
+        # of its session IDs -- the source may not have adopted the split (one
+        # session per animal) while this project has, or the reverse.  A name
+        # two source animals would claim is dropped rather than guessed.
+        lookup, clashes = {}, set()
+        for animal, sids in sessions.items():
+            for name in {animal} | {split_subject_id(s, src_pattern)[0] for s in sids}:
+                if lookup.get(name, animal) != animal:
+                    clashes.add(name)
+                lookup.setdefault(name, animal)
+        for name in clashes:
+            lookup.pop(name, None)
+
+        tgt_pattern = self._session_pattern()
+        additions, missing, matched = {}, [], set()
+        for subject in sorted(self.processed_data):
+            for name in (self.get_animal_id(subject), subject,
+                         split_subject_id(subject, tgt_pattern)[0]):
+                if name in lookup:
+                    animal = lookup[name]
+                    break
+            else:
+                continue
+            matched.add(animal)
+            have = set(self.exclusions.get(subject, []))
+            offered = set(self.exclusion_channels_for(subject))
+            for ch in carried.get(animal, []):
+                if ch not in offered:
+                    missing.append((subject, ch))
+                elif ch not in have:
+                    additions.setdefault(subject, []).append(ch)
+
+        return {
+            'additions': additions,
+            'carried': carried,
+            'partial': partial,
+            'sessions': sessions,
+            'missing_channel': missing,
+            'unmatched': sorted(a for a in carried if a not in matched),
+            'n_behavior': sum(1 for chs in src_excl.values()
+                              if self.BEHAVIOR_EXCLUSION_KEY in (chs or [])),
+        }
+
+    def import_exclusions(self):
+        """Import exclusions from another project, applied per animal."""
+        if not self.processed_data:
+            messagebox.showwarning("No Data", "Load or process this project's subjects first, "
+                                              "so the imported exclusions have something to match.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select Project to Import Exclusions From",
+            initialdir=self.project_dir,
+            filetypes=[("Project config", "project_config.json"),
+                       ("TRACY files", "*.tracy"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, 'r') as fh:
+                source = json.load(fh)
+        except Exception as exc:
+            messagebox.showerror("Import Error", f"Could not read that project:\n{exc}")
+            return
+        label = source.get('project_name') or os.path.basename(os.path.dirname(path)) or path
+        if not source.get('exclusions'):
+            messagebox.showinfo("Nothing to Import", f"{label} has no exclusions.")
+            return
+        if not source.get('processed_subjects'):
+            # Without the full subject list a session that had no exclusions is
+            # invisible, and an animal bad on one day of three would look bad on
+            # all of them.
+            if not messagebox.askyesno(
+                    "Incomplete Source",
+                    f"{label} does not list its processed subjects, so a session with "
+                    "no exclusions cannot be seen and an animal excluded on only some "
+                    "days may be carried as if excluded on all of them.\n\nImport anyway?"):
+                return
+
+        plan = self.plan_exclusion_import(source)
+        additions = plan['additions']
+        n_add = sum(len(v) for v in additions.values())
+
+        def _listing(lines, limit=12):
+            shown = lines[:limit]
+            if len(lines) > limit:
+                shown.append(f"  ...and {len(lines) - limit} more (see log)")
+            return "\n".join(shown)
+
+        add_lines = [f"  {s}: {', '.join(chs)}" for s, chs in sorted(additions.items())]
+        partial_lines = [f"  {a} {ch}: {n} of {len(plan['sessions'][a])} days"
+                         for a, chs in sorted(plan['partial'].items())
+                         for ch, n in sorted(chs.items())]
+
+        msg = [f"Import exclusions from {label}?\n",
+               "A channel is imported only when it was excluded on every day of "
+               "that animal; it is then applied to all of the animal's sessions here.\n"]
+        msg.append(f"{n_add} channel exclusion(s) to add across {len(additions)} subject(s):")
+        msg.append(_listing(add_lines) if add_lines else "  (none)")
+        if partial_lines:
+            msg.append(f"\nNot imported -- excluded on only some days ({len(partial_lines)}):")
+            msg.append(_listing(partial_lines, 8))
+        if plan['missing_channel']:
+            msg.append(f"\n{len(plan['missing_channel'])} exclusion(s) name a channel the "
+                       "subject here does not have and are skipped.")
+        if plan['unmatched']:
+            msg.append(f"\n{len(plan['unmatched'])} excluded animal(s) are not in this project.")
+        if plan['n_behavior']:
+            msg.append("\nBehavior exclusions describe a session's scoring, not the fiber, "
+                       "and are not imported.")
+
+        for line in add_lines:
+            self.log_message(f"  import exclusion{line}")
+        for line in partial_lines:
+            self.log_message(f"  not imported (some days only):{line}")
+        for s, ch in plan['missing_channel']:
+            self.log_message(f"  not imported (no {ch} channel here): {s}")
+
+        if not n_add:
+            messagebox.showinfo("Nothing to Import", "\n".join(msg[1:]))
+            return
+        if not messagebox.askyesno("Import Exclusions", "\n".join(msg)):
+            return
+        for subject, chs in additions.items():
+            self.exclusions.setdefault(subject, []).extend(chs)
+        self.refresh_exclusions_list()
+        self.log_message(f"Imported {n_add} channel exclusion(s) for {len(additions)} "
+                         f"subject(s) from {label}")
+        if self.current_project:
+            self.save_project_config(quiet=True)
+
     def is_subject_channel_excluded(self, subject, channel):
         """Check if a specific subject/channel combination is excluded"""
         return channel in self.exclusions.get(subject, [])
@@ -30827,56 +31076,129 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 avail = 1200
         return max(320, avail - 24)
 
+    def _screen_px_ratio(self):
+        """Physical pixels per 96-dpi pixel: 1.35 at 135% Windows scaling.
+
+        The same figure matplotlib's Tk backend derives on <Map>; computed here
+        so the plot dpi can include it up front instead.
+        """
+        try:
+            if sys.platform == 'win32':
+                return max(0.5, round(float(self.root.tk.call('tk', 'scaling'))
+                                      / (96 / 72), 2))
+            return max(0.5, self.root.winfo_fpixels('1i') / 96.0)
+        except Exception:
+            return 1.0
+
+    def _visible_plot_height_px(self, parent):
+        """Height of the scroll viewport *parent* is shown in, or None."""
+        node = parent
+        while node is not None:
+            if isinstance(node, tk.Canvas):
+                try:
+                    h = node.winfo_height()
+                except tk.TclError:
+                    return None
+                return h if h > 1 else None
+            node = getattr(node, 'master', None)
+        return None
+
+    def _standard_plot_geometry(self, fig, parent, fit_width=True, grow=True):
+        """Choose the on-screen ``(dpi, width_px, height_px)`` for *fig*.
+
+        Each plot routine authors its own figsize and dpi -- from 4.5 x 4.5 in
+        to 14 x 10 in, at 90 to 150 dpi -- so shown as authored, plots on one
+        display measured from 12 % to 52 % of the plot area's width. Every
+        figure is instead fitted to one band of the area it lands in:
+
+        * text is drawn at one reference dpi (display scaling x plot size
+          setting), so a 9 pt label is the same size on every plot;
+        * a figure narrower than 60 % of the area (x the plot size setting)
+          is enlarged -- the first 30 %
+          by zooming (bigger text), the rest by giving it more inches (more
+          room, same text), so a small plot is not blown up into huge type;
+        * a figure wider than the area, or a normally proportioned one taller
+          than the visible viewport, is zoomed down uniformly so it fits whole.
+          Tall stacked panels (taller than 1.3x their width) keep their height
+          and scroll, since fitting them would make every panel unreadable.
+
+        The authored size is remembered on the figure, so a cached figure that
+        is shown again is fitted from what its code asked for, not from the
+        size it was last displayed at. *grow* is False when the user typed a
+        size, which is then only ever shrunk to fit.
+        """
+        authored = getattr(fig, '_tracy_authored_in', None)
+        if authored is None:
+            authored = tuple(float(v) for v in fig.get_size_inches())
+            fig._tracy_authored_in = authored
+        w_in, h_in = authored
+        scale = PLOT_BASE_SCALE * float(getattr(self, 'plot_scale', 1.0) or 1.0)
+        ref_dpi = 100.0 * self._screen_px_ratio() * scale
+        nat_w, nat_h = w_in * ref_dpi, h_in * ref_dpi
+
+        if fit_width:
+            avail_w = self._available_plot_width_px(parent)
+            avail_h = self._visible_plot_height_px(parent)
+        else:
+            # A pop-out window is sized from the figure, so the screen is the
+            # area it has to fit.
+            try:
+                avail_w = int(parent.winfo_screenwidth() * 0.95) - 60
+                avail_h = int(parent.winfo_screenheight() * 0.90) - 90
+            except tk.TclError:
+                avail_w, avail_h = 1400, 800
+        if avail_h is not None:
+            # Room for the navigation toolbar under the figure. A pane that
+            # shares its tab with a table (Bout Analysis) can be a few hundred
+            # pixels tall; fitting to that squashed a two-panel plot to a
+            # thumbnail, so below half the screen it scrolls instead.
+            try:
+                floor_h = int(parent.winfo_screenheight() * 0.5)
+            except tk.TclError:
+                floor_h = self.ui_px(400)
+            avail_h = max(floor_h, avail_h - self.ui_px(48))
+
+        # The band is a share of the area, not inches: an inch floor shrinks
+        # with the plot-size setting, and at 50 % a 1650 px pane got a 432 px
+        # plot. The setting moves the floor; the area is always the ceiling.
+        size = float(getattr(self, 'plot_scale', 1.0) or 1.0)
+        hi_w = float(avail_w)
+        lo_w = min(hi_w, 0.6 * avail_w * size)
+        s_hi = hi_w / nat_w
+        if avail_h is not None and h_in <= 1.3 * w_in:
+            s_hi = min(s_hi, avail_h / nat_h)
+        if not fit_width:
+            # Wide many-panel pop-outs (whole-session coherence) scroll rather
+            # than shrink past readability.
+            s_hi = max(s_hi, 0.75)
+        s_lo = lo_w / nat_w if grow else 1.0
+        s = min(max(1.0, s_lo), s_hi)
+
+        zoom = min(s, 1.3)
+        dpi = max(40.0, ref_dpi * zoom)
+        return dpi, max(100, int(round(nat_w * s))), max(80, int(round(nat_h * s)))
+
     def _embed_plot_canvas(self, fig, parent, manual_height=None, add_toolbar=True,
                            fit_width=True):
         """Embed a matplotlib figure (+ optional toolbar) in `parent`, rendered
         at a sensible, readable scale and centered horizontally so it does not
         stretch to fill the whole window.
 
-        The figure is shown at its natural pixel size, except that its on-screen
-        width is capped at MAX_PLOT_WIDTH_IN (figures wider than that are scaled
-        down proportionally, preserving aspect ratio, so nothing balloons across
-        a maximized monitor). The canvas sits in a centering container so wide
-        windows get neutral margins instead of a left-anchored plot.
+        The on-screen size is fitted to the plot area by
+        _standard_plot_geometry, so plots of every type come up at a comparable
+        size with the same text size. The canvas sits in a centering container
+        so wide windows get neutral margins instead of a left-anchored plot.
 
         manual_height: optional pixel height for the graphing area; when None
         the figure's natural height (figsize x dpi) is used.
         Returns the FigureCanvasTkAgg.
         """
-        # Cap the figure width by scaling its dpi down (preserves layout/aspect
-        # and shrinks fonts uniformly). Done before drawing so the Agg buffer is
-        # rendered at the final size rather than clipped by the widget.
-        #
-        # Two caps are applied and the smaller wins:
-        #   1. MAX_PLOT_WIDTH_IN — an absolute inch cap so fonts/layout stay sane
-        #      on very large monitors.
-        #   2. The actual available on-screen width in pixels — the inch cap is
-        #      meaningless on a DPI-scaled or smaller display, where 13in x dpi
-        #      can exceed the window and overflow (e.g. the multi-subject Signal
-        #      Integrity dashboard). Converting the available pixels back to
-        #      inches at the current dpi keeps the rendered plot inside the panel.
-        dpi = fig.get_dpi()
-        w_in, h_in = fig.get_size_inches()
-        # Global plot-size scaling: shrink/grow every figure uniformly (dpi
-        # scales rendered pixels AND fonts together, preserving layout/aspect).
-        # PLOT_BASE_SCALE keeps defaults compact; self.plot_scale is the user
-        # setting. Applied before the width cap so a large scale can't overflow.
-        render_scale = PLOT_BASE_SCALE * float(getattr(self, 'plot_scale', 1.0) or 1.0)
-        if abs(render_scale - 1.0) > 1e-3:
-            dpi = max(20, dpi * render_scale)
-            fig.set_dpi(dpi)
-        # fit_width=False (used by the scrollable pop-out) keeps the figure at
-        # its natural width so wide, many-panel plots (e.g. whole-session
-        # coherence) render full-size and are reached by horizontal scrolling
-        # instead of being shrunk to fit — the "can't zoom out / scroll to see
-        # them all" case.
-        if fit_width:
-            avail_px = self._available_plot_width_px(parent)
-            max_w_in = min(MAX_PLOT_WIDTH_IN, avail_px / float(dpi))
-            if w_in > max_w_in:
-                new_dpi = max(40, dpi * (max_w_in / float(w_in)))
-                fig.set_dpi(new_dpi)
-                dpi = new_dpi
+        dpi, w_px, h_px = self._standard_plot_geometry(
+            fig, parent, fit_width=fit_width,
+            grow=manual_height is None
+            and not getattr(fig, '_tracy_user_sized', False))
+        fig.set_dpi(dpi)
+        fig.set_size_inches(w_px / dpi, h_px / dpi, forward=False)
 
         # Honour the global gridline toggle before drawing (and remember this
         # figure so the toggle can live-update it later).
@@ -30887,6 +31209,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # fill, is centered horizontally with margins on wide windows.
         holder = ttk.Frame(parent)
         canvas = FigureCanvasTkAgg(fig, holder)
+        # The dpi above already counts the display's scaling. Left bound, the
+        # backend multiplies it in a second time on <Map> -- whenever the tab
+        # happens to be mapped -- which is what made the same figure come up at
+        # one size in a visible tab and 1.35x that in a hidden one.
+        canvas.get_tk_widget().unbind('<Map>')
         self._active_plot_canvases.append(canvas)
 
         if add_toolbar:
@@ -30900,8 +31227,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         canvas.draw_idle()
         widget = canvas.get_tk_widget()
 
-        w_px = int(w_in * dpi)
-        h_px = int(h_in * dpi)
         if manual_height is not None:
             h_px = max(100, int(manual_height))
         widget.configure(width=w_px, height=h_px)
@@ -30942,9 +31267,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # size raised no <Configure> and make_scrollable has not
                         # seen it yet. Measuring before this ran gave the *old*
                         # plot's extent.
-                        resync = getattr(parent, '_resync_content', None)
-                        if callable(resync):
-                            resync()
+                        # Hand-rolled viewports (Bout Analysis's plot pane) are
+                        # pinned to their empty startup height by
+                        # _resync_scroll_regions too, so refit those as well;
+                        # left pinned, a taller plot was squashed to the pane.
+                        parent.update_idletasks()
+                        self._refit_viewport(parent)
                         bbox = parent.bbox('all')
                         if bbox:
                             parent.configure(scrollregion=bbox)
@@ -31366,7 +31694,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig_h = default_h
 
         fig = Figure(figsize=(fig_w, fig_h))
-        
+        # A size the user typed is kept rather than fitted to the plot area.
+        fig._tracy_user_sized = (fig_w, fig_h) != (default_w, default_h)
+
         # For single subject plots, use first selected subject
         # EXCEPT for Signal Integrity, which can handle multiple subjects
         plot_error = False
@@ -41244,9 +41574,10 @@ cat("OK\n")
             ref_b_combo.configure(state='disabled')
             comp_b_combo.configure(state='disabled')
 
-        # --- Behaviors in the factor model (one model over the ticked levels) ---
+        # --- Behaviors: one model over the ticked levels (factor), or the
+        #     single-behavior analysis repeated for each ticked behavior ---
         ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=8)
-        beh_head = ttk.Label(dlg, text="Behaviors in the factor model:",
+        beh_head = ttk.Label(dlg, text="Behaviors:",
                              font=('Segoe UI', 9, 'bold'))
         beh_head.pack(anchor='w', padx=12)
         beh_outer = ttk.Frame(dlg)
@@ -41332,19 +41663,23 @@ cat("OK\n")
         forced = {'from': None}
 
         def _sync_engine_controls(*_):
-            # Behaviour picker only bites on the factor model; grey it out
-            # elsewhere so it can't look like it applies to every analysis.
-            is_factor = ref_var.get() == 'factor'
-            st = 'normal' if is_factor else 'disabled'
+            # The behavior picker feeds the factor model and the single-behavior
+            # analyses; grey it out for the contrast and pairwise views, which
+            # pick their behaviors elsewhere.
+            ref = ref_var.get()
+            is_factor = ref == 'factor'
+            uses_behs = is_factor or ref in self._FLMM_PER_BEHAVIOR_REFERENCES
+            st = 'normal' if uses_behs else 'disabled'
             for w in list(beh_outer.winfo_children()) + [beh_all, beh_none]:
                 try:
                     w.configure(state=st)
                 except tk.TclError:
                     pass
-            beh_head.configure(foreground=('' if is_factor else 'gray'))
-            beh_hint.configure(text=("one model over the ticked behaviors"
-                                     if is_factor
-                                     else "applies to the factor model only"))
+            beh_head.configure(foreground=('' if uses_behs else 'gray'))
+            beh_hint.configure(text=("one model over the ticked behaviors" if is_factor
+                                     else "each ticked behavior is analysed separately"
+                                     if uses_behs
+                                     else "not used by this analysis"))
             python_only = ref_var.get() in self._FLMM_PYTHON_ONLY_REFERENCES
             if python_only:
                 if engine_var.get() == 'r':
@@ -41405,6 +41740,10 @@ cat("OK\n")
                 messagebox.showerror("Error", "Time range end must be after its start.",
                                      parent=dlg)
                 return
+            if (ref_var.get() in self._FLMM_PER_BEHAVIOR_REFERENCES
+                    and behaviors and not sel_beh):
+                messagebox.showerror("Error", "Tick at least 1 behavior.", parent=dlg)
+                return
             if ref_var.get() == 'factor':
                 if len(sel_beh) < 2:
                     messagebox.showerror(
@@ -41441,6 +41780,11 @@ cat("OK\n")
         'factor': "Factor: all behaviors vs a reference",
         'pairwise': "Pairwise matrix: every behavior vs every other",
     }
+
+    # Single-behavior analyses: ticking several behaviors repeats the model once
+    # per behavior (and channel) in one run.
+    _FLMM_PER_BEHAVIOR_REFERENCES = ('zero', 'across_bouts', 'between_groups',
+                                     'interaction')
 
     def _flmm_confirm_run(self, reference, engine, engine_note, rows):
         """Confirmation step shown after Run: spells out exactly what is about to
@@ -41641,7 +41985,7 @@ cat("OK\n")
                     "No Data", "\n".join(warns) or "No usable bouts for the factor model.")
                 return
             store = self._build_flmm_factor_store(panels, order, factor_kind)
-            self.flmm_timecourse_data = store
+            self._flmm_remember(store, 'factor')
             self._show_pairwise_panels(store)
             if warns:
                 messagebox.showwarning("Some channels skipped", "\n".join(warns))
@@ -41755,7 +42099,10 @@ cat("OK\n")
 
         gp_subj = sorted(set(subject_to_group.values())) if in_group_mode else []
         can_groups = in_group_mode and len(gp_subj) == 2
-        can_acrossbouts = _has_multiple_bouts(behavior)
+        # Any behavior with repeated bouts enables the bout-order analyses, since
+        # the run can now cover every ticked behavior, not just the dropdown's.
+        can_acrossbouts = any(_has_multiple_bouts(b)
+                              for b in [behavior] + available_behaviors)
         r_available = self._flmm_r_available()
         all_channels = self._all_channel_names()
 
@@ -41786,6 +42133,14 @@ cat("OK\n")
                                       + ", ".join(factor_behaviors)))
         elif reference == 'pairwise':
             rows.append(("Behaviors", f"{len(available_behaviors)} available"))
+        elif reference in self._FLMM_PER_BEHAVIOR_REFERENCES:
+            run_behaviors = choice.get('behaviors') or ([behavior] if behavior else [])
+            if reference in ('across_bouts', 'interaction'):
+                run_behaviors = [b for b in run_behaviors if _has_multiple_bouts(b)]
+            rows.append(("Behaviors", f"{len(run_behaviors)}: "
+                                      + (", ".join(run_behaviors) or "—")))
+            rows.append(("Models", f"{len(run_behaviors) * len(sel_channels)} "
+                                   f"(each behavior × channel fit separately)"))
         else:
             rows.append(("Behavior", behavior or "—"))
         if reference in ('factor', 'behavior_contrast'):
@@ -41830,37 +42185,42 @@ cat("OK\n")
                 comp_behaviors = [comp_sel]
                 comp_label = comp_sel
             ref_level = ref_b
-            behavior_label = f"{comp_label} vs {ref_b}"
             model_reference = 'between_groups'      # identical model path
+            run_behaviors = [(behavior, f"{comp_label} vs {ref_b}")]
         else:
-            if not behavior:
-                messagebox.showerror("Error", "Please select a behavior")
+            run_behaviors = [(b, b) for b in (run_behaviors or [])]
+            if not run_behaviors:
+                messagebox.showerror(
+                    "Error", "Please select a behavior" if reference == 'zero'
+                    else "No ticked behavior has 2 or more bouts per subject.")
                 return
-            behavior_label = behavior
             model_reference = reference
-
+        multi_beh = len(run_behaviors) > 1
+        jobs = [(b, lab, ch) for b, lab in run_behaviors for ch in sel_channels]
         holder = {}
 
         def worker(q):
             panels, order, warns = {}, [], []
-            C = max(1, len(sel_channels))
-            for ci, ch in enumerate(sel_channels):
+            C = max(1, len(jobs))
+            for ci, (beh, beh_label, ch) in enumerate(jobs):
                 if q.cancel_event.is_set():
                     raise _ProgressCancelled()
-                q.put(('status', f"Channel {ch}  ({ci + 1}/{C})"))
+                where = f"{beh_label} · {ch}" if multi_beh else f"Channel {ch}"
+                q.put(('status', f"{where}  ({ci + 1}/{C})"))
                 panel, warn = self._compute_flmm_timecourse_panel(
-                    selected_subjects, ch, behavior, behavior_label, reference,
+                    selected_subjects, ch, beh, beh_label, reference,
                     model_reference, ref_level, ref_b, comp_behaviors, comp_label,
                     subject_to_group, engine, pointwise_only, max_bouts,
                     q=q, base=ci / C, span=1.0 / C, use_exclusions=use_exclusions,
                     time_range=choice.get('time_range'))
                 if panel is None:
-                    warns.append(warn)
+                    warns.append(f"{beh_label} — {warn}" if multi_beh else warn)
                     continue
                 if panel.get('engine_note'):
                     warns.append(panel['engine_note'])
-                panels[ch] = panel
-                order.append(ch)
+                key = self._flmm_panel_key(beh_label, ch, multi_beh)
+                panels[key] = panel
+                order.append(key)
             holder['panels'], holder['order'], holder['warns'] = panels, order, warns
 
         def on_done():
@@ -41869,18 +42229,81 @@ cat("OK\n")
             if not order:
                 messagebox.showwarning(
                     "No Data", "\n".join(warns)
-                    or f"No usable bout traces for {behavior_label}.")
+                    or f"No usable bout traces for "
+                       f"{', '.join(lab for _, lab in run_behaviors)}.")
                 return
-            store = self._build_flmm_timecourse_store(panels, order)
-            self.flmm_timecourse_data = store
+            store = self._build_flmm_timecourse_store(
+                panels, order,
+                behaviors=[lab for _, lab in run_behaviors] if multi_beh else None,
+                channels=sel_channels if multi_beh else None)
+            self._flmm_remember(store, reference, who)
             self._show_pairwise_panels(store)
             if warns:
-                messagebox.showwarning("Some channels skipped", "\n".join(warns))
+                messagebox.showwarning(
+                    "Some panels skipped" if multi_beh else "Some channels skipped",
+                    "\n".join(warns))
 
         self._run_with_progress(
             "Time-course statistics", worker, on_done_fn=on_done, cancelable=True,
-            subtitle=f"{len(sel_channels)} channel(s) · "
-                     f"{self._FLMM_REFERENCE_TITLES.get(reference, reference)}")
+            subtitle=(f"{len(run_behaviors)} behavior(s) × " if multi_beh else "")
+                     + f"{len(sel_channels)} channel(s) · "
+                     + f"{self._FLMM_REFERENCE_TITLES.get(reference, reference)}")
+
+    @staticmethod
+    def _flmm_panel_key(behavior_label, channel, multi_behavior):
+        """Panel key: the channel alone, or 'behavior · channel' when one run
+        covers several behaviors."""
+        return f"{behavior_label} · {channel}" if multi_behavior else channel
+
+    _FLMM_HISTORY_MAX = 10
+
+    def _flmm_remember(self, store, reference, who=""):
+        """Make ``store`` the current FLMM result and keep it in the session's
+        run history, so Plot ▾ → Time-Course Statistics can bring it back after
+        another plot has replaced it on the canvas."""
+        import datetime
+        self.flmm_timecourse_data = store
+        title = self._FLMM_REFERENCE_TITLES.get(reference, reference)
+        behs = store.get('facet_behaviors')
+        what = (f"{len(behs)} behaviors" if behs
+                else store.get('behavior') or store.get('factor_kind') or "")
+        chans = store.get('facet_channels') or (
+            store.get('order') if store.get('selector_label') == "Channel:" else None)
+        bits = [title, what, (", ".join(chans) if chans else ""), who]
+        store['history_label'] = (f"{datetime.datetime.now():%H:%M}  "
+                                  + "  ·  ".join(b for b in bits if b))
+        hist = [s for s in getattr(self, 'flmm_results_history', []) if s is not store]
+        self.flmm_results_history = [store] + hist[:self._FLMM_HISTORY_MAX - 1]
+
+    def _populate_flmm_history_menu(self, menu):
+        """postcommand for Plot ▾ → Time-Course Statistics: the new-analysis entry,
+        then one entry per cached run, newest first."""
+        menu.delete(0, 'end')
+        menu.add_command(label="New analysis…", command=self.plot_timecourse_flmm)
+        menu.add_separator()
+        hist = getattr(self, 'flmm_results_history', [])
+        if not hist:
+            menu.add_command(label="(no results yet this session)", state='disabled')
+            return
+        menu.add_command(label="Recent results (shown without refitting):",
+                         state='disabled')
+        for store in hist:
+            menu.add_command(label=store.get('history_label', 'FLMM result'),
+                             command=lambda s=store: self.show_flmm_result(s))
+
+    def show_flmm_result(self, store=None):
+        """Redraw a cached FLMM result (the latest by default) without refitting,
+        on the panel that was last viewed."""
+        if store is None:
+            hist = getattr(self, 'flmm_results_history', [])
+            store = hist[0] if hist else getattr(self, 'flmm_timecourse_data', None)
+        if not store:
+            messagebox.showinfo(
+                "No FLMM results",
+                "Run Plot ▾ → Time-Course Statistics (FLMM-style) → New analysis… first.")
+            return
+        self.flmm_timecourse_data = store
+        self._show_pairwise_panels(store)
 
     def _compute_flmm_timecourse_panel(self, selected_subjects, channel, behavior,
                                        behavior_label, reference, model_reference,
@@ -42009,8 +42432,11 @@ cat("OK\n")
             'excluded_subjects': excluded_subjects,
         }, None
 
-    def _build_flmm_timecourse_store(self, panels, order):
-        """Wrap per-channel time-course panels in the shared panel-store shape."""
+    def _build_flmm_timecourse_store(self, panels, order, behaviors=None, channels=None):
+        """Wrap per-channel time-course panels in the shared panel-store shape.
+
+        ``behaviors``/``channels`` mark a multi-behavior run: panels are keyed
+        'behavior · channel' and the viewer gets one selector per facet."""
         def make_fig(key):
             p = panels[key]
             if p.get('terms'):
@@ -42041,6 +42467,14 @@ cat("OK\n")
                   'sig_pointwise', 'sig_simultaneous', 'reference', 'behavior',
                   'channel', 'c_star', 'pointwise_only', 'backend'):
             store[k] = first[k]
+        if behaviors:
+            behs = [b for b in behaviors if any(p['behavior'] == b for p in panels.values())]
+            chans = [c for c in (channels or []) if any(p['channel'] == c
+                                                         for p in panels.values())]
+            store['facet_behaviors'], store['facet_channels'] = behs, chans
+            store['facets'] = [("Behavior:", behs), ("Channel:", chans)]
+            store['facet_key'] = lambda vals: self._flmm_panel_key(vals[0], vals[1], True)
+            store['behavior'] = f"{len(behs)} behaviors"
         return store
 
     def _build_flmm_figure(self, Z, groups, time_axis, reference, beta, ci_lo, ci_hi,
@@ -42701,7 +43135,7 @@ cat("OK\n")
                 if warn:
                     messagebox.showwarning("No Data", warn)
                 return
-            self.flmm_timecourse_data = store
+            self._flmm_remember(store, 'pairwise', f"{len(behaviors)} behaviors")
             self._show_pairwise_panels(store)
 
         subtitle = ("within channel — one matrix per channel" if mode == 'within'
@@ -42920,7 +43354,15 @@ cat("OK\n")
         for w in self.bout_histogram_frame.winfo_children():
             w.destroy()
         keys = store['order']
-        sel_var = tk.StringVar(value=keys[0])
+        # Reopen on the panel last viewed (a recalled run keeps its place).
+        start = store.get('last_key') if store.get('last_key') in keys else keys[0]
+        sel_var = tk.StringVar(self.root, value=start)
+        facets = store.get('facets')
+        facet_vars = []
+        if facets:
+            first = store['panels'][start]
+            facet_vars = [tk.StringVar(self.root, value=first['behavior']),
+                          tk.StringVar(self.root, value=first['channel'])]
 
         top = ttk.Frame(self.bout_histogram_frame)
         # Peak-effect ("max difference") is available wherever the panels carry
@@ -42928,15 +43370,27 @@ cat("OK\n")
         # factor model both do.
         has_peak = store.get('kind') in ('pairwise_within', 'factor') and any(
             p.get('subj_means') for p in store.get('panels', {}).values())
-        if (len(keys) > 1 and store.get('selector_label')) or has_peak:
+        if (len(keys) > 1 and (store.get('selector_label') or facets)) or has_peak:
             top.pack(fill='x', padx=6, pady=(6, 0))
-        if len(keys) > 1 and store.get('selector_label'):
+        combos = []
+        if facets:
+            for (label, values), var in zip(facets, facet_vars):
+                if len(values) < 2:
+                    continue
+                ttk.Label(top, text=label).pack(side='left')
+                combo = ttk.Combobox(top, values=values, textvariable=var,
+                                     state='readonly',
+                                     width=max(10, min(32, max(len(v) for v in values) + 2)))
+                combo.pack(side='left', padx=(6, 12))
+                combos.append(combo)
+            ttk.Button(top, text="Summary of all panels",
+                       command=lambda: self._display_bout_stats(
+                           self._flmm_multi_summary_lines(store))).pack(side='right', padx=6)
+        elif len(keys) > 1 and store.get('selector_label'):
             ttk.Label(top, text=store['selector_label']).pack(side='left')
-            combo = ttk.Combobox(top, values=keys, textvariable=sel_var,
-                                 state='readonly', width=24)
-            combo.pack(side='left', padx=6)
-        else:
-            combo = None
+            combos.append(ttk.Combobox(top, values=keys, textvariable=sel_var,
+                                       state='readonly', width=24))
+            combos[-1].pack(side='left', padx=6)
         if has_peak:
             ttk.Button(top, text="Per-subject peak effect…",
                        command=lambda: self._flmm_show_peak_effect(
@@ -42948,7 +43402,16 @@ cat("OK\n")
             self.root.update_idletasks()
             for w in holder.winfo_children():
                 w.destroy()
+            if facets:
+                sel_var.set(store['facet_key']([v.get() for v in facet_vars]))
             key = sel_var.get()
+            if key not in store['panels'] and facets:
+                ttk.Label(holder, foreground='gray',
+                          text=f"No result for {key} — that behavior had no usable "
+                               f"bouts on this channel (see the skipped-panel note).").pack(
+                    padx=12, pady=24)
+                return
+            store['last_key'] = key
             fig = store['make_fig'](key)
             canvas = self._embed_plot_canvas(fig, holder)
             self.current_bout_canvas = canvas
@@ -42958,9 +43421,39 @@ cat("OK\n")
                 scrollregion=self.bout_histogram_canvas.bbox("all"))
             self._display_bout_stats(store['make_lines'](key))
 
-        if combo is not None:
+        for combo in combos:
             combo.bind("<<ComboboxSelected>>", _draw)
         self.bout_histogram_canvas.after(10, _draw)
+
+    def _flmm_multi_summary_lines(self, store):
+        """One line per behavior × channel of a multi-behavior run: where the
+        tested β(t) is significant, so every behavior can be scanned at once."""
+        first = store['panels'][store['order'][0]]
+        band = "pointwise 95%" if first['pointwise_only'] else "simultaneous 95%"
+        lines = [f"FLMM summary — {self._FLMM_REFERENCE_TITLES.get(first['reference'], first['reference'])}",
+                 f"Significant windows of the tested β(t) ({band} band excludes 0)", ""]
+        wb = max([len("Behavior")] + [len(b) for b in store.get('facet_behaviors', [])]) + 2
+        lines.append(f"{'Behavior':<{wb}}{'Channel':<10}{'bouts':>7}{'subj':>6}"
+                     f"{'peak β':>10}  significant window(s), s")
+        lines.append("-" * (wb + 70))
+        for beh in store.get('facet_behaviors', []):
+            for ch in store.get('facet_channels', []):
+                p = store['panels'].get(self._flmm_panel_key(beh, ch, True))
+                if p is None:
+                    lines.append(f"{beh:<{wb}}{ch:<10}{'—':>7}{'':>6}{'':>10}  not run "
+                                 f"(no usable bouts)")
+                    continue
+                sig = p['sig_pointwise'] if p['pointwise_only'] else p['sig_simultaneous']
+                wins = self._flmm_mask_windows(np.asarray(sig, bool), p['time'])
+                beta = np.asarray(p['beta'], float)
+                peak = (beta[np.nanargmax(np.abs(beta))] if np.isfinite(beta).any()
+                        else float('nan'))
+                winstr = "; ".join(f"{a:.2f}..{b:.2f}" for a, b in wins) or "ns"
+                lines.append(f"{beh:<{wb}}{ch:<10}{p['Z'].shape[0]:>7}"
+                             f"{p['n_subjects']:>6}{peak:>10.3f}  {winstr}")
+        lines += ["", "Each behavior × channel is its own model; windows are not corrected "
+                      "across behaviors.", f"Engine: {first.get('backend')}"]
+        return lines
 
     @staticmethod
     def _flmm_pairwise_stars(p):
@@ -43664,7 +44157,7 @@ cat("OK\n")
         if not d:
             messagebox.showinfo(
                 "No Data",
-                "Run Plot ▾ → Time-Course Statistics (FLMM-style)… first.")
+                "Run Plot ▾ → Time-Course Statistics (FLMM-style) → New analysis… first.")
             return
         if d.get('kind') in ('pairwise_within', 'pairwise_across'):
             # Long table across every panel: one row per contrast with raw+FDR p.
@@ -43760,14 +44253,16 @@ cat("OK\n")
                 f"clipboard.\nPaste into Excel or Prism.")
             return
         plist = [panels[k] for k in order] if order else [d]
-        headers = ['Channel', 'Time_s', 'beta', 'SE', 'CI_lo', 'CI_hi',
-                   'simCI_lo', 'simCI_hi', 'sig_pointwise', 'sig_simultaneous']
+        multi = bool(d.get('facet_behaviors'))
+        headers = ((['Behavior'] if multi else [])
+                   + ['Channel', 'Time_s', 'beta', 'SE', 'CI_lo', 'CI_hi',
+                      'simCI_lo', 'simCI_hi', 'sig_pointwise', 'sig_simultaneous'])
         rows = ['\t'.join(headers)]
         for p in plist:
             ch = str(p.get('channel', ''))
+            lead = [str(p['behavior']), ch] if multi else [ch]
             for i in range(len(p['time'])):
-                rows.append('\t'.join([
-                    ch,
+                rows.append('\t'.join(lead + [
                     f"{p['time'][i]:.4f}", f"{p['beta'][i]:.6f}", f"{p['se'][i]:.6f}",
                     f"{p['ci_lo'][i]:.6f}", f"{p['ci_hi'][i]:.6f}",
                     f"{p['sci_lo'][i]:.6f}", f"{p['sci_hi'][i]:.6f}",
@@ -43777,7 +44272,7 @@ cat("OK\n")
         tsv = '\n'.join(rows)
         self.root.clipboard_clear()
         self.root.clipboard_append(tsv)
-        chans = ', '.join(order) if order else d.get('channel', '')
+        chans = ', '.join(d.get('facet_channels') or order) if order else d.get('channel', '')
         messagebox.showinfo(
             "Copied",
             f"Time-course stats ({d['reference']}, {d['behavior']}; {chans}) "
@@ -43795,9 +44290,14 @@ cat("OK\n")
         import pandas as pd
         order = d.get('order') or []
         plist = [d['panels'][k] for k in order]
+        multi = bool(d.get('facet_behaviors'))
         eff, traces, obs, pred = [], [], [], []
         for p in plist:
             ch, time = p['channel'], np.asarray(p['time'], float)
+            # A multi-behavior run leads every sheet with a Behavior column.
+            lead = {'Behavior': str(p['behavior']), 'Channel': ch} if multi else {'Channel': ch}
+            tcols = [f"{x:.4f}" for x in time]
+            p_obs, p_pred = [], []
             terms = p.get('terms') or [{
                 'label': self._FLMM_REFERENCE_TITLES.get(p['reference'], p['reference']),
                 'tested': True, **{k: p[k] for k in (
@@ -43805,7 +44305,7 @@ cat("OK\n")
                     'sig_pointwise', 'sig_simultaneous')}}]
             for t in terms:
                 eff.append(pd.DataFrame({
-                    'Channel': ch, 'Term': t['label'], 'Tested': int(bool(t['tested'])),
+                    **lead, 'Term': t['label'], 'Tested': int(bool(t['tested'])),
                     'Time_s': time, 'beta': t['beta'], 'SE': t['se'],
                     'CI_lo': t['ci_lo'], 'CI_hi': t['ci_hi'],
                     'simCI_lo': t['sci_lo'], 'simCI_hi': t['sci_hi'],
@@ -43815,9 +44315,8 @@ cat("OK\n")
             subj = p.get('subjects')
             if subj is None:
                 continue
-            tcols = [f"{x:.4f}" for x in time]
             meta = pd.DataFrame({
-                'Channel': ch, 'Subject': [str(s) for s in subj],
+                **lead, 'Subject': [str(s) for s in subj],
                 'Animal': self._animal_ids_for(subj, log=lambda *_: None),
                 'Group': [('' if g is None else str(g)) for g in p['groups']],
                 'Bout_number': np.asarray(p['orders'], float).astype(int)})
@@ -43835,19 +44334,29 @@ cat("OK\n")
                     mean, sem, n = self._flmm_animal_means(Z, subj, gm & (orders == k))
                     if mean is not None:
                         for stat, row in (('mean', mean), ('sem', sem)):
-                            obs.append([ch, g, k, stat, n] + list(row))
+                            p_obs.append([g, k, stat, n] + list(row))
                     if inter:
                         mt, st = tm['mean_ref' if gi == 0 else 'mean_oth'], \
                             tm['slope_ref' if gi == 0 else 'slope_oth']
                     else:
                         mt, st = tm['mean'], tm['slope']
-                    pred.append([ch, g, k] + list(mt['beta'] + st['beta'] * (k - center)))
+                    p_pred.append([g, k] + list(mt['beta'] + st['beta'] * (k - center)))
+            # Per panel: behaviors can differ in window length, so each panel's
+            # rows get their own time columns before the sheets are stacked.
+            if p_obs:
+                df = pd.DataFrame(p_obs, columns=['Group', 'Bout_number', 'Stat',
+                                                  'n_animals'] + tcols)
+                obs.append(pd.concat([pd.DataFrame({**lead}, index=df.index), df], axis=1))
+            if p_pred:
+                df = pd.DataFrame(p_pred, columns=['Group', 'Bout_number'] + tcols)
+                pred.append(pd.concat([pd.DataFrame({**lead}, index=df.index), df], axis=1))
         sheets = {}
         first = plist[0]
         readme = [
-            f"FLMM time-course export — {first['behavior']}",
+            f"FLMM time-course export — "
+            f"{', '.join(d['facet_behaviors']) if multi else first['behavior']}",
             f"Analysis : {self._FLMM_REFERENCE_TITLES.get(first['reference'], first['reference'])}",
-            f"Channels : {', '.join(order)}",
+            f"Channels : {', '.join(d.get('facet_channels') or order)}",
             f"Engine   : {first.get('backend')}",
             f"Bands    : {'pointwise 95% only' if first['pointwise_only'] else 'pointwise 95% + simultaneous 95%'}",
             "",
@@ -43856,8 +44365,8 @@ cat("OK\n")
             readme.append("Exclusions: " + (
                 "APPLIED (Apply exclusions was ticked)" if first['use_exclusions']
                 else "not applied (every selected subject used on every channel)"))
-        for p in plist:
-            readme.append(f"{p['channel']}: {p['Z'].shape[0]} bouts, {p['n_subjects']} "
+        for key, p in zip(order, plist):
+            readme.append(f"{key}: {p['Z'].shape[0]} bouts, {p['n_subjects']} "
                           f"subject(s), groups: {', '.join(map(str, p['groups_present'])) or '—'}")
             if p.get('use_exclusions'):
                 ex = p.get('excluded_subjects') or []
@@ -43946,12 +44455,9 @@ cat("OK\n")
         sheets['Model_terms'] = pd.concat(eff, ignore_index=True)
         if traces:
             sheets['Input_bouts'] = pd.concat(traces, ignore_index=True)
-        tcols = [f"{x:.4f}" for x in np.asarray(first['time'], float)]
         if obs:
-            sheets['Observed_mean_per_bout'] = pd.DataFrame(
-                obs, columns=['Channel', 'Group', 'Bout_number', 'Stat', 'n_animals'] + tcols)
-            sheets['Model_fit_per_bout'] = pd.DataFrame(
-                pred, columns=['Channel', 'Group', 'Bout_number'] + tcols)
+            sheets['Observed_mean_per_bout'] = pd.concat(obs, ignore_index=True)
+            sheets['Model_fit_per_bout'] = pd.concat(pred, ignore_index=True)
         return sheets
 
     def export_flmm_workbook(self):
@@ -43964,7 +44470,7 @@ cat("OK\n")
         if not d:
             messagebox.showinfo(
                 "No Data",
-                "Run Plot ▾ → Time-Course Statistics (FLMM-style)… with a single-model "
+                "Run Plot ▾ → Time-Course Statistics (FLMM-style) → New analysis… with a single-model "
                 "analysis (signal ≠ 0, across bouts, between groups, across-bouts × group "
                 "or a behavior contrast) first.\n\nFactor and pairwise results export via "
                 "copy/paste or the PDF report.")
@@ -44006,7 +44512,7 @@ cat("OK\n")
             messagebox.showinfo(
                 "No Data",
                 "Run an FLMM analysis first (Bout Analysis → Plot ▾ → "
-                "\"Time-Course Statistics (FLMM-style)…\").")
+                "\"Time-Course Statistics (FLMM-style)\" → \"New analysis…\").")
             return
         import datetime
         default = f"FLMM_report_{datetime.datetime.now():%Y%m%d_%H%M}.pdf"
@@ -44097,7 +44603,8 @@ cat("OK\n")
                 else:
                     # factor / time-course: one panel per channel
                     panel = (d.get('panels') or {}).get(key, {})
-                    cap = f"{key}: {panel.get('behavior', d.get('behavior', ''))}"
+                    cap = (key if d.get('facet_behaviors')
+                           else f"{key}: {panel.get('behavior', d.get('behavior', ''))}")
                 yield cap, d['make_fig'](key), d['make_lines'](key)
                 # Every panel that carries per-subject traces also contributes its
                 # peak-effect ("max difference") figure — the readers always want it.

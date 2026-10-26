@@ -45,6 +45,7 @@ class _Scroller:
 
     make_scrollable = _G.make_scrollable
     _scroll_plot_zone_to_top = _G._scroll_plot_zone_to_top
+    _refit_viewport = _G._refit_viewport
 
     colors = {'bg_light': '#ffffff'}
 

@@ -40,7 +40,11 @@ Version 1.2.2.
   multiple-comparison-corrected *simultaneous* confidence bands, so you can see
   *when* an effect is significant. Reference points: signal ≠ 0, across bouts,
   between groups, and bout-order × group. (Bout Analysis tab → **Plot ▾ →
-  Time-Course Statistics (FLMM-style)**.) Bout-order models plot the observed
+  Time-Course Statistics (FLMM-style) → New analysis…**.) Tick several
+  behaviors to fit every behavior × channel in one run, then flip between them
+  or view a summary of all. Finished runs are cached for the session: the same
+  menu lists recent results, which reopen without refitting after another plot
+  has replaced them. Bout-order models plot the observed
   traces by bout number and report each group's own slope beside the tested
   term; **Export ▾ → Time-Course Stats — workbook** saves every term, the
   per-bout input matrix, and observed vs model-predicted traces per bout number.
