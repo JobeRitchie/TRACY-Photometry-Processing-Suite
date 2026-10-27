@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.29.0"
-APP_VERSION_DATE = "October 26, 2026"
+APP_VERSION = "1.29.1"
+APP_VERSION_DATE = "October 27, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -16247,6 +16247,24 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • Fix — Processing is much faster on long sessions. Lining behavior up
+    with photometry searched the whole photometry clock once per behavior
+    frame, so time grew with the square of session length (a 40-minute
+    session spent minutes there). It now uses a sorted lookup that picks
+    exactly the same samples; processed output is unchanged.
+  • Fix — The bi-exponential bleaching fit runs on block averages of at
+    most 10,000 points and is still evaluated on every sample. Processing
+    of five test sessions went from 128 s to 18 s; dF/F and z-score move by
+    at most 0.0004 SD (r = 1.000000), bout metrics by at most 0.0001 SD.
+  • Change — Signal Linkage: the SG window is set in seconds (default 2 s)
+    so one value means the same on 20 Hz and 30 Hz rigs. Reliability now
+    correlates bout traces smoothed with that window, and rate/latency use
+    half of it so fast rises are timed on the rise, not the decay.
+  • Fix — Signal Integrity's channel selector follows Group mode, where the
+    subject list's own selection is hidden.
+
+Version 1.29.0  •  October 26, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — FLMM runs every ticked behavior at once. Signal ≠ 0, across bouts,
     between groups and the interaction now fit each ticked behavior × channel
     in one run; Behavior and Channel dropdowns switch panels, and "Summary of
@@ -23381,6 +23399,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # linear detrend with a logged reason, instead of freezing the GUI as an
     # unbounded search did.
     FIT_MAX_NFEV = 20000
+    # Most samples the bi-exponential is fitted on (see fit_biexponential).
+    BIEXP_FIT_POINTS = 10000
     FIT_RETRY_MAX_NFEV = 4000
     FIT_MAX_WORK = 200_000_000
 
@@ -23460,10 +23480,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         p0 = [float(np.clip(v, lo, hi))
               for v, lo, hi in zip(p0, bounds[0], bounds[1])]
 
+        # Fit on block means of at most BIEXP_FIT_POINTS samples, with the
+        # analytic Jacobian. A bleaching curve has no detail a 10k-point summary
+        # loses, while fitting every sample of a 40-minute session cost ~10 s
+        # per channel (76-6: 80 of 90 s of processing). Measured on five
+        # sessions (Maria's alcohol set, 76-6, DR22/23): dF/F and z-score moved
+        # by at most 0.0004 SD, r = 1.000000. The curve is still evaluated on
+        # every sample below.
+        k = max(1, int(np.ceil(len(y_norm) / self.BIEXP_FIT_POINTS)))
+        m = (len(y_norm) // k) * k if k > 1 else len(y_norm)
+        x_fit = x_norm[:m].reshape(-1, k).mean(axis=1) if k > 1 else x_norm
+        y_fit = y_norm[:m].reshape(-1, k).mean(axis=1) if k > 1 else y_norm
+
+        def biexp_jac(x, a, b, c, d, offset):
+            eb, ed = np.exp(-b * x), np.exp(-d * x)
+            return np.column_stack([eb, -a * x * eb, ed, -c * x * ed, np.ones_like(x)])
+
         # Fit with increased iterations and better tolerance
         try:
-            popt, _ = curve_fit(biexp, x_norm, y_norm, p0=p0, bounds=bounds,
-                              maxfev=self._fit_nfev_cap(len(y_norm), self.FIT_MAX_NFEV),
+            popt, _ = curve_fit(biexp, x_fit, y_fit, p0=p0, bounds=bounds, jac=biexp_jac,
+                              maxfev=self._fit_nfev_cap(len(y_fit), self.FIT_MAX_NFEV),
                               ftol=1e-10, xtol=1e-10)
         except RuntimeError:
             # If strict fit fails, try with relaxed bounds.  Every bound stays
@@ -23839,14 +23875,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         match_tol = self._sync_match_tolerance(fp_ts_ref, beh_ts_ref)
 
         # For each behavior timestamp, find closest photometry timestamp
+        nearest = self._nearest_sample_indices(fp_ts_ref, beh_ts_ref[:len(beh_raw)])
         n_uncovered = 0
         for i in range(len(beh_raw)):
             beh_ts = beh_ts_ref[i]
-            if np.isnan(beh_ts):
+            idx = nearest[i]
+            if idx < 0:
                 continue
-
-            # Find closest match
-            idx = np.argmin(np.abs(fp_ts_ref - beh_ts))
             if abs(float(fp_ts_ref[idx]) - float(beh_ts)) > match_tol:
                 n_uncovered += 1
                 continue        # no photometry sample here -- leave NaN
@@ -23871,11 +23906,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Sanity check: warn if the vast majority of frames still map to the same FP index
         # (can happen if relative matching also fails, e.g. completely different session lengths)
-        matched_indices = []
-        for i in range(len(beh_raw)):
-            beh_ts = beh_ts_ref[i]
-            if not np.isnan(beh_ts):
-                matched_indices.append(np.argmin(np.abs(fp_ts_ref - beh_ts)))
+        matched_indices = [int(j) for j in nearest if j >= 0]
         if len(matched_indices) > 10:
             n_unique = len(set(matched_indices))
             if n_unique / len(matched_indices) < 0.05:
@@ -23886,7 +23917,46 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 )
         
         return beh_synced
-    
+
+    @staticmethod
+    def _nearest_sample_indices(ref, targets):
+        """``argmin(|ref - t|)`` for every target ``t``, in O(n log n).
+
+        Searching the whole photometry clock once per behavior frame is
+        quadratic in session length: a 20-minute session spent most of its
+        processing time here, and a 40-minute one took minutes. The result is
+        identical to the per-frame argmin, ties included -- equal distances go
+        to the lowest original index, which is what a stalled clock's repeated
+        timestamps (NSF07) relied on. NaN targets give -1.
+        """
+        ref = np.asarray(ref, dtype=float)
+        t = np.asarray(targets, dtype=float)
+        out = np.full(t.shape, -1, dtype=np.intp)
+        ok = ~np.isnan(t)
+        if ref.size == 0 or not ok.any():
+            return out
+        if not np.isfinite(ref).all():
+            # argmin over a NaN-holding array returns the first NaN; keep that
+            # exact behavior rather than reason about it in sorted order.
+            for i in np.flatnonzero(ok):
+                out[i] = np.argmin(np.abs(ref - t[i]))
+            return out
+        order = np.argsort(ref, kind='stable')
+        s = ref[order]
+        tv = t[ok]
+        pos = np.searchsorted(s, tv, side='left')
+        lo = np.clip(pos - 1, 0, s.size - 1)
+        hi = np.clip(pos, 0, s.size - 1)
+        # First of any run of equal values: the stable sort put the lowest
+        # original index there.
+        lo = np.searchsorted(s, s[lo], side='left')
+        hi = np.searchsorted(s, s[hi], side='left')
+        d_lo, d_hi = np.abs(s[lo] - tv), np.abs(s[hi] - tv)
+        i_lo, i_hi = order[lo], order[hi]
+        pick_lo = (d_lo < d_hi) | ((d_lo == d_hi) & (i_lo < i_hi))
+        out[ok] = np.where(pick_lo, i_lo, i_hi)
+        return out
+
     def synchronize_abel_position(self, subject_id, zscore_data, frames, x_vals, y_vals,
                                   file_fps=None):
         """Build ``beh_synced`` from an ABEL position track (no shared clock).
@@ -30558,34 +30628,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         else:
             self.spatial_bin_entry['state'] = 'disabled'
         
-        # Enable Signal Integrity channel selector for single-subject Signal Integrity view
-        if plot_type == "Signal Integrity":
-            # Check if single subject is selected
-            selected_indices = self.viz_subject_listbox.curselection()
-            if len(selected_indices) == 1:
-                # Enable channel selector for single-subject view
-                self.integrity_channel_combo['state'] = 'readonly'
-                # Update available channels based on the selected subject's data
-                subject = self.viz_subject_listbox.get(selected_indices[0])
-                if subject in self.processed_data:
-                    data = self.processed_data[subject]
-                    # Use the real channel designations (G0/G1/R4/…) in column
-                    # order so every channel is selectable and labelled correctly.
-                    available_channels = self._ordered_channel_names(data)
-
-                    if available_channels:
-                        self.integrity_channel_combo['values'] = available_channels
-                        # Set to first available channel if current selection is invalid
-                        if self.integrity_channel_var.get() not in available_channels:
-                            self.integrity_channel_var.set(available_channels[0])
-            else:
-                # Disable for multi-subject view
-                self.integrity_channel_combo['state'] = 'disabled'
-            # Sensor mode applies to both single- and multi-subject integrity views
-            self.integrity_sensor_check['state'] = 'normal'
-        else:
-            self.integrity_channel_combo['state'] = 'disabled'
-            self.integrity_sensor_check['state'] = 'disabled'
+        self.update_integrity_channel_selector()
 
         # Restore saved selections after a brief delay to ensure UI has updated
         if saved_groups is not None:
@@ -32679,12 +32722,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if plot_type == "Signal Integrity":
             # Sensor mode applies to both single- and multi-subject integrity views
             self.integrity_sensor_check['state'] = 'normal'
-            selected_indices = self.viz_subject_listbox.curselection()
-            if len(selected_indices) == 1:
+            # Resolve through the active mode: in Group mode the subject
+            # listbox is hidden, so its selection says nothing about what
+            # generate_plot will draw.
+            selected = [s for s in self._get_selected_viz_subjects()
+                        if s in self.processed_data]
+            if len(selected) == 1:
                 # Enable channel selector
                 self.integrity_channel_combo['state'] = 'readonly'
                 # Update available channels
-                subject = self.viz_subject_listbox.get(selected_indices[0])
+                subject = selected[0]
                 if subject in self.processed_data:
                     data = self.processed_data[subject]
                     # Use the real channel designations (G0/G1/R4/…) in column order.
@@ -51520,7 +51567,8 @@ cat("OK\n")
     #    * Latency (s)      – time of the dF/dt peak relative to onset (sign =
     #                         lead/lag: negative means the signal turns first).
     #    * Reliability r    – mean pairwise correlation of individual bout traces
-    #                         around onset; trial-to-trial consistency (n-free).
+    #                         around onset, each smoothed with the same SG window
+    #                         as dF/dt; trial-to-trial consistency (n-free).
     #    * Locking Z, p     – observed peak |dF/dt| vs a random-onset null built
     #                         by resampling windows from the full z-score trace
     #                         (1000 permutations, vectorized). This is the actual
@@ -51546,7 +51594,12 @@ cat("OK\n")
         # sig_link_by_var (a Subject/Group mode toggle) lived here unread: the
         # tab had no grouping to toggle. The facet column supplies it now, so
         # the variable is gone rather than left as a second, dead way to say it.
-        self.sig_link_sg_win_var = tk.StringVar(value="11")
+        # The SG window is in seconds so one default means the same thing on a
+        # 20 Hz and a 30 Hz rig. 2 s was chosen against real data (DBG and
+        # GRAB-NE startle, KORKO drinking): the old 11 frames (0.37 s at 30 Hz)
+        # found a 20-bout sucrose response 30% of the time, 2 s found it 92%,
+        # at the same ~5% false-positive rate on random onsets.
+        self.sig_link_sg_win_var = tk.StringVar(value="2.0")
         self.sig_link_sg_poly_var = tk.StringVar(value="3")
         self.sig_link_search_var = tk.StringVar(value="1.0")
         self.sig_link_base_var = tk.StringVar(value="1.0")
@@ -51639,7 +51692,7 @@ cat("OK\n")
                           font=('Segoe UI', 7)).pack(side='right',
                                                      padx=(0, self.ui_px(4)))
 
-        _mk_row(settings, "SG window (frames)", self.sig_link_sg_win_var)
+        _mk_row(settings, "SG window (s)", self.sig_link_sg_win_var, hint="smoothing")
         _mk_row(settings, "SG poly order", self.sig_link_sg_poly_var)
         _mk_row(settings, "Search ± (s)", self.sig_link_search_var, hint="dF/dt peak")
         _mk_row(settings, "Baseline (s)", self.sig_link_base_var, hint="pre-onset")
@@ -51821,7 +51874,7 @@ cat("OK\n")
         fps = self.get_fps()
         cfg = {
             'fps': fps,
-            'sg_win': _f(self.sig_link_sg_win_var, 11, 3, 199, integer=True),
+            'sg_win_s': _f(self.sig_link_sg_win_var, 2.0, 0.1, 10.0),
             'sg_poly': _f(self.sig_link_sg_poly_var, 3, 1, 8, integer=True),
             'search_s': _f(self.sig_link_search_var, 1.0, 0.1, 5.0),
             'base_s': _f(self.sig_link_base_var, 1.0, 0.1, 10.0),
@@ -51996,11 +52049,18 @@ cat("OK\n")
         mt = self._fill_nan_1d(mean_tr)
         if mt is None:
             return None
-        win = self._sig_sg_window(cfg['sg_win'], cfg['sg_poly'], total)
-        deriv = savgol_filter(mt, win, cfg['sg_poly'], deriv=1, delta=1.0 / fps)
-
+        win = self._sig_sg_window(round(cfg['sg_win_s'] * fps), cfg['sg_poly'], total)
         sw = max(1, int(round(cfg['search_s'] * fps)))
         lo, hi = max(0, onset - sw), min(total, onset + sw)
+        # The locking test uses the full window (power on slow responses);
+        # the reported rate and latency use half of it. A 2 s derivative of a
+        # fast rise-then-decay peaks on the decay or ahead of onset (DBG
+        # startle read as a 0.25 s lead), while 1 s timed every tested
+        # sensor's rise correctly.
+        obs = float(np.max(np.abs(savgol_filter(
+            mt, win, cfg['sg_poly'], deriv=1, delta=1.0 / fps)[lo:hi])))
+        dwin = self._sig_sg_window(win // 2, cfg['sg_poly'], total)
+        deriv = savgol_filter(mt, dwin, cfg['sg_poly'], deriv=1, delta=1.0 / fps)
         seg = deriv[lo:hi]
         k = int(np.argmax(np.abs(seg)))
         peak_rate = float(seg[k])
@@ -52012,13 +52072,23 @@ cat("OK\n")
         resp = float(np.nanmean(mt[onset:min(total, onset + rw)]))
         delta = resp - base
 
+        # Each bout is smoothed with the dF/dt window before correlating: raw
+        # traces are mostly sample noise at this scale, which held slow-sensor
+        # responses (GRAB-NE, drinking GCaMP) near r 0.1 while random onsets
+        # stay at r 0 either way. Smoothed over a margin of half a window so
+        # the kept span is free of SG edge effects.
         rlw = max(1, int(round(cfg['relia_s'] * fps)))
-        seg2 = mat[:, max(0, onset - rlw):min(total, onset + rlw)]
+        r_lo, r_hi = max(0, onset - rlw), min(total, onset + rlw)
+        pad = win // 2
+        p_lo, p_hi = max(0, r_lo - pad), min(total, r_hi + pad)
+        seg2 = mat[:, p_lo:p_hi]
         good = np.all(np.isfinite(seg2), axis=1)
         reliability = np.nan
         if good.sum() >= 2:
+            rwin = self._sig_sg_window(win, cfg['sg_poly'], seg2.shape[1])
+            sub = savgol_filter(seg2[good], rwin, cfg['sg_poly'], axis=1)
+            sub = sub[:, r_lo - p_lo:r_hi - p_lo]
             # drop zero-variance rows (would produce NaN correlations)
-            sub = seg2[good]
             var_ok = np.nanstd(sub, axis=1) > 1e-9
             sub = sub[var_ok]
             if sub.shape[0] >= 2:
@@ -52026,7 +52096,6 @@ cat("OK\n")
                 iu = np.triu_indices_from(C, k=1)
                 reliability = float(np.nanmean(C[iu]))
 
-        obs = abs(peak_rate)
         z, p = np.nan, np.nan
         valid = [t for t in full_traces
                  if t is not None and np.isfinite(t).sum() > total + 2]
