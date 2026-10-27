@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.29.1"
+APP_VERSION = "1.29.2"
 APP_VERSION_DATE = "October 27, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -16246,6 +16246,14 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Fix — Visualization → Export CSV writes bout traces for every ticked
+    channel. Extracted Bouts and Zone Entry Bouts exported only the first
+    two channels (G0/G1), so G2–G4 on a five-channel rig were dropped, and
+    Compare Across Bouts stopped at two. Export columns name each subject's
+    real channel (G2, R4…); exclusions apply per channel as before.
+
+Version 1.29.1  •  October 27, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — Processing is much faster on long sessions. Lining behavior up
     with photometry searched the whole photometry clock once per behavior
@@ -32809,7 +32817,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         present in a bout entry, alongside the real designation and the legacy
         G0/G1 aliases); ``label`` is the human channel designation (e.g. ``R4``),
         also used as the per-channel exclusion key.  Missing slots are returned
-        as ``(None, None)`` so callers can skip them.
+        as ``(None, None)`` so callers can skip them.  ``max_slots=None``
+        returns every selected channel with no padding (used by the exports,
+        which are not limited to the two plot panels).
         """
         ref = {}
         for s in subjects:
@@ -32819,11 +32829,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         sel = self.get_selected_viz_channels(ref)
         if not sel:
             sel = [0, 1]
-        slots = []
-        for idx in sel[:max_slots]:
-            slots.append((f'Ch{idx}', self.get_channel_name(ref, idx)))
-        while len(slots) < max_slots:
+        if max_slots is not None:
+            sel = sel[:max_slots]
+        slots = [(f'Ch{idx}', self.get_channel_name(ref, idx)) for idx in sel]
+        while max_slots is not None and len(slots) < max_slots:
             slots.append((None, None))
+        return slots
+
+    @staticmethod
+    def _bout_entry_slot_key(entry, ch_slot):
+        """Key holding channel slot ``ch_slot``'s bouts in a bout entry.
+
+        Entries store every channel as ``Ch{n}``; very old ones only carry the
+        ``G0``/``G1`` aliases.  Returns None when the slot is absent.
+        """
+        key = f'Ch{ch_slot}'
+        if key in entry:
+            return key
+        legacy = {0: 'G0', 1: 'G1'}.get(ch_slot)
+        return legacy if legacy in entry else None
+
+    def _viz_export_bout_slots(self, subject, data, entry):
+        """``(slot, store_key, channel_name)`` for each ticked channel this
+        subject's bout entry holds, skipping excluded channels.
+
+        The bout-trace CSV exports used to loop a literal ``['G0', 'G1']``, so
+        a recording with G2-G4 exported only its first two channels even with
+        every channel ticked and plotted.
+        """
+        slots = []
+        for ch_slot in self.get_selected_viz_channels(data):
+            key = self._bout_entry_slot_key(entry, ch_slot)
+            if key is None:
+                continue
+            if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot, data):
+                continue
+            slots.append((ch_slot, key, self.get_channel_name(data, ch_slot)))
         return slots
 
     def _viz_channel_wavelengths(self, data, sel_chs, has_470, has_570):
@@ -35750,27 +35791,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if not isinstance(behavior_entry, dict):
                             continue
                         
-                        # Process each channel separately. The store may use legacy
-                        # G0/G1 aliases for positional data, but we export the real
-                        # channel name assigned to that slot for clarity.
-                        for ch_slot, ch_key in enumerate(['G0', 'G1']):
-                            actual_channel_name = self.get_channel_name(data, ch_slot)
-
-                            # Check if this channel should be exported
-                            if ch_slot == 0 and not show_g0:
-                                continue
-                            if ch_slot == 1 and not show_g1:
-                                continue
-
-                            # Check if this channel is excluded for this subject
-                            if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
-                                continue
-                            
-                            # Get bouts for this channel
-                            if ch_key not in behavior_entry:
-                                continue
-                            
-                            bouts_list = behavior_entry[ch_key]
+                        # Every ticked channel, exported under the real channel
+                        # name assigned to its slot.
+                        for _slot, store_key, actual_channel_name in self._viz_export_bout_slots(
+                                subject, data, behavior_entry):
+                            bouts_list = behavior_entry[store_key]
                             if not isinstance(bouts_list, (list, tuple)) or len(bouts_list) == 0:
                                 continue
 
@@ -35799,7 +35824,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 
                                 if valid_bouts > 0:
                                     subject_avg = np.nanmean(bout_matrix, axis=0)
-                                    col_name = f"{subject}_{ch_key}_avg"
+                                    col_name = f"{subject}_{actual_channel_name}_avg"
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                     subject_behavior_channel_bouts[col_name] = subject_avg
@@ -35809,7 +35834,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     if bout is None or len(bout) == 0:
                                         continue
 
-                                    col_name = f"{subject}_{ch_key}_bout{bout_idx + 1}"
+                                    col_name = f"{subject}_{actual_channel_name}_bout{bout_idx + 1}"
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
 
@@ -36049,55 +36074,33 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     
                     # Collect all bouts for this subject in wide format
                     subject_bouts = {}
-                    actual_channel_name_0 = self.get_channel_name(data, 0)
-                    actual_channel_name_1 = self.get_channel_name(data, 1)
-                    
+
                     # Export each zone's bouts (should be 'open_arm')
                     for zone_name, zone_bouts in bout_type_data.items():
-                        # G0 bouts
-                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)) and zone_bouts.get('G0'):
+                        if not isinstance(zone_bouts, dict):
+                            continue
+                        for _slot, store_key, channel_name in self._viz_export_bout_slots(
+                                subject, data, zone_bouts):
                             # Realign to current window before export.
-                            g0_bouts = self._entry_channel_bouts(zone_bouts, 'G0', max_bouts)
+                            ch_bouts = self._entry_channel_bouts(zone_bouts, store_key, max_bouts)
+                            if not ch_bouts:
+                                continue
 
-                            if average_within_subject and len(g0_bouts) > 0:
+                            if average_within_subject:
                                 # Average within subject - create one averaged trace
-                                max_len = max(len(b) for b in g0_bouts)
-                                bout_matrix = np.full((len(g0_bouts), max_len), np.nan)
-                                for i, bout in enumerate(g0_bouts):
+                                max_len = max(len(b) for b in ch_bouts)
+                                bout_matrix = np.full((len(ch_bouts), max_len), np.nan)
+                                for i, bout in enumerate(ch_bouts):
                                     bout_matrix[i, :len(bout)] = bout
                                 subject_avg = np.nanmean(bout_matrix, axis=0)
-                                col_name = f"{subject}_{actual_channel_name_0}_avg"
+                                col_name = f"{subject}_{channel_name}_avg"
                                 if subject_to_group:
                                     col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                 subject_bouts[col_name] = subject_avg
                             else:
                                 # Export individual bouts
-                                for bout_idx, bout in enumerate(g0_bouts):
-                                    col_name = f"{subject}_{actual_channel_name_0}_bout{bout_idx + 1}"
-                                    if subject_to_group:
-                                        col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
-                                    subject_bouts[col_name] = bout
-                                    bout_col_ordinals[col_name] = bout_idx + 1
-                        
-                        # G1 bouts
-                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)) and zone_bouts.get('G1'):
-                            g1_bouts = self._entry_channel_bouts(zone_bouts, 'G1', max_bouts)
-
-                            if average_within_subject and len(g1_bouts) > 0:
-                                # Average within subject - create one averaged trace
-                                max_len = max(len(b) for b in g1_bouts)
-                                bout_matrix = np.full((len(g1_bouts), max_len), np.nan)
-                                for i, bout in enumerate(g1_bouts):
-                                    bout_matrix[i, :len(bout)] = bout
-                                subject_avg = np.nanmean(bout_matrix, axis=0)
-                                col_name = f"{subject}_{actual_channel_name_1}_avg"
-                                if subject_to_group:
-                                    col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
-                                subject_bouts[col_name] = subject_avg
-                            else:
-                                # Export individual bouts
-                                for bout_idx, bout in enumerate(g1_bouts):
-                                    col_name = f"{subject}_{actual_channel_name_1}_bout{bout_idx + 1}"
+                                for bout_idx, bout in enumerate(ch_bouts):
+                                    col_name = f"{subject}_{channel_name}_bout{bout_idx + 1}"
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
                                     subject_bouts[col_name] = bout
@@ -39864,7 +39867,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         bin_size = self._viz_bout_bin_size()
         selected_bout = self._viz_selected_bout_number()
-        slot_defs = self._viz_bout_channel_slots(subjects, max_slots=2)
+        # Every ticked channel, not just the two the plot has panels for.
+        slot_defs = self._viz_bout_channel_slots(subjects, max_slots=None)
 
         if subject_to_group:
             groups = []
