@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.29.2"
+APP_VERSION = "1.30.0"
 APP_VERSION_DATE = "October 27, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -16247,6 +16247,28 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Every Visualization plot and export covers however many channels
+    a recording has (G0–G4, R4…), following the channel checkboxes. Zone
+    Averages, Distance from Center (X/Y and Euclidean) and Out/Back were
+    computed for the first two channels only; they now cover all of them,
+    for one subject, several subjects and group comparisons, and in their
+    CSV exports. Projects processed earlier fill in the missing channels
+    from their saved data the first time they are plotted — no reprocessing.
+  • New — Extracted Bouts, Zone Entry Bouts and Compare Across Bouts draw
+    one row per ticked channel, and the figure grows to fit. Charts and
+    CSV columns name each subject's real channel (a red cohort shows R4,
+    not G0); channels past G1 get their own colors.
+  • New — All Behaviors → Bout Metrics writes a sheet per behavior for
+    every channel; the Decision Probability channel list, the Show Bout #
+    list and spike export metadata cover every channel too.
+  • Fix — Compare Across Bouts with many bout bins: a per-bin legend (80+
+    entries at one bout per bin) buried the panels. Past 12 bins a color
+    bar keys bout order; group plots keep one legend entry per group.
+  • Fix — Group plot titles no longer sit on top of the first panel's
+    title (Zone Entry, Distance from Center, Out/Back).
+
+Version 1.29.2  •  October 27, 2026
+────────────────────────────────────────────────────────────────────────────────
   • Fix — Visualization → Export CSV writes bout traces for every ticked
     channel. Extracted Bouts and Zone Entry Bouts exported only the first
     two channels (G0/G1), so G2–G4 on a five-channel rig were dropped, and
@@ -24709,6 +24731,28 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return beh_synced, entry_frames_dict
     
+    def _slot_value_stats(self, beh_synced, rows, n_channels, out, stats):
+        """Per-channel statistics of ``beh_synced[rows]`` written into ``out``.
+
+        Keys are ``G{slot}_<stat>`` for every channel slot (column ``6+slot``):
+        the ``G0``/``G1`` keys these dicts always used, extended to however
+        many channels the recording has instead of stopping at two.
+        """
+        for ch in range(n_channels):
+            vals = np.asarray(beh_synced[rows, 6 + ch], dtype=float).ravel()
+            vals = vals[~np.isnan(vals)]
+            n = len(vals)
+            for stat in stats:
+                if stat == 'n':
+                    out[f'G{ch}_n'] = int(n)
+                elif stat == 'mean':
+                    out[f'G{ch}_mean'] = float(np.mean(vals)) if n else np.nan
+                elif stat == 'std':
+                    out[f'G{ch}_std'] = float(np.std(vals)) if n else np.nan
+                elif stat == 'sem':
+                    out[f'G{ch}_sem'] = float(np.std(vals) / np.sqrt(n)) if n else np.nan
+        return out
+
     def calculate_zone_averages(self, beh_synced, zones, n_channels=None):
         """Calculate average z-score for each zone
 
@@ -24729,42 +24773,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # kinematics field — reading it as G1 produces a phantom second channel.
         if n_channels is None:
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
-        has_g0 = n_channels >= 1
-        has_g1 = n_channels >= 2
-        
-        # Calculate averages for each zone
+        # Calculate averages for each zone, for every channel slot.
         for zone_name in self.zones.keys():
             zone_frames = [i for i, z in enumerate(zones) if z == zone_name]
-            
+
             if zone_frames:
-                zone_data = {}
-                
-                # G0 channel
-                if has_g0:
-                    g0_values = beh_synced[zone_frames, 6]
-                    g0_values = g0_values[~np.isnan(g0_values)]
-                    if len(g0_values) > 0:
-                        zone_data['G0_mean'] = np.mean(g0_values)
-                        zone_data['G0_std'] = np.std(g0_values)
-                        zone_data['G0_n'] = len(g0_values)
-                    else:
-                        zone_data['G0_mean'] = np.nan
-                        zone_data['G0_std'] = np.nan
-                        zone_data['G0_n'] = 0
-                
-                # G1 channel
-                if has_g1:
-                    g1_values = beh_synced[zone_frames, 7]
-                    g1_values = g1_values[~np.isnan(g1_values)]
-                    if len(g1_values) > 0:
-                        zone_data['G1_mean'] = np.mean(g1_values)
-                        zone_data['G1_std'] = np.std(g1_values)
-                        zone_data['G1_n'] = len(g1_values)
-                    else:
-                        zone_data['G1_mean'] = np.nan
-                        zone_data['G1_std'] = np.nan
-                        zone_data['G1_n'] = 0
-                
+                zone_data = self._slot_value_stats(
+                    beh_synced, zone_frames, n_channels, {}, ('mean', 'std', 'n'))
                 zone_averages[zone_name] = zone_data
         
         return zone_averages
@@ -24786,9 +24801,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # is a kinematics field for single-channel subjects, not a real G1.
         if n_channels is None:
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
-        has_g0 = n_channels >= 1
-        has_g1 = n_channels >= 2
-
         # Distance from center lives in the kinematics block at 6+N (+3 = X, +4 = Y).
         kin_base = self._beh_kin_base(n_channels)
         x_distances = beh_synced[:, kin_base + 3]
@@ -24817,19 +24829,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for d in range(max_dist_x + 1):
             bin_mask = (np.floor(x_distances) == d) & ~np.isnan(x_distances)
             
-            bin_data = {'distance': d}
-            
-            if has_g0:
-                g0_values = beh_synced[bin_mask, 6]
-                g0_values = g0_values[~np.isnan(g0_values)]
-                bin_data['G0_mean'] = np.mean(g0_values) if len(g0_values) > 0 else np.nan
-                bin_data['G0_n'] = len(g0_values)
-            
-            if has_g1:
-                g1_values = beh_synced[bin_mask, 7]
-                g1_values = g1_values[~np.isnan(g1_values)]
-                bin_data['G1_mean'] = np.mean(g1_values) if len(g1_values) > 0 else np.nan
-                bin_data['G1_n'] = len(g1_values)
+            bin_data = self._slot_value_stats(
+                beh_synced, bin_mask, n_channels, {'distance': d}, ('mean', 'n'))
             
             x_axis_results[d] = bin_data
         
@@ -24837,19 +24838,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for d in range(max_dist_y + 1):
             bin_mask = (np.floor(y_distances) == d) & ~np.isnan(y_distances)
             
-            bin_data = {'distance': d}
-            
-            if has_g0:
-                g0_values = beh_synced[bin_mask, 6]
-                g0_values = g0_values[~np.isnan(g0_values)]
-                bin_data['G0_mean'] = np.mean(g0_values) if len(g0_values) > 0 else np.nan
-                bin_data['G0_n'] = len(g0_values)
-            
-            if has_g1:
-                g1_values = beh_synced[bin_mask, 7]
-                g1_values = g1_values[~np.isnan(g1_values)]
-                bin_data['G1_mean'] = np.mean(g1_values) if len(g1_values) > 0 else np.nan
-                bin_data['G1_n'] = len(g1_values)
+            bin_data = self._slot_value_stats(
+                beh_synced, bin_mask, n_channels, {'distance': d}, ('mean', 'n'))
             
             y_axis_results[d] = bin_data
         
@@ -24857,19 +24847,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for d in range(max_dist_eucl + 1):
             bin_mask = (np.floor(eucl_distances) == d) & ~np.isnan(eucl_distances)
             
-            bin_data = {'distance': d}
-            
-            if has_g0:
-                g0_values = beh_synced[bin_mask, 6]
-                g0_values = g0_values[~np.isnan(g0_values)]
-                bin_data['G0_mean'] = np.mean(g0_values) if len(g0_values) > 0 else np.nan
-                bin_data['G0_n'] = len(g0_values)
-            
-            if has_g1:
-                g1_values = beh_synced[bin_mask, 7]
-                g1_values = g1_values[~np.isnan(g1_values)]
-                bin_data['G1_mean'] = np.mean(g1_values) if len(g1_values) > 0 else np.nan
-                bin_data['G1_n'] = len(g1_values)
+            bin_data = self._slot_value_stats(
+                beh_synced, bin_mask, n_channels, {'distance': d}, ('mean', 'n'))
             
             eucl_results[d] = bin_data
         
@@ -24934,53 +24913,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'frames_in_zone': int(np.sum(zone_mask))
         }
         
-        # Calculate photometry averages in this zone. Derive channel availability
-        # from the channel count, not the raw width (column 7 is a kinematics
-        # field for single-channel subjects, not a real G1).
+        # Photometry averages in this zone for every channel slot. The channel
+        # count, not the raw width, says how many there are (kinematics columns
+        # follow the channels).
         n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
-        has_g0 = n_channels >= 1
-        has_g1 = n_channels >= 2
+        self._slot_value_stats(beh_synced, zone_frames, n_channels, result,
+                               ('mean', 'std', 'sem', 'n'))
 
-        if len(zone_frames) > 0:
-            # G0 channel (column 6)
-            if has_g0:
-                g0_values = beh_synced[zone_frames, 6]
-                g0_values = g0_values[~np.isnan(g0_values)]
-                if len(g0_values) > 0:
-                    result['G0_mean'] = float(np.mean(g0_values))
-                    result['G0_std'] = float(np.std(g0_values))
-                    result['G0_sem'] = float(np.std(g0_values) / np.sqrt(len(g0_values)))
-                    result['G0_n'] = int(len(g0_values))
-                else:
-                    result['G0_mean'] = np.nan
-                    result['G0_std'] = np.nan
-                    result['G0_sem'] = np.nan
-                    result['G0_n'] = 0
-            
-            # G1 channel (column 7)
-            if has_g1:
-                g1_values = beh_synced[zone_frames, 7]
-                g1_values = g1_values[~np.isnan(g1_values)]
-                if len(g1_values) > 0:
-                    result['G1_mean'] = float(np.mean(g1_values))
-                    result['G1_std'] = float(np.std(g1_values))
-                    result['G1_sem'] = float(np.std(g1_values) / np.sqrt(len(g1_values)))
-                    result['G1_n'] = int(len(g1_values))
-                else:
-                    result['G1_mean'] = np.nan
-                    result['G1_std'] = np.nan
-                    result['G1_sem'] = np.nan
-                    result['G1_n'] = 0
-        else:
-            result['G0_mean'] = np.nan
-            result['G0_std'] = np.nan
-            result['G0_sem'] = np.nan
-            result['G0_n'] = 0
-            result['G1_mean'] = np.nan
-            result['G1_std'] = np.nan
-            result['G1_sem'] = np.nan
-            result['G1_n'] = 0
-        
         return result
     
     def detect_max_distance_zone_entries(self, beh_synced, max_dist_metrics):
@@ -25268,9 +25207,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # shape[1] > 7 would invent a phantom G1.
         if n_channels is None:
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
-        has_g0 = n_channels >= 1
-        has_g1 = n_channels >= 2
-
         frames, outward = self._outback_outward_velocity(
             beh_synced, zones, open_zones, fps=fps)
         out_frames = frames[outward > velocity_threshold].tolist()
@@ -25282,48 +25218,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'back': {}
         }
         
-        # Out movement statistics
-        if len(out_frames) > 0:
-            if has_g0:
-                g0_out = beh_synced[out_frames, 6]
-                g0_out = g0_out[~np.isnan(g0_out)]
-                result['out']['G0_mean'] = np.mean(g0_out) if len(g0_out) > 0 else np.nan
-                result['out']['G0_sem'] = np.std(g0_out) / np.sqrt(len(g0_out)) if len(g0_out) > 0 else np.nan
-                result['out']['G0_std'] = np.std(g0_out) if len(g0_out) > 0 else np.nan
-                result['out']['G0_n'] = len(g0_out)
-            
-            if has_g1:
-                g1_out = beh_synced[out_frames, 7]
-                g1_out = g1_out[~np.isnan(g1_out)]
-                result['out']['G1_mean'] = np.mean(g1_out) if len(g1_out) > 0 else np.nan
-                result['out']['G1_sem'] = np.std(g1_out) / np.sqrt(len(g1_out)) if len(g1_out) > 0 else np.nan
-                result['out']['G1_std'] = np.std(g1_out) if len(g1_out) > 0 else np.nan
-                result['out']['G1_n'] = len(g1_out)
-        else:
-            result['out']['G0_n'] = 0
-            result['out']['G1_n'] = 0
-        
-        # Back movement statistics
-        if len(back_frames) > 0:
-            if has_g0:
-                g0_back = beh_synced[back_frames, 6]
-                g0_back = g0_back[~np.isnan(g0_back)]
-                result['back']['G0_mean'] = np.mean(g0_back) if len(g0_back) > 0 else np.nan
-                result['back']['G0_sem'] = np.std(g0_back) / np.sqrt(len(g0_back)) if len(g0_back) > 0 else np.nan
-                result['back']['G0_std'] = np.std(g0_back) if len(g0_back) > 0 else np.nan
-                result['back']['G0_n'] = len(g0_back)
-            
-            if has_g1:
-                g1_back = beh_synced[back_frames, 7]
-                g1_back = g1_back[~np.isnan(g1_back)]
-                result['back']['G1_mean'] = np.mean(g1_back) if len(g1_back) > 0 else np.nan
-                result['back']['G1_sem'] = np.std(g1_back) / np.sqrt(len(g1_back)) if len(g1_back) > 0 else np.nan
-                result['back']['G1_std'] = np.std(g1_back) if len(g1_back) > 0 else np.nan
-                result['back']['G1_n'] = len(g1_back)
-        else:
-            result['back']['G0_n'] = 0
-            result['back']['G1_n'] = 0
-        
+        # Out / Back statistics for every channel slot.
+        for key, rows in (('out', out_frames), ('back', back_frames)):
+            self._slot_value_stats(beh_synced, rows, n_channels, result[key],
+                                   ('mean', 'sem', 'std', 'n'))
+
         return result
     
     def classify_zone(self, x, y):
@@ -30712,9 +30611,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     data = self.processed_data[subject]
                     if 'bouts' in data and behavior in data['bouts']:
                         bout_data = data['bouts'][behavior]
-                        for channel in ['G0', 'G1', 'Ch0', 'Ch1', 'Ch2', 'Ch3']:
-                            if channel in bout_data and bout_data[channel]:
-                                max_bout_num = max(max_bout_num, len(bout_data[channel]))
+                        # Every channel's trace list (Ch0..ChN and aliases), not just the first four.
+                        for channel, traces in bout_data.items():
+                            if not str(channel).startswith('_') and isinstance(traces, list):
+                                max_bout_num = max(max_bout_num, len(traces))
             
             # Create dropdown values: "All", "1", "2", "3", etc.
             if max_bout_num > 0:
@@ -31482,16 +31382,23 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                          "Z-scored", "Bouts Overlay"):
             return (10.5, 4.5)
 
-        # Bar / average style plots: these stack one subplot per visible
-        # photometry channel (G0 / G1), so size by channel ROWS for height and
-        # keep the width modest so a 2-category plot isn't wide-and-short.
+        # Bar / average style plots. Compare Across Bouts and the group
+        # comparisons (except Zone Averages, which lays channels out as
+        # columns) stack one subplot row per visible channel, so size by
+        # channel ROWS for height; the rest draw every channel on one axes.
+        # Width stays modest so a 2-category plot isn't wide-and-short.
         if any(t in plot_type for t in ("Zone Averages", "Distance from Center",
                                         "Out/Back", "Compare Across Bouts")):
+            rows = 1
             try:
-                rows = (1 if self.show_g0.get() else 0) + (1 if self.show_g1.get() else 0)
+                group_cmp = (self.plot_by_var.get() == "Group" and len(
+                    self.selected_series('visualization', self.viz_group_listbox)) > 1)
+                if "Compare Across Bouts" in plot_type or (
+                        group_cmp and "Zone Averages" not in plot_type):
+                    rows = len(self._viz_plot_slots(subjects or []))
             except Exception:
                 rows = 2
-            rows = max(1, rows)
+            rows = max(1, min(rows, 8))
             width = min(9.5, 6.5 + (n - 1) * 0.4)
             return (width, 3.2 * rows + 0.8)
 
@@ -31516,30 +31423,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return max(1, rows)
 
     def _viz_bout_channel_rows(self, subjects):
-        """How many channel rows the bout trace+heatmap plots will draw (1 or 2).
+        """How many channel rows the bout trace+heatmap plots will draw.
 
         The Extracted Bouts and Zone Entry Bouts plots lay out one row of
-        trace+heatmap per photometry channel that has data (G0 and/or G1), and
-        do NOT add a panel per subject. Sizing therefore depends on channel
-        count, not subject count. Returns 2 when any selected subject was
-        recorded on two photometry channels (and both are visible), else 1.
+        trace+heatmap per visible photometry channel, and do NOT add a panel
+        per subject. Sizing therefore depends on channel count, not subject
+        count: one row per ticked channel any selected subject records.
         """
-        two_channel = False
-        for s in subjects:
-            d = self.processed_data.get(s, {})
-            if isinstance(d, dict) and d.get('num_photometry_channels', 1) and d['num_photometry_channels'] >= 2:
-                two_channel = True
-                break
-        if not two_channel:
-            return 1
-        # Respect the G0/G1 visibility toggles (Zone Entry Bouts honors these);
-        # if one channel is hidden only a single row is drawn.
         try:
-            if not (self.show_g0.get() and self.show_g1.get()):
-                return 1
+            return max(1, min(len(self._viz_plot_slots(subjects)), 8))
         except Exception:
-            pass
-        return 2
+            return 1
 
     def _keep_legends_clear_of_data(self, fig):
         """Reposition every legend in the figure so it never sits on top of data.
@@ -31555,6 +31449,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if leg is None:
                 continue
             handles, labels = ax.get_legend_handles_labels()
+            legend_labels = [t.get_text() for t in leg.get_texts()]
+            if len(legend_labels) != len(labels):
+                # The legend was built from proxy entries (e.g. one per group
+                # while a colour bar keys the bins); keep them.
+                handles = list(getattr(leg, 'legend_handles', None)
+                               or getattr(leg, 'legendHandles', []))
+                labels = legend_labels
             if not handles:
                 continue
 
@@ -31871,9 +31772,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception as e:
             self.log_message(f"Legend repositioning skipped: {e}")
 
-        # Tighten layout before embedding so labels aren't clipped.
+        # Tighten layout before embedding so labels aren't clipped.  A figure
+        # title sits above the panels, so keep ~0.45 in clear of it or it lands
+        # on the top panel's own title.
         try:
-            fig.tight_layout()
+            suptitle = getattr(fig, '_suptitle', None)
+            if suptitle is not None and suptitle.get_text():
+                top = 1 - min(0.12, 0.45 / max(fig.get_size_inches()[1], 1e-6))
+                fig.tight_layout(rect=(0, 0, 1, top))
+            else:
+                fig.tight_layout()
         except Exception:
             pass  # Some plots may not support tight_layout
 
@@ -32866,6 +32774,52 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 continue
             slots.append((ch_slot, key, self.get_channel_name(data, ch_slot)))
         return slots
+
+    # First two match the colours G0/G1 always had in these plots.
+    SLOT_COLORS = ('blue', 'green', '#d62728', '#9467bd', '#ff7f0e',
+                   '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f')
+
+    def _slot_color(self, slot):
+        return self.SLOT_COLORS[slot % len(self.SLOT_COLORS)]
+
+    def _viz_plot_slots(self, subjects):
+        """``[(slot, label)]`` for every ticked channel that at least one of
+        ``subjects`` was recorded on, in checkbox order.
+
+        The spatial and bout plots used to draw a fixed G0/G1 pair, so channels
+        G2 and up could be ticked but were never drawn.  ``label`` is the
+        designation on the first subject with data; each subject's own
+        designation is used for exclusions (see :meth:`_slot_included`).
+        """
+        present = [s for s in subjects if s in self.processed_data]
+        if not present:
+            return []
+        ref = self.processed_data[present[0]]
+        n_max = max(self._slot_count(self.processed_data[s]) for s in present)
+        return [(slot, self.get_channel_name(ref, slot))
+                for slot in self.get_selected_viz_channels(ref) if slot < n_max]
+
+    def _slot_count(self, data):
+        """Channel slots a subject was recorded on (at least 1).
+
+        The stored channel count, else the processed arrays, else the length
+        of its channel-name list.
+        """
+        n = self._beh_channel_count(data)
+        if n <= 0:
+            names = data.get('channel_names') or data.get('channel_name_map') or []
+            n = len(names)
+        return max(1, n)
+
+    def _slot_included(self, subject, slot, data=None):
+        """True when ``subject`` was recorded on ``slot`` and, with exclusions
+        applied, that channel is not excluded for it."""
+        if data is None:
+            data = self.processed_data.get(subject) or {}
+        if slot >= self._slot_count(data):
+            return False
+        return not (self.use_exclusions_viz.get()
+                    and self.is_channel_slot_excluded(subject, slot, data))
 
     def _viz_channel_wavelengths(self, data, sel_chs, has_470, has_570):
         """Map each selected channel to its OWN wavelength for plotting.
@@ -35555,9 +35509,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Get wavelength and channel selections
             show_470 = self.show_470.get()
             show_570 = self.show_570.get()
-            show_g0 = self.show_g0.get()
-            show_g1 = self.show_g1.get()
-            
+
             all_data = []
             # Bout ordinal per wide-format column name, so the bout columns can
             # be re-blocked by bout number at assembly time. Column names embed
@@ -35856,59 +35808,46 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     maze_type_export = self.params.get('maze_type', 'EPM')
                     category_data = self._aggregate_zones_by_category(zone_data, maze_type_export)
 
-                    # Create row data with categories as columns (horizontal format)
-                    for ch_slot, channel in enumerate(['G0', 'G1']):
-                        channel_label = self.get_channel_name(data, ch_slot)
-                        if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
+                    # One row per channel, categories as columns (horizontal format)
+                    self._ensure_spatial_stats_channels(data, subject)
+                    for ch_slot in self.get_selected_viz_channels(data):
+                        if not self._slot_included(subject, ch_slot, data):
                             continue
-                        # Skip excluded channels (slot resolves to this subject's designation)
-                        if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
-                            continue
-
                         row_data = {
                             'subject': subject,
-                            'channel': channel_label
+                            'channel': self.get_channel_name(data, ch_slot)
                         }
 
                         if subject_to_group:
                             row_data['group'] = subject_to_group.get(subject, 'Unknown')
 
-                        # Add each category as a column
                         for cat_name, cat_metrics in category_data.items():
-                            if channel == 'G0':
-                                zone_mean = cat_metrics.get('G0_mean', float('nan'))
-                            else:
-                                zone_mean = cat_metrics.get('G1_mean', float('nan'))
-
                             safe_cat = cat_name.replace(' ', '_')
-                            row_data[f'{safe_cat}_mean'] = zone_mean
+                            row_data[f'{safe_cat}_mean'] = cat_metrics.get(f'G{ch_slot}_mean', float('nan'))
 
                         all_data.append(pd.DataFrame([row_data]))
                     continue  # Skip the wavelength loop for zone averages
                 elif "Distance from Center" in plot_type:
                     # Export distance from center data - horizontal format with distances as columns
+                    self._ensure_distance_averages(data, subject)
                     if 'distance_averages_x' not in data and 'distance_averages_y' not in data:
                         continue
-                    
-                    # Process each axis and channel
+
+                    # Process each axis and every selected channel
                     for axis_name, axis_key in [('X', 'distance_averages_x'), ('Y', 'distance_averages_y')]:
                         if axis_key not in data:
                             continue
 
                         dist_data = data[axis_key]
 
-                        for ch_slot, channel in enumerate(['G0', 'G1']):
-                            channel_label = self.get_channel_name(data, ch_slot)
-                            if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
-                                continue
-                            # Skip excluded channels (slot resolves to this subject's designation)
-                            if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
+                        for ch_slot in self.get_selected_viz_channels(data):
+                            if not self._slot_included(subject, ch_slot, data):
                                 continue
 
                             row_data = {
                                 'subject': subject,
                                 'axis': axis_name,
-                                'channel': channel_label
+                                'channel': self.get_channel_name(data, ch_slot)
                             }
 
                             if subject_to_group:
@@ -35916,8 +35855,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                             # Add each distance as a column
                             for distance, metrics in sorted(dist_data.items()):
-                                mean_val = metrics.get(f'{channel}_mean', float('nan'))
-                                row_data[f'dist_{int(distance)}cm_mean'] = mean_val
+                                row_data[f'dist_{int(distance)}cm_mean'] = metrics.get(f'G{ch_slot}_mean', float('nan'))
 
                             all_data.append(pd.DataFrame([row_data]))
                     continue  # Skip the wavelength loop for distance data
@@ -35926,59 +35864,27 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if 'outback' not in data or not data['outback']:
                         continue
                     
+                    self._ensure_spatial_stats_channels(data, subject)
                     outback = data['outback']
-                    actual_channel_name_0 = self.get_channel_name(data, 0)
-                    actual_channel_name_1 = self.get_channel_name(data, 1)
-                    
-                    # Out movement
-                    if 'out' in outback and outback['out'].get('G0_n', 0) > 0:
-                        out_dict = {'subject': [subject], 'movement': ['Out']}
-                        
-                        # Only include channel slot 0 if it's selected and not excluded
-                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)):
-                            out_dict[f'{actual_channel_name_0}_mean'] = [outback['out'].get('G0_mean', np.nan)]
-                            out_dict[f'{actual_channel_name_0}_sem'] = [outback['out'].get('G0_sem', np.nan)]
-                            out_dict[f'{actual_channel_name_0}_std'] = [outback['out'].get('G0_std', np.nan)]
-                            out_dict[f'{actual_channel_name_0}_n'] = [outback['out'].get('G0_n', 0)]
-                        
-                        # Only include channel slot 1 if it's selected and not excluded
-                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)):
-                            out_dict[f'{actual_channel_name_1}_mean'] = [outback['out'].get('G1_mean', np.nan)]
-                            out_dict[f'{actual_channel_name_1}_sem'] = [outback['out'].get('G1_sem', np.nan)]
-                            out_dict[f'{actual_channel_name_1}_std'] = [outback['out'].get('G1_std', np.nan)]
-                            out_dict[f'{actual_channel_name_1}_n'] = [outback['out'].get('G1_n', 0)]
-                        
+                    slots = [s for s in self.get_selected_viz_channels(data)
+                             if self._slot_included(subject, s, data)]
+
+                    for direction, label in (('out', 'Out'), ('back', 'Back')):
+                        stats = outback.get(direction) or {}
+                        if stats.get('G0_n', 0) <= 0:
+                            continue
+                        row = {'subject': [subject], 'movement': [label]}
+                        for s in slots:
+                            name = self.get_channel_name(data, s)
+                            for stat, default in (('mean', np.nan), ('sem', np.nan),
+                                                  ('std', np.nan), ('n', 0)):
+                                row[f'{name}_{stat}'] = [stats.get(f'G{s}_{stat}', default)]
                         # Skip this movement if no channels are available
-                        if len(out_dict) > 2:  # More than just 'subject' and 'movement'
-                            out_df = pd.DataFrame(out_dict)
+                        if len(row) > 2:  # More than just 'subject' and 'movement'
+                            row_df = pd.DataFrame(row)
                             if subject_to_group:
-                                out_df.insert(0, 'group', subject_to_group.get(subject, 'Unknown'))
-                            all_data.append(out_df)
-                    
-                    # Back movement
-                    if 'back' in outback and outback['back'].get('G0_n', 0) > 0:
-                        back_dict = {'subject': [subject], 'movement': ['Back']}
-                        
-                        # Only include channel slot 0 if it's selected and not excluded
-                        if show_g0 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 0)):
-                            back_dict[f'{actual_channel_name_0}_mean'] = [outback['back'].get('G0_mean', np.nan)]
-                            back_dict[f'{actual_channel_name_0}_sem'] = [outback['back'].get('G0_sem', np.nan)]
-                            back_dict[f'{actual_channel_name_0}_std'] = [outback['back'].get('G0_std', np.nan)]
-                            back_dict[f'{actual_channel_name_0}_n'] = [outback['back'].get('G0_n', 0)]
-                        
-                        # Only include channel slot 1 if it's selected and not excluded
-                        if show_g1 and not (self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, 1)):
-                            back_dict[f'{actual_channel_name_1}_mean'] = [outback['back'].get('G1_mean', np.nan)]
-                            back_dict[f'{actual_channel_name_1}_sem'] = [outback['back'].get('G1_sem', np.nan)]
-                            back_dict[f'{actual_channel_name_1}_std'] = [outback['back'].get('G1_std', np.nan)]
-                            back_dict[f'{actual_channel_name_1}_n'] = [outback['back'].get('G1_n', 0)]
-                        
-                        # Skip this movement if no channels are available
-                        if len(back_dict) > 2:  # More than just 'subject' and 'movement'
-                            back_df = pd.DataFrame(back_dict)
-                            if subject_to_group:
-                                back_df.insert(0, 'group', subject_to_group.get(subject, 'Unknown'))
-                            all_data.append(back_df)
+                                row_df.insert(0, 'group', subject_to_group.get(subject, 'Unknown'))
+                            all_data.append(row_df)
                     continue  # Skip the wavelength loop for Out/Back data
                 elif "Position Heatmap" in plot_type:
                     # Export position heatmap data as binned matrix (like the plot shows)
@@ -35998,12 +35904,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     maze_width = self.params['maze_width_cm']
                     bins = np.arange(0, maze_width + bin_size, bin_size)
                     
-                    # Process each channel
-                    for ch_slot, (channel, col_idx) in enumerate([('G0', 6), ('G1', 7)]):
-                        if (channel == 'G0' and not show_g0) or (channel == 'G1' and not show_g1):
-                            continue
+                    # Process every selected channel
+                    for ch_slot in self.get_selected_viz_channels(data):
+                        channel = self.get_channel_name(data, ch_slot)
+                        col_idx = 6 + ch_slot
                         # Slot resolves to this subject's own designation
-                        if self.use_exclusions_viz.get() and self.is_channel_slot_excluded(subject, ch_slot):
+                        if not self._slot_included(subject, ch_slot, data):
                             continue
                         if beh_synced.shape[1] <= col_idx:
                             continue
@@ -36737,238 +36643,156 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fig.tight_layout()
     
     def plot_zone_entry_bouts(self, fig, data, subject_name):
-        """Plot zone entry-aligned photometry traces"""
+        """Plot zone entry-aligned photometry traces, one row per channel"""
         if 'entry_bouts' not in data or not data['entry_bouts']:
             fig.text(0.5, 0.5, 'No zone entry bout data available for this subject',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         # Map UI selection to data keys
         entry_type_map = self._get_zone_entry_type_map()
-        
         selected_entry_type = self.zone_entry_type_var.get()
         if selected_entry_type not in entry_type_map:
             selected_entry_type = list(entry_type_map.keys())[0]
-        
         data_key, display_key = entry_type_map[selected_entry_type]
-        
+
         # Check if the selected entry type exists in data
         if data_key not in data['entry_bouts']:
             fig.text(0.5, 0.5, f'No {selected_entry_type} data available for this subject',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         bout_type_data = data['entry_bouts'][data_key]
-        
+
         # Get the specific zone data
         if display_key not in bout_type_data:
             fig.text(0.5, 0.5, f'No {selected_entry_type} detected',
                 ha='center', va='center', fontsize=14)
             return
 
-        display_data = bout_type_data[display_key]
-        if not display_data.get('G0', []) and not display_data.get('G1', []):
-            fig.text(0.5, 0.5, f'No {selected_entry_type} detected',
-                    ha='center', va='center', fontsize=14)
-            return
-        
-        bout_data = display_data
+        bout_data = bout_type_data[display_key]
         entry_label = selected_entry_type
-        
         fps = self.get_fps(data)
         prebout = self.params['preboutframes']
-        
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
-        
-        # Apply exclusions if enabled
-        if self.use_exclusions_viz.get():
-            if self.is_channel_slot_excluded(subject_name, 0, data):
-                show_g0 = False
-            if self.is_channel_slot_excluded(subject_name, 1, data):
-                show_g1 = False
-        
-        # Use .get() — single-channel subjects only have a 'G0' key (no 'G1'),
-        # so direct indexing would raise KeyError and crash the whole plot.
-        # Realign to the current window so the onset marker matches the traces.
-        g0_bouts = self._entry_channel_bouts(bout_data, 'G0') if show_g0 else []
-        g1_bouts = self._entry_channel_bouts(bout_data, 'G1') if show_g1 else []
 
-        # Determine layout
-        n_plots = (1 if g0_bouts else 0) + (1 if g1_bouts else 0)
-        if n_plots == 0:
+        # Every ticked channel this subject has and does not exclude, realigned
+        # to the current window so the onset marker matches the traces.
+        rows = []
+        for s, label in self._single_subject_slots(subject_name, data):
+            key = self._bout_entry_slot_key(bout_data, s)
+            bouts = self._entry_channel_bouts(bout_data, key) if key else []
+            if bouts:
+                rows.append((s, label, bouts))
+
+        if not rows:
             fig.text(0.5, 0.5, 'No data to display. Check channel selection.',
                     ha='center', va='center', fontsize=14)
             return
-        
-        plot_idx = 1
-        
-        # Get trace styling parameters
+
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
-        
-        # Plot G0
-        if g0_bouts:
-            ax = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            for bout in g0_bouts:
+        cmap = self.get_heatmap_colormap()
+        vmin, vmax = self.get_heatmap_range()
+        n_plots = len(rows)
+
+        for row, (s, label, bouts) in enumerate(rows):
+            color = self._slot_color(s)
+            ax = fig.add_subplot(n_plots, 2, row * 2 + 1)
+            for bout in bouts:
                 time_axis = (np.arange(len(bout)) - prebout) / fps
                 ax.plot(time_axis, bout, alpha=trace_alpha, color='gray', linewidth=trace_width)
-            
+
             # Mean trace
-            max_len = max(len(b) for b in g0_bouts)
-            padded = np.full((len(g0_bouts), max_len), np.nan)
-            for i, bout in enumerate(g0_bouts):
+            max_len = max(len(b) for b in bouts)
+            padded = np.full((len(bouts), max_len), np.nan)
+            for i, bout in enumerate(bouts):
                 padded[i, :len(bout)] = bout
-            
             mean_trace = np.nanmean(padded, axis=0)
             sem_trace = np.nanstd(padded, axis=0) / np.sqrt(np.sum(~np.isnan(padded), axis=0))
             time_axis = (np.arange(max_len) - prebout) / fps
-            
-            ax.plot(time_axis, mean_trace, 'b', linewidth=mean_width, label='Mean')
+
+            ax.plot(time_axis, mean_trace, color=color, linewidth=mean_width, label='Mean')
             ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                           alpha=0.3, color='b', label='SEM')
+                           alpha=0.3, color=color, label='SEM')
             self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {entry_label.lower()} (s)')
-            ax.set_ylabel('G0 Z-score')
-            ax.set_title(f'{subject_name} - {entry_label}\nG0 (n={len(g0_bouts)})')
+            ax.set_ylabel(f'{label} Z-score')
+            ax.set_title(f'{subject_name} - {entry_label}\n{label} (n={len(bouts)})')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            
+
             # Heatmap
-            ax_heat = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            cmap = self.get_heatmap_colormap()
-            vmin, vmax = self.get_heatmap_range()
+            ax_heat = fig.add_subplot(n_plots, 2, row * 2 + 2)
             im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
-                               extent=[time_axis[0], time_axis[-1], len(g0_bouts), 0],
+                               extent=[time_axis[0], time_axis[-1], len(bouts), 0],
                                vmin=vmin, vmax=vmax, interpolation='nearest')
             self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {entry_label.lower()} (s)')
             ax_heat.set_ylabel('Entry #')
-            ax_heat.set_title('G0 Heatmap')
+            ax_heat.set_title(f'{label} Heatmap')
             plt.colorbar(im, ax=ax_heat, label='Z-score')
-        
-        # Plot G1
-        if g1_bouts:
-            ax = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            for bout in g1_bouts:
-                time_axis = (np.arange(len(bout)) - prebout) / fps
-                ax.plot(time_axis, bout, alpha=trace_alpha, color='gray', linewidth=trace_width)
-            
-            # Mean trace
-            max_len = max(len(b) for b in g1_bouts)
-            padded = np.full((len(g1_bouts), max_len), np.nan)
-            for i, bout in enumerate(g1_bouts):
-                padded[i, :len(bout)] = bout
-            
-            mean_trace = np.nanmean(padded, axis=0)
-            sem_trace = np.nanstd(padded, axis=0) / np.sqrt(np.sum(~np.isnan(padded), axis=0))
-            time_axis = (np.arange(max_len) - prebout) / fps
-            
-            ax.plot(time_axis, mean_trace, 'g', linewidth=mean_width, label='Mean')
-            ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                           alpha=0.3, color='g', label='SEM')
-            self.draw_zero_line(ax, label='Entry')
-            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax.set_xlabel(f'Time from {entry_label.lower()} (s)')
-            ax.set_ylabel('G1 Z-score')
-            ax.set_title(f'{subject_name} - {entry_label}\nG1 (n={len(g1_bouts)})')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Heatmap
-            ax_heat = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            cmap = self.get_heatmap_colormap()
-            vmin, vmax = self.get_heatmap_range()
-            im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
-                               extent=[time_axis[0], time_axis[-1], len(g1_bouts), 0],
-                               vmin=vmin, vmax=vmax, interpolation='nearest')
-            self.draw_zero_line(ax_heat)
-            ax_heat.set_xlabel(f'Time from {entry_label.lower()} (s)')
-            ax_heat.set_ylabel('Entry #')
-            ax_heat.set_title('G1 Heatmap')
-            plt.colorbar(im, ax=ax_heat, label='Z-score')
-        
+
         fig.tight_layout()
-    
+
     def plot_zone_averages(self, fig, data, subject_name):
-        """Plot average z-scores by zone category (aggregated)"""
+        """Plot average z-scores by zone category (aggregated), one bar per channel"""
         zone_averages = self._get_or_compute_zone_averages(data)
         if not zone_averages:
             fig.text(0.5, 0.5, 'No zone average data available for this subject',
                     ha='center', va='center', fontsize=14)
             return
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
-        
-        # Apply exclusions if enabled
-        if self.use_exclusions_viz.get():
-            if self.is_channel_slot_excluded(subject_name, 0, data):
-                show_g0 = False
-            if self.is_channel_slot_excluded(subject_name, 1, data):
-                show_g1 = False
 
-        # A single-channel subject has no G1 — never draw a phantom second bar.
-        if self._beh_channel_count(data) < 2:
-            show_g1 = False
+        # Every ticked channel this subject has and does not exclude.
+        slots = [(s, self.get_channel_name(data, s))
+                 for s, _l in self._viz_plot_slots([subject_name])
+                 if self._slot_included(subject_name, s, data)]
 
         # Aggregate zones by category
         maze_type = self.params.get('maze_type', 'EPM')
         category_data = self._aggregate_zones_by_category(zone_averages, maze_type)
-        
+
         if not category_data:
             fig.text(0.5, 0.5, 'No zone category data available',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         categories = list(category_data.keys())
-        g0_means = [category_data[cat]['G0_mean'] for cat in categories]
-        g0_stds = [category_data[cat]['G0_std'] for cat in categories]
-        g1_means = [category_data[cat]['G1_mean'] for cat in categories]
-        g1_stds = [category_data[cat]['G1_std'] for cat in categories]
-        
+        means = {s: [category_data[cat].get(f'G{s}_mean', np.nan) for cat in categories]
+                 for s, _l in slots}
+        stds = {s: [category_data[cat].get(f'G{s}_std', 0) for cat in categories]
+                for s, _l in slots}
+
         # Add max distance zone if available
-        if 'max_distance_zone' in data and data['max_distance_zone']:
-            max_dist = data['max_distance_zone']
-            if 'G0_mean' in max_dist:
-                categories.append('Max Open\nDistance')
-                g0_means.append(max_dist.get('G0_mean', np.nan))
-                g0_stds.append(max_dist.get('G0_std', 0))
-                g1_means.append(max_dist.get('G1_mean', np.nan))
-                g1_stds.append(max_dist.get('G1_std', 0))
-        
-        # Create bar plot
+        max_dist = data.get('max_distance_zone')
+        if max_dist and 'G0_mean' in max_dist:
+            categories.append('Max Open\nDistance')
+            for s, _l in slots:
+                means[s].append(max_dist.get(f'G{s}_mean', np.nan))
+                stds[s].append(max_dist.get(f'G{s}_std', 0))
+
+        # Create bar plot: bars for each channel side by side within a category
         x = np.arange(len(categories))
-        width = 0.35
-        
+        width = 0.7 / max(1, len(slots))
+
         ax = fig.add_subplot(111)
-        
-        if show_g0:
-            ax.bar(x - width/2, g0_means, width, yerr=g0_stds, label='G0', 
-                   alpha=0.8, capsize=5, color='blue')
-        
-        if show_g1:
-            ax.bar(x + width/2, g1_means, width, yerr=g1_stds, label='G1',
-                   alpha=0.8, capsize=5, color='green')
-        
+
+        for i, (s, label) in enumerate(slots):
+            offset = (i - (len(slots) - 1) / 2) * width
+            ax.bar(x + offset, means[s], width, yerr=stds[s], label=label,
+                   alpha=0.8, capsize=5, color=self._slot_color(s))
+
         ax.set_xlabel('Zone Category')
         ax.set_ylabel('Average Z-score')
         ax.set_title(f'{subject_name} - Average Photometry by Zone Category')
         ax.set_xticks(x)
         ax.set_xticklabels(categories, rotation=45, ha='right')
         ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-        ax.legend()
+        if slots:
+            ax.legend()
         ax.grid(True, alpha=0.3, axis='y')
-        
+
         fig.tight_layout()
-    
+
     def _get_category_order(self, maze_type):
         """Get the desired display order for zone categories based on maze type"""
         if maze_type == 'EPM_Complex':
@@ -36994,6 +36818,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Returns:
             dict: zone_averages keyed by zone name, or empty dict if unavailable.
         """
+        self._ensure_spatial_stats_channels(data)
         stored = data.get('zone_averages', {})
 
         # If stored zone_averages share at least one key with the current zone definitions,
@@ -37030,26 +36855,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 category_zones[category] = []
             category_zones[category].append(zone_name)
         
+        # Every channel slot the zone averages carry (G0_mean, G1_mean, G2_mean...).
+        slots = sorted({int(m.group(1)) for v in zone_averages.values() if isinstance(v, dict)
+                        for k in v for m in [re.match(r'^G(\d+)_mean$', str(k))] if m})
+        for slot in (0, 1):
+            if slot not in slots:
+                slots.append(slot)
+
         # Calculate average for each category
         for category, zones in category_zones.items():
-            # Collect all G0 and G1 values from zones in this category
-            g0_values = []
-            g1_values = []
-            
-            for zone in zones:
-                if zone in zone_averages:
-                    if 'G0_mean' in zone_averages[zone] and not np.isnan(zone_averages[zone]['G0_mean']):
-                        g0_values.append(zone_averages[zone]['G0_mean'])
-                    if 'G1_mean' in zone_averages[zone] and not np.isnan(zone_averages[zone]['G1_mean']):
-                        g1_values.append(zone_averages[zone]['G1_mean'])
-            
-            # Store category averages
-            category_data[category] = {
-                'G0_mean': np.mean(g0_values) if g0_values else np.nan,
-                'G0_std': np.std(g0_values) if len(g0_values) > 1 else 0,
-                'G1_mean': np.mean(g1_values) if g1_values else np.nan,
-                'G1_std': np.std(g1_values) if len(g1_values) > 1 else 0
-            }
+            stats = {}
+            for slot in sorted(slots):
+                key = f'G{slot}_mean'
+                values = [zone_averages[z][key] for z in zones
+                          if z in zone_averages and key in zone_averages[z]
+                          and not np.isnan(zone_averages[z][key])]
+                stats[key] = np.mean(values) if values else np.nan
+                stats[f'G{slot}_std'] = np.std(values) if len(values) > 1 else 0
+            category_data[category] = stats
         
         # Sort categories according to maze-specific order
         category_order = self._get_category_order(maze_type)
@@ -37067,12 +36890,62 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return category_data
     
+    SPATIAL_STAT_KEYS = ('zone_averages', 'distance_averages_x', 'distance_averages_y',
+                         'distance_averages_euclidean', 'outback')
+
+    @staticmethod
+    def _spatial_stats_missing_slot(stats, slot):
+        """True when a stored spatial-stat dict has entries but none for ``slot``."""
+        if not isinstance(stats, dict) or not stats:
+            return False
+        key = f'G{slot}_n'
+        rows = [v for v in stats.values() if isinstance(v, dict)]
+        return bool(rows) and not any(key in r for r in rows)
+
+    def _ensure_spatial_stats_channels(self, data, subject_name=""):
+        """Recompute stored zone/distance/out-back averages that stop short of
+        the recording's channel count.
+
+        These averages were computed for the first two channels only, so a
+        project processed before every slot was covered has nothing for G2+.
+        They are pure functions of ``beh_synced``, so they are rebuilt in place.
+        """
+        n_ch = self._beh_channel_count(data)
+        beh = data.get('beh_synced')
+        if n_ch <= 2 or not isinstance(beh, np.ndarray) or beh.ndim != 2:
+            return
+        stale = [k for k in self.SPATIAL_STAT_KEYS
+                 if self._spatial_stats_missing_slot(data.get(k), n_ch - 1)]
+        if not stale:
+            return
+        try:
+            fps = data.get('photometry_fps')
+            zones = ['unknown' if (np.isnan(x) or np.isnan(y)) else self.classify_zone(x, y)
+                     for x, y in beh[:, 2:4]]
+            if 'zone_averages' in stale:
+                data['zone_averages'] = self.calculate_zone_averages(beh, zones, n_channels=n_ch)
+            if any(k.startswith('distance_') for k in stale):
+                x_avg, y_avg, eucl_avg = self.calculate_distance_based_averages(beh, n_channels=n_ch)
+                data['distance_averages_x'] = x_avg
+                data['distance_averages_y'] = y_avg
+                data['distance_averages_euclidean'] = eucl_avg
+            if 'outback' in stale:
+                outback = self.calculate_outback_movements(beh, zones, n_channels=n_ch, fps=fps)
+                if outback:
+                    data['outback'] = outback
+            self.log_message(f"  Recomputed spatial averages for all {n_ch} channels"
+                             f"{' of ' + subject_name if subject_name else ''}")
+        except Exception as e:
+            self.log_message(f"  Warning: Could not recompute spatial averages for "
+                             f"{subject_name or 'subject'}: {e}")
+
     def _ensure_distance_averages(self, data, subject_name=""):
         """Recompute missing X/Y/Euclidean distance averages from beh_synced if possible.
 
         Handles older project files where only distance_averages_euclidean was saved
         but not distance_averages_x and distance_averages_y (or vice versa).
         """
+        self._ensure_spatial_stats_channels(data, subject_name)
         if ('distance_averages_x' in data and 'distance_averages_y' in data and
                 'distance_averages_euclidean' in data):
             return  # All present, nothing to do
@@ -37119,10 +36992,50 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         bins.sort(key=lambda b: b[0])
         return bins
 
-    def plot_distance_from_center(self, fig, data, subject_name):
-        """Plot average z-score vs distance from center"""
+    def _distance_axis_titles(self):
+        """(X title, Y title) for the distance-from-center panels of this maze."""
         maze_type = self.params.get('maze_type', 'EPM')
+        if maze_type in ['EPM', 'EPM_Complex']:
+            return 'X-axis (Closed Arms for EPM)', 'Y-axis (Open Arms for EPM)'
+        if maze_type == 'OFT':
+            return 'X-axis (Center to Side Walls)', 'Y-axis (Center to Top/Bottom Walls)'
+        return 'X-axis distance from center zone', 'Y-axis distance from center zone'
 
+    def _single_subject_slots(self, subject_name, data):
+        """Ticked channels this subject has and does not exclude, as (slot, label)."""
+        return [(s, self.get_channel_name(data, s))
+                for s, _l in self._viz_plot_slots([subject_name])
+                if self._slot_included(subject_name, s, data)]
+
+    def _distance_curves(self, subjects, data_key, slot):
+        """Per-subject curves and their mean/SEM for one channel slot.
+
+        Returns ``(distances, {subject: values}, means, sems)``; only subjects
+        that record ``slot`` and do not exclude it contribute.
+        """
+        key = f'G{slot}_mean'
+        per_subject = {}
+        pooled = {}
+        for subject in subjects:
+            data = self.processed_data.get(subject)
+            if not data or data_key not in data or not self._slot_included(subject, slot, data):
+                continue
+            per_subject[subject] = data[data_key]
+            for dist, values in data[data_key].items():
+                v = values.get(key, np.nan)
+                pooled.setdefault(dist, [])
+                if not np.isnan(v):
+                    pooled[dist].append(v)
+        distances = sorted(pooled)
+        curves = {s: [d_avgs[d].get(key, np.nan) if d in d_avgs else np.nan for d in distances]
+                  for s, d_avgs in per_subject.items()}
+        means = [np.nanmean(pooled[d]) if pooled[d] else np.nan for d in distances]
+        sems = [np.nanstd(pooled[d]) / np.sqrt(len(pooled[d])) if pooled[d] else 0
+                for d in distances]
+        return distances, curves, means, sems
+
+    def plot_distance_from_center(self, fig, data, subject_name):
+        """Plot average z-score vs distance from center, one line per channel"""
         # Try to recompute from beh_synced if keys are missing (e.g., older project files)
         self._ensure_distance_averages(data, subject_name)
 
@@ -37130,77 +37043,32 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'No distance-from-center data available\n(re-process subject to generate)',
                     ha='center', va='center', fontsize=14)
             return
-        
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
-        
-        # Apply exclusions if enabled
-        if self.use_exclusions_viz.get():
-            if self.is_channel_slot_excluded(subject_name, 0, data):
-                show_g0 = False
-            if self.is_channel_slot_excluded(subject_name, 1, data):
-                show_g1 = False
 
-        # A single-channel subject has no G1 — don't plot a phantom second trace.
-        if self._beh_channel_count(data) < 2:
-            show_g1 = False
+        slots = self._single_subject_slots(subject_name, data)
+        x_title, y_title = self._distance_axis_titles()
+        markers = 'os^Dv<>ph*'
 
-        # X-axis subplot
-        ax1 = fig.add_subplot(1, 2, 1)
-        
-        x_bins = self._sorted_distance_bins(data['distance_averages_x'])
-        distances_x = [b[0] for b in x_bins]
+        for col, (data_key, axis_label, title) in enumerate(
+                (('distance_averages_x', 'X', x_title), ('distance_averages_y', 'Y', y_title)), 1):
+            ax = fig.add_subplot(1, 2, col)
+            bins = self._sorted_distance_bins(data[data_key])
+            distances = [b[0] for b in bins]
+            for i, (s, label) in enumerate(slots):
+                ax.plot(distances, [v.get(f'G{s}_mean', np.nan) for _, v in bins],
+                        f'{markers[i % len(markers)]}-', label=label, linewidth=2,
+                        markersize=6, color=self._slot_color(s))
+            ax.set_xlabel(f'Distance from Center {axis_label}-axis (cm)')
+            ax.set_ylabel('Average Z-score')
+            ax.set_title(f'{subject_name}\n{title}')
+            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
+            if slots:
+                ax.legend()
+            ax.grid(True, alpha=0.3)
 
-        if show_g0:
-            g0_means_x = [v.get('G0_mean', np.nan) for _, v in x_bins]
-            ax1.plot(distances_x, g0_means_x, 'o-', label='G0', linewidth=2, markersize=6, color='blue')
-
-        if show_g1:
-            g1_means_x = [v.get('G1_mean', np.nan) for _, v in x_bins]
-            ax1.plot(distances_x, g1_means_x, 's-', label='G1', linewidth=2, markersize=6, color='green')
-        
-        ax1.set_xlabel('Distance from Center X-axis (cm)')
-        ax1.set_ylabel('Average Z-score')
-        if maze_type in ['EPM', 'EPM_Complex']:
-            x_title = 'X-axis (Closed Arms for EPM)'
-            y_title = 'Y-axis (Open Arms for EPM)'
-        elif maze_type == 'OFT':
-            x_title = 'X-axis (Center to Side Walls)'
-            y_title = 'Y-axis (Center to Top/Bottom Walls)'
-        else:
-            x_title = 'X-axis distance from center zone'
-            y_title = 'Y-axis distance from center zone'
-
-        ax1.set_title(f'{subject_name}\n{x_title}')
-        ax1.axhline(0, color='k', linestyle='--', alpha=0.3)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Y-axis subplot
-        ax2 = fig.add_subplot(1, 2, 2)
-        
-        y_bins = self._sorted_distance_bins(data['distance_averages_y'])
-        distances_y = [b[0] for b in y_bins]
-
-        if show_g0:
-            g0_means_y = [v.get('G0_mean', np.nan) for _, v in y_bins]
-            ax2.plot(distances_y, g0_means_y, 'o-', label='G0', linewidth=2, markersize=6, color='blue')
-
-        if show_g1:
-            g1_means_y = [v.get('G1_mean', np.nan) for _, v in y_bins]
-            ax2.plot(distances_y, g1_means_y, 's-', label='G1', linewidth=2, markersize=6, color='green')
-        
-        ax2.set_xlabel('Distance from Center Y-axis (cm)')
-        ax2.set_ylabel('Average Z-score')
-        ax2.set_title(f'{subject_name}\n{y_title}')
-        ax2.axhline(0, color='k', linestyle='--', alpha=0.3)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
         fig.tight_layout()
 
     def plot_distance_from_center_euclidean(self, fig, data, subject_name):
-        """Plot average z-score vs Euclidean distance from center"""
+        """Plot average z-score vs Euclidean distance from center, one line per channel"""
         # Try to recompute from beh_synced if key is missing (e.g., older project files)
         self._ensure_distance_averages(data, subject_name)
 
@@ -37209,36 +37077,22 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
 
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
-
-        if self.use_exclusions_viz.get():
-            if self.is_channel_slot_excluded(subject_name, 0, data):
-                show_g0 = False
-            if self.is_channel_slot_excluded(subject_name, 1, data):
-                show_g1 = False
-
-        # A single-channel subject has no G1 — don't plot a phantom second trace.
-        if self._beh_channel_count(data) < 2:
-            show_g1 = False
-
+        slots = self._single_subject_slots(subject_name, data)
+        markers = 'os^Dv<>ph*'
         ax = fig.add_subplot(1, 1, 1)
         eucl_bins = self._sorted_distance_bins(data['distance_averages_euclidean'])
         distances = [b[0] for b in eucl_bins]
-
-        if show_g0:
-            g0_means = [v.get('G0_mean', np.nan) for _, v in eucl_bins]
-            ax.plot(distances, g0_means, 'o-', label='G0', linewidth=2, markersize=6, color='blue')
-
-        if show_g1:
-            g1_means = [v.get('G1_mean', np.nan) for _, v in eucl_bins]
-            ax.plot(distances, g1_means, 's-', label='G1', linewidth=2, markersize=6, color='green')
+        for i, (s, label) in enumerate(slots):
+            ax.plot(distances, [v.get(f'G{s}_mean', np.nan) for _, v in eucl_bins],
+                    f'{markers[i % len(markers)]}-', label=label, linewidth=2,
+                    markersize=6, color=self._slot_color(s))
 
         ax.set_xlabel('Euclidean Distance from Center (cm)')
         ax.set_ylabel('Average Z-score')
         ax.set_title(f'{subject_name}\nEuclidean Distance from Center')
         ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-        ax.legend()
+        if slots:
+            ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
 
@@ -37248,7 +37102,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
 
         if self.plot_by_var.get() == "Group":
-            selected_indices = self.viz_group_listbox.curselection()
             # Count series, not listbox rows: one group split by Session is
             # two series and belongs on the comparison path.
             selected_groups = self.selected_series('visualization', self.viz_group_listbox)
@@ -37266,70 +37119,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ha='center', va='center', fontsize=14)
             return
 
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
-
-        # Suppress G1 when no selected subject has a 2nd channel.
-        if not self._any_subject_has_g1(subjects):
-            show_g1 = False
-
-        subjects_for_g0 = subjects
-        subjects_for_g1 = subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
-            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
-
-        all_eucl_data = {}
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'distance_averages_euclidean' not in data:
-                continue
-            subject_has_g0 = subject in subjects_for_g0
-            subject_has_g1 = subject in subjects_for_g1
-            for dist, values in data['distance_averages_euclidean'].items():
-                if dist not in all_eucl_data:
-                    all_eucl_data[dist] = {'G0': [], 'G1': []}
-                if subject_has_g0 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
-                    all_eucl_data[dist]['G0'].append(values['G0_mean'])
-                if subject_has_g1 and 'G1_mean' in values and not np.isnan(values['G1_mean']):
-                    all_eucl_data[dist]['G1'].append(values['G1_mean'])
-
-        distances = sorted(all_eucl_data.keys())
+        markers = 'os^Dv<>ph*'
         ax = fig.add_subplot(1, 1, 1)
-
-        # Individual traces
-        if show_g0:
-            for subject in subjects:
-                if subject not in subjects_for_g0:
-                    continue
-                data = self.processed_data[subject]
-                if 'distance_averages_euclidean' in data:
-                    vals = [data['distance_averages_euclidean'][d].get('G0_mean', np.nan)
-                            if d in data['distance_averages_euclidean'] else np.nan for d in distances]
-                    ax.plot(distances, vals, color='blue', alpha=0.2, linewidth=0.8, zorder=1)
-        if show_g1:
-            for subject in subjects:
-                if subject not in subjects_for_g1:
-                    continue
-                data = self.processed_data[subject]
-                if 'distance_averages_euclidean' in data:
-                    vals = [data['distance_averages_euclidean'][d].get('G1_mean', np.nan)
-                            if d in data['distance_averages_euclidean'] else np.nan for d in distances]
-                    ax.plot(distances, vals, color='green', alpha=0.2, linewidth=0.8, zorder=1)
-
-        # Group mean ± SEM
-        if show_g0:
-            g0_means = [np.nanmean(all_eucl_data[d]['G0']) if all_eucl_data[d]['G0'] else np.nan for d in distances]
-            g0_sems = [np.nanstd(all_eucl_data[d]['G0']) / np.sqrt(len(all_eucl_data[d]['G0']))
-                       if len(all_eucl_data[d]['G0']) > 0 else 0 for d in distances]
-            ax.errorbar(distances, g0_means, yerr=g0_sems, fmt='o-',
-                        label='G0 Mean±SEM', linewidth=2.5, markersize=6, color='blue', capsize=4, zorder=3)
-        if show_g1:
-            g1_means = [np.nanmean(all_eucl_data[d]['G1']) if all_eucl_data[d]['G1'] else np.nan for d in distances]
-            g1_sems = [np.nanstd(all_eucl_data[d]['G1']) / np.sqrt(len(all_eucl_data[d]['G1']))
-                       if len(all_eucl_data[d]['G1']) > 0 else 0 for d in distances]
-            ax.errorbar(distances, g1_means, yerr=g1_sems, fmt='s-',
-                        label='G1 Mean±SEM', linewidth=2.5, markersize=6, color='green', capsize=4, zorder=3)
+        for i, (s, label) in enumerate(self._viz_plot_slots(subjects)):
+            color = self._slot_color(s)
+            distances, curves, means, sems = self._distance_curves(
+                subjects, 'distance_averages_euclidean', s)
+            # Individual traces
+            for vals in curves.values():
+                ax.plot(distances, vals, color=color, alpha=0.2, linewidth=0.8, zorder=1)
+            # Group mean ± SEM
+            ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[i % len(markers)]}-',
+                        label=f'{label} Mean±SEM', linewidth=2.5, markersize=6,
+                        color=color, capsize=4, zorder=3)
 
         ax.set_xlabel('Euclidean Distance from Center (cm)', fontsize=11)
         ax.set_ylabel('Average Z-score', fontsize=11)
@@ -37340,70 +37142,26 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fig.tight_layout()
 
     def _plot_distance_euclidean_group_comparison(self, fig, group_names):
-        """Plot Euclidean distance-from-center comparing multiple groups"""
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
-
-        # Suppress G1 when no subject across the compared groups has a 2nd channel.
-        if not self._any_subject_has_g1(
-                [s for g in group_names for s in self._series_members(g)]):
-            show_g1 = False
-
-        subjects_for_g0_by_group = {}
-        subjects_for_g1_by_group = {}
-        if self.use_exclusions_viz.get():
-            for group_name in group_names:
-                subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 0)
-                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 1)
-        else:
-            for group_name in group_names:
-                subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = subjects
-                subjects_for_g1_by_group[group_name] = subjects
-
-        colors = plt.cm.tab10(np.linspace(0, 0.9, len(group_names)))
-        channel_rows = []
-        if show_g0:
-            channel_rows.append(('G0', 'G0_mean', '-', 'o'))
-        if show_g1:
-            channel_rows.append(('G1', 'G1_mean', '--', 's'))
-
-        n_rows = len(channel_rows)
-        if n_rows == 0:
+        """Plot Euclidean distance-from-center comparing groups, one row per channel"""
+        all_subjects = [s for g in group_names for s in self._series_members(g)]
+        for subject in all_subjects:
+            if subject in self.processed_data:
+                self._ensure_distance_averages(self.processed_data[subject], subject)
+        slots = self._viz_plot_slots(all_subjects)
+        if not slots:
             return
 
-        axes = [fig.add_subplot(n_rows, 1, i + 1) for i in range(n_rows)]
-        if n_rows == 1:
-            axes = [axes[0]]
-
-        for ax_idx, (ch_label, mean_key, ls, marker) in enumerate(channel_rows):
-            ax = axes[ax_idx]
+        colors = plt.cm.tab10(np.linspace(0, 0.9, len(group_names)))
+        markers = 'os^Dv<>ph*'
+        for row, (s, ch_label) in enumerate(slots):
+            ax = fig.add_subplot(len(slots), 1, row + 1)
             for g_idx, group_name in enumerate(group_names):
-                subjects = self._series_members(group_name)
-                incl = subjects_for_g0_by_group[group_name] if ch_label == 'G0' else subjects_for_g1_by_group[group_name]
-                group_eucl = {}
-                for subject in incl:
-                    if subject not in self.processed_data:
-                        continue
-                    data = self.processed_data[subject]
-                    if 'distance_averages_euclidean' not in data:
-                        continue
-                    for dist, values in data['distance_averages_euclidean'].items():
-                        if dist not in group_eucl:
-                            group_eucl[dist] = []
-                        val = values.get(mean_key, np.nan)
-                        if not np.isnan(val):
-                            group_eucl[dist].append(val)
-                if not group_eucl:
+                distances, curves, means, sems = self._distance_curves(
+                    self._series_members(group_name), 'distance_averages_euclidean', s)
+                if not distances:
                     continue
-                distances = sorted(group_eucl.keys())
-                means = [np.nanmean(group_eucl[d]) if group_eucl[d] else np.nan for d in distances]
-                sems = [np.nanstd(group_eucl[d]) / np.sqrt(len(group_eucl[d]))
-                        if len(group_eucl[d]) > 0 else 0 for d in distances]
-                n = len(incl)
-                ax.errorbar(distances, means, yerr=sems, fmt=f'{marker}{ls}',
-                            label=f'{group_name} (n={n})', linewidth=2.5, markersize=6,
+                ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[row % len(markers)]}-',
+                            label=f'{group_name} (n={len(curves)})', linewidth=2.5, markersize=6,
                             color=colors[g_idx], capsize=4, zorder=3)
             ax.set_xlabel('Euclidean Distance from Center (cm)', fontsize=10)
             ax.set_ylabel(f'{ch_label} Average Z-score', fontsize=10)
@@ -37413,11 +37171,45 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.grid(True, alpha=0.3)
         fig.tight_layout()
 
+    def _pooled_slot_bouts(self, subjects, entry_for, slot, average_within_subject, max_bouts):
+        """Pool one channel slot's bouts across subjects: ``(bouts, ordinals)``.
+
+        ``entry_for(subject)`` returns that subject's bout entry (or None).
+        Subjects that do not record or exclude the slot are skipped.  With
+        averaging on, each subject contributes its mean trace instead.
+        """
+        pooled, ordinals = [], []
+        for subject in subjects:
+            data = self.processed_data.get(subject)
+            entry = entry_for(subject) if data else None
+            if not entry or not self._slot_included(subject, slot, data):
+                continue
+            key = self._bout_entry_slot_key(entry, slot)
+            bouts = self._entry_channel_bouts(entry, key, max_bouts) if key else []
+            if not bouts:
+                continue
+            if average_within_subject:
+                max_len = max(len(b) for b in bouts)
+                bout_matrix = np.full((len(bouts), max_len), np.nan)
+                for i, bout in enumerate(bouts):
+                    bout_matrix[i, :len(bout)] = bout
+                pooled.append(np.nanmean(bout_matrix, axis=0))
+            else:
+                pooled.extend(bouts)
+                ordinals.extend(range(1, len(bouts) + 1))
+        return pooled, ordinals
+
+    def _entry_bout_getter(self, data_key, display_key):
+        """Callable returning a subject's zone-entry bout entry for the selected type."""
+        def get(subject):
+            entry_bouts = self.processed_data.get(subject, {}).get('entry_bouts') or {}
+            return (entry_bouts.get(data_key) or {}).get(display_key)
+        return get
+
     def plot_zone_entry_bouts_multi(self, fig, subjects):
-        """Plot zone entry bouts for multiple subjects"""
+        """Plot zone entry bouts for multiple subjects, one row per channel"""
         # Check if we're in group comparison mode with multiple groups
         if self.plot_by_var.get() == "Group":
-            selected_indices = self.viz_group_listbox.curselection()
             # Count series, not listbox rows: one group split by Session is
             # two series and belongs on the comparison path.
             selected_groups = self.selected_series('visualization', self.viz_group_listbox)
@@ -37427,165 +37219,79 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Map UI selection to data keys
         entry_type_map = self._get_zone_entry_type_map()
-        
         selected_entry_type = self.zone_entry_type_var.get()
         if selected_entry_type not in entry_type_map:
             selected_entry_type = list(entry_type_map.keys())[0]
-        
         data_key, display_key = entry_type_map[selected_entry_type]
-        
+        entry_for = self._entry_bout_getter(data_key, display_key)
+
         # Check if any subject has the selected entry type data
-        has_data = False
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'entry_bouts' in data and data['entry_bouts']:
-                if data_key in data['entry_bouts']:
-                    bout_type_data = data['entry_bouts'][data_key]
-                    if display_key in bout_type_data:
-                        if bout_type_data[display_key]['G0'] or bout_type_data[display_key]['G1']:
-                            has_data = True
-                            break
-        
-        if not has_data:
+        if not any(any(isinstance(v, list) and v for k, v in (entry_for(s) or {}).items()
+                       if not str(k).startswith('_'))
+                   for s in subjects):
             fig.text(0.5, 0.5, f'No {selected_entry_type} data available',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Apply exclusions if enabled - need to check both channels per subject
-        subjects_for_g0 = subjects
-        subjects_for_g1 = subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
-            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
-        
-        # Get display settings
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
+
         average_within_subject = self.viz_average_within_subject.get()
         prebout = self.params.get('preboutframes', 90)
         fps = self.get_fps()
-        
-        # Get max bouts limit
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-        
-        # Collect all bouts across subjects. The ordinal lists stay parallel so
-        # the rows can be re-blocked by bout number below.
-        all_g0_bouts = []
-        all_g1_bouts = []
-        g0_ordinals = []
-        g1_ordinals = []
-        
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'entry_bouts' not in data or data_key not in data['entry_bouts']:
-                continue
-            
-            bout_type_data = data['entry_bouts'][data_key]
-            if display_key not in bout_type_data:
-                continue
-            
-            bout_data = bout_type_data[display_key]
-            
-            # Check if subject is excluded for each channel
-            subject_has_g0 = subject in subjects_for_g0
-            subject_has_g1 = subject in subjects_for_g1
-            
-            if average_within_subject:
-                # Average within subject first (realigned to current window)
-                if show_g0 and subject_has_g0 and bout_data['G0']:
-                    subject_g0_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
-
-                    if len(subject_g0_bouts) > 0:
-                        max_len = max(len(b) for b in subject_g0_bouts)
-                        bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
-                        for i, bout in enumerate(subject_g0_bouts):
-                            bout_matrix[i, :len(bout)] = bout
-                        subject_avg = np.nanmean(bout_matrix, axis=0)
-                        all_g0_bouts.append(subject_avg)
-
-                if show_g1 and subject_has_g1 and bout_data['G1']:
-                    subject_g1_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
-
-                    if len(subject_g1_bouts) > 0:
-                        max_len = max(len(b) for b in subject_g1_bouts)
-                        bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
-                        for i, bout in enumerate(subject_g1_bouts):
-                            bout_matrix[i, :len(bout)] = bout
-                        subject_avg = np.nanmean(bout_matrix, axis=0)
-                        all_g1_bouts.append(subject_avg)
-            else:
-                # Use all bouts (original behavior), realigned to current window
-                if show_g0 and subject_has_g0 and bout_data['G0']:
-                    subject_g0 = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
-                    all_g0_bouts.extend(subject_g0)
-                    g0_ordinals.extend(range(1, len(subject_g0) + 1))
-
-                if show_g1 and subject_has_g1 and bout_data['G1']:
-                    subject_g1 = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
-                    all_g1_bouts.extend(subject_g1)
-                    g1_ordinals.extend(range(1, len(subject_g1) + 1))
-
         # Re-block the pooled rows by entry ordinal when asked, so entry 1 of
         # every subject sits together. Averaging within subject collapses the
         # ordinal away, so that combination keeps the acquisition order.
         rows_by_number = self._bout_order_by_number() and not average_within_subject
-        g0_ticks = g0_tick_labels = g0_blocks = None
-        g1_ticks = g1_tick_labels = g1_blocks = None
-        if rows_by_number:
-            if all_g0_bouts:
-                (all_g0_bouts, g0_ticks, g0_tick_labels,
-                 g0_blocks) = self._bout_number_blocks(list(zip(g0_ordinals, all_g0_bouts)))
-            if all_g1_bouts:
-                (all_g1_bouts, g1_ticks, g1_tick_labels,
-                 g1_blocks) = self._bout_number_blocks(list(zip(g1_ordinals, all_g1_bouts)))
 
-        n_plots = (1 if all_g0_bouts else 0) + (1 if all_g1_bouts else 0)
-        if n_plots == 0:
+        rows = []
+        for s, label in self._viz_plot_slots(subjects):
+            bouts, ordinals = self._pooled_slot_bouts(
+                subjects, entry_for, s, average_within_subject, max_bouts)
+            if not bouts:
+                continue
+            blocks = (None, None, None)
+            if rows_by_number:
+                bouts, *blocks = self._bout_number_blocks(list(zip(ordinals, bouts)))
+            rows.append((s, label, bouts, blocks))
+
+        if not rows:
             fig.text(0.5, 0.5, 'No data to display',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Get trace styling parameters
+
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
-        
-        plot_idx = 1
-        
-        # Plot G0 - Trace and Heatmap
-        if all_g0_bouts:
+        cmap = self.get_heatmap_colormap()
+        vmin, vmax = self.get_heatmap_range()
+        n_plots = len(rows)
+
+        for row, (s, label, bouts, (ticks, tick_labels, block_sizes)) in enumerate(rows):
+            color = self._slot_color(s)
             # Trace
-            ax = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            max_len = max(len(b) for b in all_g0_bouts)
-            padded = np.full((len(all_g0_bouts), max_len), np.nan)
-            for i, bout in enumerate(all_g0_bouts):
+            ax = fig.add_subplot(n_plots, 2, row * 2 + 1)
+            max_len = max(len(b) for b in bouts)
+            padded = np.full((len(bouts), max_len), np.nan)
+            for i, bout in enumerate(bouts):
                 padded[i, :len(bout)] = bout
-            
             mean_trace = np.nanmean(padded, axis=0)
             sem_trace = np.nanstd(padded, axis=0) / np.sqrt(np.sum(~np.isnan(padded), axis=0))
             time_axis = (np.arange(max_len) - prebout) / fps
-            
-            ax.plot(time_axis, mean_trace, 'b', linewidth=mean_width, label='Mean')
+
+            ax.plot(time_axis, mean_trace, color=color, linewidth=mean_width, label='Mean')
             ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                           alpha=0.3, color='b', label='SEM')
+                           alpha=0.3, color=color, label='SEM')
             self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            ax.set_ylabel('G0 Z-score')
-            n_label = f"n={len(all_g0_bouts)} subjects" if average_within_subject else f"n={len(all_g0_bouts)} bouts"
+            ax.set_ylabel(f'{label} Z-score')
+            n_label = f"n={len(bouts)} subjects" if average_within_subject else f"n={len(bouts)} bouts"
             title_suffix = " (averaged within subject)" if average_within_subject else ""
-            ax.set_title(f'{selected_entry_type}\nG0 ({n_label} from {len(subjects)} subjects){title_suffix}')
+            ax.set_title(f'{selected_entry_type}\n{label} ({n_label} from {len(subjects)} subjects){title_suffix}')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            
+
             # Heatmap
-            ax_heat = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            cmap = self.get_heatmap_colormap()
-            vmin, vmax = self.get_heatmap_range()
+            ax_heat = fig.add_subplot(n_plots, 2, row * 2 + 2)
             im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
-                               extent=[time_axis[0], time_axis[-1], len(all_g0_bouts), 0],
+                               extent=[time_axis[0], time_axis[-1], len(bouts), 0],
                                vmin=vmin, vmax=vmax, interpolation='nearest')
             self.draw_zero_line(ax_heat)
             ax_heat.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
@@ -37594,166 +37300,56 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             else:
                 ax_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
                                    else 'Bout #')
-            ax_heat.set_title('G0 Heatmap (by bout number)' if rows_by_number
-                              else 'G0 Heatmap')
-            self._label_bout_number_blocks(ax_heat, g0_ticks, g0_tick_labels,
-                                           g0_blocks, len(all_g0_bouts))
+            ax_heat.set_title(f'{label} Heatmap (by bout number)' if rows_by_number
+                              else f'{label} Heatmap')
+            self._label_bout_number_blocks(ax_heat, ticks, tick_labels,
+                                           block_sizes, len(bouts))
             plt.colorbar(im, ax=ax_heat, label='Z-score')
-        
-        # Plot G1 - Trace and Heatmap
-        if all_g1_bouts:
-            # Trace
-            ax = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            max_len = max(len(b) for b in all_g1_bouts)
-            padded = np.full((len(all_g1_bouts), max_len), np.nan)
-            for i, bout in enumerate(all_g1_bouts):
-                padded[i, :len(bout)] = bout
-            
-            mean_trace = np.nanmean(padded, axis=0)
-            sem_trace = np.nanstd(padded, axis=0) / np.sqrt(np.sum(~np.isnan(padded), axis=0))
-            time_axis = (np.arange(max_len) - prebout) / fps
-            
-            ax.plot(time_axis, mean_trace, 'g', linewidth=mean_width, label='Mean')
-            ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                           alpha=0.3, color='g', label='SEM')
-            self.draw_zero_line(ax, label='Entry')
-            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            ax.set_ylabel('G1 Z-score')
-            n_label = f"n={len(all_g1_bouts)} subjects" if average_within_subject else f"n={len(all_g1_bouts)} bouts"
-            title_suffix = " (averaged within subject)" if average_within_subject else ""
-            ax.set_title(f'{selected_entry_type}\nG1 ({n_label} from {len(subjects)} subjects){title_suffix}')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Heatmap
-            ax_heat = fig.add_subplot(n_plots, 2, plot_idx)
-            plot_idx += 1
-            
-            cmap = self.get_heatmap_colormap()
-            vmin, vmax = self.get_heatmap_range()
-            im = ax_heat.imshow(padded, aspect='auto', cmap=cmap,
-                               extent=[time_axis[0], time_axis[-1], len(all_g1_bouts), 0],
-                               vmin=vmin, vmax=vmax, interpolation='nearest')
-            self.draw_zero_line(ax_heat)
-            ax_heat.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            if average_within_subject:
-                ax_heat.set_ylabel('Bout/Subject #')
-            else:
-                ax_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
-                                   else 'Bout #')
-            ax_heat.set_title('G1 Heatmap (by bout number)' if rows_by_number
-                              else 'G1 Heatmap')
-            self._label_bout_number_blocks(ax_heat, g1_ticks, g1_tick_labels,
-                                           g1_blocks, len(all_g1_bouts))
-            plt.colorbar(im, ax=ax_heat, label='Z-score')
-        
+
         fig.tight_layout()
 
     def _plot_zone_entry_bouts_group_comparison(self, fig, group_names):
-        """Plot zone entry bouts comparing multiple groups with overlaid mean±SEM traces"""
+        """Plot zone entry bouts comparing groups: one panel per channel, overlaid mean±SEM"""
         entry_type_map = self._get_zone_entry_type_map()
-
         selected_entry_type = self.zone_entry_type_var.get()
         if selected_entry_type not in entry_type_map:
             selected_entry_type = list(entry_type_map.keys())[0]
-
         data_key, display_key = entry_type_map[selected_entry_type]
+        entry_for = self._entry_bout_getter(data_key, display_key)
 
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
         average_within_subject = self.viz_average_within_subject.get()
         prebout = self.params.get('preboutframes', 90)
         fps = self.get_fps()
         max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
 
-        # Collect bouts per group per channel
-        group_g0_bouts = {}
-        group_g1_bouts = {}
-        group_subject_counts = {}
+        group_subject_counts = {
+            g: sum(1 for s in self._series_members(g)
+                   if s in self.processed_data and entry_for(s) is not None)
+            for g in group_names}
+        all_subjects = [s for g in group_names for s in self._series_members(g)]
 
-        for group_name in group_names:
-            subjects = self._series_members(group_name)
-            subjects_for_g0 = subjects
-            subjects_for_g1 = subjects
-            if self.use_exclusions_viz.get():
-                subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
-                subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
+        # {slot: {group: bouts}} for every ticked channel with data
+        panels = []
+        for s, label in self._viz_plot_slots(all_subjects):
+            per_group = {g: self._pooled_slot_bouts(self._series_members(g), entry_for, s,
+                                                    average_within_subject, max_bouts)[0]
+                         for g in group_names}
+            if any(per_group.values()):
+                panels.append((s, label, per_group))
 
-            g0_bouts = []
-            g1_bouts = []
-            n_subjects = 0
-
-            for subject in subjects:
-                if subject not in self.processed_data:
-                    continue
-                data = self.processed_data[subject]
-                if 'entry_bouts' not in data or data_key not in data['entry_bouts']:
-                    continue
-                bout_type_data = data['entry_bouts'][data_key]
-                if display_key not in bout_type_data:
-                    continue
-                bout_data = bout_type_data[display_key]
-                n_subjects += 1
-
-                subject_has_g0 = subject in subjects_for_g0
-                subject_has_g1 = subject in subjects_for_g1
-
-                if average_within_subject:
-                    if show_g0 and subject_has_g0 and bout_data['G0']:
-                        subj_bouts = self._entry_channel_bouts(bout_data, 'G0', max_bouts)
-                        if subj_bouts:
-                            m = max(len(b) for b in subj_bouts)
-                            mat = np.full((len(subj_bouts), m), np.nan)
-                            for i, bout in enumerate(subj_bouts):
-                                mat[i, :len(bout)] = bout
-                            g0_bouts.append(np.nanmean(mat, axis=0))
-
-                    if show_g1 and subject_has_g1 and bout_data['G1']:
-                        subj_bouts = self._entry_channel_bouts(bout_data, 'G1', max_bouts)
-                        if subj_bouts:
-                            m = max(len(b) for b in subj_bouts)
-                            mat = np.full((len(subj_bouts), m), np.nan)
-                            for i, bout in enumerate(subj_bouts):
-                                mat[i, :len(bout)] = bout
-                            g1_bouts.append(np.nanmean(mat, axis=0))
-                else:
-                    if show_g0 and subject_has_g0 and bout_data['G0']:
-                        g0_bouts.extend(self._entry_channel_bouts(bout_data, 'G0', max_bouts))
-
-                    if show_g1 and subject_has_g1 and bout_data['G1']:
-                        g1_bouts.extend(self._entry_channel_bouts(bout_data, 'G1', max_bouts))
-
-            group_g0_bouts[group_name] = g0_bouts
-            group_g1_bouts[group_name] = g1_bouts
-            group_subject_counts[group_name] = n_subjects
-
-        has_g0 = show_g0 and any(len(b) > 0 for b in group_g0_bouts.values())
-        has_g1 = show_g1 and any(len(b) > 0 for b in group_g1_bouts.values())
-
-        if not has_g0 and not has_g1:
+        if not panels:
             fig.text(0.5, 0.5, f'No {selected_entry_type} data available for selected groups',
                      ha='center', va='center', fontsize=14)
             return
 
-        n_plots = (1 if has_g0 else 0) + (1 if has_g1 else 0)
         colors = plt.cm.Set1(np.linspace(0, 0.9, max(len(group_names), 1)))
-
-        plot_idx = 1
-
-        if has_g0:
-            ax = fig.add_subplot(1, n_plots, plot_idx)
-            plot_idx += 1
-
-            all_flat = [b for bouts in group_g0_bouts.values() for b in bouts]
-            max_len = max(len(b) for b in all_flat)
+        for plot_idx, (s, label, per_group) in enumerate(panels, 1):
+            ax = fig.add_subplot(len(panels), 1, plot_idx)
+            max_len = max(len(b) for bouts in per_group.values() for b in bouts)
             time_axis = (np.arange(max_len) - prebout) / fps
-
             for group_idx, group_name in enumerate(group_names):
-                bouts = group_g0_bouts[group_name]
+                bouts = per_group[group_name]
                 if not bouts:
                     continue
                 padded = np.full((len(bouts), max_len), np.nan)
@@ -37768,44 +37364,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         label=f'{group_name} ({n_label})')
                 ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
                                 alpha=0.3, color=color)
-
             self.draw_zero_line(ax, label='Entry')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            ax.set_ylabel('G0 Z-score')
-            ax.set_title(f'{selected_entry_type} - G0\nGroup Comparison')
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3)
-
-        if has_g1:
-            ax = fig.add_subplot(1, n_plots, plot_idx)
-
-            all_flat = [b for bouts in group_g1_bouts.values() for b in bouts]
-            max_len = max(len(b) for b in all_flat)
-            time_axis = (np.arange(max_len) - prebout) / fps
-
-            for group_idx, group_name in enumerate(group_names):
-                bouts = group_g1_bouts[group_name]
-                if not bouts:
-                    continue
-                padded = np.full((len(bouts), max_len), np.nan)
-                for i, bout in enumerate(bouts):
-                    padded[i, :len(bout)] = bout
-                mean_trace = np.nanmean(padded, axis=0)
-                sem_trace = np.nanstd(padded, axis=0) / np.sqrt(np.sum(~np.isnan(padded), axis=0))
-                color = colors[group_idx]
-                n_label = (f"n={len(bouts)} subjects" if average_within_subject
-                           else f"n={len(bouts)} bouts, {group_subject_counts[group_name]} subjects")
-                ax.plot(time_axis, mean_trace, color=color, linewidth=mean_width,
-                        label=f'{group_name} ({n_label})')
-                ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                                alpha=0.3, color=color)
-
-            self.draw_zero_line(ax, label='Entry')
-            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax.set_xlabel(f'Time from {selected_entry_type.lower()} (s)')
-            ax.set_ylabel('G1 Z-score')
-            ax.set_title(f'{selected_entry_type} - G1\nGroup Comparison')
+            ax.set_ylabel(f'{label} Z-score')
+            ax.set_title(f'{selected_entry_type} - {label}\nGroup Comparison')
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
 
@@ -37816,10 +37379,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Plot zone averages for multiple subjects with individual data points"""
         if not subjects:
             return
-        
+
         # Check if we're in group comparison mode
         if self.plot_by_var.get() == "Group":
-            selected_indices = self.viz_group_listbox.curselection()
             # Count series, not listbox rows: one group split by Session is
             # two series and belongs on the comparison path.
             selected_groups = self.selected_series('visualization', self.viz_group_listbox)
@@ -37827,30 +37389,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Multiple groups selected - do group comparison
                 self._plot_zone_averages_group_comparison(fig, selected_groups)
                 return
-        
+
         # Single group or subject mode
         first_data = self.processed_data[subjects[0]]
         if not self._get_or_compute_zone_averages(first_data):
             fig.text(0.5, 0.5, 'No zone average data available',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         maze_type = self.params.get('maze_type', 'EPM')
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
+        # Every ticked channel any subject has; each subject contributes only
+        # to the channels it records and does not exclude.
+        slots = self._viz_plot_slots(subjects)
 
-        # Suppress G1 entirely when none of the selected subjects has a 2nd
-        # channel, so single-channel cohorts don't show a phantom G1 series.
-        if not self._any_subject_has_g1(subjects):
-            show_g1 = False
-
-        # Apply exclusions if enabled - need to check both channels per subject
-        subjects_for_g0 = subjects
-        subjects_for_g1 = subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
-            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
-        
         # Collect category-aggregated data for each subject
         subject_category_data = {}
         for subject in subjects:
@@ -37858,310 +37409,169 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             zone_averages = self._get_or_compute_zone_averages(data)
             if not zone_averages:
                 continue
-            category_data = self._aggregate_zones_by_category(zone_averages, maze_type)
-            subject_category_data[subject] = category_data
-        
+            subject_category_data[subject] = self._aggregate_zones_by_category(
+                zone_averages, maze_type)
+
         if not subject_category_data:
             fig.text(0.5, 0.5, 'No valid data',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         # Get all categories
-        categories = sorted(set(cat for subj_data in subject_category_data.values() for cat in subj_data.keys()))      
-        
-        # Collect G0 and G1 data by category
-        g0_by_category = {cat: [] for cat in categories}
-        g1_by_category = {cat: [] for cat in categories}
-        
+        categories = sorted(set(cat for subj_data in subject_category_data.values() for cat in subj_data.keys()))
+
+        # Per-channel values by category
+        by_category = {s: {cat: [] for cat in categories} for s, _l in slots}
         for subject, cat_data in subject_category_data.items():
-            # Check if subject is excluded for each channel
-            subject_has_g0 = subject in subjects_for_g0
-            subject_has_g1 = subject in subjects_for_g1
-            
-            for cat in categories:
-                if cat in cat_data:
-                    if subject_has_g0 and not np.isnan(cat_data[cat]['G0_mean']):
-                        g0_by_category[cat].append(cat_data[cat]['G0_mean'])
-                    if subject_has_g1 and not np.isnan(cat_data[cat]['G1_mean']):
-                        g1_by_category[cat].append(cat_data[cat]['G1_mean'])
-        
+            for s, _l in slots:
+                if not self._slot_included(subject, s):
+                    continue
+                for cat in categories:
+                    v = cat_data.get(cat, {}).get(f'G{s}_mean', np.nan)
+                    if not np.isnan(v):
+                        by_category[s][cat].append(v)
+
         # Add max distance zone data if available
-        max_dist_g0 = []
-        max_dist_g1 = []
+        max_dist_vals = {s: [] for s, _l in slots}
         for subject in subjects:
-            # Check if subject is excluded for each channel
-            subject_has_g0 = subject in subjects_for_g0
-            subject_has_g1 = subject in subjects_for_g1
-            
-            data = self.processed_data[subject]
-            if 'max_distance_zone' in data and data['max_distance_zone']:
-                max_dist = data['max_distance_zone']
-                if subject_has_g0 and 'G0_mean' in max_dist and not np.isnan(max_dist['G0_mean']):
-                    max_dist_g0.append(max_dist['G0_mean'])
-                if subject_has_g1 and 'G1_mean' in max_dist and not np.isnan(max_dist['G1_mean']):
-                    max_dist_g1.append(max_dist['G1_mean'])
-        
-        if max_dist_g0 or max_dist_g1:
+            max_dist = self.processed_data[subject].get('max_distance_zone')
+            if not max_dist:
+                continue
+            for s, _l in slots:
+                v = max_dist.get(f'G{s}_mean', np.nan)
+                if self._slot_included(subject, s) and not np.isnan(v):
+                    max_dist_vals[s].append(v)
+        if any(max_dist_vals.values()):
             categories.append('Max Open\nDistance')
-            g0_by_category['Max Open\nDistance'] = max_dist_g0
-            g1_by_category['Max Open\nDistance'] = max_dist_g1
-        
-        # Calculate means and SEMs
-        g0_means = [np.mean(g0_by_category[cat]) if g0_by_category[cat] else 0 for cat in categories]
-        g0_sems = [np.std(g0_by_category[cat]) / np.sqrt(len(g0_by_category[cat])) 
-                   if len(g0_by_category[cat]) > 0 else 0 for cat in categories]
-        g1_means = [np.mean(g1_by_category[cat]) if g1_by_category[cat] else 0 for cat in categories]
-        g1_sems = [np.std(g1_by_category[cat]) / np.sqrt(len(g1_by_category[cat])) 
-                   if len(g1_by_category[cat]) > 0 else 0 for cat in categories]
-        
-        # Create plot
+            for s, _l in slots:
+                by_category[s]['Max Open\nDistance'] = max_dist_vals[s]
+
+        # Create plot: one bar per channel within each category
         x = np.arange(len(categories))
-        width = 0.35
-        
+        width = 0.7 / max(1, len(slots))
+
         ax = fig.add_subplot(111)
-        
-        # Plot individual subject data points
-        if show_g0:
-            for i, cat in enumerate(categories):
-                if g0_by_category[cat]:
-                    jitter = np.random.normal(0, 0.03, len(g0_by_category[cat]))
-                    ax.scatter([x[i] - width/2] * len(g0_by_category[cat]) + jitter, 
-                              g0_by_category[cat], 
-                              alpha=0.4, s=40, color='blue', edgecolors='darkblue', linewidth=0.5)
-        
-        if show_g1:
-            for i, cat in enumerate(categories):
-                if g1_by_category[cat]:
-                    jitter = np.random.normal(0, 0.03, len(g1_by_category[cat]))
-                    ax.scatter([x[i] + width/2] * len(g1_by_category[cat]) + jitter, 
-                              g1_by_category[cat], 
-                              alpha=0.4, s=40, color='green', edgecolors='darkgreen', linewidth=0.5)
-        
-        # Plot group means and error bars
-        if show_g0:
-            ax.bar(x - width/2, g0_means, width, yerr=g0_sems, label='G0 Mean±SEM',
-                   alpha=0.7, capsize=5, color='blue', edgecolor='darkblue', linewidth=1.5)
-        
-        if show_g1:
-            ax.bar(x + width/2, g1_means, width, yerr=g1_sems, label='G1 Mean±SEM',
-                   alpha=0.7, capsize=5, color='green', edgecolor='darkgreen', linewidth=1.5)
-        
+
+        for i, (s, label) in enumerate(slots):
+            offset = (i - (len(slots) - 1) / 2) * width
+            color = self._slot_color(s)
+            vals = by_category[s]
+            means = [np.mean(vals[cat]) if vals[cat] else 0 for cat in categories]
+            sems = [np.std(vals[cat]) / np.sqrt(len(vals[cat])) if vals[cat] else 0
+                    for cat in categories]
+            # Individual subject data points
+            for j, cat in enumerate(categories):
+                if vals[cat]:
+                    jitter = np.random.normal(0, 0.03, len(vals[cat]))
+                    ax.scatter([x[j] + offset] * len(vals[cat]) + jitter, vals[cat],
+                               alpha=0.4, s=40, color=color, edgecolors='black', linewidth=0.5)
+            # Group means and error bars
+            ax.bar(x + offset, means, width, yerr=sems, label=f'{label} Mean±SEM',
+                   alpha=0.7, capsize=5, color=color, edgecolor='black', linewidth=1.5)
+
         ax.set_xlabel('Zone Category', fontsize=12)
         ax.set_ylabel('Average Z-score', fontsize=12)
         ax.set_title(f'Average Photometry by Zone Category (n={len(subjects)} subjects)', fontsize=13, fontweight='bold')
         ax.set_xticks(x)
         ax.set_xticklabels(categories, rotation=45, ha='right')
         ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-        ax.legend(fontsize=10)
+        if slots:
+            ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3, axis='y')
-        
+
         fig.tight_layout()
-    
+
     def _plot_zone_averages_group_comparison(self, fig, group_names):
-        """Plot zone averages comparing multiple groups"""
+        """Plot zone averages comparing multiple groups, one panel per channel"""
         maze_type = self.params.get('maze_type', 'EPM')
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
+        all_subjects = [s for g in group_names for s in self._series_members(g)]
+        slots = self._viz_plot_slots(all_subjects)
 
-        # Suppress G1 when no subject across the compared groups has a 2nd channel.
-        if not self._any_subject_has_g1(
-                [s for g in group_names for s in self._series_members(g)]):
-            show_g1 = False
-
-        # Apply exclusions if enabled
-        subjects_for_g0_by_group = {}
-        subjects_for_g1_by_group = {}
-        if self.use_exclusions_viz.get():
-            for group_name in group_names:
-                subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 0)
-                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 1)
-        else:
-            for group_name in group_names:
-                subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = subjects
-                subjects_for_g1_by_group[group_name] = subjects
-        
-        # Collect data for each group
+        # Collect category data per group: [(subject, cat_data, max_dist)]
         group_data = {}
-        group_max_dist_data = {}
         categories = None
-        
         for group_name in group_names:
-            subjects = self._series_members(group_name)
-            if not subjects:
-                continue
-            
-            # Collect category data for this group
-            group_category_data = []
-            group_max_dist_values = {'G0': [], 'G1': []}
-            
-            for subject in subjects:
+            rows = []
+            for subject in self._series_members(group_name):
                 if subject not in self.processed_data:
                     continue
                 data = self.processed_data[subject]
-                if 'zone_averages' not in data:
+                zone_averages = self._get_or_compute_zone_averages(data)
+                if not zone_averages:
                     continue
-                
-                # Check if subject is excluded for each channel
-                subject_has_g0 = subject in subjects_for_g0_by_group[group_name]
-                subject_has_g1 = subject in subjects_for_g1_by_group[group_name]
-                
-                cat_data = self._aggregate_zones_by_category(data['zone_averages'], maze_type)
-                group_category_data.append((cat_data, subject_has_g0, subject_has_g1))
-                
-                # Collect max distance zone data if available
-                if 'max_distance_zone' in data and data['max_distance_zone']:
-                    max_dist = data['max_distance_zone']
-                    if subject_has_g0 and 'G0_mean' in max_dist and not np.isnan(max_dist['G0_mean']):
-                        group_max_dist_values['G0'].append(max_dist['G0_mean'])
-                    if subject_has_g1 and 'G1_mean' in max_dist and not np.isnan(max_dist['G1_mean']):
-                        group_max_dist_values['G1'].append(max_dist['G1_mean'])
-                
+                cat_data = self._aggregate_zones_by_category(zone_averages, maze_type)
+                rows.append((subject, cat_data, data.get('max_distance_zone') or {}))
                 if categories is None:
                     categories = list(cat_data.keys())
-            
-            group_data[group_name] = group_category_data
-            group_max_dist_data[group_name] = group_max_dist_values
-        
-        # Add max distance category if any group has data
-        has_max_dist = any(group_max_dist_data[g]['G0'] or group_max_dist_data[g]['G1'] 
-                           for g in group_max_dist_data)
-        if has_max_dist:
-            categories = list(categories) if categories else []
-            categories.append('Max Open\nDistance')
-        
+            if rows:
+                group_data[group_name] = rows
+
         if not categories or not group_data:
             fig.text(0.5, 0.5, 'No valid data for comparison',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Create subplots for each channel
-        n_plots = (1 if show_g0 else 0) + (1 if show_g1 else 0)
-        if n_plots == 0:
+        if not slots:
             fig.text(0.5, 0.5, 'Please select at least one channel',
                     ha='center', va='center', fontsize=14)
             return
-        
-        plot_idx = 1
+
+        categories = list(categories)
+        if any(not np.isnan(md.get(f'G{s}_mean', np.nan))
+               for rows in group_data.values() for _subj, _c, md in rows for s, _l in slots):
+            categories.append('Max Open\nDistance')
+
         colors = plt.cm.Set3(np.linspace(0, 1, len(group_names)))
-        
-        # G0 plot
-        if show_g0:
-            ax = fig.add_subplot(1, n_plots, plot_idx)
-            plot_idx += 1
-            
-            x = np.arange(len(categories))
-            group_width = 0.8 / len(group_names)
-            
-            for group_idx, (group_name, subjects_data) in enumerate(group_data.items()):
-                # Collect G0 values by category
-                g0_by_cat = {cat: [] for cat in categories}
-                for subj_data_tuple in subjects_data:
-                    cat_data, subject_has_g0, subject_has_g1 = subj_data_tuple
+        x = np.arange(len(categories))
+        group_width = 0.8 / len(group_names)
+
+        for plot_idx, (s, label) in enumerate(slots, 1):
+            ax = fig.add_subplot(1, len(slots), plot_idx)
+            key = f'G{s}_mean'
+            for group_idx, (group_name, rows) in enumerate(group_data.items()):
+                by_cat = {cat: [] for cat in categories}
+                for subject, cat_data, max_dist in rows:
+                    if not self._slot_included(subject, s):
+                        continue
                     for cat in categories:
-                        if cat == 'Max Open\nDistance':
-                            # Skip - will be added from max_dist_data
-                            continue
-                        if cat in cat_data and subject_has_g0 and not np.isnan(cat_data[cat]['G0_mean']):
-                            g0_by_cat[cat].append(cat_data[cat]['G0_mean'])
-                
-                # Add max distance zone data if available
-                if 'Max Open\nDistance' in categories:
-                    g0_by_cat['Max Open\nDistance'] = group_max_dist_data[group_name]['G0']
-                
-                # Calculate means and SEMs
-                means = [np.mean(g0_by_cat[cat]) if g0_by_cat[cat] else 0 for cat in categories]
-                sems = [np.std(g0_by_cat[cat]) / np.sqrt(len(g0_by_cat[cat])) 
-                       if len(g0_by_cat[cat]) > 0 else 0 for cat in categories]
-                
-                # Plot individual points
-                for i, cat in enumerate(categories):
-                    if g0_by_cat[cat]:
-                        jitter = np.random.normal(0, 0.02, len(g0_by_cat[cat]))
-                        x_pos = x[i] + (group_idx - len(group_names)/2 + 0.5) * group_width
-                        ax.scatter([x_pos] * len(g0_by_cat[cat]) + jitter, g0_by_cat[cat],
-                                  alpha=0.5, s=30, color=colors[group_idx], 
-                                  edgecolors='black', linewidth=0.5, zorder=3)
-                
-                # Plot bars
+                        v = (max_dist.get(key, np.nan) if cat == 'Max Open\nDistance'
+                             else cat_data.get(cat, {}).get(key, np.nan))
+                        if not np.isnan(v):
+                            by_cat[cat].append(v)
+
+                means = [np.mean(by_cat[cat]) if by_cat[cat] else 0 for cat in categories]
+                sems = [np.std(by_cat[cat]) / np.sqrt(len(by_cat[cat])) if by_cat[cat] else 0
+                        for cat in categories]
                 offset = (group_idx - len(group_names)/2 + 0.5) * group_width
-                ax.bar(x + offset, means, group_width, yerr=sems, 
-                      label=group_name, alpha=0.7, capsize=4,
-                      color=colors[group_idx], edgecolor='black', linewidth=1)
-            
+
+                # Individual points
+                for i, cat in enumerate(categories):
+                    if by_cat[cat]:
+                        jitter = np.random.normal(0, 0.02, len(by_cat[cat]))
+                        ax.scatter([x[i] + offset] * len(by_cat[cat]) + jitter, by_cat[cat],
+                                   alpha=0.5, s=30, color=colors[group_idx],
+                                   edgecolors='black', linewidth=0.5, zorder=3)
+                ax.bar(x + offset, means, group_width, yerr=sems,
+                       label=group_name, alpha=0.7, capsize=4,
+                       color=colors[group_idx], edgecolor='black', linewidth=1)
+
             ax.set_xlabel('Zone Category', fontsize=11)
             ax.set_ylabel('Average Z-score', fontsize=11)
-            ax.set_title('G0 Channel', fontsize=12, fontweight='bold')
+            ax.set_title(f'{label} Channel', fontsize=12, fontweight='bold')
             ax.set_xticks(x)
             ax.set_xticklabels(categories, rotation=45, ha='right')
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3, axis='y')
-        
-        # G1 plot
-        if show_g1:
-            ax = fig.add_subplot(1, n_plots, plot_idx)
-            
-            x = np.arange(len(categories))
-            group_width = 0.8 / len(group_names)
-            
-            for group_idx, (group_name, subjects_data) in enumerate(group_data.items()):
-                # Collect G1 values by category
-                g1_by_cat = {cat: [] for cat in categories}
-                for subj_data_tuple in subjects_data:
-                    cat_data, subject_has_g0, subject_has_g1 = subj_data_tuple
-                    for cat in categories:
-                        if cat == 'Max Open\nDistance':
-                            # Skip - will be added from max_dist_data
-                            continue
-                        if cat in cat_data and subject_has_g1 and not np.isnan(cat_data[cat]['G1_mean']):
-                            g1_by_cat[cat].append(cat_data[cat]['G1_mean'])
-                
-                # Add max distance zone data if available
-                if 'Max Open\nDistance' in categories:
-                    g1_by_cat['Max Open\nDistance'] = group_max_dist_data[group_name]['G1']
-                
-                # Calculate means and SEMs
-                means = [np.mean(g1_by_cat[cat]) if g1_by_cat[cat] else 0 for cat in categories]
-                sems = [np.std(g1_by_cat[cat]) / np.sqrt(len(g1_by_cat[cat])) 
-                       if len(g1_by_cat[cat]) > 0 else 0 for cat in categories]
-                
-                # Plot individual points
-                for i, cat in enumerate(categories):
-                    if g1_by_cat[cat]:
-                        jitter = np.random.normal(0, 0.02, len(g1_by_cat[cat]))
-                        x_pos = x[i] + (group_idx - len(group_names)/2 + 0.5) * group_width
-                        ax.scatter([x_pos] * len(g1_by_cat[cat]) + jitter, g1_by_cat[cat],
-                                  alpha=0.5, s=30, color=colors[group_idx], 
-                                  edgecolors='black', linewidth=0.5, zorder=3)
-                
-                # Plot bars
-                offset = (group_idx - len(group_names)/2 + 0.5) * group_width
-                ax.bar(x + offset, means, group_width, yerr=sems, 
-                      label=group_name, alpha=0.7, capsize=4,
-                      color=colors[group_idx], edgecolor='black', linewidth=1)
-            
-            ax.set_xlabel('Zone Category', fontsize=11)
-            ax.set_ylabel('Average Z-score', fontsize=11)
-            ax.set_title('G1 Channel', fontsize=12, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels(categories, rotation=45, ha='right')
-            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3, axis='y')
-        
-        fig.suptitle('Group Comparison - Zone Category Averages', fontsize=14, fontweight='bold', y=0.98)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-    
+
+        fig.tight_layout()
+
     def plot_distance_from_center_multi(self, fig, subjects):
         """Plot distance-from-center averages for multiple subjects with individual traces"""
         if not subjects:
             return
-        
+
         # Check if we're in group comparison mode
         if self.plot_by_var.get() == "Group":
-            selected_indices = self.viz_group_listbox.curselection()
             # Count series, not listbox rows: one group split by Session is
             # two series and belongs on the comparison path.
             selected_groups = self.selected_series('visualization', self.viz_group_listbox)
@@ -38169,7 +37579,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Multiple groups selected - do group comparison
                 self._plot_distance_group_comparison(fig, selected_groups)
                 return
-        
+
         # Try to recompute missing distance averages from beh_synced for all subjects
         for subject in subjects:
             self._ensure_distance_averages(self.processed_data[subject], subject)
@@ -38180,420 +37590,167 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             fig.text(0.5, 0.5, 'No distance-from-center data available\n(re-process subjects to generate)',
                     ha='center', va='center', fontsize=14)
             return
-        
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
 
-        # Suppress G1 when no selected subject has a 2nd channel.
-        if not self._any_subject_has_g1(subjects):
-            show_g1 = False
+        slots = self._viz_plot_slots(subjects)
+        x_title, y_title = self._distance_axis_titles()
+        markers = 'os^Dv<>ph*'
+        for col, (data_key, axis_label, title) in enumerate(
+                (('distance_averages_x', 'X', x_title), ('distance_averages_y', 'Y', y_title)), 1):
+            ax = fig.add_subplot(1, 2, col)
+            for i, (s, label) in enumerate(slots):
+                color = self._slot_color(s)
+                distances, curves, means, sems = self._distance_curves(subjects, data_key, s)
+                # Individual subject traces (lighter, thinner lines)
+                for vals in curves.values():
+                    ax.plot(distances, vals, color=color, alpha=0.2, linewidth=0.8, zorder=1)
+                ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[i % len(markers)]}-',
+                            label=f'{label} Mean±SEM', linewidth=2.5, markersize=6,
+                            color=color, capsize=4, zorder=3)
+            ax.set_xlabel(f'Distance from Center {axis_label}-axis (cm)', fontsize=11)
+            ax.set_ylabel('Average Z-score', fontsize=11)
+            ax.set_title(f'{title}\nn={len(subjects)} subjects', fontsize=12, fontweight='bold')
+            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
+            if slots:
+                ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
 
-        # Apply exclusions if enabled - need to check both channels per subject
-        subjects_for_g0 = subjects
-        subjects_for_g1 = subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.get_included_subjects_for_slot(subjects, 0)
-            subjects_for_g1 = self.get_included_subjects_for_slot(subjects, 1)
-
-        # Collect all distance data
-        all_x_data = {}
-        all_y_data = {}
-        
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'distance_averages_x' not in data or 'distance_averages_y' not in data:
-                continue
-            
-            # Check if subject is excluded for each channel
-            subject_has_g0 = subject in subjects_for_g0
-            subject_has_g1 = subject in subjects_for_g1
-            
-            # X-axis data
-            for dist, values in data['distance_averages_x'].items():
-                if dist not in all_x_data:
-                    all_x_data[dist] = {'G0': [], 'G1': []}
-                if subject_has_g0 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
-                    all_x_data[dist]['G0'].append(values['G0_mean'])
-                if subject_has_g1 and 'G1_mean' in values and not np.isnan(values['G1_mean']):
-                    all_x_data[dist]['G1'].append(values['G1_mean'])
-            
-            # Y-axis data
-            for dist, values in data['distance_averages_y'].items():
-                if dist not in all_y_data:
-                    all_y_data[dist] = {'G0': [], 'G1': []}
-                if subject_has_g0 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
-                    all_y_data[dist]['G0'].append(values['G0_mean'])
-                if subject_has_g1 and 'G1_mean' in values and not np.isnan(values['G1_mean']):
-                    all_y_data[dist]['G1'].append(values['G1_mean'])
-        
-        # Calculate means and SEMs
-        distances_x = sorted(all_x_data.keys())
-        distances_y = sorted(all_y_data.keys())
-        
-        # X-axis subplot
-        ax1 = fig.add_subplot(1, 2, 1)
-        
-        # Plot individual subject traces (lighter, thinner lines)
-        if show_g0:
-            for subject in subjects:
-                # Check if subject is excluded
-                if subject not in subjects_for_g0:
-                    continue
-                data = self.processed_data[subject]
-                if 'distance_averages_x' in data:
-                    subj_g0_x = [data['distance_averages_x'][d].get('G0_mean', np.nan) 
-                                 if d in data['distance_averages_x'] else np.nan for d in distances_x]
-                    ax1.plot(distances_x, subj_g0_x, color='blue', alpha=0.2, linewidth=0.8, zorder=1)
-        
-        if show_g1:
-            for subject in subjects:
-                # Check if subject is excluded
-                if subject not in subjects_for_g1:
-                    continue
-                data = self.processed_data[subject]
-                if 'distance_averages_x' in data:
-                    subj_g1_x = [data['distance_averages_x'][d].get('G1_mean', np.nan) 
-                                 if d in data['distance_averages_x'] else np.nan for d in distances_x]
-                    ax1.plot(distances_x, subj_g1_x, color='green', alpha=0.2, linewidth=0.8, zorder=1)
-        
-        # Plot group means
-        if show_g0:
-            g0_means_x = [np.nanmean(all_x_data[d]['G0']) if all_x_data[d]['G0'] else np.nan for d in distances_x]
-            g0_sems_x = [np.nanstd(all_x_data[d]['G0']) / np.sqrt(len(all_x_data[d]['G0']))
-                        if len(all_x_data[d]['G0']) > 0 else 0 for d in distances_x]
-            ax1.errorbar(distances_x, g0_means_x, yerr=g0_sems_x, fmt='o-',
-                        label='G0 Mean±SEM', linewidth=2.5, markersize=6, color='blue', capsize=4, zorder=3)
-        
-        if show_g1:
-            g1_means_x = [np.nanmean(all_x_data[d]['G1']) if all_x_data[d]['G1'] else np.nan for d in distances_x]
-            g1_sems_x = [np.nanstd(all_x_data[d]['G1']) / np.sqrt(len(all_x_data[d]['G1']))
-                        if len(all_x_data[d]['G1']) > 0 else 0 for d in distances_x]
-            ax1.errorbar(distances_x, g1_means_x, yerr=g1_sems_x, fmt='s-',
-                        label='G1 Mean±SEM', linewidth=2.5, markersize=6, color='green', capsize=4, zorder=3)
-        
-        maze_type = self.params.get('maze_type', 'EPM')
-        if maze_type in ['EPM', 'EPM_Complex']:
-            x_title = 'X-axis (Closed Arms for EPM)'
-            y_title = 'Y-axis (Open Arms for EPM)'
-        elif maze_type == 'OFT':
-            x_title = 'X-axis (Center to Side Walls)'
-            y_title = 'Y-axis (Center to Top/Bottom Walls)'
-        else:
-            x_title = 'X-axis distance from center zone'
-            y_title = 'Y-axis distance from center zone'
-
-        ax1.set_xlabel('Distance from Center X-axis (cm)', fontsize=11)
-        ax1.set_ylabel('Average Z-score', fontsize=11)
-        ax1.set_title(f'{x_title}\nn={len(subjects)} subjects', fontsize=12, fontweight='bold')
-        ax1.axhline(0, color='k', linestyle='--', alpha=0.3)
-        ax1.legend(fontsize=9)
-        ax1.grid(True, alpha=0.3)
-        
-        # Y-axis subplot
-        ax2 = fig.add_subplot(1, 2, 2)
-        
-        # Plot individual subject traces
-        if show_g0:
-            for subject in subjects:
-                # Check if subject is excluded
-                if subject not in subjects_for_g0:
-                    continue
-                data = self.processed_data[subject]
-                if 'distance_averages_y' in data:
-                    subj_g0_y = [data['distance_averages_y'][d].get('G0_mean', np.nan) 
-                                 if d in data['distance_averages_y'] else np.nan for d in distances_y]
-                    ax2.plot(distances_y, subj_g0_y, color='blue', alpha=0.2, linewidth=0.8, zorder=1)
-        
-        if show_g1:
-            for subject in subjects:
-                # Check if subject is excluded
-                if subject not in subjects_for_g1:
-                    continue
-                data = self.processed_data[subject]
-                if 'distance_averages_y' in data:
-                    subj_g1_y = [data['distance_averages_y'][d].get('G1_mean', np.nan) 
-                                 if d in data['distance_averages_y'] else np.nan for d in distances_y]
-                    ax2.plot(distances_y, subj_g1_y, color='green', alpha=0.2, linewidth=0.8, zorder=1)
-        
-        # Plot group means
-        if show_g0:
-            g0_means_y = [np.nanmean(all_y_data[d]['G0']) if all_y_data[d]['G0'] else np.nan for d in distances_y]
-            g0_sems_y = [np.nanstd(all_y_data[d]['G0']) / np.sqrt(len(all_y_data[d]['G0']))
-                        if len(all_y_data[d]['G0']) > 0 else 0 for d in distances_y]
-            ax2.errorbar(distances_y, g0_means_y, yerr=g0_sems_y, fmt='o-',
-                        label='G0 Mean±SEM', linewidth=2.5, markersize=6, color='blue', capsize=4, zorder=3)
-        
-        if show_g1:
-            g1_means_y = [np.nanmean(all_y_data[d]['G1']) if all_y_data[d]['G1'] else np.nan for d in distances_y]
-            g1_sems_y = [np.nanstd(all_y_data[d]['G1']) / np.sqrt(len(all_y_data[d]['G1']))
-                        if len(all_y_data[d]['G1']) > 0 else 0 for d in distances_y]
-            ax2.errorbar(distances_y, g1_means_y, yerr=g1_sems_y, fmt='s-',
-                        label='G1 Mean±SEM', linewidth=2.5, markersize=6, color='green', capsize=4, zorder=3)
-        
-        ax2.set_xlabel('Distance from Center Y-axis (cm)', fontsize=11)
-        ax2.set_ylabel('Average Z-score', fontsize=11)
-        ax2.set_title(f'{y_title}\nn={len(subjects)} subjects', fontsize=12, fontweight='bold')
-        ax2.axhline(0, color='k', linestyle='--', alpha=0.3)
-        ax2.legend(fontsize=9)
-        ax2.grid(True, alpha=0.3)
-        
         fig.tight_layout()
-    
-    def _plot_distance_group_comparison(self, fig, group_names):
-        """Plot distance-from-center comparing multiple groups in a 2x2 grid"""
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
 
-        # Suppress G1 when no subject across the compared groups has a 2nd channel.
-        if not self._any_subject_has_g1(
-                [s for g in group_names for s in self._series_members(g)]):
-            show_g1 = False
+    def _plot_distance_group_comparison(self, fig, group_names):
+        """Plot distance-from-center comparing groups: one row per channel, X and Y columns"""
+        all_subjects = [s for g in group_names for s in self._series_members(g)]
+        for subject in all_subjects:
+            if subject in self.processed_data:
+                self._ensure_distance_averages(self.processed_data[subject], subject)
+        slots = self._viz_plot_slots(all_subjects)
 
         maze_type = self.params.get('maze_type', 'EPM')
-
         if maze_type in ['EPM', 'EPM_Complex']:
-            x_axis_desc = 'Closed'
-            y_axis_desc = 'Open'
+            x_axis_desc, y_axis_desc = 'Closed', 'Open'
         elif maze_type == 'OFT':
-            x_axis_desc = 'Side Walls'
-            y_axis_desc = 'Top/Bottom Walls'
+            x_axis_desc, y_axis_desc = 'Side Walls', 'Top/Bottom Walls'
         else:
-            x_axis_desc = 'X'
-            y_axis_desc = 'Y'
-        
-        # Apply exclusions if enabled
-        subjects_for_g0_by_group = {}
-        subjects_for_g1_by_group = {}
-        if self.use_exclusions_viz.get():
-            for group_name in group_names:
-                subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 0)
-                subjects_for_g1_by_group[group_name] = self.get_included_subjects_for_slot(subjects, 1)
-        else:
-            for group_name in group_names:
-                subjects = self._series_members(group_name)
-                subjects_for_g0_by_group[group_name] = subjects
-                subjects_for_g1_by_group[group_name] = subjects
-        
-        # Collect data for each group
-        group_data = {}
-        distances_x = None
-        distances_y = None
-        
-        for group_name in group_names:
-            subjects = self._series_members(group_name)
-            if not subjects:
-                continue
-            
-            # Initialize storage for this group
-            all_x_data = {}
-            all_y_data = {}
-            
-            for subject in subjects:
-                if subject not in self.processed_data:
-                    continue
-                data = self.processed_data[subject]
-                
-                if 'distance_averages_x' not in data or 'distance_averages_y' not in data:
-                    continue
-                
-                # Check if subject is excluded for each channel
-                subject_has_g0 = subject in subjects_for_g0_by_group[group_name]
-                subject_has_g1 = subject in subjects_for_g1_by_group[group_name]
-                
-                # X-axis data
-                for dist, values in data['distance_averages_x'].items():
-                    if dist not in all_x_data:
-                        all_x_data[dist] = {'G0': [], 'G1': []}
-                    if subject_has_g0 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
-                        all_x_data[dist]['G0'].append(values['G0_mean'])
-                    if subject_has_g1 and 'G1_mean' in values and not np.isnan(values['G1_mean']):
-                        all_x_data[dist]['G1'].append(values['G1_mean'])
-                
-                # Y-axis data
-                for dist, values in data['distance_averages_y'].items():
-                    if dist not in all_y_data:
-                        all_y_data[dist] = {'G0': [], 'G1': []}
-                    if subject_has_g0 and 'G0_mean' in values and not np.isnan(values['G0_mean']):
-                        all_y_data[dist]['G0'].append(values['G0_mean'])
-                    if subject_has_g1 and 'G1_mean' in values and not np.isnan(values['G1_mean']):
-                        all_y_data[dist]['G1'].append(values['G1_mean'])
-            
-            if distances_x is None:
-                distances_x = sorted(all_x_data.keys())
-                distances_y = sorted(all_y_data.keys())
-            
-            group_data[group_name] = {
-                'x_data': all_x_data,
-                'y_data': all_y_data
-            }
-        
-        if not distances_x or not distances_y or not group_data:
+            x_axis_desc, y_axis_desc = 'X', 'Y'
+
+        if not slots or not any(
+                'distance_averages_x' in self.processed_data.get(s, {}) for s in all_subjects):
             fig.text(0.5, 0.5, 'No valid data for comparison',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Create 2x2 grid: rows=G0/G1, cols=X/Y
+
         colors = plt.cm.Set3(np.linspace(0, 1, len(group_names)))
-        
-        plot_idx = 1
-        # G0 X-axis
-        if show_g0:
-            ax = fig.add_subplot(2, 2, plot_idx)
-            for group_idx, (group_name, gdata) in enumerate(group_data.items()):
-                means = [np.nanmean(gdata['x_data'][d]['G0']) if gdata['x_data'][d]['G0'] else np.nan for d in distances_x]
-                sems = [np.nanstd(gdata['x_data'][d]['G0']) / np.sqrt(len(gdata['x_data'][d]['G0'])) 
-                       if len(gdata['x_data'][d]['G0']) > 0 else 0 for d in distances_x]
-                ax.errorbar(distances_x, means, yerr=sems, label=group_name, 
-                           marker='o', capsize=3, alpha=0.8, color=colors[group_idx], linewidth=2)
-            ax.set_xlabel('Distance X (cm)', fontsize=10)
-            ax.set_ylabel('Avg Z-score', fontsize=10)
-            ax.set_title(f'G0 - X Axis ({x_axis_desc})', fontsize=11, fontweight='bold')
-            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-        
-        plot_idx += 1
-        # G0 Y-axis
-        if show_g0:
-            ax = fig.add_subplot(2, 2, plot_idx)
-            for group_idx, (group_name, gdata) in enumerate(group_data.items()):
-                means = [np.nanmean(gdata['y_data'][d]['G0']) if gdata['y_data'][d]['G0'] else np.nan for d in distances_y]
-                sems = [np.nanstd(gdata['y_data'][d]['G0']) / np.sqrt(len(gdata['y_data'][d]['G0'])) 
-                       if len(gdata['y_data'][d]['G0']) > 0 else 0 for d in distances_y]
-                ax.errorbar(distances_y, means, yerr=sems, label=group_name, 
-                           marker='o', capsize=3, alpha=0.8, color=colors[group_idx], linewidth=2)
-            ax.set_xlabel('Distance Y (cm)', fontsize=10)
-            ax.set_ylabel('Avg Z-score', fontsize=10)
-            ax.set_title(f'G0 - Y Axis ({y_axis_desc})', fontsize=11, fontweight='bold')
-            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-        
-        plot_idx += 1
-        # G1 X-axis
-        if show_g1:
-            ax = fig.add_subplot(2, 2, plot_idx)
-            for group_idx, (group_name, gdata) in enumerate(group_data.items()):
-                means = [np.nanmean(gdata['x_data'][d]['G1']) if gdata['x_data'][d]['G1'] else np.nan for d in distances_x]
-                sems = [np.nanstd(gdata['x_data'][d]['G1']) / np.sqrt(len(gdata['x_data'][d]['G1'])) 
-                       if len(gdata['x_data'][d]['G1']) > 0 else 0 for d in distances_x]
-                ax.errorbar(distances_x, means, yerr=sems, label=group_name, 
-                           marker='s', capsize=3, alpha=0.8, color=colors[group_idx], linewidth=2)
-            ax.set_xlabel('Distance X (cm)', fontsize=10)
-            ax.set_ylabel('Avg Z-score', fontsize=10)
-            ax.set_title(f'G1 - X Axis ({x_axis_desc})', fontsize=11, fontweight='bold')
-            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-        
-        plot_idx += 1
-        # G1 Y-axis
-        if show_g1:
-            ax = fig.add_subplot(2, 2, plot_idx)
-            for group_idx, (group_name, gdata) in enumerate(group_data.items()):
-                means = [np.nanmean(gdata['y_data'][d]['G1']) if gdata['y_data'][d]['G1'] else np.nan for d in distances_y]
-                sems = [np.nanstd(gdata['y_data'][d]['G1']) / np.sqrt(len(gdata['y_data'][d]['G1'])) 
-                       if len(gdata['y_data'][d]['G1']) > 0 else 0 for d in distances_y]
-                ax.errorbar(distances_y, means, yerr=sems, label=group_name, 
-                           marker='s', capsize=3, alpha=0.8, color=colors[group_idx], linewidth=2)
-            ax.set_xlabel('Distance Y (cm)', fontsize=10)
-            ax.set_ylabel('Avg Z-score', fontsize=10)
-            ax.set_title(f'G1 - Y Axis ({y_axis_desc})', fontsize=11, fontweight='bold')
-            ax.axhline(0, color='k', linestyle='--', alpha=0.3)
-            ax.legend(fontsize=8)
-            ax.grid(True, alpha=0.3)
-        
+        markers = 'os^Dv<>ph*'
+        for row, (s, ch_label) in enumerate(slots):
+            for col, (data_key, axis_label, desc) in enumerate(
+                    (('distance_averages_x', 'X', x_axis_desc),
+                     ('distance_averages_y', 'Y', y_axis_desc))):
+                ax = fig.add_subplot(len(slots), 2, row * 2 + col + 1)
+                for group_idx, group_name in enumerate(group_names):
+                    distances, _curves, means, sems = self._distance_curves(
+                        self._series_members(group_name), data_key, s)
+                    if not distances:
+                        continue
+                    ax.errorbar(distances, means, yerr=sems, label=group_name,
+                                marker=markers[row % len(markers)], capsize=3, alpha=0.8,
+                                color=colors[group_idx], linewidth=2)
+                ax.set_xlabel(f'Distance {axis_label} (cm)', fontsize=10)
+                ax.set_ylabel('Avg Z-score', fontsize=10)
+                ax.set_title(f'{ch_label} - {axis_label} Axis ({desc})', fontsize=11, fontweight='bold')
+                ax.axhline(0, color='k', linestyle='--', alpha=0.3)
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.3)
+
         fig.suptitle('Group Comparison - Distance from Center', fontsize=13, fontweight='bold', y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.96])
-    
+
+    def _outback_values(self, subjects, slot):
+        """Per-subject Out and Back means for one channel slot: ``(out, back)``.
+
+        Exclusions apply per channel slot, matching export_plot_data, so the
+        graph and the CSV report the same n.
+        """
+        key = f'G{slot}_mean'
+        out_vals, back_vals = [], []
+        for subject in subjects:
+            data = self.processed_data.get(subject)
+            if not data:
+                continue
+            self._ensure_spatial_stats_channels(data, subject)
+            outback = data.get('outback')
+            if not outback or not self._slot_included(subject, slot, data):
+                continue
+            for direction, sink in (('out', out_vals), ('back', back_vals)):
+                d = outback.get(direction) or {}
+                v = d.get(key, np.nan)
+                if d.get(f'G{slot}_n', 0) > 0 and not np.isnan(v):
+                    sink.append(v)
+        return out_vals, back_vals
+
     def plot_outback(self, fig, data, subject_name):
         """Plot Out vs Back movement photometry averages for single subject"""
+        self._ensure_spatial_stats_channels(data, subject_name)
         if 'outback' not in data or not data['outback']:
             fig.text(0.5, 0.5, 'No Out/Back movement data available\n(EPM open arms only)',
                     ha='center', va='center', fontsize=14)
             return
-        
-        outback_data = data['outback']
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
 
-        # A single-channel subject has no G1 — don't plot a phantom second bar.
-        if self._beh_channel_count(data) < 2:
-            show_g1 = False
+        outback_data = data['outback']
+        slots = self._single_subject_slots(subject_name, data)
 
         # Check if data exists
         has_out = 'out' in outback_data and outback_data['out'].get('G0_n', 0) > 0
         has_back = 'back' in outback_data and outback_data['back'].get('G0_n', 0) > 0
-        
+
         if not has_out and not has_back:
             fig.text(0.5, 0.5, 'No Out/Back movement detected\n(Requires velocity > 1 cm/s in open arms)',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Create bar plot
+
+        directions = []
         categories = []
-        g0_means = []
-        g0_sems = []
-        g1_means = []
-        g1_sems = []
-        
         if has_out:
+            directions.append('out')
             categories.append('Out\n(→ Distal)')
-            g0_means.append(outback_data['out'].get('G0_mean', np.nan))
-            g0_sems.append(outback_data['out'].get('G0_sem', 0))
-            g1_means.append(outback_data['out'].get('G1_mean', np.nan))
-            g1_sems.append(outback_data['out'].get('G1_sem', 0))
-        
         if has_back:
+            directions.append('back')
             categories.append('Back\n(→ Center)')
-            g0_means.append(outback_data['back'].get('G0_mean', np.nan))
-            g0_sems.append(outback_data['back'].get('G0_sem', 0))
-            g1_means.append(outback_data['back'].get('G1_mean', np.nan))
-            g1_sems.append(outback_data['back'].get('G1_sem', 0))
-        
+
         x = np.arange(len(categories))
-        width = 0.35
-        
+        width = 0.7 / max(1, len(slots))
         ax = fig.add_subplot(111)
-        
-        if show_g0:
-            bars_g0 = ax.bar(x - width/2, g0_means, width, yerr=g0_sems, 
-                            label='G0', alpha=0.8, capsize=5, color='blue')
-        
-        if show_g1:
-            bars_g1 = ax.bar(x + width/2, g1_means, width, yerr=g1_sems,
-                            label='G1', alpha=0.8, capsize=5, color='green')
-        
+
+        for i, (s, label) in enumerate(slots):
+            offset = (i - (len(slots) - 1) / 2) * width
+            ax.bar(x + offset,
+                   [outback_data[d].get(f'G{s}_mean', np.nan) for d in directions], width,
+                   yerr=[outback_data[d].get(f'G{s}_sem', 0) for d in directions],
+                   label=label, alpha=0.8, capsize=5, color=self._slot_color(s))
+
         ax.set_xlabel('Movement Direction in Open Arms', fontsize=12)
         ax.set_ylabel('Average Z-score', fontsize=12)
         ax.set_title(f'{subject_name} - Out/Back Movements in Open Arms', fontsize=13, fontweight='bold')
         ax.set_xticks(x)
         ax.set_xticklabels(categories)
         ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-        ax.legend(fontsize=10)
+        if slots:
+            ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3, axis='y')
-        
-        # Add sample sizes as text
+
+        # Add sample sizes (frames) as text
         y_pos = ax.get_ylim()[0] + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.02
-        for i, cat in enumerate(categories):
-            if 'Out' in cat and has_out:
-                n_g0 = outback_data['out'].get('G0_n', 0)
-                ax.text(x[i], y_pos, f'n={n_g0}', ha='center', va='bottom', fontsize=9, color='gray')
-            elif 'Back' in cat and has_back:
-                n_g0 = outback_data['back'].get('G0_n', 0)
-                ax.text(x[i], y_pos, f'n={n_g0}', ha='center', va='bottom', fontsize=9, color='gray')
-        
+        for i, d in enumerate(directions):
+            ax.text(x[i], y_pos, f'n={outback_data[d].get("G0_n", 0)}',
+                    ha='center', va='bottom', fontsize=9, color='gray')
+
         fig.tight_layout()
-    
+
     def plot_outback_multi(self, fig, subjects):
         """Plot Out vs Back movement photometry averages for multiple subjects"""
         if not subjects:
             return
-        
+
         # Check if we're in group comparison mode
         if self.plot_by_var.get() == "Group":
-            selected_indices = self.viz_group_listbox.curselection()
             # Count series, not listbox rows: one group split by Session is
             # two series and belongs on the comparison path.
             selected_groups = self.selected_series('visualization', self.viz_group_listbox)
@@ -38601,264 +37758,94 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Multiple groups selected - do group comparison
                 self._plot_outback_group_comparison(fig, selected_groups)
                 return
-        
-        # Single group mode - collect data across subjects
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
 
-        # Suppress G1 when no selected subject has a 2nd channel.
-        if not self._any_subject_has_g1(subjects):
-            show_g1 = False
-
-        out_g0_values = []
-        out_g1_values = []
-        back_g0_values = []
-        back_g1_values = []
-        
-        apply_excl = self.use_exclusions_viz.get()
-
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'outback' not in data or not data['outback']:
-                continue
-
-            # Honour exclusions per channel slot.  This aggregate view used to
-            # apply none at all while export_plot_data filtered the same Out/Back
-            # store, so the graph and the CSV reported different n.
-            keep_g0 = not (apply_excl and self.is_channel_slot_excluded(subject, 0, data))
-            keep_g1 = not (apply_excl and self.is_channel_slot_excluded(subject, 1, data))
-
-            outback_data = data['outback']
-
-            # Out data
-            if 'out' in outback_data and outback_data['out'].get('G0_n', 0) > 0:
-                if keep_g0 and 'G0_mean' in outback_data['out'] and not np.isnan(outback_data['out']['G0_mean']):
-                    out_g0_values.append(outback_data['out']['G0_mean'])
-                if keep_g1 and 'G1_mean' in outback_data['out'] and not np.isnan(outback_data['out']['G1_mean']):
-                    out_g1_values.append(outback_data['out']['G1_mean'])
-
-            # Back data
-            if 'back' in outback_data and outback_data['back'].get('G0_n', 0) > 0:
-                if keep_g0 and 'G0_mean' in outback_data['back'] and not np.isnan(outback_data['back']['G0_mean']):
-                    back_g0_values.append(outback_data['back']['G0_mean'])
-                if keep_g1 and 'G1_mean' in outback_data['back'] and not np.isnan(outback_data['back']['G1_mean']):
-                    back_g1_values.append(outback_data['back']['G1_mean'])
-
-        if not (out_g0_values or back_g0_values):
+        slots = self._viz_plot_slots(subjects)
+        values = {s: self._outback_values(subjects, s) for s, _l in slots}
+        if not any(o or b for o, b in values.values()):
             fig.text(0.5, 0.5, 'No Out/Back movement data available for selected subjects',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Calculate means and SEMs
+
         categories = ['Out\n(→ Distal)', 'Back\n(→ Center)']
-        
-        g0_means = [
-            np.nanmean(out_g0_values) if out_g0_values else np.nan,
-            np.nanmean(back_g0_values) if back_g0_values else np.nan
-        ]
-        g0_sems = [
-            np.nanstd(out_g0_values) / np.sqrt(len(out_g0_values)) if len(out_g0_values) > 0 else 0,
-            np.nanstd(back_g0_values) / np.sqrt(len(back_g0_values)) if len(back_g0_values) > 0 else 0
-        ]
-        
-        g1_means = [
-            np.nanmean(out_g1_values) if out_g1_values else np.nan,
-            np.nanmean(back_g1_values) if back_g1_values else np.nan
-        ]
-        g1_sems = [
-            np.nanstd(out_g1_values) / np.sqrt(len(out_g1_values)) if len(out_g1_values) > 0 else 0,
-            np.nanstd(back_g1_values) / np.sqrt(len(back_g1_values)) if len(back_g1_values) > 0 else 0
-        ]
-        
         x = np.arange(len(categories))
-        width = 0.35
-        
+        width = 0.7 / max(1, len(slots))
         ax = fig.add_subplot(111)
-        
-        # Plot individual subject points with jitter
-        jitter_amount = 0.08
-        if show_g0:
-            for i, values in enumerate([out_g0_values, back_g0_values]):
-                if values:
-                    jittered_x = x[i] - width/2 + np.random.uniform(-jitter_amount, jitter_amount, len(values))
-                    ax.scatter(jittered_x, values, alpha=0.4, s=30, color='blue', zorder=2)
-        
-        if show_g1:
-            for i, values in enumerate([out_g1_values, back_g1_values]):
-                if values:
-                    jittered_x = x[i] + width/2 + np.random.uniform(-jitter_amount, jitter_amount, len(values))
-                    ax.scatter(jittered_x, values, alpha=0.4, s=30, color='green', zorder=2)
-        
-        # Plot bars with error bars
-        if show_g0:
-            ax.bar(x - width/2, g0_means, width, yerr=g0_sems, 
-                  label='G0', alpha=0.7, capsize=5, color='blue', zorder=3)
-        
-        if show_g1:
-            ax.bar(x + width/2, g1_means, width, yerr=g1_sems,
-                  label='G1', alpha=0.7, capsize=5, color='green', zorder=3)
-        
+        jitter_amount = min(0.08, width / 3)
+
+        for i, (s, label) in enumerate(slots):
+            offset = (i - (len(slots) - 1) / 2) * width
+            color = self._slot_color(s)
+            pair = values[s]
+            # Individual subject points with jitter
+            for j, vals in enumerate(pair):
+                if vals:
+                    jittered_x = x[j] + offset + np.random.uniform(-jitter_amount, jitter_amount, len(vals))
+                    ax.scatter(jittered_x, vals, alpha=0.4, s=30, color=color, zorder=2)
+            means = [np.nanmean(v) if v else np.nan for v in pair]
+            sems = [np.nanstd(v) / np.sqrt(len(v)) if v else 0 for v in pair]
+            ax.bar(x + offset, means, width, yerr=sems,
+                   label=label, alpha=0.7, capsize=5, color=color, zorder=3)
+
         ax.set_xlabel('Movement Direction in Open Arms', fontsize=12)
         ax.set_ylabel('Average Z-score', fontsize=12)
-        ax.set_title(f'Out/Back Movements - Group Average (n={len(subjects)} subjects)', 
+        ax.set_title(f'Out/Back Movements - Group Average (n={len(subjects)} subjects)',
                     fontsize=13, fontweight='bold')
         ax.set_xticks(x)
         ax.set_xticklabels(categories)
         ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3, axis='y')
-        
-        # Add sample sizes
-        y_pos = ax.get_ylim()[0] + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.02
-        ax.text(x[0], y_pos, f'n={len(out_g0_values)}', ha='center', va='bottom', fontsize=9, color='gray')
-        ax.text(x[1], y_pos, f'n={len(back_g0_values)}', ha='center', va='bottom', fontsize=9, color='gray')
-        
+
+        # Sample sizes (subjects contributing to the first channel shown)
+        if slots:
+            first_out, first_back = values[slots[0][0]]
+            y_pos = ax.get_ylim()[0] + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.02
+            ax.text(x[0], y_pos, f'n={len(first_out)}', ha='center', va='bottom', fontsize=9, color='gray')
+            ax.text(x[1], y_pos, f'n={len(first_back)}', ha='center', va='bottom', fontsize=9, color='gray')
+
         fig.tight_layout()
-    
+
     def _plot_outback_group_comparison(self, fig, group_names):
-        """Compare Out/Back movements between multiple groups"""
-        show_g0 = self.show_g0.get()
-        show_g1 = self.show_g1.get()
+        """Compare Out/Back movements between groups, one panel per channel"""
+        all_subjects = [s for g in group_names for s in self._series_members(g)]
+        slots = self._viz_plot_slots(all_subjects)
+        if not slots:
+            return
 
-        # Suppress G1 when no subject across the compared groups has a 2nd channel.
-        if not self._any_subject_has_g1(
-                [s for g in group_names for s in self._series_members(g)]):
-            show_g1 = False
+        categories = ['Out (→ Distal)', 'Back (→ Center)']
+        x = np.arange(len(categories))
+        width = 0.8 / len(group_names)
+        colors = plt.cm.Set2(np.linspace(0, 1, len(group_names)))
 
-        apply_excl = self.use_exclusions_viz.get()
-
-        # Collect data for each group
-        group_data = {}
-        for group_name in group_names:
-            subjects = self._series_members(group_name)
-            out_g0 = []
-            out_g1 = []
-            back_g0 = []
-            back_g1 = []
-
-            for subject in subjects:
-                if subject not in self.processed_data:
-                    continue
-                data = self.processed_data[subject]
-                if 'outback' not in data or not data['outback']:
-                    continue
-
-                # Honour exclusions per channel slot, matching export_plot_data
-                # (this comparison used to apply none, so the per-group n on the
-                # graph disagreed with the CSV).
-                keep_g0 = not (apply_excl and self.is_channel_slot_excluded(subject, 0, data))
-                keep_g1 = not (apply_excl and self.is_channel_slot_excluded(subject, 1, data))
-
-                outback = data['outback']
-                if 'out' in outback and outback['out'].get('G0_n', 0) > 0:
-                    if keep_g0 and not np.isnan(outback['out'].get('G0_mean', np.nan)):
-                        out_g0.append(outback['out']['G0_mean'])
-                    if keep_g1 and not np.isnan(outback['out'].get('G1_mean', np.nan)):
-                        out_g1.append(outback['out']['G1_mean'])
-
-                if 'back' in outback and outback['back'].get('G0_n', 0) > 0:
-                    if keep_g0 and not np.isnan(outback['back'].get('G0_mean', np.nan)):
-                        back_g0.append(outback['back']['G0_mean'])
-                    if keep_g1 and not np.isnan(outback['back'].get('G1_mean', np.nan)):
-                        back_g1.append(outback['back']['G1_mean'])
-
-            group_data[group_name] = {
-                'out_g0': out_g0, 'out_g1': out_g1,
-                'back_g0': back_g0, 'back_g1': back_g1
-            }
-        
-        # Create 2x1 subplots (G0 and G1)
-        plot_idx = 1
-        
-        # G0 plot
-        if show_g0:
-            ax = fig.add_subplot(2, 1, plot_idx)
-            plot_idx += 1
-            
-            categories = ['Out (→ Distal)', 'Back (→ Center)']
-            x = np.arange(len(categories))
-            width = 0.8 / len(group_names)
-            colors = plt.cm.Set2(np.linspace(0, 1, len(group_names)))
-            
-            for group_idx, (group_name, gdata) in enumerate(group_data.items()):
-                means = [
-                    np.nanmean(gdata['out_g0']) if gdata['out_g0'] else np.nan,
-                    np.nanmean(gdata['back_g0']) if gdata['back_g0'] else np.nan
-                ]
-                sems = [
-                    np.nanstd(gdata['out_g0']) / np.sqrt(len(gdata['out_g0'])) if len(gdata['out_g0']) > 0 else 0,
-                    np.nanstd(gdata['back_g0']) / np.sqrt(len(gdata['back_g0'])) if len(gdata['back_g0']) > 0 else 0
-                ]
-                
+        for row, (s, ch_label) in enumerate(slots):
+            ax = fig.add_subplot(len(slots), 1, row + 1)
+            for group_idx, group_name in enumerate(group_names):
+                pair = self._outback_values(self._series_members(group_name), s)
+                means = [np.nanmean(v) if v else np.nan for v in pair]
+                sems = [np.nanstd(v) / np.sqrt(len(v)) if v else 0 for v in pair]
                 offset = width * (group_idx - len(group_names)/2 + 0.5)
-                
-                # Plot individual subject points with jitter
+                # Individual subject points with jitter
                 jitter = 0.03
-                for i, values in enumerate([gdata['out_g0'], gdata['back_g0']]):
-                    if values:
-                        jittered_x = x[i] + offset + np.random.uniform(-jitter, jitter, len(values))
-                        ax.scatter(jittered_x, values, alpha=0.5, s=25, color=colors[group_idx], 
-                                  edgecolors='white', linewidths=0.5, zorder=2)
-                
-                # Plot bars
+                for i, vals in enumerate(pair):
+                    if vals:
+                        jittered_x = x[i] + offset + np.random.uniform(-jitter, jitter, len(vals))
+                        ax.scatter(jittered_x, vals, alpha=0.5, s=25, color=colors[group_idx],
+                                   edgecolors='white', linewidths=0.5, zorder=2)
                 ax.bar(x + offset, means, width, yerr=sems, label=group_name,
-                      alpha=0.7, capsize=4, color=colors[group_idx], zorder=3)
-            
+                       alpha=0.7, capsize=4, color=colors[group_idx], zorder=3)
             ax.set_xlabel('Movement Direction', fontsize=11)
             ax.set_ylabel('Average Z-score', fontsize=11)
-            ax.set_title('G0 Channel', fontsize=12, fontweight='bold')
+            ax.set_title(f'{ch_label} Channel', fontsize=12, fontweight='bold')
             ax.set_xticks(x)
             ax.set_xticklabels(categories)
             ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3, axis='y')
-        
-        # G1 plot
-        if show_g1:
-            ax = fig.add_subplot(2, 1, plot_idx)
-            
-            categories = ['Out (→ Distal)', 'Back (→ Center)']
-            x = np.arange(len(categories))
-            width = 0.8 / len(group_names)
-            colors = plt.cm.Set2(np.linspace(0, 1, len(group_names)))
-            
-            for group_idx, (group_name, gdata) in enumerate(group_data.items()):
-                means = [
-                    np.nanmean(gdata['out_g1']) if gdata['out_g1'] else np.nan,
-                    np.nanmean(gdata['back_g1']) if gdata['back_g1'] else np.nan
-                ]
-                sems = [
-                    np.nanstd(gdata['out_g1']) / np.sqrt(len(gdata['out_g1'])) if len(gdata['out_g1']) > 0 else 0,
-                    np.nanstd(gdata['back_g1']) / np.sqrt(len(gdata['back_g1'])) if len(gdata['back_g1']) > 0 else 0
-                ]
-                
-                offset = width * (group_idx - len(group_names)/2 + 0.5)
-                
-                # Plot individual subject points with jitter
-                jitter = 0.03
-                for i, values in enumerate([gdata['out_g1'], gdata['back_g1']]):
-                    if values:
-                        jittered_x = x[i] + offset + np.random.uniform(-jitter, jitter, len(values))
-                        ax.scatter(jittered_x, values, alpha=0.5, s=25, color=colors[group_idx], 
-                                  edgecolors='white', linewidths=0.5, zorder=2)
-                
-                # Plot bars
-                ax.bar(x + offset, means, width, yerr=sems, label=group_name,
-                      alpha=0.7, capsize=4, color=colors[group_idx], zorder=3)
-            
-            ax.set_xlabel('Movement Direction', fontsize=11)
-            ax.set_ylabel('Average Z-score', fontsize=11)
-            ax.set_title('G1 Channel', fontsize=12, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels(categories)
-            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3, axis='y')
-        
-        fig.suptitle('Group Comparison - Out/Back Movements in Open Arms', 
-                    fontsize=14, fontweight='bold', y=0.98)
+
+        fig.suptitle('Group Comparison - Out/Back Movements in Open Arms',
+                     fontsize=14, fontweight='bold', y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.96])
-    
+
     def _bout_order_by_number(self):
         """True when bout rows/columns should be blocked by bout ordinal.
 
@@ -38979,13 +37966,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return rows, ytick_positions, ytick_labels, group_row_counts
 
     def plot_extracted_bouts_by_group(self, fig, group_names):
-        """Plot extracted bouts by group with traces and individual subject heatmaps"""
+        """Plot extracted bouts by group: per channel, group traces and a subject heatmap"""
         behavior = self.behavior_var.get()
         if not behavior:
             fig.text(0.5, 0.5, 'Please select a behavior',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         fps = self.get_fps()
         prebout = self.params['preboutframes']
         average_within_subject = self.viz_average_within_subject.get()
@@ -38993,39 +37980,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # within subject collapses the ordinal away, so it wins over the choice.
         rows_by_number = self._bout_order_by_number() and not average_within_subject
         heat_order_note = ', by bout number' if rows_by_number else ''
+        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
 
-        # Resolve the two plot slots from the channel checkboxes so the selected
-        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
-        # 'G0'/'G1' below are internal slot identifiers only; key_a/key_b are the
-        # real stored-bout keys and label_a/label_b the channel designations.
-        _slot_subjects = []
-        for _g in group_names:
-            _slot_subjects.extend(self._series_members(_g))
-        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(_slot_subjects, max_slots=2)
+        # Every ticked channel: key is the stored-bout key (Ch{n}), label the
+        # channel designation.  Exclusions resolve per subject by slot.
+        all_subjects = [s for g in group_names for s in self._series_members(g)]
+        slot_defs = self._viz_bout_channel_slots(all_subjects, max_slots=None)
 
-        # Collect bouts per group AND track subjects for heatmap
-        group_bouts = {}  # {group_name: {'G0': [bouts], 'G1': [bouts]}}
-        subject_order = []  # List of (group_name, subject) tuples for heatmap ordering
-        subject_bouts = {}  # {(group_name, subject, channel): averaged_bout_array}
-        subject_bout_rows = {}  # {(group_name, subject, channel): [individual bout arrays]}
-        
+        group_bouts = {g: {key: [] for key, _l in slot_defs} for g in group_names}
+        subject_order = []      # (group_name, subject) tuples for heatmap ordering
+        subject_bouts = {}      # {(group_name, subject, key): averaged bout}
+        subject_bout_rows = {}  # {(group_name, subject, key): [individual bouts]}
+
         for group_name in group_names:
-            group_bouts[group_name] = {'G0': [], 'G1': []}
-            subjects = self._series_members(group_name)
-            
-            # Apply exclusions if enabled - need to check both channels
-            subjects_for_g0 = subjects
-            subjects_for_g1 = subjects
-            if self.use_exclusions_viz.get():
-                subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
-                subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
-            
-            # We'll process all subjects and track which channels are valid
-            for subject in subjects:
+            for subject in self._series_members(group_name):
                 if subject not in self.processed_data:
                     continue
                 data = self.processed_data[subject]
-                
+
                 # If bouts are missing, try extracting if boutframes file exists
                 if 'bouts' not in data or behavior not in data.get('bouts', {}):
                     boutframes_file = self.boutframes_path_var.get()
@@ -39036,508 +38008,211 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 data.setdefault('bouts', {}).update(extracted)
                         except Exception:
                             pass
-                
+
                 if 'bouts' not in data or behavior not in data['bouts']:
                     continue
-                
                 bout_data = data['bouts'][behavior]
-                
-                # Check if subject is excluded for each channel
-                subject_has_g0 = subject in subjects_for_g0
-                subject_has_g1 = subject in subjects_for_g1
-                
-                # Process slot-A bouts for this subject (only if not excluded)
-                if subject_has_g0 and key_a is not None and bout_data.get(key_a):
+
+                for key, _label in slot_defs:
+                    slot = self.channel_slot_index(key)
+                    if not self._slot_included(subject, slot, data) or not bout_data.get(key):
+                        continue
                     # Realign to current window so groups built from subjects with
                     # different pre/post still share a common onset.
-                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    subject_g0_bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
+                    bouts = self._entry_channel_bouts(bout_data, key, max_bouts)
+                    if not bouts:
+                        continue
+                    max_len = max(len(b) for b in bouts)
+                    bout_matrix = np.full((len(bouts), max_len), np.nan)
+                    for i, bout in enumerate(bouts):
+                        bout_matrix[i, :len(bout)] = bout
+                    # Average within subject for the trace
+                    subject_avg = np.nanmean(bout_matrix, axis=0)
+                    group_bouts[group_name][key].append(subject_avg)
+                    # Store for heatmap: subject average (when averaging
+                    # within subject) and all individual bouts (when not)
+                    subject_bouts[(group_name, subject, key)] = subject_avg
+                    subject_bout_rows[(group_name, subject, key)] = list(bouts)
+                    if (group_name, subject) not in subject_order:
+                        subject_order.append((group_name, subject))
 
-                    if len(subject_g0_bouts) > 0:
-                        max_len = max(len(b) for b in subject_g0_bouts)
-                        bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
-                        for i, bout in enumerate(subject_g0_bouts):
-                            bout_matrix[i, :len(bout)] = bout
-
-                        # Average within subject for the trace
-                        subject_avg = np.nanmean(bout_matrix, axis=0)
-                        group_bouts[group_name]['G0'].append(subject_avg)
-                        
-                        # Store for heatmap: subject average (when averaging
-                        # within subject) and all individual bouts (when not)
-                        subject_bouts[(group_name, subject, 'G0')] = subject_avg
-                        subject_bout_rows[(group_name, subject, 'G0')] = list(subject_g0_bouts)
-                        if (group_name, subject) not in subject_order:
-                            subject_order.append((group_name, subject))
-                
-                # Process slot-B bouts for this subject (only if not excluded)
-                if subject_has_g1 and key_b is not None and bout_data.get(key_b):
-                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    subject_g1_bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
-
-                    if len(subject_g1_bouts) > 0:
-                        max_len = max(len(b) for b in subject_g1_bouts)
-                        bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
-                        for i, bout in enumerate(subject_g1_bouts):
-                            bout_matrix[i, :len(bout)] = bout
-
-                        # Average within subject for the trace
-                        subject_avg = np.nanmean(bout_matrix, axis=0)
-                        group_bouts[group_name]['G1'].append(subject_avg)
-                        
-                        # Store for heatmap: subject average (when averaging
-                        # within subject) and all individual bouts (when not)
-                        subject_bouts[(group_name, subject, 'G1')] = subject_avg
-                        subject_bout_rows[(group_name, subject, 'G1')] = list(subject_g1_bouts)
-                        if (group_name, subject) not in subject_order:
-                            subject_order.append((group_name, subject))
-        
-        # Check if any data
-        has_g0_data = any(len(group_bouts[g]['G0']) > 0 for g in group_names)
-        has_g1_data = any(len(group_bouts[g]['G1']) > 0 for g in group_names)
-        
-        if not has_g0_data and not has_g1_data:
+        panels = [(key, label) for key, label in slot_defs
+                  if any(group_bouts[g][key] for g in group_names)]
+        if not panels:
             fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
                     ha='center', va='center', fontsize=14)
             return
-        
-        # Define colors for groups
+
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-        
-        # Determine layout: 2x2 grid (trace + heatmap for each channel)
-        # Row 1: G0 trace | G0 heatmap
-        # Row 2: G1 trace | G1 heatmap
-        if has_g0_data and has_g1_data:
-            ax1_trace = fig.add_subplot(2, 2, 1)
-            ax1_heat = fig.add_subplot(2, 2, 2)
-            ax2_trace = fig.add_subplot(2, 2, 3)
-            ax2_heat = fig.add_subplot(2, 2, 4)
-        elif has_g0_data:
-            # Only G0 has data - use top row
-            ax1_trace = fig.add_subplot(1, 2, 1)
-            ax1_heat = fig.add_subplot(1, 2, 2)
-            ax2_trace = None
-            ax2_heat = None
-        elif has_g1_data:
-            # Only G1 has data - use top row
-            ax1_trace = None
-            ax1_heat = None
-            ax2_trace = fig.add_subplot(1, 2, 1)
-            ax2_heat = fig.add_subplot(1, 2, 2)
-        else:
-            return
-        
-        # Get heatmap colormap and range
         cmap = self.get_heatmap_colormap()
         vmin, vmax = self.get_heatmap_range()
-        
-        # Plot G0 trace and heatmap
-        if has_g0_data and ax1_trace is not None:
-            # Plot group mean traces
+        n_rows = len(panels)
+
+        # One row per channel: trace | heatmap
+        for row, (key, label) in enumerate(panels):
+            ax_trace = fig.add_subplot(n_rows, 2, row * 2 + 1)
+            ax_heat = fig.add_subplot(n_rows, 2, row * 2 + 2)
+
+            # Group mean traces
             for idx, group_name in enumerate(group_names):
-                bouts = group_bouts[group_name]['G0']
+                bouts = group_bouts[group_name][key]
                 if not bouts:
                     continue
-                    
                 max_len = max(len(b) for b in bouts)
                 time_axis = (np.arange(max_len) - prebout) / fps
-                
-                # Calculate mean ± SEM
                 bout_matrix = np.full((len(bouts), max_len), np.nan)
                 for i, bout in enumerate(bouts):
                     bout_matrix[i, :len(bout)] = bout
-                
                 mean_trace = np.nanmean(bout_matrix, axis=0)
                 sem_trace = np.nanstd(bout_matrix, axis=0) / np.sqrt(np.sum(~np.isnan(bout_matrix), axis=0))
-                
                 color = colors[idx % len(colors)]
-                n_label = f"n={len(bouts)} subjects"
-                ax1_trace.plot(time_axis, mean_trace, color=color, linewidth=2, label=f'{group_name} ({n_label})')
-                ax1_trace.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                               alpha=0.2, color=color)
-            
-            self.draw_zero_line(ax1_trace, label='Bout Onset')
-            ax1_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax1_trace.set_xlabel('Time from bout onset (s)')
-            ax1_trace.set_ylabel(f'{label_a} Z-score')
-            ax1_trace.set_title(f'{label_a}: {behavior} by Group')
-            ax1_trace.legend(loc='best', fontsize=8)
-            ax1_trace.grid(True, alpha=0.3)
-            
-            # Plot G0 heatmap (individual subjects ordered by group). When
-            # "average within subject" is off, every bout is its own row.
-            if ax1_heat is not None and subject_order:
-                (heatmap_data, ytick_positions, ytick_labels,
-                 group_row_counts) = self._build_group_heatmap_rows(
-                    'G0', group_names, subject_order, subject_bouts,
-                    subject_bout_rows, average_within_subject)
+                ax_trace.plot(time_axis, mean_trace, color=color, linewidth=2,
+                              label=f'{group_name} (n={len(bouts)} subjects)')
+                ax_trace.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
+                                      alpha=0.2, color=color)
+            self.draw_zero_line(ax_trace, label='Bout Onset')
+            ax_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+            ax_trace.set_xlabel('Time from bout onset (s)')
+            ax_trace.set_ylabel(f'{label} Z-score')
+            ax_trace.set_title(f'{label}: {behavior} by Group')
+            ax_trace.legend(loc='best', fontsize=8)
+            ax_trace.grid(True, alpha=0.3)
 
-                if heatmap_data:
-                    # Pad all to same length
-                    max_len = max(len(b) for b in heatmap_data)
-                    heatmap_matrix = np.full((len(heatmap_data), max_len), np.nan)
-                    for i, bout in enumerate(heatmap_data):
-                        heatmap_matrix[i, :len(bout)] = bout
+            # Heatmap (individual subjects ordered by group). When "average
+            # within subject" is off, every bout is its own row.
+            if not subject_order:
+                continue
+            (heatmap_data, ytick_positions, ytick_labels,
+             group_row_counts) = self._build_group_heatmap_rows(
+                key, group_names, subject_order, subject_bouts,
+                subject_bout_rows, average_within_subject)
+            if not heatmap_data:
+                continue
+            max_len = max(len(b) for b in heatmap_data)
+            heatmap_matrix = np.full((len(heatmap_data), max_len), np.nan)
+            for i, bout in enumerate(heatmap_data):
+                heatmap_matrix[i, :len(bout)] = bout
+            time_axis = (np.arange(max_len) - prebout) / fps
+            im = ax_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
+                                extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
+                                vmin=vmin, vmax=vmax, interpolation='nearest')
+            self.draw_zero_line(ax_heat)
+            ax_heat.set_xlabel('Time from bout onset (s)')
+            ax_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
+                               else 'Subject (by group)')
+            ax_heat.set_title(f'{label} Heatmap' if average_within_subject
+                              else f'{label} Heatmap (All Bouts{heat_order_note})')
+            ax_heat.set_yticks(ytick_positions)
+            ax_heat.set_yticklabels(ytick_labels, fontsize=7)
+            # Divide the row blocks -- one block per group, or per bout
+            # ordinal when the rows are ordered by bout number.
+            current_row = 0
+            for group_count in group_row_counts:
+                if group_count > 0:
+                    current_row += group_count
+                    if current_row < len(heatmap_data):
+                        ax_heat.axhline(current_row, color='white', linestyle='-', linewidth=2)
+            plt.colorbar(im, ax=ax_heat, label='Z-score')
 
-                    time_axis = (np.arange(max_len) - prebout) / fps
-                    im = ax1_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
-                                        extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
-                                        vmin=vmin, vmax=vmax, interpolation='nearest')
-                    self.draw_zero_line(ax1_heat)
-                    ax1_heat.set_xlabel('Time from bout onset (s)')
-                    ax1_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
-                                       else 'Subject (by group)')
-                    ax1_heat.set_title(f'{label_a} Heatmap' if average_within_subject
-                                       else f'{label_a} Heatmap (All Bouts{heat_order_note})')
-                    ax1_heat.set_yticks(ytick_positions)
-                    ax1_heat.set_yticklabels(ytick_labels, fontsize=7)
-
-                    # Divide the row blocks -- one block per group, or per bout
-                    # ordinal when the rows are ordered by bout number.
-                    current_row = 0
-                    for group_count in group_row_counts:
-                        if group_count > 0:
-                            current_row += group_count
-                            if current_row < len(heatmap_data):
-                                ax1_heat.axhline(current_row, color='white', linestyle='-', linewidth=2)
-
-                    plt.colorbar(im, ax=ax1_heat, label='Z-score')
-        
-        # Plot G1 trace and heatmap
-        if has_g1_data and ax2_trace is not None:
-            # Plot group mean traces
-            for idx, group_name in enumerate(group_names):
-                bouts = group_bouts[group_name]['G1']
-                if not bouts:
-                    continue
-                    
-                max_len = max(len(b) for b in bouts)
-                time_axis = (np.arange(max_len) - prebout) / fps
-                
-                # Calculate mean ± SEM
-                bout_matrix = np.full((len(bouts), max_len), np.nan)
-                for i, bout in enumerate(bouts):
-                    bout_matrix[i, :len(bout)] = bout
-                
-                mean_trace = np.nanmean(bout_matrix, axis=0)
-                sem_trace = np.nanstd(bout_matrix, axis=0) / np.sqrt(np.sum(~np.isnan(bout_matrix), axis=0))
-                
-                color = colors[idx % len(colors)]
-                n_label = f"n={len(bouts)} subjects"
-                ax2_trace.plot(time_axis, mean_trace, color=color, linewidth=2, label=f'{group_name} ({n_label})')
-                ax2_trace.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                               alpha=0.2, color=color)
-            
-            self.draw_zero_line(ax2_trace, label='Bout Onset')
-            ax2_trace.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax2_trace.set_xlabel('Time from bout onset (s)')
-            ax2_trace.set_ylabel(f'{label_b} Z-score')
-            ax2_trace.set_title(f'{label_b}: {behavior} by Group')
-            ax2_trace.legend(loc='best', fontsize=8)
-            ax2_trace.grid(True, alpha=0.3)
-            
-            # Plot G1 heatmap (individual subjects ordered by group). When
-            # "average within subject" is off, every bout is its own row.
-            if ax2_heat is not None and subject_order:
-                (heatmap_data, ytick_positions, ytick_labels,
-                 group_row_counts) = self._build_group_heatmap_rows(
-                    'G1', group_names, subject_order, subject_bouts,
-                    subject_bout_rows, average_within_subject)
-
-                if heatmap_data:
-                    # Pad all to same length
-                    max_len = max(len(b) for b in heatmap_data)
-                    heatmap_matrix = np.full((len(heatmap_data), max_len), np.nan)
-                    for i, bout in enumerate(heatmap_data):
-                        heatmap_matrix[i, :len(bout)] = bout
-
-                    time_axis = (np.arange(max_len) - prebout) / fps
-                    im = ax2_heat.imshow(heatmap_matrix, aspect='auto', cmap=cmap,
-                                        extent=[time_axis[0], time_axis[-1], len(heatmap_data), 0],
-                                        vmin=vmin, vmax=vmax, interpolation='nearest')
-                    self.draw_zero_line(ax2_heat)
-                    ax2_heat.set_xlabel('Time from bout onset (s)')
-                    ax2_heat.set_ylabel('Bout number (all subjects)' if rows_by_number
-                                       else 'Subject (by group)')
-                    ax2_heat.set_title(f'{label_b} Heatmap' if average_within_subject
-                                       else f'{label_b} Heatmap (All Bouts{heat_order_note})')
-                    ax2_heat.set_yticks(ytick_positions)
-                    ax2_heat.set_yticklabels(ytick_labels, fontsize=7)
-
-                    # Divide the row blocks -- one block per group, or per bout
-                    # ordinal when the rows are ordered by bout number.
-                    current_row = 0
-                    for group_count in group_row_counts:
-                        if group_count > 0:
-                            current_row += group_count
-                            if current_row < len(heatmap_data):
-                                ax2_heat.axhline(current_row, color='white', linestyle='-', linewidth=2)
-
-                    plt.colorbar(im, ax=ax2_heat, label='Z-score')
-        
         fig.tight_layout()
-    
+
     def plot_extracted_bouts_multi(self, fig, subjects):
-        """Plot extracted bouts for multiple subjects (average comparison with heatmaps)"""
+        """Plot extracted bouts for multiple subjects: per channel, traces and a heatmap"""
         behavior = self.behavior_var.get()
         if not behavior:
             fig.text(0.5, 0.5, 'Please select a behavior',
                     ha='center', va='center', fontsize=14)
             return
-        
+
         average_within_subject = self.viz_average_within_subject.get()
-
-        # Resolve the two plot slots from the channel checkboxes so the selected
-        # channels (e.g. R4/R5 at 570 nm) are plotted instead of always G0/G1.
-        (key_a, label_a), (key_b, label_b) = self._viz_bout_channel_slots(subjects, max_slots=2)
-
-        # Apply exclusions if enabled - need to check both channels
-        subjects_for_g0 = subjects
-        subjects_for_g1 = subjects
-        if self.use_exclusions_viz.get():
-            subjects_for_g0 = self.included_subjects_for_slot_key(subjects, key_a)
-            subjects_for_g1 = self.included_subjects_for_slot_key(subjects, key_b)
-
-        # Collect bouts from all subjects. The ordinal lists stay parallel to
-        # the bout lists so the rows can be re-blocked by bout number below.
-        all_g0_bouts = []
-        all_g1_bouts = []
-        g0_ordinals = []
-        g1_ordinals = []
-        subject_labels = []
-        
-        for subject in subjects:
-            data = self.processed_data[subject]
-            if 'bouts' in data and behavior in data['bouts']:
-                bout_data = data['bouts'][behavior]
-                
-                # Check if subject is excluded for each channel
-                subject_has_g0 = subject in subjects_for_g0
-                subject_has_g1 = subject in subjects_for_g1
-                
-                if average_within_subject:
-                    # Average G0 bouts for this subject (only if not excluded).
-                    # Use .get(): a subject recorded on a single channel may not
-                    # have a 'G0'/'G1' key at all, and a bracket access would
-                    # raise KeyError and abort the whole multi-subject plot.
-                    if subject_has_g0 and key_a is not None and bout_data.get(key_a):
-                        # Realign to current window so subjects extracted with a
-                        # different pre/post still average against a common onset.
-                        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        subject_g0_bouts = self._entry_channel_bouts(bout_data, key_a, max_bouts)
-
-                        max_len = max(len(b) for b in subject_g0_bouts)
-                        bout_matrix = np.full((len(subject_g0_bouts), max_len), np.nan)
-                        for i, bout in enumerate(subject_g0_bouts):
-                            bout_matrix[i, :len(bout)] = bout
-                        subject_avg = np.nanmean(bout_matrix, axis=0)
-                        all_g0_bouts.append(subject_avg)
-                    
-                    # Average G1 bouts for this subject (only if not excluded)
-                    if subject_has_g1 and key_b is not None and bout_data.get(key_b):
-                        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                        subject_g1_bouts = self._entry_channel_bouts(bout_data, key_b, max_bouts)
-
-                        max_len = max(len(b) for b in subject_g1_bouts)
-                        bout_matrix = np.full((len(subject_g1_bouts), max_len), np.nan)
-                        for i, bout in enumerate(subject_g1_bouts):
-                            bout_matrix[i, :len(bout)] = bout
-                        subject_avg = np.nanmean(bout_matrix, axis=0)
-                        all_g1_bouts.append(subject_avg)
-                else:
-                    # Use all bouts (original behavior), realigned to current window
-                    max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
-                    bouts_g0 = (self._entry_channel_bouts(bout_data, key_a, max_bouts)
-                                if subject_has_g0 and key_a is not None else [])
-                    bouts_g1 = (self._entry_channel_bouts(bout_data, key_b, max_bouts)
-                                if subject_has_g1 and key_b is not None else [])
-
-                    if bouts_g0:
-                        all_g0_bouts.extend(bouts_g0)
-                        g0_ordinals.extend(range(1, len(bouts_g0) + 1))
-                    if bouts_g1:
-                        all_g1_bouts.extend(bouts_g1)
-                        g1_ordinals.extend(range(1, len(bouts_g1) + 1))
-                
-                subject_labels.append(subject)
-        
-        if not all_g0_bouts and not all_g1_bouts:
-            fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
-                    ha='center', va='center', fontsize=14)
-            return
-        
+        max_bouts = self._get_max_bouts_limit(self.viz_max_bouts_var.get())
         fps = self.get_fps()
         prebout = self.params['preboutframes']
-
         # Re-block the pooled rows by bout ordinal when asked, so bout 1 of every
         # subject sits together. Averaging within subject leaves one row per
         # subject and no ordinal, so it keeps the acquisition order.
         rows_by_number = self._bout_order_by_number() and not average_within_subject
-        g0_ticks = g0_tick_labels = g0_blocks = None
-        g1_ticks = g1_tick_labels = g1_blocks = None
-        if rows_by_number:
-            if all_g0_bouts:
-                (all_g0_bouts, g0_ticks, g0_tick_labels,
-                 g0_blocks) = self._bout_number_blocks(list(zip(g0_ordinals, all_g0_bouts)))
-            if all_g1_bouts:
-                (all_g1_bouts, g1_ticks, g1_tick_labels,
-                 g1_blocks) = self._bout_number_blocks(list(zip(g1_ordinals, all_g1_bouts)))
 
-        # Determine layout based on what data exists
-        if all_g0_bouts and all_g1_bouts:
-            # Both channels have data - use 2x2 grid: G0 traces, G1 traces, G0 heatmap, G1 heatmap
-            trace_subplot_g0 = 221
-            trace_subplot_g1 = 222
-            heatmap_subplot_g0 = 223
-            heatmap_subplot_g1 = 224
-        elif all_g0_bouts:
-            # Only G0 has data - use 1x2 grid: traces and heatmap
-            trace_subplot_g0 = 121
-            heatmap_subplot_g0 = 122
-        elif all_g1_bouts:
-            # Only G1 has data - use 1x2 grid: traces and heatmap
-            trace_subplot_g1 = 121
-            heatmap_subplot_g1 = 122
-        else:
-            # No data (already checked above, but just in case)
+        def entry_for(subject):
+            return (self.processed_data.get(subject, {}).get('bouts') or {}).get(behavior)
+
+        # Every ticked channel (e.g. G0-G4, or R4/R5 at 570 nm), pooled across
+        # subjects; realigned to the current window by _pooled_slot_bouts.
+        rows = []
+        for key, label in self._viz_bout_channel_slots(subjects, max_slots=None):
+            bouts, ordinals = self._pooled_slot_bouts(
+                subjects, entry_for, self.channel_slot_index(key),
+                average_within_subject, max_bouts)
+            if not bouts:
+                continue
+            blocks = (None, None, None)
+            if rows_by_number:
+                bouts, *blocks = self._bout_number_blocks(list(zip(ordinals, bouts)))
+            rows.append((self.channel_slot_index(key), label, bouts, blocks))
+
+        if not rows:
+            fig.text(0.5, 0.5, f'No bout data for behavior: {behavior}',
+                    ha='center', va='center', fontsize=14)
             return
-        
-        # Plot G0 traces and heatmap
-        if all_g0_bouts:
-            max_len = max(len(b) for b in all_g0_bouts)
+
+        if average_within_subject:
+            heatmap_ylabel = "Subject #"
+            heatmap_title_suffix = " (Averaged Within Subject)"
+        elif rows_by_number:
+            heatmap_ylabel = "Bout number (all subjects)"
+            heatmap_title_suffix = " (All Bouts, by bout number)"
+        else:
+            heatmap_ylabel = "Bout #"
+            heatmap_title_suffix = " (All Bouts)"
+        cmap = self.get_heatmap_colormap()
+        vmin, vmax = self.get_heatmap_range()
+        n_rows = len(rows)
+
+        # One row per channel: traces | heatmap
+        for row, (slot, label, bouts, (ticks, tick_labels, block_sizes)) in enumerate(rows):
+            color = self._slot_color(slot)
+            max_len = max(len(b) for b in bouts)
             time_axis = (np.arange(max_len) - prebout) / fps
-            
-            # Plot traces
-            ax1 = fig.add_subplot(trace_subplot_g0)
-            
+            matrix = np.full((len(bouts), max_len), np.nan)
+            for i, bout in enumerate(bouts):
+                matrix[i, :len(bout)] = bout
+
+            ax = fig.add_subplot(n_rows, 2, row * 2 + 1)
             if average_within_subject:
                 # When averaging: show only mean ± SEM
-                bout_matrix = np.full((len(all_g0_bouts), max_len), np.nan)
-                for i, bout in enumerate(all_g0_bouts):
-                    bout_matrix[i, :len(bout)] = bout
-                
-                mean_trace = np.nanmean(bout_matrix, axis=0)
-                sem_trace = np.nanstd(bout_matrix, axis=0) / np.sqrt(np.sum(~np.isnan(bout_matrix), axis=0))
-                
-                ax1.plot(time_axis, mean_trace, 'b-', linewidth=2, label='Mean')
-                ax1.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                               alpha=0.3, color='b', label='SEM')
+                mean_trace = np.nanmean(matrix, axis=0)
+                sem_trace = np.nanstd(matrix, axis=0) / np.sqrt(np.sum(~np.isnan(matrix), axis=0))
+                ax.plot(time_axis, mean_trace, '-', color=color, linewidth=2, label='Mean')
+                ax.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
+                                alpha=0.3, color=color, label='SEM')
             else:
                 # When not averaging: show all individual bouts as distinct traces
-                for bout in all_g0_bouts:
-                    padded = np.full(max_len, np.nan)
-                    padded[:len(bout)] = bout
-                    ax1.plot(time_axis, padded, color='b', alpha=0.4, linewidth=0.8)
-            
-            self.draw_zero_line(ax1, label='Bout Onset')
-            ax1.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax1.set_xlabel('Time from bout onset (s)')
-            ax1.set_ylabel(f'{label_a} Z-score')
-            n_label = f"n={len(all_g0_bouts)} subjects" if average_within_subject else f"n={len(all_g0_bouts)} bouts"
+                for trace in matrix:
+                    ax.plot(time_axis, trace, color=color, alpha=0.4, linewidth=0.8)
+            self.draw_zero_line(ax, label='Bout Onset')
+            ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+            ax.set_xlabel('Time from bout onset (s)')
+            ax.set_ylabel(f'{label} Z-score')
+            n_label = f"n={len(bouts)} subjects" if average_within_subject else f"n={len(bouts)} bouts"
             title_suffix = " (averaged within subject)" if average_within_subject else ""
-            ax1.set_title(f'{label_a}: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
+            ax.set_title(f'{label}: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
             if average_within_subject:
-                ax1.legend(loc='best', fontsize=8)
-            ax1.grid(True, alpha=0.3)
-            
-            # Plot heatmap
-            ax3 = fig.add_subplot(heatmap_subplot_g0)
-            heatmap_data = np.full((len(all_g0_bouts), max_len), np.nan)
-            for i, bout in enumerate(all_g0_bouts):
-                heatmap_data[i, :len(bout)] = bout
-            
-            if average_within_subject:
-                heatmap_ylabel = "Subject #"
-                heatmap_title_suffix = " (Averaged Within Subject)"
-            elif rows_by_number:
-                heatmap_ylabel = "Bout number (all subjects)"
-                heatmap_title_suffix = " (All Bouts, by bout number)"
-            else:
-                heatmap_ylabel = "Bout #"
-                heatmap_title_suffix = " (All Bouts)"
-            
-            cmap = self.get_heatmap_colormap()
-            vmin, vmax = self.get_heatmap_range()
-            im = ax3.imshow(heatmap_data, aspect='auto', cmap=cmap, 
-                          extent=[time_axis[0], time_axis[-1], len(all_g0_bouts), 0],
-                          vmin=vmin, vmax=vmax, interpolation='nearest')
-            self.draw_zero_line(ax3)
-            ax3.set_xlabel('Time from bout onset (s)')
-            ax3.set_ylabel(heatmap_ylabel)
-            ax3.set_title(f'{label_a} Heatmap{heatmap_title_suffix}')
-            self._label_bout_number_blocks(ax3, g0_ticks, g0_tick_labels, g0_blocks,
-                                           len(all_g0_bouts))
-            plt.colorbar(im, ax=ax3, label='Z-score')
-        
-        # Plot G1 traces and heatmap
-        if all_g1_bouts:
-            max_len = max(len(b) for b in all_g1_bouts)
-            time_axis = (np.arange(max_len) - prebout) / fps
-            
-            # Plot traces
-            ax2 = fig.add_subplot(trace_subplot_g1)
-            
-            if average_within_subject:
-                # When averaging: show only mean ± SEM
-                bout_matrix = np.full((len(all_g1_bouts), max_len), np.nan)
-                for i, bout in enumerate(all_g1_bouts):
-                    bout_matrix[i, :len(bout)] = bout
-                
-                mean_trace = np.nanmean(bout_matrix, axis=0)
-                sem_trace = np.nanstd(bout_matrix, axis=0) / np.sqrt(np.sum(~np.isnan(bout_matrix), axis=0))
-                
-                ax2.plot(time_axis, mean_trace, 'g-', linewidth=2, label='Mean')
-                ax2.fill_between(time_axis, mean_trace - sem_trace, mean_trace + sem_trace,
-                               alpha=0.3, color='g', label='SEM')
-            else:
-                # When not averaging: show all individual bouts as distinct traces
-                for bout in all_g1_bouts:
-                    padded = np.full(max_len, np.nan)
-                    padded[:len(bout)] = bout
-                    ax2.plot(time_axis, padded, color='g', alpha=0.4, linewidth=0.8)
-            
-            self.draw_zero_line(ax2, label='Bout Onset')
-            ax2.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
-            ax2.set_xlabel('Time from bout onset (s)')
-            ax2.set_ylabel(f'{label_b} Z-score')
-            n_label = f"n={len(all_g1_bouts)} subjects" if average_within_subject else f"n={len(all_g1_bouts)} bouts"
-            title_suffix = " (averaged within subject)" if average_within_subject else ""
-            ax2.set_title(f'{label_b}: {behavior} ({n_label}, {len(subjects)} subjects){title_suffix}')
-            if average_within_subject:
-                ax2.legend(loc='best', fontsize=8)
-            ax2.grid(True, alpha=0.3)
-            
-            # Plot heatmap
-            ax4 = fig.add_subplot(heatmap_subplot_g1)
-            heatmap_data = np.full((len(all_g1_bouts), max_len), np.nan)
-            for i, bout in enumerate(all_g1_bouts):
-                heatmap_data[i, :len(bout)] = bout
-            
-            if average_within_subject:
-                heatmap_ylabel = "Subject #"
-                heatmap_title_suffix = " (Averaged Within Subject)"
-            elif rows_by_number:
-                heatmap_ylabel = "Bout number (all subjects)"
-                heatmap_title_suffix = " (All Bouts, by bout number)"
-            else:
-                heatmap_ylabel = "Bout #"
-                heatmap_title_suffix = " (All Bouts)"
-            
-            cmap = self.get_heatmap_colormap()
-            vmin, vmax = self.get_heatmap_range()
-            im = ax4.imshow(heatmap_data, aspect='auto', cmap=cmap,
-                          extent=[time_axis[0], time_axis[-1], len(all_g1_bouts), 0],
-                          vmin=vmin, vmax=vmax, interpolation='nearest')
-            self.draw_zero_line(ax4)
-            ax4.set_xlabel('Time from bout onset (s)')
-            ax4.set_ylabel(heatmap_ylabel)
-            ax4.set_title(f'{label_b} Heatmap{heatmap_title_suffix}')
-            self._label_bout_number_blocks(ax4, g1_ticks, g1_tick_labels, g1_blocks,
-                                           len(all_g1_bouts))
-            plt.colorbar(im, ax=ax4, label='Z-score')
-        
+                ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            ax_heat = fig.add_subplot(n_rows, 2, row * 2 + 2)
+            im = ax_heat.imshow(matrix, aspect='auto', cmap=cmap,
+                                extent=[time_axis[0], time_axis[-1], len(bouts), 0],
+                                vmin=vmin, vmax=vmax, interpolation='nearest')
+            self.draw_zero_line(ax_heat)
+            ax_heat.set_xlabel('Time from bout onset (s)')
+            ax_heat.set_ylabel(heatmap_ylabel)
+            ax_heat.set_title(f'{label} Heatmap{heatmap_title_suffix}')
+            self._label_bout_number_blocks(ax_heat, ticks, tick_labels, block_sizes, len(bouts))
+            plt.colorbar(im, ax=ax_heat, label='Z-score')
+
         fig.tight_layout()
-    
+
     # ── Compare Across Bouts: traces binned by bout ordinal ──────────────
     # These plots used to draw every individual bout as its own line, so a
     # cohort with a dozen bouts per subject came out as an unreadable pile.
@@ -39726,11 +38401,42 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                          fontsize=10)
             ax.grid(True, alpha=0.3)
             handles, _ = ax.get_legend_handles_labels()
-            if handles:
+            if len(handles) > self.BOUT_BIN_LEGEND_MAX:
+                self._bout_bin_key(fig, ax, series, all_bins, bin_size, line_styles)
+            elif handles:
                 ax.legend(loc='best', fontsize=7,
                           ncol=2 if len(handles) > 6 else 1,
                           title='Bout bin' if len(series) == 1 else None)
         fig.tight_layout()
+
+    # Past this many bins a per-bin legend outgrows its panel, so the bins are
+    # keyed by a colour bar instead.
+    BOUT_BIN_LEGEND_MAX = 12
+
+    def _bout_bin_key(self, fig, ax, series, all_bins, bin_size, line_styles):
+        """Colour-bar key for many bout bins, plus one legend entry per series."""
+        n_bins = len(all_bins)
+        if len(series) == 1 and series[0][1] is None:
+            cmap = plt.cm.viridis
+        else:
+            cmap = mcolors.LinearSegmentedColormap.from_list(
+                'bout_bin_shade', [self._bout_bin_shade('#808080', f)
+                                   for f in np.linspace(0, 1, 16)])
+        sm = plt.cm.ScalarMappable(cmap=cmap,
+                                   norm=mcolors.Normalize(0, max(n_bins - 1, 1)))
+        cbar = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.04)
+        ticks = sorted({int(round(t)) for t in np.linspace(0, n_bins - 1, min(n_bins, 5))})
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([self._bout_bin_label(all_bins[t], bin_size) for t in ticks],
+                            fontsize=7)
+        cbar.set_label('Bout bin', fontsize=8)
+        if len(series) > 1:
+            from matplotlib.lines import Line2D
+            proxies = [Line2D([], [], color=base or 'k',
+                              linestyle=line_styles[i % len(line_styles)])
+                       for i, (_, base, _) in enumerate(series)]
+            ax.legend(proxies, [label for label, _, _ in series],
+                      loc='best', fontsize=7)
 
     def _bout_comparison_subtitle(self, bin_size, selected_bout, n_subjects):
         """One-line description of what the panels show."""
@@ -39763,7 +38469,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      ha='center', va='center', fontsize=14)
             return
 
-        slot_defs = self._viz_bout_channel_slots([subject], max_slots=2)
+        slot_defs = self._viz_bout_channel_slots([subject], max_slots=None)
         bin_size = self._viz_bout_bin_size()
         selected_bout = self._viz_selected_bout_number()
         by_slot = self._bout_comparison_slot_subjects([subject], slot_defs)
@@ -39793,7 +38499,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      ha='center', va='center', fontsize=14)
             return
 
-        slot_defs = self._viz_bout_channel_slots(subjects, max_slots=2)
+        slot_defs = self._viz_bout_channel_slots(subjects, max_slots=None)
         bin_size = self._viz_bout_bin_size()
         selected_bout = self._viz_selected_bout_number()
         by_slot = self._bout_comparison_slot_subjects(subjects, slot_defs)
@@ -39827,7 +38533,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      ha='center', va='center', fontsize=14)
             return
 
-        slot_defs = self._viz_bout_channel_slots(all_subjects, max_slots=2)
+        slot_defs = self._viz_bout_channel_slots(all_subjects, max_slots=None)
         bin_size = self._viz_bout_bin_size()
         selected_bout = self._viz_selected_bout_number()
 
@@ -44800,9 +43506,10 @@ cat("OK\n")
         elif export_type == 'spike':
             metadata.update({
                 'Exclusions Applied': self.use_exclusions_spike.get(),
-                'G0 Included': self.spike_show_g0.get(),
-                'G1 Included': self.spike_show_g1.get(),
             })
+            # One entry per channel checkbox actually shown (G0..GN, R channels).
+            for ch, var in (getattr(self, 'spike_channel_vars', None) or {}).items():
+                metadata[f'{ch} Included'] = var.get()
             if self.use_exclusions_spike.get() and self.exclusions:
                 excluded_info = []
                 for subject, channels in self.exclusions.items():
@@ -48276,10 +46983,16 @@ cat("OK\n")
         average_ws       = self.bout_average_within_subject.get()
         apply_exclusions = self.use_exclusions_bout.get()
         max_bouts        = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
-        # Bout stores alias slots 0/1 as 'G0'/'G1', so these keys read the right
-        # traces on any cohort — but the exclusion lookup must go through the slot
-        # index, which resolves to each subject's own designation.
-        channels         = ['G0', 'G1']
+        # Every channel slot the selected subjects were recorded on.  Bouts are
+        # read through the positional Ch{n} key (present on every cohort); the
+        # sheets are named by the designation, and the exclusion lookup goes
+        # through the slot index, which resolves to each subject's own name.
+        n_slots = max([self._beh_channel_count(self.processed_data[s])
+                       for s in base_subjects if s in self.processed_data] or [2])
+        ref = next((self.processed_data[s] for s in base_subjects
+                    if s in self.processed_data), {})
+        channels = [(slot, f'Ch{slot}', self.get_channel_name(ref, slot))
+                    for slot in range(max(1, n_slots))]
 
         # ── Compute every combo up front (so we never write an empty file) ─
         used_names = set()
@@ -48300,7 +47013,7 @@ cat("OK\n")
         combo_summary = []   # (behavior, channel, n_rows, n_bouts)
 
         for behavior in behaviors:
-            for ch_slot, channel in enumerate(channels):
+            for ch_slot, store_key, channel in channels:
                 subs = base_subjects
                 if apply_exclusions:
                     subs = self.get_included_subjects_for_slot(base_subjects, ch_slot)
@@ -48308,7 +47021,7 @@ cat("OK\n")
                     continue
 
                 by_subject, rows, columns, total_bouts = self._compute_bout_metrics_for(
-                    behavior, channel, subs, subject_to_group,
+                    behavior, store_key, subs, subject_to_group,
                     window_start_sec, window_end_sec,
                     metric_specs, max_bouts, auc_mode)
                 if total_bouts == 0:
@@ -48338,6 +47051,8 @@ cat("OK\n")
                     df = pd.DataFrame(data_rows)
                 else:
                     df = pd.DataFrame(rows, columns=columns)
+                    if 'Channel' in df.columns:
+                        df['Channel'] = channel
 
                 to_write.append((_sheet_name(behavior, channel), df))
                 combo_summary.append((behavior, channel, df.shape[0], total_bouts))
@@ -48379,7 +47094,7 @@ cat("OK\n")
                     ('Scope',                    'All behaviors (current settings)'),
                     ('Behaviors Exported',       ', '.join(behaviors)),
                     ('Sheets Written',           len(to_write)),
-                    ('Channels',                 ', '.join(channels)),
+                    ('Channels',                 ', '.join(c for _s, _k, c in channels)),
                     ('Analysis Mode',            analysis_mode),
                     ('Selected Groups/Subjects', sel_label),
                     ('n Subjects Selected',      len(base_subjects)),
@@ -50315,8 +49030,13 @@ cat("OK\n")
         ch_row = ttk.Frame(settings)
         ch_row.pack(fill='x')
         ttk.Label(ch_row, text="Channel:").pack(side='left')
-        ttk.Combobox(ch_row, textvariable=self.dec_prob_channel_var,
-                     values=["G0", "G1"], state='readonly', width=8).pack(side='right')
+        # Listed afresh each time it opens, so every detected channel (G2+,
+        # red channels) is selectable rather than a fixed G0/G1 pair.
+        dec_combo = ttk.Combobox(ch_row, textvariable=self.dec_prob_channel_var,
+                                 values=["G0", "G1"], state='readonly', width=8)
+        dec_combo.configure(postcommand=lambda c=dec_combo: c.configure(
+            values=self._all_channel_names()))
+        dec_combo.pack(side='right')
 
         plot_type_frame = ttk.Frame(settings)
         plot_type_frame.pack(fill='x', pady=(self.ui_px(6), 0))

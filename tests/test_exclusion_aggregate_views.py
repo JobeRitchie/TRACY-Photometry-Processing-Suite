@@ -135,7 +135,7 @@ def test_outback_multi_filters_a_red_channel_cohort():
     fig = _Fig()
     app.plot_outback_multi(fig, ['S1', 'S2'])
 
-    assert fig.series(1, 'G0')[0] == pytest.approx(1.0)
+    assert fig.series(1, 'R4')[0] == pytest.approx(1.0)
 
 
 def test_outback_multi_filters_each_slot_independently():
