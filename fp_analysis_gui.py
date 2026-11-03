@@ -23132,7 +23132,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             computer_ts = beh_synced[:, 1]
             
             # Convert TTL to boutframes format
-            ttl_boutframes = self.convert_ttl_to_boutframes(ttl_file, computer_ts)
+            fp_clock_offset_ms = None
+            if has_computer_ts:
+                try:
+                    _sys = fp_raw[:, 1].astype(float)
+                    _cmp = fp_raw[:, computer_ts_col].astype(float)
+                    _ok = np.isfinite(_sys) & np.isfinite(_cmp)
+                    if _ok.any():
+                        fp_clock_offset_ms = float(np.median(_cmp[_ok] - _sys[_ok] * 1000.0))
+                except (TypeError, ValueError, IndexError):
+                    fp_clock_offset_ms = None
+            ttl_boutframes = self.convert_ttl_to_boutframes(
+                ttl_file, computer_ts, fp_clock_offset_ms=fp_clock_offset_ms)
             
             if ttl_boutframes is not None and len(ttl_boutframes) > 0:
                 # A TTL frame is a row of beh_synced, matched by clock -- already
@@ -26603,17 +26614,22 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # If baseline correction can't be applied, return original
         return bout
     
-    def convert_ttl_to_boutframes(self, ttl_file, computer_timestamps):
+    def convert_ttl_to_boutframes(self, ttl_file, computer_timestamps, fp_clock_offset_ms=None):
         """Convert TTL or DigitalIOs timestamps to boutframes format
-        
+
         Supports two file formats:
         1. TTL format: timestamp,value (no header) - processes every other row
         2. DigitalIOs format: DigitalIOName,Flag,State,SystemTS,ComputerTS (with header) - processes all rows
-        
+
         Args:
             ttl_file: Path to TTL/DigitalIOs CSV file
             computer_timestamps: Array of computer timestamps from FP data
-            
+            fp_clock_offset_ms: median(ComputerTimestamp - 1000*SystemTimestamp)
+                of the FPData file.  A DigitalIOs file's own ComputerTimestamp
+                sits on a host clock that can differ from the FPData file's by
+                seconds, whereas SystemTimestamp is the shared hardware clock,
+                so DigitalIOs events are placed through it when this is given.
+
         Returns:
             DataFrame with columns: Behavior, Frame
         """
@@ -26632,7 +26648,19 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # DigitalIOs format: behavior in column 0, timestamp in column 4
                 behavior_names = ttl_data_with_header.iloc[:, 0].values
                 bout_timestamps = ttl_data_with_header.iloc[:, 4].values  # ComputerTimestamp column
-                
+                if (fp_clock_offset_ms is not None
+                        and 'SystemTimestamp' in ttl_data_with_header.columns):
+                    sys_ts = pd.to_numeric(ttl_data_with_header['SystemTimestamp'],
+                                           errors='coerce').to_numpy(dtype=float)
+                    if np.all(np.isfinite(sys_ts)):
+                        shift_ms = float(np.median(
+                            bout_timestamps.astype(float) - sys_ts * 1000.0)
+                            - fp_clock_offset_ms)
+                        bout_timestamps = sys_ts * 1000.0 + fp_clock_offset_ms
+                        self.log_message(
+                            f"  Aligned DigitalIO events on SystemTimestamp (their ComputerTimestamp "
+                            f"clock differs from the FPData's by {shift_ms / 1000.0:+.3f} s)")
+
                 self.log_message(f"Found {len(bout_timestamps)} DigitalIO events in file")
                 
                 # Convert timestamps to frames by finding nearest computer timestamp
