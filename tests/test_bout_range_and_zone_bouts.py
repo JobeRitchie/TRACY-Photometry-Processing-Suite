@@ -77,3 +77,62 @@ def test_zone_entry_bouts():
     app.processed_data = {'S1': dict(data, beh_synced=beh)}
     app._ensure_zone_entry_bouts('S1')
     assert 'Zone - Edge Entry' in app.processed_data['S1']['bouts']
+
+
+class _V:
+    def __init__(self, v):
+        self.v = v
+
+    def get(self):
+        return self.v
+
+
+@pytest.mark.parametrize("text, expect", [
+    ("1", 1), ("3", 3), ("", 1), ("junk", 1),
+    ("1-2, 4-5", ((1, 2), (4, 5))), ("1-10", ((1, 10),)),
+    ("1-2;4", ((1, 2), (4, 4))), ("5-3", 1),
+])
+def test_bin_spec_parse(text, expect):
+    assert G.FPAnalysisGUI._parse_bout_bin_spec(text) == expect
+
+
+def _bins_app(max_bouts="all", average=False):
+    app = _app()
+    app.viz_max_bouts_var = _V(max_bouts)
+    app.viz_average_within_subject = _V(average)
+    app._realign_bouts = lambda b, *a, **k: list(b)
+    app._entry_prebout = lambda e: 0
+    app._entry_fs = lambda e: 1.0
+    # Bout i has constant value i so bins are easy to read back.
+    app.processed_data = {
+        s: {'bouts': {'Approach': {'G0': [np.full(4, float(i)) for i in range(1, 11)]}}}
+        for s in ('A', 'B')}
+    return app
+
+
+def test_custom_bins_group_and_average():
+    app = _bins_app()
+    spec = app._parse_bout_bin_spec("1-2, 4-5")
+    got = app._collect_bout_number_bins({'G0': ['A', 'B']}, 'Approach', spec)['G0']
+    assert sorted(got) == [0, 1]
+    assert sorted(t[0] for _, _, t in got[0]) == [1, 1, 2, 2]
+    assert sorted(t[0] for _, _, t in got[1]) == [4, 4, 5, 5]
+    mean, _, _ = app._bout_bin_mean_sem([t for _, _, t in got[1]])
+    assert mean[0] == 4.5
+    assert app._bout_bin_label(1, spec) == "Bouts #4–5"
+    assert app._bout_bin_label(0, 2) == "Bouts #1–2"
+    assert app._bout_bin_label(2, 1) == "Bout #3"
+
+
+def test_custom_bins_average_within_subject():
+    app = _bins_app(average=True)
+    spec = app._parse_bout_bin_spec("1-2, 4-5")
+    got = app._collect_bout_number_bins({'G0': ['A', 'B']}, 'Approach', spec)['G0']
+    assert [(s, tag, t[0]) for s, tag, t in got[1]] == [('A', '4-5avg', 4.5), ('B', '4-5avg', 4.5)]
+
+
+def test_compare_bins_respect_max_bout_range_numbering():
+    app = _bins_app(max_bouts="5-8")
+    got = app._collect_bout_number_bins({'G0': ['A']}, 'Approach', 1)['G0']
+    assert sorted(got) == [4, 5, 6, 7]                 # bins for bouts 5..8
+    assert got[4][0][1] == '5' and got[4][0][2][0] == 5

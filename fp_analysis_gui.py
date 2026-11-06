@@ -38,7 +38,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.31.0"
+APP_VERSION = "1.31.1"
 APP_VERSION_DATE = "November 6, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -7478,11 +7478,12 @@ class FPAnalysisGUI:
         ttk.Label(num_box, text="Bouts per bin:").grid(row=1, column=0, sticky='w',
                                                       pady=(4, 0))
         self.viz_bout_bin_var = tk.StringVar(value="1")
-        ttk.Entry(num_box, textvariable=self.viz_bout_bin_var, width=6).grid(
+        ttk.Entry(num_box, textvariable=self.viz_bout_bin_var, width=12).grid(
             row=1, column=1, sticky='w', padx=(4, 0), pady=(4, 0))
         # The hint gets its own wrapped row: on a narrow settings column a
         # trailing label beside the entry is clipped rather than wrapped.
-        ttk.Label(num_box, text='1 = one line per bout; 3 = bouts 1-3, 4-6, ...',
+        ttk.Label(num_box, text='1 = one line per bout; 3 = bouts 1-3, 4-6, ...; '
+                       'or custom bins, e.g. 1-2, 4-5',
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(230), justify='left').grid(
                       row=2, column=0, columnspan=2, sticky='w')
@@ -16273,6 +16274,15 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Compare Across Bouts takes custom bout bins. "Bouts per bin"
+    accepts a list such as 1-2, 4-5 (one averaged line per item; bouts in
+    no item are left out) as well as a plain number. Titles, exported
+    column names and metadata show the bins as typed.
+  • Fix — Compare Across Bouts numbered bouts from 1 under a Max bouts
+    range; with 40-50 they are now bouts 40 to 50.
+
+Version 1.31.0  •  November 6, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Max bouts accepts a range. Type 40-50 for bouts 40 to 50, 5- for
     bout 5 onward, or a plain number / all as before. Works across
@@ -38451,20 +38461,66 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # writes out.
 
     def _viz_bout_bin_size(self):
-        """Bouts per bin for Compare Across Bouts; 1 = one series per bout."""
+        """Bin spec for Compare Across Bouts.
+
+        A plain number N gives consecutive N-bout bins (1 = one series per
+        bout).  A list of bout numbers / ranges such as "1-2, 4-5" or "1-10"
+        gives one bin per item, as a tuple of inclusive (lo, hi) pairs; bouts
+        outside every item are left out."""
         try:
-            n = int(float(str(self.viz_bout_bin_var.get()).strip()))
-        except (AttributeError, TypeError, ValueError):
+            raw = str(self.viz_bout_bin_var.get()).strip()
+        except AttributeError:
             return 1
-        return max(1, n)
+        return self._parse_bout_bin_spec(raw)
+
+    @staticmethod
+    def _parse_bout_bin_spec(raw):
+        raw = str(raw or '').strip()
+        if re.fullmatch(r'\d+(\.0*)?', raw):
+            return max(1, int(float(raw)))
+        ranges = []
+        for part in re.split(r'[,;]+', raw):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.fullmatch(r'(\d+)\s*(?:-|:|–|to)\s*(\d+)', part, re.I)
+            if m:
+                lo, hi = int(m.group(1)), int(m.group(2))
+            elif part.isdigit():
+                lo = hi = int(part)
+            else:
+                return 1
+            if lo < 1 or hi < lo:
+                return 1
+            ranges.append((lo, hi))
+        return tuple(ranges) if ranges else 1
+
+    @staticmethod
+    def _bout_bin_indices(bout_num, bin_size):
+        """Bin(s) a 1-based bout number falls in under a bin spec."""
+        if isinstance(bin_size, tuple):
+            return [i for i, (lo, hi) in enumerate(bin_size) if lo <= bout_num <= hi]
+        return [(bout_num - 1) // bin_size]
+
+    @staticmethod
+    def _bout_bin_spec_text(bin_size):
+        """Bin spec as the user would type it, for titles and metadata."""
+        if isinstance(bin_size, tuple):
+            return ', '.join(f"{lo}" if lo == hi else f"{lo}-{hi}"
+                             for lo, hi in bin_size)
+        return str(bin_size)
 
     @staticmethod
     def _bout_bin_label(bin_idx, bin_size):
         """Human label for a bout-ordinal bin, e.g. 'Bouts #4-6'."""
-        lo = bin_idx * bin_size + 1
-        if bin_size == 1:
+        if isinstance(bin_size, tuple):
+            lo, hi = bin_size[bin_idx]
+        else:
+            lo = bin_idx * bin_size + 1
+            hi = lo + bin_size - 1
+        if lo == hi:
             return f"Bout #{lo}"
-        return f"Bouts #{lo}–{lo + bin_size - 1}"
+        return f"Bouts #{lo}–{hi}"
 
     def _viz_selected_bout_number(self):
         """The 'Show Bout #' selection as an int, or None when set to All."""
@@ -38503,7 +38559,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     continue
                 subject_bins = {}
                 for bout_num, bout in enumerate(
-                        self._entry_channel_bouts(entry, slot_key, max_bouts), 1):
+                        self._entry_channel_bouts(entry, slot_key, max_bouts),
+                        1 + self._bout_limit_offset(max_bouts)):
                     if bout is None or len(bout) == 0:
                         continue
                     if selected_bout is not None and bout_num != selected_bout:
@@ -38511,8 +38568,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     trace = np.asarray(bout, dtype=float)
                     if np.all(np.isnan(trace)):
                         continue
-                    subject_bins.setdefault((bout_num - 1) // bin_size, []).append(
-                        (bout_num, trace))
+                    for bin_idx in self._bout_bin_indices(bout_num, bin_size):
+                        subject_bins.setdefault(bin_idx, []).append((bout_num, trace))
                 for bin_idx, items in subject_bins.items():
                     if average_within and len(items) > 1:
                         mean_trace, _, _ = self._bout_bin_mean_sem(
@@ -38673,6 +38730,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         subj = f"{n_subjects} subject{'s' if n_subjects != 1 else ''}"
         if selected_bout is not None:
             return f'Bout #{selected_bout} only, mean ± SEM over {subj}'
+        if isinstance(bin_size, tuple):
+            return f'Mean ± SEM per bout bin ({self._bout_bin_spec_text(bin_size)}), {subj}'
         if bin_size > 1:
             return f'Mean ± SEM per {bin_size}-bout bin, {subj}'
         return f'Mean ± SEM per bout number, {subj}'
@@ -38713,6 +38772,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         if selected_bout is not None:
             detail = f'Bout #{selected_bout} only'
+        elif isinstance(bin_size, tuple):
+            detail = f'Mean ± SEM per bout bin ({self._bout_bin_spec_text(bin_size)})'
         elif bin_size > 1:
             detail = f'Mean ± SEM per {bin_size}-bout bin'
         else:
@@ -38842,7 +38903,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         base = filename.rsplit('.', 1)[0]
         metadata = self._create_export_metadata('plot')
         metadata['Behavior'] = behavior
-        metadata['Bouts per bin'] = bin_size
+        metadata['Bouts per bin'] = self._bout_bin_spec_text(bin_size)
         metadata['Show Bout #'] = self.bout_number_var.get()
         exported = []
 
@@ -38903,7 +38964,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             "Export Successful",
             f"Bout traces exported to {2 * len(exported)} file(s):\n\n{file_list}\n\n"
             f"Behavior: {behavior}\n"
-            f"Bouts per bin: {bin_size}\n"
+            f"Bouts per bin: {self._bout_bin_spec_text(bin_size)}\n"
             f"Show Bout #: {self.bout_number_var.get()}\n"
             f"Averaged within subject: {self.viz_average_within_subject.get()}\n"
             f"Exclusions applied: {self.use_exclusions_viz.get()}\n"
