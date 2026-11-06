@@ -38,8 +38,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.30.0"
-APP_VERSION_DATE = "October 27, 2026"
+APP_VERSION = "1.31.0"
+APP_VERSION_DATE = "November 6, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -71,6 +71,16 @@ WIDGET_PAD = 3
 # Sentinel: "read the max-bouts limit from the Tk entry" (vs. a value passed in
 # from a worker thread, which must not touch Tk variables).
 _MAX_BOUTS_UNSET = object()
+
+
+class _BoutRange:
+    """Bout-number range limit: skip ``start`` bouts, keep up to ``stop`` (0-based,
+    exclusive; None = to the end).  Built from entries like "40-50"."""
+    __slots__ = ('start', 'stop')
+
+    def __init__(self, start, stop):
+        self.start = start
+        self.stop = stop
 
 
 # ── Animal / session identity ───────────────────────────────────────────────
@@ -3893,10 +3903,27 @@ class FPAnalysisGUI:
         list_frame = ttk.Frame(existing_frame)
         list_frame.pack(fill='both', expand=True)
         
-        self.projects_listbox = tk.Listbox(list_frame, height=8, font=('Segoe UI', 10), selectmode='extended')
+        sort_row = ttk.Frame(existing_frame)
+        sort_row.pack(fill='x', before=list_frame, pady=(0, 6))
+        ttk.Label(sort_row, text="Sort by:").pack(side='left')
+        self.project_sort_var = tk.StringVar(value=self._PROJECT_SORTS[0])
+        sort_combo = ttk.Combobox(sort_row, textvariable=self.project_sort_var,
+                                  values=self._PROJECT_SORTS, state='readonly', width=24)
+        sort_combo.pack(side='left', padx=6)
+        sort_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_projects_list())
+
+        self.projects_listbox = ttk.Treeview(
+            list_frame, columns=('name', 'created', 'opened'), show='headings',
+            height=8, selectmode='extended')
+        for col, text, width, stretch in (('name', 'Project', 260, True),
+                                          ('created', 'Created', 140, False),
+                                          ('opened', 'Last opened', 140, False)):
+            self.projects_listbox.heading(col, text=text,
+                                          command=lambda c=col: self._sort_projects_by_column(c))
+            self.projects_listbox.column(col, width=width, stretch=stretch)
         projects_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.projects_listbox.yview)
         self.projects_listbox.config(yscrollcommand=projects_scrollbar.set)
-        
+
         self.projects_listbox.pack(side='left', fill='both', expand=True)
         projects_scrollbar.pack(side='right', fill='y')
         
@@ -7475,7 +7502,7 @@ class FPAnalysisGUI:
         max_bouts_frame.grid(row=1, column=1, sticky='w', padx=(4, 0))
         self.viz_max_bouts_var = tk.StringVar(value="all")
         ttk.Entry(max_bouts_frame, textvariable=self.viz_max_bouts_var, width=8).pack(side='left')
-        ttk.Label(max_bouts_frame, text='(number or "all")', foreground='gray',
+        ttk.Label(max_bouts_frame, text='(number, range e.g. 40-50, or "all")', foreground='gray',
                   font=('Segoe UI', 8)).pack(side='left', padx=(4, 0))
         # Row order for heatmaps and export columns -- see BOUT_ORDER_CHOICES.
         ttk.Label(bouts_box, text="Order bouts by:").grid(row=2, column=0, sticky='w',
@@ -12912,7 +12939,7 @@ class FPAnalysisGUI:
         ttk.Label(max_row, text="Max bouts/subject:").pack(side='left')
         ttk.Entry(max_row, textvariable=self.bout_max_bouts_var, width=7).pack(
             side='right')
-        ttk.Label(settings, text='("all" or a number)', foreground='gray',
+        ttk.Label(settings, text='("all", a number, or range e.g. 40-50)', foreground='gray',
                   font=('Segoe UI', 8)).pack(anchor='w')
 
         binx_row = ttk.Frame(settings)
@@ -16247,6 +16274,22 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
+  • New — Max bouts accepts a range. Type 40-50 for bouts 40 to 50, 5- for
+    bout 5 onward, or a plain number / all as before. Works across
+    Visualization plots and exports, Bout Analysis metrics and exports,
+    bouts across time, binned progression and FLMM; bout numbers and CSV
+    column names keep their true numbers (bout40, not bout1).
+  • New — Zone entries are bout behaviors. Center / Corner / Edge Entry
+    (OFT) and the EPM entry types appear as "Zone - ..." in the Bout
+    Analysis and Visualization behavior lists. Existing projects pick them
+    up without reprocessing. They have no end frame, so only onset-aligned
+    windows apply.
+  • Fix — DigitalIOs events are placed through SystemTimestamp (the shared
+    hardware clock) instead of ComputerTimestamp, which could sit 0.4-2.3 s
+    off the FPData file's clock. Plain TTL files are unchanged.
+
+Version 1.30.0  •  October 27, 2026
+────────────────────────────────────────────────────────────────────────────────
   • New — Every Visualization plot and export covers however many channels
     a recording has (G0–G4, R4…), following the channel checkboxes. Zone
     Averages, Distance from Center (X/Y and Euclidean) and Out/Back were
@@ -18616,7 +18659,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             f"Loading project '{self.current_project}'...\nPlease wait."
         )
         try:
-            return self._load_project_impl()
+            ok = self._load_project_impl()
+            if ok:
+                self._record_project_opened()
+            return ok
         finally:
             self._close_loading_dialog(self._loading_dialog)
             self._loading_dialog = None
@@ -19516,51 +19562,103 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def refresh_projects_list(self):
         """Refresh the list of existing projects"""
-        self.projects_listbox.delete(0, tk.END)
-        
+        self.projects_listbox.delete(*self.projects_listbox.get_children())
+
         if not os.path.exists(self.project_dir):
             os.makedirs(self.project_dir, exist_ok=True)
             return
-        
-        # Find all directories in the project directory
+
+        # (name, status, created_ts, opened_ts or None)
         projects = []
         for item in os.listdir(self.project_dir):
             item_path = os.path.join(self.project_dir, item)
-            if os.path.isdir(item_path):
-                # Check if it's a valid project (has project_config.json)
-                config_file = os.path.join(item_path, 'project_config.json')
-                if os.path.exists(config_file):
-                    projects.append((item, '✓'))  # Valid project
-                else:
-                    projects.append((item, '?'))  # Folder exists but no config
-        
-        # Sort projects alphabetically
-        projects.sort(key=lambda x: x[0])
-        
-        # Add to listbox
-        for project_name, status in projects:
-            display_name = f"{status} {project_name}"
-            self.projects_listbox.insert(tk.END, display_name)
-        
+            if not os.path.isdir(item_path):
+                continue
+            has_config = os.path.exists(os.path.join(item_path, 'project_config.json'))
+            meta = self._read_project_meta(item_path)
+            try:
+                created = float(meta.get('created') or os.stat(item_path).st_ctime)
+            except (OSError, ValueError):
+                created = 0.0
+            opened = meta.get('last_opened')
+            projects.append((item, '✓' if has_config else '?', created,
+                             float(opened) if opened else None))
+
+        sort = self.project_sort_var.get() if hasattr(self, 'project_sort_var') else self._PROJECT_SORTS[0]
+        if sort == self._PROJECT_SORTS[1]:      # Z-A
+            projects.sort(key=lambda p: p[0].lower(), reverse=True)
+        elif sort == self._PROJECT_SORTS[2]:    # recently opened
+            projects.sort(key=lambda p: p[3] or 0, reverse=True)
+        elif sort == self._PROJECT_SORTS[3]:    # newest created
+            projects.sort(key=lambda p: p[2], reverse=True)
+        elif sort == self._PROJECT_SORTS[4]:    # oldest created
+            projects.sort(key=lambda p: p[2])
+        else:                                   # A-Z
+            projects.sort(key=lambda p: p[0].lower())
+
+        from datetime import datetime
+        fmt = lambda ts: datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else 'Never'
+        for name, status, created, opened in projects:
+            self.projects_listbox.insert('', 'end', iid=name,
+                                         values=(f"{status} {name}", fmt(created), fmt(opened)))
+
         if not projects:
-            self.projects_listbox.insert(tk.END, "(No projects found)")
-    
+            self.projects_listbox.insert('', 'end', iid='(No projects found)',
+                                         values=("(No projects found)", '', ''))
+
+    _PROJECT_SORTS = ("Name (A-Z)", "Name (Z-A)", "Recently opened",
+                      "Newest created", "Oldest created")
+
+    def _sort_projects_by_column(self, col):
+        """Header click: name toggles A-Z/Z-A; date columns sort newest first."""
+        cur = self.project_sort_var.get()
+        if col == 'name':
+            new = self._PROJECT_SORTS[1] if cur == self._PROJECT_SORTS[0] else self._PROJECT_SORTS[0]
+        elif col == 'opened':
+            new = self._PROJECT_SORTS[2]
+        else:
+            new = self._PROJECT_SORTS[4] if cur == self._PROJECT_SORTS[3] else self._PROJECT_SORTS[3]
+        self.project_sort_var.set(new)
+        self.refresh_projects_list()
+
+    @staticmethod
+    def _project_meta_path(project_path):
+        return os.path.join(project_path, '.tracy_meta.json')
+
+    def _read_project_meta(self, project_path):
+        try:
+            with open(self._project_meta_path(project_path), 'r') as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def _record_project_opened(self):
+        """Stamp the current project's last-opened time (and creation time once)."""
+        if not self.current_project:
+            return
+        import time
+        path = os.path.join(self.project_dir, self.current_project)
+        try:
+            meta = self._read_project_meta(path)
+            meta.setdefault('created', os.stat(path).st_ctime)
+            meta['last_opened'] = time.time()
+            with open(self._project_meta_path(path), 'w') as f:
+                json.dump(meta, f)
+        except OSError:
+            pass
+
     def load_selected_project(self):
         """Load the project selected in the listbox"""
-        selection = self.projects_listbox.curselection()
+        selection = self.projects_listbox.selection()
         if not selection:
             messagebox.showwarning("No Selection", "Please select a project from the list")
             return
-        
-        # Get selected project name
-        selected_text = self.projects_listbox.get(selection[0])
-        
-        if selected_text == "(No projects found)":
+
+        # Row iid is the folder name
+        project_name = selection[0]
+        if project_name == "(No projects found)":
             return
-        
-        # Remove the status indicator (✓ or ?)
-        project_name = selected_text.split(' ', 1)[1] if ' ' in selected_text else selected_text
-        
+
         # Set as current project
         self.current_project = project_name
         self.project_name_var.set(project_name)
@@ -19611,20 +19709,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def delete_selected_project(self):
         """Delete the selected project(s) from disk"""
-        selection = self.projects_listbox.curselection()
+        selection = self.projects_listbox.selection()
         if not selection:
             messagebox.showwarning("No Selection", "Please select one or more projects from the list to delete")
             return
-        
-        # Get all selected project names
-        project_names = []
-        for idx in selection:
-            selected_text = self.projects_listbox.get(idx)
-            if selected_text == "(No projects found)":
-                continue
-            # Remove the status indicator (✓ or ?)
-            project_name = selected_text.split(' ', 1)[1] if ' ' in selected_text else selected_text
-            project_names.append(project_name)
+
+        project_names = [n for n in selection if n != "(No projects found)"]
         
         if not project_names:
             return
@@ -28007,6 +28097,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                 bout_data[behavior] = behavior_entry
 
+            # Zone entries (center/corner/edge, ...) become analyzable behaviors.
+            try:
+                for _zname, _zentry in self._zone_entry_bout_entries(
+                        subject_id, subject_data, beh_synced).items():
+                    bout_data.setdefault(_zname, _zentry)
+            except Exception as _zexc:
+                self.log_message(f"    Warning: zone-entry bouts skipped: {_zexc}")
+
             # Generate offset-derived behaviors if any offsets are defined.
             # Each offset creates a copy of every original behavior with shifted onsets.
             if self.bout_offsets:
@@ -28090,6 +28188,108 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception as e:
             self.log_message(f"    Warning: Could not extract bouts for {subject_id}: {str(e)}")
             return {}
+
+    # ── Zone entries as bout-analysis behaviors ──────────────────────
+    # Zone entries (Center/Corner/Edge for OFT, open-arm etc. for EPM) are
+    # detected during processing as ``entry_frames``.  Exposing them under a
+    # "Zone - <entry type>" name in ``bouts`` lets every bout tool (Bout
+    # Analysis, Visualization, FLMM, exports) treat them like any behavior.
+    ZONE_BOUT_PREFIX = 'Zone - '
+
+    def _zone_entry_bout_entries(self, subject_id, subject_data, beh_synced):
+        """Build ``{'Zone - Center Entry': entry, ...}`` in the same layout
+        ``extract_bouts`` produces, from the subject's detected entry frames."""
+        out = {}
+        entry_frames = subject_data.get('entry_frames') or {}
+        if beh_synced is None or not entry_frames:
+            return out
+        prebout, postbout, baseline_frames = self.bout_window_samples(subject_id)
+        baseline_correct = self.params.get('baseline_correct_bouts', False)
+        stored_nch = subject_data.get('num_photometry_channels')
+        if stored_nch is not None and stored_nch > 0:
+            phot_cols = list(range(6, 6 + stored_nch))
+        else:
+            guess = beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS)
+            phot_cols = list(range(6, 6 + guess)) if guess > 0 else []
+        num_channels = len(phot_cols)
+        if num_channels == 0:
+            return out
+
+        for label, (entry_key, _disp) in self._get_zone_entry_type_map().items():
+            raw = entry_frames.get(entry_key)
+            if raw is None or len(raw) == 0:
+                continue
+            frames = []
+            for f in raw:
+                try:
+                    if f is not None and np.isfinite(float(f)):
+                        frames.append(int(round(float(f))))
+                except (TypeError, ValueError):
+                    continue
+            if not frames:
+                continue
+            traces = {f'Ch{ch}': [] for ch in range(num_channels)}
+            kept = {f'Ch{ch}': [] for ch in range(num_channels)}
+            for bout_i, frame in enumerate(frames):
+                start_idx, end_idx = frame - prebout, frame + postbout
+                if start_idx < 0 or end_idx > len(beh_synced):
+                    continue
+                for ch, col_idx in enumerate(phot_cols):
+                    tr = beh_synced[start_idx:end_idx, col_idx]
+                    if np.any(np.isnan(tr)):
+                        continue
+                    if baseline_correct:
+                        tr = self.apply_baseline_correction(
+                            tr, frame, start_idx, prebout, baseline_frames)
+                    if self._is_valid_bout(tr):
+                        traces[f'Ch{ch}'].append(tr)
+                        kept[f'Ch{ch}'].append(bout_i)
+            entry, kept_idx = {}, {}
+            for ch in range(num_channels):
+                entry[f'Ch{ch}'] = traces[f'Ch{ch}']
+                kept_idx[f'Ch{ch}'] = kept[f'Ch{ch}']
+            for ch in range(num_channels):
+                real = self.get_channel_name(subject_data, ch)
+                if real not in entry:
+                    entry[real] = entry[f'Ch{ch}']
+                    kept_idx[real] = kept_idx[f'Ch{ch}']
+            if num_channels >= 1:
+                entry.setdefault('G0', entry['Ch0'])
+                kept_idx.setdefault('G0', kept_idx['Ch0'])
+            if num_channels >= 2:
+                entry.setdefault('G1', entry['Ch1'])
+                kept_idx.setdefault('G1', kept_idx['Ch1'])
+            entry['_kept_indices'] = kept_idx
+            entry['onset_frames'] = list(frames)
+            entry['end_frames'] = None
+            entry['durations'] = None
+            entry['_prebout'] = int(prebout)
+            entry['_postbout'] = int(postbout)
+            entry['_fs'] = float(self.get_fps(subject_id))
+            out[self.ZONE_BOUT_PREFIX + label] = entry
+        return out
+
+    def _ensure_zone_entry_bouts(self, subject_id):
+        """Add any missing 'Zone - ...' behaviors to a processed subject (covers
+        projects processed or loaded before this existed).  Never overwrites."""
+        data = self.processed_data.get(subject_id)
+        if not isinstance(data, dict) or not data.get('entry_frames'):
+            return
+        bouts = data.get('bouts')
+        if bouts is None:
+            bouts = {}
+        wanted = [self.ZONE_BOUT_PREFIX + lbl for lbl in self._get_zone_entry_type_map()]
+        if all(w in bouts for w in wanted):
+            return
+        try:
+            new = self._zone_entry_bout_entries(subject_id, data, data.get('beh_synced'))
+        except Exception as exc:
+            self.log_message(f"  Could not build zone-entry bouts for {subject_id}: {exc}")
+            return
+        added = {k: v for k, v in new.items() if k not in bouts}
+        if added:
+            bouts.update(added)
+            data['bouts'] = bouts
 
     # ── Bout window normalization for visualization ──────────────────
     # Stored bouts carry the pre/post window they were extracted with
@@ -28194,7 +28394,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not bouts:
             return []
         if max_bouts is not None:
-            bouts = bouts[:max_bouts]
+            bouts = self._slice_bouts(bouts, max_bouts)
         return self._realign_bouts(bouts, self._entry_prebout(entry), self._entry_fs(entry))
 
     def _stored_bout_trace_length(self, data):
@@ -30590,6 +30790,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         behaviors = set()
         for subject in subjects:
+            self._ensure_zone_entry_bouts(subject)
             data = self.processed_data.get(subject, {})
             bouts = data.get('bouts', {})
             if bouts:
@@ -30911,6 +31112,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Update behavior combo box in bout analysis tab"""
         behaviors = set()
         for subject in self.processed_data.keys():
+            self._ensure_zone_entry_bouts(subject)
             if 'bouts' in self.processed_data[subject]:
                 behaviors.update(self.processed_data[subject]['bouts'].keys())
         
@@ -35780,8 +35982,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 continue
 
                             # Apply max bouts limit
-                            if max_bouts is not None and len(bouts_list) > max_bouts:
-                                bouts_list = bouts_list[:max_bouts]
+                            if max_bouts is not None:
+                                bouts_list = self._slice_bouts(bouts_list, max_bouts)
 
                             # Realign to the current window so exported bouts share
                             # a common onset even across mixed extraction windows.
@@ -35810,7 +36012,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                     subject_behavior_channel_bouts[col_name] = subject_avg
                             else:
                                 # Export individual bouts
-                                for bout_idx, bout in enumerate(bouts_list):
+                                for bout_idx, bout in enumerate(bouts_list, self._bout_limit_offset(max_bouts)):
                                     if bout is None or len(bout) == 0:
                                         continue
 
@@ -36033,7 +36235,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 subject_bouts[col_name] = subject_avg
                             else:
                                 # Export individual bouts
-                                for bout_idx, bout in enumerate(ch_bouts):
+                                for bout_idx, bout in enumerate(ch_bouts, self._bout_limit_offset(max_bouts)):
                                     col_name = f"{subject}_{channel_name}_bout{bout_idx + 1}"
                                     if subject_to_group:
                                         col_name = f"{subject_to_group.get(subject, 'Unknown')}_{col_name}"
@@ -38897,12 +39099,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Apply max bouts limit per subject
             max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
             if max_bouts is not None:
-                bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._slice_bouts(bouts_data, max_bouts)
             
             # Get group if in group mode
             group = subject_to_group.get(subject, None)
             
-            for bout_num, bout in enumerate(bouts_data, 1):
+            for bout_num, bout in enumerate(bouts_data, 1 + self._bout_limit_offset(max_bouts)):
                 # Collect every non-empty bout and let _bout_analysis_segment()
                 # (below) decide validity by actually extracting the window.  A
                 # crude length pre-filter here (comparing the raw stored trace
@@ -39295,7 +39497,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     key, bouts_data = alt, entry.get(alt, [])
             numbers = self._flmm_bout_numbers(entry, key, len(bouts_data))
             if max_bouts is not None:
-                bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._slice_bouts(bouts_data, max_bouts)
+                numbers = self._slice_bouts(numbers, max_bouts)
             # Realign to current window so subjects/bouts extracted with different
             # pre/post stack on a common onset (otherwise the min-length truncation
             # below silently drops samples and mis-aligns the time course).
@@ -39355,7 +39558,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if alt:
                             bouts_data = entry.get(alt, [])
                     if max_bouts is not None:
-                        bouts_data = bouts_data[:max_bouts]
+                        bouts_data = self._slice_bouts(bouts_data, max_bouts)
                     bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
                                                 self._entry_fs(entry))
                     for bout in bouts_data:
@@ -39401,7 +39604,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if alt:
                         bouts_data = entry.get(alt, [])
                 if max_bouts is not None:
-                    bouts_data = bouts_data[:max_bouts]
+                    bouts_data = self._slice_bouts(bouts_data, max_bouts)
                 bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
                                                 self._entry_fs(entry))
                 for bout in bouts_data:
@@ -39450,7 +39653,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if alt:
                         bouts_data = entry.get(alt, [])
                 if max_bouts is not None:
-                    bouts_data = bouts_data[:max_bouts]
+                    bouts_data = self._slice_bouts(bouts_data, max_bouts)
                 bouts_data = self._realign_bouts(bouts_data, self._entry_prebout(entry),
                                                 self._entry_fs(entry))
                 for bout in bouts_data:
@@ -43610,6 +43813,20 @@ cat("OK\n")
             for key, value in metadata.items():
                 f.write(f'# {key}: {value}\n')
     
+    @staticmethod
+    def _slice_bouts(seq, limit):
+        """Apply a bouts limit (None, N = first N, or _BoutRange) to a sequence."""
+        if limit is None:
+            return seq
+        if isinstance(limit, _BoutRange):
+            return seq[limit.start:limit.stop]
+        return seq[:limit]
+
+    @staticmethod
+    def _bout_limit_offset(limit):
+        """Number of leading bouts skipped by a limit (0 unless a range)."""
+        return limit.start if isinstance(limit, _BoutRange) else 0
+
     def _get_max_bouts_limit(self, value_str):
         """Parse max bouts limit from string input
         
@@ -43622,6 +43839,17 @@ cat("OK\n")
         value_str = value_str.strip().lower()
         if value_str == 'all' or value_str == '':
             return None
+        # Range: "40-50" (bouts 40..50), "40-" (40 onward), "-10" (first 10)
+        m = re.fullmatch(r'(\d*)\s*(?:-|:|–|to)\s*(\d*)', value_str)
+        if m and (m.group(1) or m.group(2)):
+            lo = int(m.group(1)) if m.group(1) else 1
+            hi = int(m.group(2)) if m.group(2) else None
+            lo = max(lo, 1)
+            if hi is not None and hi < lo:
+                return None
+            if lo == 1:
+                return hi
+            return _BoutRange(lo - 1, hi)
         try:
             max_val = int(value_str)
             if max_val <= 0:
@@ -43809,7 +44037,7 @@ cat("OK\n")
             # Apply max bouts limit
             max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
             if max_bouts is not None:
-                bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._slice_bouts(bouts_data, max_bouts)
             
             # Initialize subject's metric storage
             if subject not in self.bout_metrics_data[combo_key]['by_subject']:
@@ -43818,7 +44046,7 @@ cat("OK\n")
                     self.bout_metrics_data[combo_key]['by_subject'][subject][metric] = []
             
             # Process each bout
-            for bout_idx, bout in enumerate(bouts_data):
+            for bout_idx, bout in enumerate(bouts_data, self._bout_limit_offset(max_bouts)):
                 if len(bout) == 0:
                     continue
                 
@@ -44471,8 +44699,14 @@ cat("OK\n")
             if baseline_correct:
                 trace = self.apply_baseline_correction(trace, s, start_idx, prebout, baseline_frames)
             out.append((trace, dur_frames / fps))
-            if max_bouts is not None and len(out) >= max_bouts:
+            if (max_bouts is not None and not isinstance(max_bouts, _BoutRange)
+                    and len(out) >= max_bouts):
                 break
+            if (isinstance(max_bouts, _BoutRange) and max_bouts.stop is not None
+                    and len(out) >= max_bouts.stop):
+                break
+        if isinstance(max_bouts, _BoutRange):
+            out = out[max_bouts.start:]
         return out, ('ok' if out else 'no_data')
 
     def _open_bout_length_bin_editor(self):
@@ -45830,7 +46064,7 @@ cat("OK\n")
             # Apply max bouts limit
             max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
             if max_bouts is not None:
-                bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._slice_bouts(bouts_data, max_bouts)
             
             n_total = len(bouts_data)
             if n_total < x_bouts:
@@ -46629,7 +46863,7 @@ cat("OK\n")
                         if metric_key in by_subject[subject]:
                             vals = np.array(by_subject[subject][metric_key])
                             if current_max_bouts is not None:
-                                vals = vals[:current_max_bouts]
+                                vals = self._slice_bouts(vals, current_max_bouts)
                             vals = vals[~np.isnan(vals)]
                             row[metric_key] = np.mean(vals) if len(vals) > 0 else np.nan
                             n_bouts = len(vals)
@@ -46669,7 +46903,12 @@ cat("OK\n")
                     if current_max_bouts is not None:
                         try:
                             bout_num = int(str(vals[bout_col_idx]).replace('#', ''))
-                            if bout_num > current_max_bouts:
+                            if isinstance(current_max_bouts, _BoutRange):
+                                if (bout_num <= current_max_bouts.start or
+                                        (current_max_bouts.stop is not None
+                                         and bout_num > current_max_bouts.stop)):
+                                    continue
+                            elif bout_num > current_max_bouts:
                                 continue
                         except (ValueError, TypeError):
                             pass
@@ -46839,7 +47078,7 @@ cat("OK\n")
             if len(bouts_data) == 0:
                 continue
             if max_bouts is not None:
-                bouts_data = bouts_data[:max_bouts]
+                bouts_data = self._slice_bouts(bouts_data, max_bouts)
 
             entry = data['bouts'][behavior]
             onsets = entry.get('onset_frames') or []
@@ -46850,7 +47089,7 @@ cat("OK\n")
             subj_store = by_subject.setdefault(subject, {key: [] for key, _ in metric_specs})
             subj_store.setdefault(self.BOUT_LENGTH_KEY, [])
 
-            for bout_idx, bout in enumerate(bouts_data):
+            for bout_idx, bout in enumerate(bouts_data, self._bout_limit_offset(max_bouts)):
                 if len(bout) == 0:
                     continue
                 seg = self._bout_analysis_segment(
