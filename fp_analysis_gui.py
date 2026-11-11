@@ -40,7 +40,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.32.0"
+APP_VERSION = "1.32.1"
 APP_VERSION_DATE = "November 11, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -16683,6 +16683,14 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Fix — The repository's LICENCE.pdf is now the UNC Copyright and
+    Permission Notice (UNC Ref 26-0137): free non-commercial use, with
+    commercial licensing through the UNC Office of Technology
+    Commercialization. It previously held the internal copyright
+    assignment, which is not the user-facing licence.
+
+Version 1.32.0  •  November 11, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Channel names. Processing > Channel Processing Options >
     "Channel Names..." lets you name each channel (G0 = BLA, R0 = OFC).
