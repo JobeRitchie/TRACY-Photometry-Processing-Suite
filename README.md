@@ -142,5 +142,5 @@ A standalone demonstration that runs the Python engine on the bundled
 
 ## License
 
-This project is distributed under the terms in [LICENCE.pdf](LICENCE.pdf).
+This project is distributed under the terms in [LICENSE.txt](LICENSE.txt) ([PDF copy](LICENCE.pdf)).
 Please review that file before use or redistribution.

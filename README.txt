@@ -69,5 +69,5 @@ existing naming schemes do not need to be renamed.
 
 License
 -------
-This project is distributed under the terms in LICENCE.pdf.
+This project is distributed under the terms in LICENSE.txt (PDF copy: LICENCE.pdf).
 Please review that file before use or redistribution.
