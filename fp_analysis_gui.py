@@ -22,6 +22,8 @@ from scipy.signal import coherence, spectrogram, fftconvolve, butter, filtfilt, 
 import os
 import re
 import sys
+import functools
+import weakref
 import json
 import subprocess
 from collections import Counter
@@ -618,6 +620,11 @@ PARAM_GROUPS = [
             ('session_bounds_enabled', "Apply per-subject session bounds",
              "True / False; bounds are set under Processing > Session Start/End"),
         ]),
+        ("Photobleaching correction", "Baseline curve divided out to get dF/F.", [
+            ('detrend_auto_triexp', "Auto-select tri-exponential fit",
+             "True / False - per channel, use a tri-exponential baseline when BIC "
+             "favours it over the bi-exponential"),
+        ]),
         ("Smoothing", "Applied as the final processing step.", [
             ('processing_rolling_avg_enabled', "Smoothing enabled",
              "True / False - master switch"),
@@ -760,6 +767,352 @@ BOUT_ORDER_CHOICES = [BOUT_ORDER_BY_SUBJECT, BOUT_ORDER_BY_NUMBER]
 # decode non-ASCII labels (e.g. the ' × ' in factor-combination group names)
 # instead of falling back to the ANSI code page and showing "Ã—".
 EXPORT_CSV_ENCODING = 'utf-8-sig'
+
+
+# ── User-defined channel names ──────────────────────────────────────────────
+# A channel's designation (G0, R4, or its column slot Ch0) is a *key*: bouts,
+# exclusions, saved project files and the wavelength routing all look channels
+# up by it, and the leading letter says which wavelength to read. A name the
+# user gives a channel ("BLA") is therefore display-only. It never replaces the
+# key; it is substituted where text leaves the program for the user's eyes:
+#   * every matplotlib text (titles, axes, legends, ticks) -- Text.set_text
+#   * every user-facing table export -- DataFrame.to_csv / to_excel while an
+#     @exports_channel_labels function is running
+#   * channel pickers -- ChannelVar / ChannelCombobox show the name and hand
+#     the key back to the code that reads them.
+# Project files are written by save_project, which is not an export, so they
+# keep the designations and reload whatever the names are later changed to.
+CHANNEL_LABEL_MAX_LEN = 24
+_CHANNEL_LABEL_OK = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _.+\-]*$')
+_CHANNEL_KEY_SHAPE = re.compile(r'^(?:[GR]\d+|Ch\d+)$', re.IGNORECASE)
+
+_CH_LABELS = {}        # designation -> name, e.g. {'G0': 'BLA'}
+_CH_SLOTS = {}         # column slot -> designation, where every subject agrees
+_CH_TOKENS = {}        # every replaceable token ('G0', 'Ch0') -> name
+_CH_REVERSE = {}       # name -> designation
+_CH_TOKEN_RE = None    # None while no channel is named: the hooks cost nothing
+_CH_EXPORT_DEPTH = 0   # >0 while a user-facing export is being written
+_CH_WIDGET_REFS = []   # weakrefs to live ChannelVar / ChannelCombobox
+
+
+def channel_label_error(designation, label, others=()):
+    """Why *label* cannot name *designation*, or None when it can.
+
+    *others* are the names already given to the other channels. A name may not
+    look like a designation: 'G1' as the name of G0 would be read back as the
+    other channel, and a second pass over already-renamed text would rename it
+    again.
+    """
+    label = str(label).strip()
+    if not label or label == designation:
+        return None
+    if len(label) > CHANNEL_LABEL_MAX_LEN:
+        return f"'{label}' is longer than {CHANNEL_LABEL_MAX_LEN} characters."
+    if not _CHANNEL_LABEL_OK.match(label):
+        return (f"'{label}' may only use letters, digits, spaces and _ . + - "
+                f"(it goes into file and sheet names), starting with a letter or digit.")
+    if _CHANNEL_KEY_SHAPE.match(label):
+        return f"'{label}' is itself a channel designation."
+    if label.lower() in {str(o).strip().lower() for o in others}:
+        return f"'{label}' is used for more than one channel."
+    return None
+
+
+def clean_channel_labels(mapping):
+    """Drop every entry of a stored name map that is blank, a no-op or invalid,
+    so a hand-edited project file cannot install a name that breaks lookups."""
+    cleaned = {}
+    if not isinstance(mapping, dict):
+        return cleaned
+    for key, label in mapping.items():
+        key, label = str(key).strip(), str(label).strip()
+        if not re.match(r'^[GR]\d+$', key) or not label or label == key:
+            continue
+        if channel_label_error(key, label, cleaned.values()) is None:
+            cleaned[key] = label
+    return cleaned
+
+
+def set_channel_labels(mapping, slots=None, protected=()):
+    """Install the channel names used everywhere text is shown or exported.
+
+    slots     : {column slot: designation} for slots on which every subject
+                agrees, so text that only says 'Ch0' can be named too.
+    protected : strings to leave alone even though they contain a designation
+                (a subject called 'G0_pilot', a group called 'G1').
+    """
+    global _CH_LABELS, _CH_SLOTS, _CH_TOKENS, _CH_REVERSE, _CH_TOKEN_RE
+    _CH_LABELS = clean_channel_labels(mapping)
+    _CH_SLOTS = {int(i): str(d) for i, d in (slots or {}).items()}
+    tokens = dict(_CH_LABELS)
+    for slot, designation in _CH_SLOTS.items():
+        if designation in _CH_LABELS:
+            tokens[f'Ch{slot}'] = _CH_LABELS[designation]
+    _CH_TOKENS = tokens
+    _CH_REVERSE = {label: key for key, label in _CH_LABELS.items()}
+    if not tokens:
+        _CH_TOKEN_RE = None
+        return
+    # A token only counts when it stands alone: 'G0' in 'G0_mean' or 'G0 470nm'
+    # but not inside 'G01' or 'NSFG0'. Underscores are separators here because
+    # export headers and generated file names join with them.
+    token_alt = '|'.join(re.escape(t) for t in sorted(tokens, key=len, reverse=True))
+    token_pat = rf'(?<![A-Za-z0-9])(?:{token_alt})(?![A-Za-z0-9])'
+    token_only = re.compile(token_pat)
+    # A group that is itself called 'G0' cannot be told apart from the channel;
+    # the name the user just asked for wins there.
+    keep = sorted({str(p) for p in protected
+                   if p and str(p) not in tokens and token_only.search(str(p))},
+                  key=len, reverse=True)
+    if keep:
+        keep_alt = '|'.join(re.escape(p) for p in keep)
+        _CH_TOKEN_RE = re.compile(rf'(?P<keep>{keep_alt})|{token_pat}')
+    else:
+        _CH_TOKEN_RE = token_only
+
+
+def _channel_token_sub(match):
+    if match.groupdict().get('keep') is not None:
+        return match.group(0)
+    return _CH_TOKENS.get(match.group(0), match.group(0))
+
+
+def relabel_channels(text):
+    """*text* with every stand-alone channel designation replaced by its name."""
+    if _CH_TOKEN_RE is None or not isinstance(text, str) or not text:
+        return text
+    return _CH_TOKEN_RE.sub(_channel_token_sub, text)
+
+
+def channel_label(name):
+    """The user's name for one channel key ('G0' or 'Ch0'), else the key."""
+    return _CH_TOKENS.get(str(name), name)
+
+
+def channel_key(text, slots=False):
+    """Inverse of channel_label: the designation a displayed name stands for.
+    With slots=True the answer is the column-slot key ('Ch0') instead."""
+    key = _CH_REVERSE.get(text, text)
+    if slots and key in _CH_LABELS:
+        for slot, designation in _CH_SLOTS.items():
+            if designation == key:
+                return f'Ch{slot}'
+    return key
+
+
+def relabel_frame(df):
+    """A copy of *df* with channel names in its headers, index and text cells.
+    Numeric columns are passed through untouched."""
+    if _CH_TOKEN_RE is None:
+        return df
+
+    def _axis(index):
+        if isinstance(index, pd.MultiIndex):
+            return pd.MultiIndex.from_tuples(
+                [tuple(relabel_channels(v) for v in tup) for tup in index],
+                names=[relabel_channels(n) for n in index.names])
+        if index.dtype == object:
+            return pd.Index([relabel_channels(v) for v in index],
+                            name=relabel_channels(index.name))
+        return index
+
+    out = df.copy(deep=False)
+    out.columns = _axis(out.columns)
+    out.index = _axis(out.index)
+    for pos in range(out.shape[1]):
+        col = out.iloc[:, pos]
+        if col.dtype != object:
+            continue
+        renamed = {v: relabel_channels(v) for v in pd.unique(col) if isinstance(v, str)}
+        renamed = {k: v for k, v in renamed.items() if k != v}
+        if renamed:
+            out.isetitem(pos, col.map(lambda v: renamed.get(v, v) if isinstance(v, str) else v))
+    return out
+
+
+def relabel_workbook(wb):
+    """Channel names into an openpyxl workbook's sheet titles and text cells."""
+    if _CH_TOKEN_RE is None:
+        return wb
+    for ws in wb.worksheets:
+        title = relabel_channels(ws.title)[:31]
+        if title != ws.title:
+            ws.title = title
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and not cell.value.startswith('='):
+                    cell.value = relabel_channels(cell.value)
+    return wb
+
+
+def exports_channel_labels(fn):
+    """Mark a function as writing files for the user: every table it writes
+    through pandas carries the channel names instead of the designations."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _CH_EXPORT_DEPTH
+        _CH_EXPORT_DEPTH += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _CH_EXPORT_DEPTH -= 1
+    return wrapper
+
+
+def keeps_channel_designations(fn):
+    """Mark a function as writing files the program reads back (project data):
+    never renamed, even when an export is what triggered the save."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _CH_EXPORT_DEPTH
+        depth, _CH_EXPORT_DEPTH = _CH_EXPORT_DEPTH, 0
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _CH_EXPORT_DEPTH = depth
+    return wrapper
+
+
+def _install_channel_label_hooks():
+    """Route matplotlib text and pandas table writers through the name map.
+    Idempotent, so re-importing the module does not stack the wrappers."""
+    import matplotlib.text as mtext
+    if not getattr(mtext.Text.set_text, '_tracy_channel_labels', False):
+        plain_set_text = mtext.Text.set_text
+
+        def set_text(self, s):
+            if _CH_TOKEN_RE is not None and isinstance(s, str):
+                s = relabel_channels(s)
+            return plain_set_text(self, s)
+        set_text._tracy_channel_labels = True
+        mtext.Text.set_text = set_text
+
+    if not getattr(pd.DataFrame.to_csv, '_tracy_channel_labels', False):
+        plain_to_csv = pd.DataFrame.to_csv
+        plain_to_excel = pd.DataFrame.to_excel
+
+        def to_csv(self, *args, **kwargs):
+            if _CH_EXPORT_DEPTH and _CH_TOKEN_RE is not None:
+                return plain_to_csv(relabel_frame(self), *args, **kwargs)
+            return plain_to_csv(self, *args, **kwargs)
+
+        def to_excel(self, *args, **kwargs):
+            if _CH_EXPORT_DEPTH and _CH_TOKEN_RE is not None:
+                # Excel caps a sheet name at 31 characters.
+                if isinstance(kwargs.get('sheet_name'), str):
+                    kwargs['sheet_name'] = relabel_channels(kwargs['sheet_name'])[:31]
+                elif len(args) > 1 and isinstance(args[1], str):
+                    args = (args[0], relabel_channels(args[1])[:31]) + tuple(args[2:])
+                return plain_to_excel(relabel_frame(self), *args, **kwargs)
+            return plain_to_excel(self, *args, **kwargs)
+
+        to_csv._tracy_channel_labels = True
+        pd.DataFrame.to_csv = to_csv
+        pd.DataFrame.to_excel = to_excel
+
+
+_install_channel_label_hooks()
+
+
+def _live_channel_widgets():
+    alive, widgets = [], []
+    for ref in _CH_WIDGET_REFS:
+        widget = ref()
+        if widget is not None:
+            alive.append(ref)
+            widgets.append(widget)
+    _CH_WIDGET_REFS[:] = alive
+    return widgets
+
+
+def retarget_channel_widgets(install):
+    """Run *install* (which changes the name map) and bring every channel
+    picker back onto the channel it was pointing at, under its new name."""
+    held = []
+    for widget in _live_channel_widgets():
+        if isinstance(widget, ChannelVar):
+            try:
+                held.append((widget, widget.get()))
+            except tk.TclError:
+                pass
+    install()
+    for var, key in held:
+        try:
+            var.set(key)
+        except tk.TclError:
+            pass
+    for widget in _live_channel_widgets():
+        if isinstance(widget, ChannelCombobox):
+            try:
+                widget.relabel()
+            except tk.TclError:
+                pass
+
+
+class ChannelVar(tk.StringVar):
+    """StringVar behind a channel picker. The widget shows the user's name;
+    get() returns the designation the rest of the program keys on, and set()
+    takes a designation. slots=True for pickers whose keys are 'Ch0', 'Ch1'."""
+
+    def __init__(self, master=None, value=None, name=None, slots=False):
+        self._slots = slots
+        super().__init__(master, value, name)
+        if value:
+            self.set(value)
+        _CH_WIDGET_REFS.append(weakref.ref(self))
+
+    def get(self):
+        return channel_key(super().get(), slots=self._slots)
+
+    def set(self, value):
+        super().set(channel_label(value))
+
+
+class ChannelCombobox(ttk.Combobox):
+    """Combobox listing channels. `values` are given and read back as
+    designations; the dropdown shows the user's names and widens to fit them."""
+
+    def __init__(self, master=None, slots=False, **kw):
+        self._slots = slots
+        self._ch_keys = list(kw.get('values') or ())
+        self._ch_min_width = kw.get('width')
+        if 'values' in kw:
+            kw.update(self._shown(self._ch_keys))
+        super().__init__(master, **kw)
+        _CH_WIDGET_REFS.append(weakref.ref(self))
+
+    def _shown(self, keys):
+        labels = [str(channel_label(k)) for k in keys]
+        opts = {'values': labels}
+        if self._ch_min_width is not None and labels:
+            opts['width'] = max(int(self._ch_min_width),
+                                max(len(lab) for lab in labels) + 2)
+        return opts
+
+    def configure(self, cnf=None, **kw):
+        if isinstance(cnf, dict):
+            kw = {**cnf, **kw}
+            cnf = None
+        if 'width' in kw:
+            self._ch_min_width = kw['width']
+        if 'values' in kw:
+            self._ch_keys = list(kw['values'] or ())
+            kw.update(self._shown(self._ch_keys))
+        return super().configure(cnf, **kw)
+
+    config = configure
+
+    def __setitem__(self, key, value):
+        self.configure(**{key: value})
+
+    def get(self):
+        return channel_key(super().get(), slots=self._slots)
+
+    def set(self, value):
+        super().set(channel_label(value))
+
+    def relabel(self):
+        super().configure(**self._shown(self._ch_keys))
 
 
 # Which option clusters each plot type actually uses. Kept as a table rather
@@ -2206,6 +2559,9 @@ class FPAnalysisGUI:
             'spatial_bin_size': 2,  # cm for heatmap binning
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
+            # User's names for channels, {designation: name} e.g. {'G0': 'BLA'}.
+            # Display-only: see the channel-name notes above set_channel_labels.
+            'channel_labels': {},
             # Baseline window, also in seconds; 0 means "half the pre-bout window".
             'baseline_seconds': 0.0,
             'baseline_frames': 45,  # derived from baseline_seconds — see _sync_bout_window_frames
@@ -2215,6 +2571,12 @@ class FPAnalysisGUI:
             # 'balanced'   — at least a half-decay must be observed (default).
             # 'permissive' — accepts partial decays; most values, most biased.
             'decay_strictness': 'balanced',
+            # Photobleaching baseline for dF/F.  Off: always bi-exponential.
+            # On: each channel is also fitted with a tri-exponential, kept only
+            # when BIC on 1-s binned residuals favours it (see fit_bleach_baseline).
+            # Helps recordings whose decay has a fast (seconds) component on top
+            # of the usual two, e.g. heavy patch-cord autofluorescence.
+            'detrend_auto_triexp': False,
             # Signal smoothing (applied as final processing step).
             # 'processing_rolling_avg_enabled' is the master on/off switch (kept
             # under its original key for backward compatibility with old projects).
@@ -5137,7 +5499,18 @@ class FPAnalysisGUI:
         
         ttk.Label(channel_frame, text="Note: LED states detected automatically\n(2=470nm, 4=570nm, 1=415nm)", 
                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=2)
-        
+
+        # User's names for the channels (G0 -> BLA), shown in place of the
+        # designation in every plot, table and export.
+        names_row = ttk.Frame(channel_frame)
+        names_row.pack(anchor='w', fill='x', pady=2)
+        ttk.Button(names_row, text="Channel Names...", style='Compact.TButton',
+                   command=self.edit_channel_names).pack(side='left')
+        self.channel_names_summary_var = tk.StringVar(
+            value="none set (plots and exports show G0, R0, ...)")
+        ttk.Label(names_row, textvariable=self.channel_names_summary_var,
+                  foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=8)
+
         # Baseline correction for bouts
         ttk.Separator(channel_frame, orient='horizontal').pack(fill='x', pady=5)
         ttk.Label(channel_frame, text="Bout Baseline Correction:", font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(5, 0))
@@ -5156,6 +5529,22 @@ class FPAnalysisGUI:
         ttk.Entry(baseline_params_frame, textvariable=self.baseline_frames_var, width=8).pack(side='left', padx=(0, 5))
         ttk.Label(baseline_params_frame, text="(seconds before bout onset to average; 0 = half the pre-bout window)",
                  foreground='gray', font=('Segoe UI', 8)).pack(side='left')
+
+        # ── Photobleaching correction ─────────────────────────────────
+        ttk.Separator(channel_frame, orient='horizontal').pack(fill='x', pady=5)
+        ttk.Label(channel_frame, text="Photobleaching Correction:",
+                  font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(5, 0))
+        bleach_frame = ttk.Frame(channel_frame)
+        bleach_frame.pack(anchor='w', pady=5, padx=20)
+        self.detrend_auto_triexp = tk.BooleanVar(
+            value=bool(self.params.get('detrend_auto_triexp', False)))
+        ttk.Checkbutton(bleach_frame,
+                        text="Auto-detect when a tri-exponential baseline fits better",
+                        variable=self.detrend_auto_triexp).pack(anchor='w')
+        ttk.Label(bleach_frame,
+                  text="(per channel, chosen by BIC; helps steep early bleaching. "
+                       "Off = bi-exponential always)",
+                  foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=(20, 0))
 
         # ── Signal smoothing (final processing step) ──────────────────
         ttk.Separator(channel_frame, orient='horizontal').pack(fill='x', pady=5)
@@ -7327,9 +7716,9 @@ class FPAnalysisGUI:
         # Heatmap: channel, spatial bin, zone overlay.
         heat_box = cluster('heatmap')
         ttk.Label(heat_box, text="Heatmap Channel:").grid(row=0, column=0, sticky='w')
-        self.channel_var = tk.StringVar(value="Ch0")
-        self.channel_combo = ttk.Combobox(heat_box, textvariable=self.channel_var,
-                                          values=["Ch0", "Ch1", "Ch2", "Ch3"], width=12)
+        self.channel_var = ChannelVar(value="Ch0", slots=True)
+        self.channel_combo = ChannelCombobox(heat_box, textvariable=self.channel_var, slots=True,
+                                               values=["Ch0", "Ch1", "Ch2", "Ch3"], width=12)
         self.channel_combo.grid(row=0, column=1, sticky='w', padx=(4, 0))
         ttk.Label(heat_box, text="Bin Size (cm):").grid(row=1, column=0, sticky='w')
         self.spatial_bin_var = tk.StringVar(value=str(self.params['spatial_bin_size']))
@@ -7344,8 +7733,8 @@ class FPAnalysisGUI:
         # Signal integrity: channel, sensor mode, and the auto-exclude action.
         integ_box = cluster('integrity')
         ttk.Label(integ_box, text="SI Channel:").grid(row=0, column=0, sticky='w')
-        self.integrity_channel_var = tk.StringVar(value="G0")
-        self.integrity_channel_combo = ttk.Combobox(
+        self.integrity_channel_var = ChannelVar(value="G0")
+        self.integrity_channel_combo = ChannelCombobox(
             integ_box, textvariable=self.integrity_channel_var,
             values=["G0", "G1", "G2", "G3"], width=10, state='disabled')
         self.integrity_channel_combo.grid(row=0, column=1, sticky='w', padx=(4, 0))
@@ -7696,8 +8085,8 @@ class FPAnalysisGUI:
         ch1_row = ttk.Frame(settings)
         ch1_row.pack(fill='x')
         ttk.Label(ch1_row, text="Channel 1:").pack(side='left')
-        self.conn_channel1_var = tk.StringVar(value="G0")
-        self.conn_channel1_combo = ttk.Combobox(
+        self.conn_channel1_var = ChannelVar(value="G0")
+        self.conn_channel1_combo = ChannelCombobox(
             ch1_row, textvariable=self.conn_channel1_var,
             values=["G0", "G1", "R1"], state='readonly', width=8)
         self.conn_channel1_combo.pack(side='right')
@@ -7705,8 +8094,8 @@ class FPAnalysisGUI:
         ch2_row = ttk.Frame(settings)
         ch2_row.pack(fill='x', pady=(self.ui_px(3), 0))
         ttk.Label(ch2_row, text="Channel 2:").pack(side='left')
-        self.conn_channel2_var = tk.StringVar(value="G1")
-        self.conn_channel2_combo = ttk.Combobox(
+        self.conn_channel2_var = ChannelVar(value="G1")
+        self.conn_channel2_combo = ChannelCombobox(
             ch2_row, textvariable=self.conn_channel2_var,
             values=["G0", "G1", "R1"], state='readonly', width=8)
         self.conn_channel2_combo.pack(side='right')
@@ -9029,6 +9418,7 @@ class FPAnalysisGUI:
             fig, "Group Coherence Band Comparison",
             f"{min(1200, n_bands * 140 + 300)}x580")
 
+    @exports_channel_labels
     def export_group_coherence_comparison(self):
         """Export per-subject per-band coherence data for all groups to CSV."""
         if not self.group_coherence_results:
@@ -10055,6 +10445,7 @@ class FPAnalysisGUI:
         win, cw = self._embed_plot_window(
             fig, "BEG Peri-Event Wavelet Coherence", f"{win_w}x{win_h}")
 
+    @exports_channel_labels
     def export_beg_comparison(self):
         """Export per-subject pre/post/delta coherence per band and per frequency to CSV."""
         if not hasattr(self, 'beg_results') or not self.beg_results:
@@ -11712,6 +12103,7 @@ class FPAnalysisGUI:
 
     def _show_tsv_export_window(self, title, text_content, initialfile):
         """Copy/paste window for a tab-separated export."""
+        text_content = relabel_channels(text_content)
         win = tk.Toplevel(self.root)
         win.title(title)
         self.fit_toplevel(win, 820, 560)
@@ -11791,6 +12183,7 @@ class FPAnalysisGUI:
         meta.update(extra or {})
         return meta
 
+    @exports_channel_labels
     def export_beg_prism(self):
         """Prism blocks for the bout-epoch group comparison (baseline vs post)."""
         if not getattr(self, 'beg_results', None):
@@ -11828,6 +12221,7 @@ class FPAnalysisGUI:
             f"coherence_group_prepost_{r0['behavior']}.txt")
         self.log_message("Bout-epoch group coherence: Prism export opened.")
 
+    @exports_channel_labels
     def export_bout_epoch_prism(self):
         """Prism blocks for the per-subject bout-epoch analysis."""
         results = getattr(self, 'bout_epoch_coherence_results', None)
@@ -11865,6 +12259,7 @@ class FPAnalysisGUI:
             f"coherence_bout_epoch_{r0['behavior']}.txt")
         self.log_message("Bout epoch coherence: Prism export opened.")
 
+    @exports_channel_labels
     def export_group_coherence_prism(self):
         """Prism blocks for the whole-session group comparison."""
         if not getattr(self, 'group_coherence_results', None):
@@ -11899,6 +12294,7 @@ class FPAnalysisGUI:
             "coherence_whole_session_by_group.txt")
         self.log_message("Group coherence: Prism export opened.")
 
+    @exports_channel_labels
     def export_bout_epoch_coherence(self):
         """Export per-frequency bout epoch coherence to CSV."""
         if not hasattr(self, 'bout_epoch_coherence_results') \
@@ -12638,6 +13034,7 @@ class FPAnalysisGUI:
                 fig, "Wavelet Coherence Spectrogram",
                 "1300x{}".format(min(900, max(500, int(fig_h * 100)))))
 
+    @exports_channel_labels
     def export_connectivity_results(self):
         """Export connectivity analysis results"""
         if not self.connectivity_results:
@@ -12707,6 +13104,7 @@ class FPAnalysisGUI:
         else:
             self._export_conn_frequency()
     
+    @exports_channel_labels
     def _export_conn_summary(self):
         """Export summary statistics to Excel"""
         try:
@@ -12750,6 +13148,7 @@ class FPAnalysisGUI:
                         pass
                 ws.column_dimensions[col[0].column_letter].width = min(max_length + 2, 50)
             
+            relabel_workbook(wb)
             wb.save(filepath)
             messagebox.showinfo("Success", f"Exported to {filepath}")
             self.log_message(f"Connectivity summary exported to {filepath}")
@@ -12757,6 +13156,7 @@ class FPAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
     
+    @exports_channel_labels
     def _export_conn_timeseries(self):
         """Export time-series data to CSV"""
         try:
@@ -12792,6 +13192,7 @@ class FPAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
     
+    @exports_channel_labels
     def _export_conn_frequency(self):
         """Export frequency-domain data to CSV"""
         try:
@@ -13355,8 +13756,8 @@ class FPAnalysisGUI:
         self.spike_trace_subject_combo.bind(
             '<<ComboboxSelected>>', self._on_spike_trace_subject_changed)
         ttk.Label(trace_ctrl, text="Channel:").pack(side='left', padx=(self.ui_px(8), 0))
-        self.spike_trace_channel_var = tk.StringVar()
-        self.spike_trace_channel_combo = ttk.Combobox(
+        self.spike_trace_channel_var = ChannelVar()
+        self.spike_trace_channel_combo = ChannelCombobox(
             trace_ctrl, textvariable=self.spike_trace_channel_var,
             state='readonly', width=6)
         self.spike_trace_channel_combo.pack(side='left', padx=(self.ui_px(3), 0))
@@ -13478,7 +13879,7 @@ class FPAnalysisGUI:
                 self.spike_channel_vars[ch_name] = tk.BooleanVar(value=True)
             ttk.Checkbutton(
                 self.spike_channel_check_frame,
-                text=ch_name,
+                text=channel_label(ch_name),
                 variable=self.spike_channel_vars[ch_name]
             ).pack(anchor=tk.W, pady=1)
 
@@ -13725,6 +14126,7 @@ class FPAnalysisGUI:
         fig.tight_layout()
         self._embed_plot_canvas(fig, host)
 
+    @exports_channel_labels
     def export_spike_trace_prism(self):
         """Save the representative trace as an XY table for GraphPad Prism.
 
@@ -13764,7 +14166,7 @@ class FPAnalysisGUI:
         filepath = filedialog.asksaveasfilename(
             title="Export Representative Trace for Prism",
             defaultextension=".csv",
-            initialfile=f"{trace['subject']}_{ch}_trace{win}_prism.csv",
+            initialfile=f"{trace['subject']}_{channel_label(ch)}_trace{win}_prism.csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
         if not filepath:
             return
@@ -13976,7 +14378,7 @@ class FPAnalysisGUI:
                 self.spike_tree.insert('', tk.END, values=(
                     subject,
                     group_name,
-                    ch_name,
+                    channel_label(ch_name),
                     ch_data['total_spikes'],
                     f"{ch_data['spike_rate_per_min']:.2f}",
                     f"{ch_data['mean_amplitude']:.3f}" if not np.isnan(ch_data['mean_amplitude']) else "N/A",
@@ -14042,6 +14444,7 @@ class FPAnalysisGUI:
         self.root.clipboard_append('\n'.join(lines))
         self.log_message(f"Copied {len(selected_items)} row(s) to clipboard")
     
+    @exports_channel_labels
     def export_spike_results(self):
         """Export spike analysis results with multiple export options"""
         if not self.spike_results:
@@ -14127,6 +14530,7 @@ class FPAnalysisGUI:
         elif result['type'] == "zone_binned":
             self._export_spike_zone_binned()
     
+    @exports_channel_labels
     def _export_spike_summary(self):
         """Export summary spike statistics with exclusions and metadata"""
         # Ask for filename
@@ -14206,6 +14610,7 @@ class FPAnalysisGUI:
             self._format_metadata_for_excel(wb, metadata)
             
             # Save workbook
+            relabel_workbook(wb)
             wb.save(filepath)
             self.log_message(f"Spike summary exported to: {filepath}")
             messagebox.showinfo("Export Complete", 
@@ -14279,6 +14684,7 @@ class FPAnalysisGUI:
             rows.append(row)
         return pd.DataFrame(rows, columns=header)
 
+    @exports_channel_labels
     def export_spike_prism(self):
         """Write the spike results as CSVs that open directly in GraphPad Prism.
 
@@ -14423,7 +14829,7 @@ class FPAnalysisGUI:
             fname = os.path.join(folder, f"{prefix}_settings.txt")
             with open(fname, 'w', encoding='utf-8') as f:
                 for k, v in meta.items():
-                    f.write(f"{k}: {v}\n")
+                    f.write(relabel_channels(f"{k}: {v}\n"))
             written.append(fname)
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export Prism files:\n{e}")
@@ -14457,6 +14863,7 @@ class FPAnalysisGUI:
         return sorted(chans, key=lambda x: (str(x)[0].upper(),
                                             int(str(x)[1:]) if str(x)[1:].isdigit() else 0))
 
+    @exports_channel_labels
     def _export_spike_time_binned(self, bin_size_sec):
         """Export spike data binned by time intervals, respecting exclusions"""
         # Ask for filename
@@ -14590,6 +14997,7 @@ class FPAnalysisGUI:
             self.log_message(f"Error exporting time-binned spike data: {str(e)}")
 
     
+    @exports_channel_labels
     def _export_spike_zone_binned(self):
         """Export spike data binned by behavioral zones, respecting exclusions"""
         # Ask for filename
@@ -15707,6 +16115,7 @@ class FPAnalysisGUI:
         title = dict(self.SPATIAL_PLOTS)[self._spatial_opts()['plot'].get()]
         self._embed_plot_window(fig, f"Spatial Transients - {title}")
 
+    @exports_channel_labels
     def export_spatial_transients_prism(self):
         """Per-animal values behind the current plot, one column per animal
         grouped by series, one row per category / bin (Prism grouped table)."""
@@ -17487,6 +17896,193 @@ Version 1.0.0
         self.update_param_labels()
         self.log_message("File naming settings applied successfully!")
 
+    # ---- User-defined channel names --------------------------------------
+    def _channel_slot_designations(self):
+        """{column slot: designation} for the slots on which every loaded
+        subject agrees, so a bare 'Ch0' can be shown under the channel's name.
+        A slot that is G0 in one subject and R4 in another has no single name."""
+        seen = {}
+        for data in getattr(self, 'processed_data', {}).values():
+            for slot, name in enumerate(self._ordered_channel_names(data)):
+                seen.setdefault(slot, set()).add(str(name))
+        return {slot: next(iter(names)) for slot, names in seen.items()
+                if len(names) == 1}
+
+    def _channel_label_protected(self):
+        """Subject, group, level and behavior names: text that must survive
+        untouched even where it happens to contain a channel designation."""
+        found = set(getattr(self, 'processed_data', {}))
+
+        def _walk(node):
+            if isinstance(node, str):
+                found.add(node)
+            elif isinstance(node, dict):
+                for key, value in node.items():
+                    _walk(key)
+                    _walk(value)
+            elif isinstance(node, (list, tuple, set)):
+                for value in node:
+                    _walk(value)
+        _walk(getattr(self, 'groups', None))
+        for key in ('subject_factors', 'factor_definitions', 'factor_levels'):
+            _walk(self.params.get(key))
+        for data in getattr(self, 'processed_data', {}).values():
+            bouts = data.get('bouts')
+            if isinstance(bouts, dict):
+                found.update(str(b) for b in bouts)
+        return found
+
+    def _sync_channel_labels(self):
+        """Bring the app-wide channel-name map in line with params and the
+        loaded subjects. Cheap when nothing changed, so every path that edits
+        params or the loaded set can simply call it."""
+        labels = clean_channel_labels(self.params.get('channel_labels'))
+        self.params['channel_labels'] = labels
+        slots = self._channel_slot_designations() if labels else {}
+        protected = frozenset(self._channel_label_protected()) if labels else frozenset()
+        state = (tuple(sorted(labels.items())), tuple(sorted(slots.items())), protected)
+        previous = getattr(self, '_channel_label_state', None)
+        if state == previous:
+            return
+        self._channel_label_state = state
+        retarget_channel_widgets(lambda: set_channel_labels(labels, slots, protected))
+
+        summary = getattr(self, 'channel_names_summary_var', None)
+        if summary is not None:
+            if labels:
+                text = ", ".join(f"{k} = {v}" for k, v in sorted(
+                    labels.items(), key=lambda kv: natural_sort_key(kv[0])))
+                summary.set(text if len(text) <= 70 else text[:67] + "...")
+            else:
+                summary.set("none set (plots and exports show G0, R0, ...)")
+
+        if previous is None and not labels:
+            return      # start-up with nothing named: no widget shows a name yet
+        # Checkbox and radio captions are plain text, so they are rebuilt.
+        for attr, refresh in (
+                ('spike_channel_check_frame', 'refresh_spike_channels'),
+                ('bout_analysis_channel_frame', 'refresh_bout_analysis_channels'),
+                ('sig_link_subject_listbox', 'refresh_signal_linkage_controls'),
+                ('exclusion_vars', 'refresh_exclusions_list'),
+                ('viz_channel_check_frame', 'on_viz_subject_selected')):
+            if hasattr(self, attr):
+                try:
+                    getattr(self, refresh)()
+                except Exception as exc:
+                    self.log_message(f"  Could not refresh channel names ({refresh}): {exc}")
+
+    def edit_channel_names(self):
+        """Dialog: give each channel a name (G0 -> BLA) used in place of its
+        designation in plots, tables and exports."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Channel Names")
+        dialog.transient(self.root)
+
+        current = dict(self.params.get('channel_labels') or {})
+        known = self._all_channel_names() if self.processed_data else ['G0', 'G1', 'R0', 'R1']
+        order = lambda name: (0 if name[0] == 'G' else 1, int(name[1:]))
+        shown = sorted(set(known) | set(current), key=order)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, justify='left', text=(
+            "Name each channel after what it records, e.g. the brain region.\n"
+            "The name replaces the G/R (and Ch) label in plots, tables and exports.\n"
+            "Leave a box empty to keep the designation.")).pack(anchor='w')
+        ttk.Label(body, justify='left', foreground='gray', font=('Segoe UI', 8), text=(
+            "Project files keep the designation, so names can be changed at any "
+            "time without reprocessing.")).pack(anchor='w', pady=(2, 8))
+
+        grid = ttk.Frame(body)
+        grid.pack(anchor='w')
+        ttk.Label(grid, text="Channel", font=('Segoe UI', 9, 'bold')).grid(
+            row=0, column=0, sticky='w', padx=(0, 12))
+        ttk.Label(grid, text="Name", font=('Segoe UI', 9, 'bold')).grid(
+            row=0, column=1, sticky='w')
+        name_vars = {}
+
+        def _add_row(designation):
+            row = len(name_vars) + 1
+            wavelength = '470 nm' if designation[0] == 'G' else '560 nm'
+            ttk.Label(grid, text=f"{designation}  ({wavelength})").grid(
+                row=row, column=0, sticky='w', padx=(0, 12), pady=2)
+            var = tk.StringVar(value=current.get(designation, ''))
+            entry = ttk.Entry(grid, textvariable=var, width=CHANNEL_LABEL_MAX_LEN + 2)
+            entry.grid(row=row, column=1, sticky='w', pady=2)
+            name_vars[designation] = var
+            return entry
+
+        first_entry = None
+        for designation in shown:
+            entry = _add_row(designation)
+            first_entry = first_entry or entry
+
+        # A channel that is not in the loaded data yet (naming before processing).
+        add_row = ttk.Frame(body)
+        add_row.pack(anchor='w', pady=(8, 0))
+        ttk.Label(add_row, text="Other channel:").pack(side='left')
+        add_var = tk.StringVar()
+        add_combo = ttk.Combobox(add_row, textvariable=add_var, width=6)
+        add_combo.pack(side='left', padx=(6, 6))
+
+        def _refresh_add_choices():
+            add_combo['values'] = [f'{letter}{i}' for letter in 'GR' for i in range(8)
+                                   if f'{letter}{i}' not in name_vars]
+
+        def _add_other():
+            designation = add_var.get().strip().upper()
+            if not re.match(r'^[GR]\d+$', designation):
+                messagebox.showinfo(
+                    "Channel", "Enter a designation such as G2 or R4.", parent=dialog)
+                return
+            if designation not in name_vars:
+                _add_row(designation).focus_set()
+                _refresh_add_choices()
+            add_var.set('')
+
+        ttk.Button(add_row, text="Add", style='Compact.TButton',
+                   command=_add_other).pack(side='left')
+        _refresh_add_choices()
+
+        def _save():
+            new = {}
+            for designation, var in name_vars.items():
+                label = var.get().strip()
+                problem = channel_label_error(designation, label, new.values())
+                if problem:
+                    messagebox.showerror("Channel Names", f"{designation}: {problem}",
+                                         parent=dialog)
+                    return
+                if label and label != designation:
+                    new[designation] = label
+            self.params['channel_labels'] = new
+            self._sync_channel_labels()
+            if new:
+                self.log_message("Channel names set: " + ", ".join(
+                    f"{k} = {v}" for k, v in new.items())
+                    + ". Regenerate open plots to see them.")
+            else:
+                self.log_message("Channel names cleared.")
+            if self.current_project:
+                self.save_project_config(quiet=True)
+            dialog.destroy()
+
+        def _clear():
+            for var in name_vars.values():
+                var.set('')
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(12, 0))
+        ttk.Button(buttons, text="Save", style='Accent.TButton',
+                   command=_save).pack(side='right')
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(
+            side='right', padx=(0, 6))
+        ttk.Button(buttons, text="Clear All", command=_clear).pack(side='left')
+        dialog.bind('<Return>', lambda _e: _save())
+        dialog.bind('<Escape>', lambda _e: dialog.destroy())
+        if first_entry is not None:
+            first_entry.focus_set()
+
     def resolve_channel_wavelength(self, data, ch):
         """Return preferred wavelength (470 or 570) for a given channel index.
 
@@ -17591,7 +18187,7 @@ Version 1.0.0
         for i in range(n):
             var = tk.IntVar(value=1)
             chk = ttk.Checkbutton(self.viz_channel_check_frame,
-                                  text=self.get_channel_name(data, i), variable=var)
+                                  text=channel_label(self.get_channel_name(data, i)), variable=var)
             chk.pack(side='left')
             self.viz_channel_vars.append(var)
 
@@ -18027,6 +18623,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self.reset_exclusion_toggles()
         if hasattr(self, 'exclusion_vars'):
             self.refresh_exclusions_list()
+        self.params['channel_labels'] = {}
+        self._sync_channel_labels()
 
         # Clear all behavior dropdowns so stale behaviors from the prior project
         # don't appear in the new project's UI.
@@ -18062,6 +18660,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showwarning("Warning", "Project folder found but no saved data detected.\n"
                                                  "This may be a new or empty project.")
     
+    @keeps_channel_designations
     def save_project_config(self, quiet=False):
         """Write project_config.json and the .tracy file only — no subject data.
 
@@ -18133,6 +18732,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return True
 
+    @keeps_channel_designations
     def save_project(self, quiet=False, subjects=None, show_completion=None):
         """Save project configuration and data.
 
@@ -18697,6 +19297,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 config = json.load(f)
             # Load parameters from project config
             loaded_params = config.get('parameters', {})
+            # Names belong to this project's implant sites; the last project's
+            # must not carry over into one saved before names existed.
+            self.params['channel_labels'] = {}
             # Update all parameters, keeping defaults for any new ones not in saved config
             for key, value in loaded_params.items():
                 if key in self.params:
@@ -18788,6 +19391,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self._sync_identity_widgets()
                 self._refresh_identity_preview()
 
+            if hasattr(self, 'detrend_auto_triexp'):
+                self.detrend_auto_triexp.set(bool(self.params.get('detrend_auto_triexp', False)))
             # Signal smoothing UI vars
             if hasattr(self, 'processing_rolling_avg_enabled'):
                 self.processing_rolling_avg_enabled.set(bool(self.params.get('processing_rolling_avg_enabled', False)))
@@ -20221,6 +20826,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 if hasattr(self, 'baseline_frames_var'):
                     self.baseline_frames_var.set(
                         f"{float(self.params.get('baseline_seconds', 0.0) or 0.0):g}")
+                if hasattr(self, 'detrend_auto_triexp'):
+                    self.detrend_auto_triexp.set(bool(self.params.get('detrend_auto_triexp', False)))
                 if hasattr(self, 'processing_rolling_avg_enabled'):
                     self.processing_rolling_avg_enabled.set(self.params['processing_rolling_avg_enabled'])
                 if hasattr(self, 'processing_smoothing_method'):
@@ -20262,6 +20869,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Every path that edits params ends here, so this is where the tab-level
         # copies of the entry thresholds are brought back into line.
         self._refresh_entry_threshold_controls()
+        self._sync_channel_labels()
     
     def sync_ui_to_params(self):
         """Sync UI variables to params dictionary before processing"""
@@ -20276,6 +20884,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._sync_bout_window_frames()
         self.baseline_frames_var.set(f"{self.params['baseline_seconds']:g}")
 
+        if hasattr(self, 'detrend_auto_triexp'):
+            self.params['detrend_auto_triexp'] = bool(self.detrend_auto_triexp.get())
         # Update processing-time smoothing settings
         self.params['processing_rolling_avg_enabled'] = self.processing_rolling_avg_enabled.get()
         self.params['processing_smoothing_method'] = self.processing_smoothing_method.get()
@@ -22431,6 +23041,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     file_fps = 1.0 / med
         return frames, x, y, file_fps
 
+    @keeps_channel_designations
     def process_fp_data(self, subject_id, fpdata_file, computerts_file=None):
         """
         Process fiber photometry data for a single subject
@@ -23342,6 +23953,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             header or self.BOUTFRAMES_SESSION_COLUMNS[0].title(), blocks)
                         wb_t.save(target_path)
 
+                    self._bf_sheet_cache = None  # workbook just changed; re-list its sheets
                     self.log_message(f"  Merged TTL behaviors into boutframes file: {target_path}")
                     self.log_message(
                         f"    Sheet: {target_sheet}"
@@ -23515,7 +24127,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             
             # Fit biexponential to RAW signal using time (not frames)
             try:
-                fitted = self.fit_biexponential(time_for_fit, signal)
+                fitted = self.fit_bleach_baseline(time_for_fit, signal, label=f"signal {i}")
                 # Calculate dF/F as percentage: 100 * (F - F_fitted) / F_fitted
                 dff[:, i + 2] = 100 * (signal - fitted) / fitted
             except Exception as e:
@@ -23551,7 +24163,87 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         n = max(1, int(n_samples))
         return int(max(2000, min(ceiling, cls.FIT_MAX_WORK // n)))
 
-    def fit_biexponential(self, x, y):
+    # Tri-exponential auto-selection (params['detrend_auto_triexp']).  The
+    # third term is kept only when BIC, computed on residuals averaged into
+    # TRIEXP_BIC_BIN_S bins, improves by more than TRIEXP_BIC_MIN.  Binning
+    # matters: raw samples are strongly autocorrelated, and scored per sample
+    # BIC prefers the bigger model almost always.  On the 43 DG fear
+    # conditioning sessions this picked tri-exp where it removed the early
+    # bleach residual (DG05: 0-5 min wander 0.29 -> 0.08 % dF/F) and kept
+    # bi-exp where the third term collapses (dBIC ~ -10, the penalty alone).
+    TRIEXP_BIC_BIN_S = 1.0
+    TRIEXP_BIC_MIN = 10.0
+
+    def fit_bleach_baseline(self, x, y, label=""):
+        """Bleaching baseline for dF/F: bi-exponential, or tri-exponential when
+        the auto-select setting is on and BIC favours it."""
+        if not getattr(self, 'params', {}).get('detrend_auto_triexp', False):
+            return self.fit_biexponential(x, y)
+        fitted_bi, popt_bi = self.fit_biexponential(x, y, return_params=True)
+        try:
+            fitted_tri = self.fit_triexponential(x, y, popt_bi)
+        except Exception as e:
+            self.log_message(f"    Tri-exponential fit failed for {label or 'channel'} "
+                             f"({type(e).__name__}); using bi-exponential")
+            return fitted_bi
+        y = np.asarray(y, dtype=float)
+        span = float(np.max(x) - np.min(x))
+        n_bin = max(1, int(round(len(y) * self.TRIEXP_BIC_BIN_S / span))) if span > 0 else 1
+
+        def bic(fitted, k):
+            r = (y - fitted) / fitted
+            m = (len(r) // n_bin) * n_bin
+            r = r[:m].reshape(-1, n_bin).mean(axis=1)
+            n = len(r)
+            return n * np.log(max(np.mean(r ** 2), 1e-300)) + k * np.log(n)
+
+        d_bic = bic(fitted_bi, 5) - bic(fitted_tri, 7)
+        use_tri = d_bic > self.TRIEXP_BIC_MIN
+        self.log_message(f"    Bleach fit {label}: "
+                         f"{'tri' if use_tri else 'bi'}-exponential (dBIC {d_bic:+.0f})")
+        return fitted_tri if use_tri else fitted_bi
+
+    def fit_triexponential(self, x, y, popt_bi):
+        """Tri-exponential baseline y = a e^-bx + c e^-dx + e e^-fx + offset,
+        seeded from a bi-exponential fit (popt_bi, in fit_biexponential's
+        normalised units).  The extra term covers a fast decay of a few seconds
+        (rate up to 2000 per session length).  Raises ValueError if the result
+        is unusable as a dF/F denominator."""
+        def triexp(x, a, b, c, d, e, f, offset):
+            return a * np.exp(-b * x) + c * np.exp(-d * x) + e * np.exp(-f * x) + offset
+
+        def triexp_jac(x, a, b, c, d, e, f, offset):
+            eb, ed, ef = np.exp(-b * x), np.exp(-d * x), np.exp(-f * x)
+            return np.column_stack([eb, -a * x * eb, ed, -c * x * ed,
+                                    ef, -e * x * ef, np.ones_like(x)])
+
+        y = np.asarray(y, dtype=float)
+        x_min, x_max = x.min(), x.max()
+        x_norm = (x - x_min) / (x_max - x_min) if x_max > x_min else x
+        y_min = float(np.min(y))
+        scale = float(np.max(y) - y_min) or 1.0
+        y_norm = (y - y_min) / scale
+
+        k = max(1, int(np.ceil(len(y_norm) / self.BIEXP_FIT_POINTS)))
+        m = (len(y_norm) // k) * k if k > 1 else len(y_norm)
+        x_fit = x_norm[:m].reshape(-1, k).mean(axis=1) if k > 1 else x_norm
+        y_fit = y_norm[:m].reshape(-1, k).mean(axis=1) if k > 1 else y_norm
+
+        lo = [0, 0.1, 0, 0.01, 0, 10, -np.inf]
+        hi = [2.0, 100, 2.0, 10, 2.0, 2000, np.inf]
+        a, b, c, d, off = popt_bi
+        p0 = [float(np.clip(v, l, h)) for v, l, h in
+              zip([a, b, c, d, 0.05, 200.0, off], lo, hi)]
+        popt, _ = curve_fit(triexp, x_fit, y_fit, p0=p0, bounds=(lo, hi), jac=triexp_jac,
+                            maxfev=self._fit_nfev_cap(len(y_fit), self.FIT_MAX_NFEV))
+        fitted = triexp(x_norm, *popt) * scale + y_min
+        if not np.all(np.isfinite(fitted)):
+            raise ValueError("tri-exponential fit produced non-finite values")
+        if np.min(fitted) <= 0 < np.min(y):
+            raise ValueError("tri-exponential baseline crosses zero")
+        return fitted
+
+    def fit_biexponential(self, x, y, return_params=False):
         """
         Fit biexponential decay to signal with offset
         Matches MATLAB: fit(x, y, 'exp2', 'Normalize', 'on')
@@ -23670,9 +24362,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             raise ValueError("biexponential baseline crosses zero; "
                              "unusable as a dF/F denominator")
 
-        # Return fitted values
+        # Return fitted values (plus normalised-unit parameters on request,
+        # used to seed fit_triexponential)
+        if return_params:
+            return fitted, popt
         return fitted
-    
+
     def motion_correction(self, dff, subtract_iso=True):
         """
         Motion correction by regressing out isosbestic signal
@@ -25775,6 +26470,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     values.append("0.00")  # Missing values default to 0
             self.behav_tree.insert('', 'end', values=values)
     
+    @exports_channel_labels
     def export_behavioral_metrics(self):
         """Export behavioral metrics to CSV, respecting selected options"""
         if not hasattr(self, 'behavioral_results') or not self.behavioral_results:
@@ -26906,7 +27602,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         sheets is far more expensive than reading one.
         """
         try:
-            key = (os.path.abspath(path), os.path.getmtime(path))
+            # Size is part of the key: network/exFAT drives report mtime to
+            # 1-2 s, so adding a sheet within that second left the old index
+            # cached and the new recording "had no boutframes sheet".
+            key = (os.path.abspath(path), os.path.getmtime(path),
+                   os.path.getsize(path))
         except OSError:
             return {}
         cached = getattr(self, '_bf_sheet_cache', None)
@@ -28727,6 +29427,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         edit_entry.bind('<Escape>', cancel_edit)
         edit_entry.bind('<FocusOut>', save_edit)
     
+    @keeps_channel_designations
     def save_boutframes(self):
         """Save modified boutframes to file"""
         subject = self.bout_subject_var.get()
@@ -28973,6 +29674,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except Exception:
             pass
 
+    @keeps_channel_designations
     def _generate_random_bouts(self, subjects, name, n_req, dur_min, dur_max,
                                user_spacing, margin, seed, has_end, prebout,
                                postbout, min_gap, reextract):
@@ -29959,6 +30661,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # The group-mode listboxes are subject pools too, so they go stale the
         # moment the loaded set changes -- not only when factors are edited.
         self.refresh_pool_listboxes()
+        # The loaded set decides which column slot is which channel.
+        self._sync_channel_labels()
 
     def update_behav_subjects(self):
         """Update subject list in behavioral data tab"""
@@ -30107,7 +30811,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             flagged = score < threshold
             fg = '#c0392b' if flagged else '#2e7d32'
             ttk.Label(cols, text=subject, width=18).grid(row=r, column=1, sticky='w')
-            ttk.Label(cols, text=channel, width=8).grid(row=r, column=2, sticky='w')
+            ttk.Label(cols, text=channel_label(channel)).grid(row=r, column=2, sticky='w')
             ttk.Label(cols, text=f"{score:.1f}", width=8, foreground=fg).grid(row=r, column=3, sticky='w')
             status = "already excluded" if already else ("below threshold" if flagged else "OK")
             if not already and not flagged and (subject, channel) in (rescued or ()):
@@ -30214,7 +30918,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 var = tk.BooleanVar(value=is_excluded)
                 self.exclusion_vars[subject][channel] = var
                 
-                cb = ttk.Checkbutton(checkbox_frame, text=channel, variable=var,
+                cb = ttk.Checkbutton(checkbox_frame, text=channel_label(channel), variable=var,
                                     command=lambda s=subject, c=channel: self.toggle_exclusion(s, c))
                 cb.grid(row=0, column=idx, padx=10, sticky='w')
             
@@ -31113,7 +31817,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             w.destroy()
         chans = self._all_channel_names()
         for idx, ch in enumerate(chans):
-            ttk.Radiobutton(frame, text=ch, variable=self.bout_analysis_channel_var,
+            ttk.Radiobutton(frame, text=channel_label(ch), variable=self.bout_analysis_channel_var,
                             value=ch).pack(side='left', padx=(0 if idx == 0 else 6, 0))
         if self.bout_analysis_channel_var.get() not in chans:
             self.bout_analysis_channel_var.set(chans[0])
@@ -32932,7 +33636,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for ch in range(num_channels):
             var = tk.IntVar(value=1 if ch < 2 else 0)
             cb = ttk.Checkbutton(self.viz_channel_check_frame,
-                                 text=self.get_channel_name(data, ch), variable=var)
+                                 text=channel_label(self.get_channel_name(data, ch)), variable=var)
             cb.pack(side='left', padx=2)
             self.viz_channel_vars.append(var)
 
@@ -35180,6 +35884,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         fig.tight_layout()
     
+    @exports_channel_labels
     def export_zscore_full_session(self):
         """Export z-score full session traces to an Excel file with one sheet per channel.
 
@@ -35309,6 +36014,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     #  side by side, and the Bouts sheet lists the spans themselves for anyone
     #  drawing the shading by hand.  One subject per file: bout frames are
     #  per-subject, so a ribbon column can only line up with one subject's rows.
+    @exports_channel_labels
     def export_bouts_overlay_workbook(self):
         """Export the plotted subject's Bouts Overlay as a graphing workbook."""
         subject = getattr(self, '_overlay_export_subject', None)
@@ -35601,6 +36307,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ]
         return lines
 
+    @exports_channel_labels
     def export_plot(self):
         """Save the current visualization figure at publication resolution.
 
@@ -35684,6 +36391,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             lines.append(' | '.join(bits))
         return '\n'.join(lines)
 
+    @exports_channel_labels
     def export_plot_data(self):
         """Export currently plotted data to CSV, respecting all selected options"""
         # Get selected subjects or groups
@@ -35935,7 +36643,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     for i, (group_name, n, matrix_df) in enumerate(sections):
                         if i > 0:
                             f.write('\n')
-                        f.write(f'# Group: {group_name} | Channel: {channel_str} | n={n} subjects | Bin size: {bin_size} cm\n')
+                        f.write(relabel_channels(f'# Group: {group_name} | Channel: {channel_str} | n={n} subjects | Bin size: {bin_size} cm\n'))
                         matrix_df.to_csv(f)
 
                 self._add_metadata_comment_to_csv(filename, self._create_export_metadata('plot'))
@@ -36330,7 +37038,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     for (behavior, channel), bout_dicts in behavior_channel_bouts.items():
                         # Create safe filename for this behavior-channel combination
                         safe_behavior = behavior.replace(' ', '_').replace('/', '_').replace('\\', '_')
-                        behavior_channel_filename = f"{base_filename}_{safe_behavior}_{channel}{extension}"
+                        behavior_channel_filename = f"{base_filename}_{safe_behavior}_{channel_label(channel)}{extension}"
                         
                         # Find max length for this behavior-channel
                         max_length = max(len(bout) for bout_dict in bout_dicts for bout in bout_dict.values())
@@ -36436,7 +37144,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             channel_data = [df[df['channel'] == channel].drop('channel', axis=1) if 'channel' in df.columns else df for df in all_data if 'channel' in df.columns and df['channel'].iloc[0] == channel]
                             
                             if channel_data:
-                                channel_filename = f"{base_filename}_{channel}{extension}"
+                                channel_filename = f"{base_filename}_{channel_label(channel)}{extension}"
                                 # Create wide format: time column + one column per subject
                                 # Start with time column from first dataframe
                                 if len(channel_data[0]) > 0:
@@ -38851,6 +39559,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._render_bout_comparison(fig, series, slot_defs, behavior,
                                      self.get_fps(), bin_size, subtitle)
 
+    @exports_channel_labels
     def _export_bout_bin_traces(self, filename, subjects, subject_to_group):
         """Write the z-scored bout traces behind Compare Across Bouts.
 
@@ -38944,8 +39653,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         traces_out[f"{prefix}_{_safe(subject)}_bout{_safe(bout_tag)}"] = padded
                         n_traces += 1
 
-            summary_path = f"{base}_{_safe(behavior)}_{_safe(slot_label)}_boutbins.csv"
-            traces_path = f"{base}_{_safe(behavior)}_{_safe(slot_label)}_boutbins_traces.csv"
+            summary_path = f"{base}_{_safe(behavior)}_{_safe(channel_label(slot_label))}_boutbins.csv"
+            traces_path = f"{base}_{_safe(behavior)}_{_safe(channel_label(slot_label))}_boutbins_traces.csv"
             pd.DataFrame(summary).to_csv(summary_path, index=False, encoding=EXPORT_CSV_ENCODING)
             pd.DataFrame(traces_out).to_csv(traces_path, index=False, encoding=EXPORT_CSV_ENCODING)
             for path in (summary_path, traces_path):
@@ -40366,6 +41075,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                               "will be used.")
         return engine, None
 
+    @keeps_channel_designations
     def _flmm_r_engine(self, Z, subjects, groups, orders, reference, ref_level=None,
                        log=None):
         """Run the real fastFMM::fui via Rscript. Returns (beta, se, qn) of the
@@ -40473,6 +41183,7 @@ cat("OK\n")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    @keeps_channel_designations
     def _flmm_r_factor_engine(self, Z, subjects, factor, ref_level, log=None):
         """Run the real fastFMM::fui for the multi-level factor model
         Y ~ fac + (1|id) with ref_level as baseline. Returns
@@ -40666,7 +41377,7 @@ cat("OK\n")
         for i, ch in enumerate(channels):
             v = tk.BooleanVar(value=(ch in default_channels))
             chan_vars[ch] = v
-            ttk.Checkbutton(chan_outer, text=ch, variable=v).grid(
+            ttk.Checkbutton(chan_outer, text=channel_label(ch), variable=v).grid(
                 row=i // per_row, column=i % per_row, sticky='w', padx=(0, 14), pady=1)
         if channels and not any(v.get() for v in chan_vars.values()):
             chan_vars[channels[0]].set(True)
@@ -42083,7 +42794,7 @@ cat("OK\n")
         for ch in channels:
             v = tk.BooleanVar(value=(ch in preset_chan))
             chan_vars[ch] = v
-            ttk.Checkbutton(chan_frame, text=ch, variable=v).pack(anchor='w', pady=1)
+            ttk.Checkbutton(chan_frame, text=channel_label(ch), variable=v).pack(anchor='w', pady=1)
         if channels and not any(v.get() for v in chan_vars.values()):
             chan_vars[channels[0]].set(True)
 
@@ -42581,6 +43292,7 @@ cat("OK\n")
         fig.tight_layout()
         return fig
 
+    @exports_channel_labels
     def _export_flmm_peak_effect_csv(self, table, channel):
         """Write the per-subject peak-effect values (subjects × behaviors) plus a
         metadata block (peak time, FDR p, significant window) to CSV for GraphPad
@@ -42589,7 +43301,7 @@ cat("OK\n")
         path = filedialog.asksaveasfilename(
             title="Export per-subject peak effect",
             defaultextension=".csv",
-            initialfile=f"FLMM_peak_effect_{channel}.csv",
+            initialfile=f"FLMM_peak_effect_{channel_label(channel)}.csv",
             filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
         if not path:
             return None
@@ -42601,7 +43313,7 @@ cat("OK\n")
         df = pd.DataFrame(data, index=subjects)
         df.index.name = 'subject'
         with open(path, 'w', newline='', encoding=EXPORT_CSV_ENCODING) as fh:
-            fh.write(f"# {channel}: per-subject signed peak z at FLMM peak time "
+            fh.write(f"# {channel_label(channel)}: per-subject signed peak z at FLMM peak time "
                      f"(within significant window); control = {table['ref_level']}\n")
             df.to_csv(fh)
             fh.write("\n# metadata\n")
@@ -43200,6 +43912,7 @@ cat("OK\n")
             self.flmm_timecourse_data['stats_lines'] = lines
         self._display_bout_stats(lines)
 
+    @exports_channel_labels
     def export_timecourse_flmm(self):
         """Copy the last FLMM time-course result to the clipboard as TSV."""
         d = getattr(self, 'flmm_timecourse_data', None)
@@ -43509,6 +44222,7 @@ cat("OK\n")
             sheets['Model_fit_per_bout'] = pd.concat(pred, ignore_index=True)
         return sheets
 
+    @exports_channel_labels
     def export_flmm_workbook(self):
         """Save the last FLMM time-course result as an Excel workbook."""
         d = getattr(self, 'flmm_timecourse_data', None)
@@ -43551,6 +44265,7 @@ cat("OK\n")
 
     # ---------------------- FLMM PDF report export ----------------------------
 
+    @exports_channel_labels
     def export_flmm_report(self):
         """Export a self-contained PDF report of the last FLMM analysis: every
         generated panel plus its full statistics readout and the method citations.
@@ -43857,6 +44572,7 @@ cat("OK\n")
         for col in [1, 2]:
             ws.cell(row=1, column=col).font = Font(bold=True)
     
+    @exports_channel_labels
     def _add_metadata_comment_to_csv(self, filename, metadata):
         """Add metadata as comment lines at end of CSV file
         
@@ -43872,7 +44588,7 @@ cat("OK\n")
         with open(filename, 'a', encoding='utf-8') as f:
             f.write('\n\n# Export Metadata\n')
             for key, value in metadata.items():
-                f.write(f'# {key}: {value}\n')
+                f.write(relabel_channels(f'# {key}: {value}\n'))
     
     @staticmethod
     def _slice_bouts(seq, limit):
@@ -45514,6 +46230,7 @@ cat("OK\n")
                          f"  ({behavior}, {channel})")
 
     # ------------------------------------------------------------------
+    @exports_channel_labels
     def export_bout_order_data(self):
         """Export bout order / binned progression data as a tab-separated CSV for easy copy-paste."""
         if not hasattr(self, 'bout_order_data') or not self.bout_order_data:
@@ -45650,7 +46367,7 @@ cat("OK\n")
                 lines.append("\t".join(prefix + ["n"]    + n_row))
             lines.append("")
 
-        text_content = "\n".join(lines)
+        text_content = relabel_channels("\n".join(lines))
 
         # Show export dialog
         export_win = tk.Toplevel(self.root)
@@ -45687,7 +46404,7 @@ cat("OK\n")
                 parent=export_win,
                 defaultextension=".csv",
                 filetypes=[("CSV / TSV", "*.csv *.tsv *.txt"), ("All files", "*.*")],
-                initialfile=f"bout_order_{behavior}_{channel}.csv"
+                initialfile=f"bout_order_{behavior}_{channel_label(channel)}.csv"
             )
             if fname:
                 with open(fname, 'w', encoding='utf-8') as fh:
@@ -45699,6 +46416,7 @@ cat("OK\n")
         ttk.Button(btn_frame, text="Close", command=export_win.destroy).pack(side='right', padx=5)
 
     # ------------------------------------------------------------------
+    @exports_channel_labels
     def export_binned_progression_all(self):
         """Export the binned bout progression for ALL behaviors into one workbook.
 
@@ -46821,6 +47539,7 @@ cat("OK\n")
         if self.current_bout_canvas:
             self.current_bout_canvas.draw()
     
+    @exports_channel_labels
     def export_bout_metrics(self):
         """Export currently selected bout metrics to a single Excel file.
 
@@ -46893,7 +47612,7 @@ cat("OK\n")
                         subject_to_group[s] = g_name
 
         # ── Ask for output filename ───────────────────────────────────────
-        default_name = f"{behavior}_{channel}_bout_metrics.xlsx"
+        default_name = f"{behavior}_{channel_label(channel)}_bout_metrics.xlsx"
         filename = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
@@ -47214,6 +47933,7 @@ cat("OK\n")
 
         return by_subject, rows, columns, total_bouts
 
+    @exports_channel_labels
     def export_bout_metrics_all(self):
         """Export bout metrics for ALL behaviors (and channels) into one workbook.
 
@@ -49282,7 +50002,7 @@ cat("OK\n")
 
         # ── Variables ────────────────────────────────────────────────────────
         self.dec_prob_by_var         = tk.StringVar(value="Group")
-        self.dec_prob_channel_var    = tk.StringVar(value="G0")
+        self.dec_prob_channel_var    = ChannelVar(value="G0")
         self.dec_prob_show_explore   = tk.BooleanVar(value=True)
         self.dec_prob_show_retreat   = tk.BooleanVar(value=True)
         # Settings variables (editable via settings dialog)
@@ -49360,7 +50080,7 @@ cat("OK\n")
         ttk.Label(ch_row, text="Channel:").pack(side='left')
         # Listed afresh each time it opens, so every detected channel (G2+,
         # red channels) is selectable rather than a fixed G0/G1 pair.
-        dec_combo = ttk.Combobox(ch_row, textvariable=self.dec_prob_channel_var,
+        dec_combo = ChannelCombobox(ch_row, textvariable=self.dec_prob_channel_var,
                                  values=["G0", "G1"], state='readonly', width=8)
         dec_combo.configure(postcommand=lambda c=dec_combo: c.configure(
             values=self._all_channel_names()))
@@ -50366,6 +51086,7 @@ cat("OK\n")
             stats_text.insert('end', stats_results['text'])
             stats_text.configure(state='disabled')
 
+    @exports_channel_labels
     def export_decision_probability(self):
         """Export decision probability results to Excel or CSV."""
         if not self.dec_prob_results:
@@ -50801,7 +51522,7 @@ cat("OK\n")
                 w.destroy()
             chans = self._all_channel_names()
             for idx, ch in enumerate(chans):
-                ttk.Radiobutton(frame, text=ch, variable=self.sig_link_channel_var,
+                ttk.Radiobutton(frame, text=channel_label(ch), variable=self.sig_link_channel_var,
                                 value=ch).pack(side='left',
                                                padx=(0 if idx == 0 else 8, 0))
             if self.sig_link_channel_var.get() not in chans:
@@ -51559,7 +52280,7 @@ cat("OK\n")
 
         # ── Variables ──────────────────────────────────────────────────────
         self.kin_by_var        = tk.StringVar(value="Subject")
-        self.kin_channel_var   = tk.StringVar(value="G0")
+        self.kin_channel_var   = ChannelVar(value="G0")
         self.kin_analysis_var  = tk.StringVar(value=self.KIN_ANALYSES[0])
         self.kin_tbin_var      = tk.StringVar(value="1.0")
         self.kin_smooth_win_var = tk.StringVar(value="11")
@@ -51673,7 +52394,7 @@ cat("OK\n")
         signal = cluster('signal')
         ttk.Label(signal, text="Channel:").grid(row=0, column=0, sticky='w',
                                                 pady=self.ui_px(2))
-        self.kin_channel_combo = ttk.Combobox(
+        self.kin_channel_combo = ChannelCombobox(
             signal, textvariable=self.kin_channel_var,
             values=["G0", "G1"], state='readonly', width=8)
         self.kin_channel_combo.grid(row=0, column=1, sticky='e', pady=self.ui_px(2))
@@ -53398,12 +54119,13 @@ cat("OK\n")
         cols = list(df.columns)
         tree = ttk.Treeview(win, columns=cols, show='headings')
         for c in cols:
-            tree.heading(c, text=c)
+            tree.heading(c, text=relabel_channels(c))
             tree.column(c, width=110, anchor='center')
         for _, r in df.iterrows():
-            tree.insert('', 'end', values=[r[c] for c in cols])
+            tree.insert('', 'end', values=[relabel_channels(r[c]) for c in cols])
         tree.pack(fill='both', expand=True, side='top')
 
+    @exports_channel_labels
     def _kin_export_df(self, df):
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
@@ -53420,6 +54142,7 @@ cat("OK\n")
         except Exception as exc:
             messagebox.showerror("Export Error", f"Could not export:\n{exc}")
 
+    @exports_channel_labels
     def export_kinematics(self):
         """Export the data behind the current plot, or save the figure as PNG."""
         # The plot's own table wins: Export is documented as "the data behind
