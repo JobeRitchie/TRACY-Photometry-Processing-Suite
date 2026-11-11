@@ -40,8 +40,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.31.1"
-APP_VERSION_DATE = "November 6, 2026"
+APP_VERSION = "1.32.0"
+APP_VERSION_DATE = "November 11, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -16683,6 +16683,18 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Channel names. Processing > Channel Processing Options >
+    "Channel Names..." lets you name each channel (G0 = BLA, R0 = OFC).
+    The name replaces the G/R/Ch label in plots, channel pickers, tables
+    and exports (headers, sheet names, file names). Saved with the
+    project; project files keep the designation, so names can be changed
+    at any time without reprocessing.
+  • New — Photobleaching correction can auto-detect when a
+    tri-exponential baseline fits better than the bi-exponential (per
+    channel, chosen by BIC). Off by default; helps steep early bleaching.
+
+Version 1.31.1  •  November 6, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Compare Across Bouts takes custom bout bins. "Bouts per bin"
     accepts a list such as 1-2, 4-5 (one averaged line per item; bouts in
