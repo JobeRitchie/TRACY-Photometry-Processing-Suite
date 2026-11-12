@@ -40,8 +40,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.32.1"
-APP_VERSION_DATE = "November 11, 2026"
+APP_VERSION = "1.33.0"
+APP_VERSION_DATE = "November 12, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -16700,6 +16700,18 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Distance from Center plots take a user-defined distance bin.
+    Visualization > "Distance bin (cm)": type 5 for 0-5, 5-10, ... cm bins
+    (2.5 and other widths work too) and press Enter. Applies to the X/Y
+    and Euclidean plots, for one subject, several, or a group comparison,
+    and to the CSV export (columns become dist_0-5cm_mean, ...). No
+    reprocessing needed; 1 cm, the default, is unchanged. Saved with the
+    project and listed in Edit Parameters under Binning.
+  • LICENSE.txt (the UNC Copyright and Permission Notice) added beside
+    LICENCE.pdf so GitHub detects the licence.
+
+Version 1.32.1  •  November 11, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — The repository's LICENCE.pdf is now the UNC Copyright and
     Permission Notice (UNC Ref 26-0137): free non-commercial use, with
