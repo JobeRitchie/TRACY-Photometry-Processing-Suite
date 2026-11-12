@@ -742,6 +742,7 @@ PARAM_GROUPS = [
         ("Binning", "", [
             ('time_bin_size', "Time bin (s)", "0 = no binning"),
             ('spatial_bin_size', "Spatial bin (cm)", "Heatmap bin size"),
+            ('distance_bin_cm', "Distance bin (cm)", "Distance from centre plots; 1 = every cm"),
         ]),
         ("Plot defaults", "", [
             ('series_factor', "Factor plotted as series", ""),
@@ -1133,8 +1134,8 @@ VIZ_OPTIONS_BY_PLOT = {
     'Position Heatmap':                 {'heatmap'},
     'Zone Entry Bouts':                 {'channels', 'entry_type', 'bouts'},
     'Zone Averages':                    {'channels'},
-    'Distance from Center (Euclidean)': {'channels'},
-    'Distance from Center':             {'channels'},
+    'Distance from Center (Euclidean)': {'channels', 'distance'},
+    'Distance from Center':             {'channels', 'distance'},
     'Out/Back':                         {'channels', 'outback'},
 }
 
@@ -2557,6 +2558,7 @@ class FPAnalysisGUI:
             # Binning parameters
             'time_bin_size': 60,  # seconds (0 = no binning)
             'spatial_bin_size': 2,  # cm for heatmap binning
+            'distance_bin_cm': 1,  # cm bins for the distance-from-centre plots
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
             # User's names for channels, {designation: name} e.g. {'G0': 'BLA'}.
@@ -7853,6 +7855,21 @@ class FPAnalysisGUI:
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(250), justify='left').grid(
             row=4, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        # Distance bin: view-time re-binning of the distance-from-centre curves.
+        dist_box = cluster('distance')
+        ttk.Label(dist_box, text="Distance bin (cm):").grid(row=0, column=0, sticky='w')
+        self.distance_bin_var = tk.StringVar(value=f"{self.params.get('distance_bin_cm', 1):g}")
+        dist_entry = ttk.Entry(dist_box, textvariable=self.distance_bin_var, width=8)
+        dist_entry.grid(row=0, column=1, sticky='w', padx=(4, 0))
+        dist_entry.bind('<Return>', lambda e: self.root.after_idle(self.generate_plot))
+        ttk.Label(dist_box,
+                  text="Averages the signal in bins this wide (5 = 0-5, 5-10, ... cm). "
+                       "Applies to the plot and its CSV export; no reprocess needed. "
+                       "Press Enter to redraw.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').grid(
+            row=1, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
         num_box = cluster('bout_number')
         ttk.Label(num_box, text="Show Bout #:").grid(row=0, column=0, sticky='w')
@@ -19343,7 +19360,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.update_param_labels()
             self.time_bin_var.set(str(self.params['time_bin_size']))
             self.spatial_bin_var.set(str(self.params['spatial_bin_size']))
-            
+            if hasattr(self, 'distance_bin_var'):
+                self.distance_bin_var.set(f"{self.params.get('distance_bin_cm', 1):g}")
+
             # Update file naming UI vars if they exist
             if hasattr(self, 'fpdata_pattern_var'):
                 self.fpdata_pattern_var.set(self.params.get('fpdata_pattern', 'FPData'))
@@ -20829,6 +20848,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # Update UI elements that display parameters
                 self.time_bin_var.set(str(self.params['time_bin_size']))
                 self.spatial_bin_var.set(str(self.params['spatial_bin_size']))
+                if hasattr(self, 'distance_bin_var'):
+                    self.distance_bin_var.set(f"{self.params.get('distance_bin_cm', 1):g}")
 
                 # Update file naming UI vars if they exist
                 if hasattr(self, 'fpdata_pattern_var'):
@@ -25610,7 +25631,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         return zone_averages
     
-    def calculate_distance_based_averages(self, beh_synced, n_channels=None):
+    def calculate_distance_based_averages(self, beh_synced, n_channels=None, bin_width=1.0):
         """Calculate average z-score based on distance from center along X, Y, and Euclidean distance
         
         Similar to MATLAB code that bins by 1cm distance from center and calculates
@@ -25640,46 +25661,107 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.log_message("    Warning: No valid distance-from-center samples; skipping distance bin averages")
             return {}, {}, {}
         
-        # Get maximum distances (floor to get bin range)
-        max_dist_x = int(np.floor(np.max(valid_x)))
-        max_dist_y = int(np.floor(np.max(valid_y)))
-        valid_eucl = eucl_distances[~np.isnan(eucl_distances)]
-        max_dist_eucl = int(np.floor(np.max(valid_eucl))) if len(valid_eucl) > 0 else 0
-        
-        # Initialize results dictionaries
-        x_axis_results = {}
-        y_axis_results = {}
-        eucl_results = {}
-        
-        # Calculate averages for X-axis distance bins
-        for d in range(max_dist_x + 1):
-            bin_mask = (np.floor(x_distances) == d) & ~np.isnan(x_distances)
-            
-            bin_data = self._slot_value_stats(
-                beh_synced, bin_mask, n_channels, {'distance': d}, ('mean', 'n'))
-            
-            x_axis_results[d] = bin_data
-        
-        # Calculate averages for Y-axis distance bins
-        for d in range(max_dist_y + 1):
-            bin_mask = (np.floor(y_distances) == d) & ~np.isnan(y_distances)
-            
-            bin_data = self._slot_value_stats(
-                beh_synced, bin_mask, n_channels, {'distance': d}, ('mean', 'n'))
-            
-            y_axis_results[d] = bin_data
-        
-        # Calculate averages for Euclidean distance bins
-        for d in range(max_dist_eucl + 1):
-            bin_mask = (np.floor(eucl_distances) == d) & ~np.isnan(eucl_distances)
-            
-            bin_data = self._slot_value_stats(
-                beh_synced, bin_mask, n_channels, {'distance': d}, ('mean', 'n'))
-            
-            eucl_results[d] = bin_data
-        
-        return x_axis_results, y_axis_results, eucl_results
-    
+        return tuple(self._distance_bin_stats(beh_synced, d, n_channels, bin_width)
+                     for d in (x_distances, y_distances, eucl_distances))
+
+    def _distance_bin_stats(self, beh_synced, distances, n_channels, bin_width=1.0):
+        """Per-channel mean and n of the signal in ``bin_width``-cm distance bins.
+
+        Keyed by each bin's lower edge: bin ``k`` covers ``[k*w, (k+1)*w)``.
+        The 1 cm default keeps the integer keys saved projects already hold.
+        """
+        valid = ~np.isnan(distances)
+        if not valid.any():
+            return {}
+        unit = float(bin_width) == 1.0
+        index = np.floor(distances / float(bin_width))
+        results = {}
+        for k in range(int(np.max(index[valid])) + 1):
+            edge = k if unit else round(k * float(bin_width), 6)
+            results[edge] = self._slot_value_stats(
+                beh_synced, valid & (index == k), n_channels,
+                {'distance': edge}, ('mean', 'n'))
+        return results
+
+    DISTANCE_AXIS_FIELD = {'distance_averages_x': 'x', 'distance_averages_y': 'y',
+                           'distance_averages_euclidean': 'euclidean'}
+
+    def _distance_bin_width(self):
+        """The user's distance bin in cm; 1 (the stored resolution) when unset or invalid."""
+        var = getattr(self, 'distance_bin_var', None)
+        try:
+            width = float(var.get()) if var is not None else float(
+                self.params.get('distance_bin_cm', 1))
+        except (TypeError, ValueError, tk.TclError):
+            return 1.0
+        if not np.isfinite(width) or width <= 0:
+            return 1.0
+        self.params['distance_bin_cm'] = width
+        return width
+
+    def _distance_table(self, data, data_key):
+        """``data[data_key]`` re-binned to the user's distance bin width.
+
+        Re-binned from the samples in beh_synced, so any width (2.5 cm
+        included) is an exact mean over the bin. Without beh_synced (legacy
+        imports) the stored 1 cm bins are merged, weighted by their n.
+        """
+        table = data.get(data_key) or {}
+        width = self._distance_bin_width()
+        if width == 1.0:
+            return table
+        beh = data.get('beh_synced')
+        n_ch = self._beh_channel_count(data)
+        if isinstance(beh, np.ndarray) and beh.ndim == 2 and beh.shape[1] >= self._beh_width(n_ch):
+            kb = self._beh_kin_base(n_ch)
+            x, y = beh[:, kb + 3], beh[:, kb + 4]
+            dist = {'x': x, 'y': y}.get(self.DISTANCE_AXIS_FIELD.get(data_key))
+            if dist is None:
+                dist = np.sqrt(x ** 2 + y ** 2)
+            return self._distance_bin_stats(beh, dist, n_ch, width)
+        return self._merge_distance_bins(table, width)
+
+    @classmethod
+    def _merge_distance_bins(cls, table, width):
+        """Merge stored 1 cm bins into ``width``-cm bins (n-weighted means)."""
+        sums = {}
+        for dist, values in cls._sorted_distance_bins(table):
+            edge = round(np.floor(dist / width) * width, 6)
+            acc = sums.setdefault(edge, {})
+            for key, mean in values.items():
+                if not key.endswith('_mean') or mean is None or np.isnan(mean):
+                    continue
+                slot = key[:-5]
+                n = values.get(f'{slot}_n', 1) or 0
+                total, count = acc.get(slot, (0.0, 0))
+                acc[slot] = (total + mean * n, count + n)
+        merged = {}
+        for edge, acc in sums.items():
+            row = {'distance': edge}
+            for slot, (total, count) in acc.items():
+                row[f'{slot}_mean'] = total / count if count else np.nan
+                row[f'{slot}_n'] = int(count)
+            merged[edge] = row
+        return merged
+
+    def _distance_plot_x(self, edges):
+        """Where to draw each bin: its lower edge at 1 cm (as before), else its centre."""
+        width = self._distance_bin_width()
+        if width == 1.0:
+            return list(edges)
+        return [e + width / 2.0 for e in edges]
+
+    def _label_distance_bins(self, ax, xs):
+        """Tick each wide bin with its range (0-5, 5-10, ...)."""
+        width = self._distance_bin_width()
+        if width == 1.0 or not len(xs) or len(xs) > 24:
+            return
+        ax.set_xticks(list(xs))
+        ax.set_xticklabels([f'{x - width / 2:g}-{x + width / 2:g}' for x in xs],
+                           rotation=45 if len(xs) > 8 else 0,
+                           ha='right' if len(xs) > 8 else 'center')
+
+
     def calculate_max_distance_zone(self, beh_synced):
         """Calculate photometry averages at the furthest point reached on Y-axis
         
@@ -36806,7 +36888,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if axis_key not in data:
                             continue
 
-                        dist_data = data[axis_key]
+                        dist_data = self._distance_table(data, axis_key)
+                        bin_cm = self._distance_bin_width()
 
                         for ch_slot in self.get_selected_viz_channels(data):
                             if not self._slot_included(subject, ch_slot, data):
@@ -36823,7 +36906,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                             # Add each distance as a column
                             for distance, metrics in sorted(dist_data.items()):
-                                row_data[f'dist_{int(distance)}cm_mean'] = metrics.get(f'G{ch_slot}_mean', float('nan'))
+                                span = (f'{int(distance)}' if bin_cm == 1.0
+                                        else f'{distance:g}-{distance + bin_cm:g}')
+                                row_data[f'dist_{span}cm_mean'] = metrics.get(f'G{ch_slot}_mean', float('nan'))
 
                             all_data.append(pd.DataFrame([row_data]))
                     continue  # Skip the wavelength loop for distance data
@@ -37988,8 +38073,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             data = self.processed_data.get(subject)
             if not data or data_key not in data or not self._slot_included(subject, slot, data):
                 continue
-            per_subject[subject] = data[data_key]
-            for dist, values in data[data_key].items():
+            table = self._distance_table(data, data_key)
+            per_subject[subject] = table
+            for dist, values in table.items():
                 v = values.get(key, np.nan)
                 pooled.setdefault(dist, [])
                 if not np.isnan(v):
@@ -38000,7 +38086,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         means = [np.nanmean(pooled[d]) if pooled[d] else np.nan for d in distances]
         sems = [np.nanstd(pooled[d]) / np.sqrt(len(pooled[d])) if pooled[d] else 0
                 for d in distances]
-        return distances, curves, means, sems
+        return self._distance_plot_x(distances), curves, means, sems
 
     def plot_distance_from_center(self, fig, data, subject_name):
         """Plot average z-score vs distance from center, one line per channel"""
@@ -38019,12 +38105,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for col, (data_key, axis_label, title) in enumerate(
                 (('distance_averages_x', 'X', x_title), ('distance_averages_y', 'Y', y_title)), 1):
             ax = fig.add_subplot(1, 2, col)
-            bins = self._sorted_distance_bins(data[data_key])
-            distances = [b[0] for b in bins]
+            bins = self._sorted_distance_bins(self._distance_table(data, data_key))
+            distances = self._distance_plot_x([b[0] for b in bins])
             for i, (s, label) in enumerate(slots):
                 ax.plot(distances, [v.get(f'G{s}_mean', np.nan) for _, v in bins],
                         f'{markers[i % len(markers)]}-', label=label, linewidth=2,
                         markersize=6, color=self._slot_color(s))
+            self._label_distance_bins(ax, distances)
             ax.set_xlabel(f'Distance from Center {axis_label}-axis (cm)')
             ax.set_ylabel('Average Z-score')
             ax.set_title(f'{subject_name}\n{title}')
@@ -38048,12 +38135,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         slots = self._single_subject_slots(subject_name, data)
         markers = 'os^Dv<>ph*'
         ax = fig.add_subplot(1, 1, 1)
-        eucl_bins = self._sorted_distance_bins(data['distance_averages_euclidean'])
-        distances = [b[0] for b in eucl_bins]
+        eucl_bins = self._sorted_distance_bins(
+            self._distance_table(data, 'distance_averages_euclidean'))
+        distances = self._distance_plot_x([b[0] for b in eucl_bins])
         for i, (s, label) in enumerate(slots):
             ax.plot(distances, [v.get(f'G{s}_mean', np.nan) for _, v in eucl_bins],
                     f'{markers[i % len(markers)]}-', label=label, linewidth=2,
                     markersize=6, color=self._slot_color(s))
+        self._label_distance_bins(ax, distances)
 
         ax.set_xlabel('Euclidean Distance from Center (cm)')
         ax.set_ylabel('Average Z-score')
@@ -38100,6 +38189,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[i % len(markers)]}-',
                         label=f'{label} Mean±SEM', linewidth=2.5, markersize=6,
                         color=color, capsize=4, zorder=3)
+            self._label_distance_bins(ax, distances)
 
         ax.set_xlabel('Euclidean Distance from Center (cm)', fontsize=11)
         ax.set_ylabel('Average Z-score', fontsize=11)
@@ -38131,6 +38221,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[row % len(markers)]}-',
                             label=f'{group_name} (n={len(curves)})', linewidth=2.5, markersize=6,
                             color=colors[g_idx], capsize=4, zorder=3)
+                self._label_distance_bins(ax, distances)
             ax.set_xlabel('Euclidean Distance from Center (cm)', fontsize=10)
             ax.set_ylabel(f'{ch_label} Average Z-score', fontsize=10)
             ax.set_title(f'Euclidean Distance from Center — {ch_label}', fontsize=11, fontweight='bold')
@@ -38574,6 +38665,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[i % len(markers)]}-',
                             label=f'{label} Mean±SEM', linewidth=2.5, markersize=6,
                             color=color, capsize=4, zorder=3)
+                self._label_distance_bins(ax, distances)
             ax.set_xlabel(f'Distance from Center {axis_label}-axis (cm)', fontsize=11)
             ax.set_ylabel('Average Z-score', fontsize=11)
             ax.set_title(f'{title}\nn={len(subjects)} subjects', fontsize=12, fontweight='bold')
@@ -38621,6 +38713,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax.errorbar(distances, means, yerr=sems, label=group_name,
                                 marker=markers[row % len(markers)], capsize=3, alpha=0.8,
                                 color=colors[group_idx], linewidth=2)
+                    self._label_distance_bins(ax, distances)
                 ax.set_xlabel(f'Distance {axis_label} (cm)', fontsize=10)
                 ax.set_ylabel('Avg Z-score', fontsize=10)
                 ax.set_title(f'{ch_label} - {axis_label} Axis ({desc})', fontsize=11, fontweight='bold')

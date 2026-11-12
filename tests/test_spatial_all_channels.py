@@ -122,3 +122,56 @@ def test_zone_average_export_writes_every_ticked_channel(monkeypatch):
     assert sorted(df['channel'].unique()) == [f'G{c}' for c in range(N_CH)]
     s2_g4 = df[(df['subject'] == 's2') & (df['channel'] == 'G4')]
     assert s2_g4['center_mean'].iloc[0] == 41.0
+
+
+def _ramp_app(width):
+    """One subject whose G0 signal equals its X distance, so bin means are known."""
+    app = _app()
+    data = app.processed_data['s1']
+    kb = 6 + N_CH
+    data['beh_synced'][:, 6] = data['beh_synced'][:, kb + 3]
+    x, y, e = app.calculate_distance_based_averages(data['beh_synced'], n_channels=N_CH)
+    data.update(distance_averages_x=x, distance_averages_y=y, distance_averages_euclidean=e)
+    app.distance_bin_var = _var(str(width))
+    return app, data
+
+
+def test_distance_bins_match_a_direct_mean_over_each_bin():
+    app, data = _ramp_app(5)
+    table = app._distance_table(data, 'distance_averages_x')
+    assert sorted(table) == [0.0, 5.0, 10.0, 15.0, 20.0]
+    dist = data['beh_synced'][:, 6 + N_CH + 3]
+    for edge, row in table.items():
+        mask = (dist >= edge) & (dist < edge + 5)
+        assert row['G0_n'] == mask.sum()
+        assert np.isclose(row['G0_mean'], dist[mask].mean())
+    # Every sample lands in exactly one bin.
+    assert sum(r['G0_n'] for r in table.values()) == N_ROWS
+
+
+def test_distance_bin_of_one_returns_the_stored_table():
+    app, data = _ramp_app(1)
+    assert app._distance_table(data, 'distance_averages_x') is data['distance_averages_x']
+    app.distance_bin_var = _var('junk')
+    assert app._distance_table(data, 'distance_averages_x') is data['distance_averages_x']
+
+
+def test_distance_bins_merge_stored_bins_without_beh_synced():
+    app, data = _ramp_app(5)
+    exact = app._distance_table(data, 'distance_averages_x')
+    legacy = {k: v for k, v in data.items() if k != 'beh_synced'}
+    merged = app._distance_table(legacy, 'distance_averages_x')
+    assert sorted(merged) == sorted(exact)
+    for edge in exact:
+        assert merged[edge]['G0_n'] == exact[edge]['G0_n']
+        assert np.isclose(merged[edge]['G0_mean'], exact[edge]['G0_mean'])
+
+
+def test_distance_plot_and_curves_use_the_bin_width():
+    from matplotlib.figure import Figure
+    app, data = _ramp_app(5)
+    xs, curves, means, _sems = app._distance_curves(['s1', 's2'], 'distance_averages_euclidean', 1)
+    assert xs[:2] == [2.5, 7.5] and len(curves) == 2 and len(means) == len(xs)
+    fig = Figure()
+    app.plot_distance_from_center(fig, data, 's1')
+    assert [t.get_text() for t in fig.axes[0].get_xticklabels()][:2] == ['0-5', '5-10']
