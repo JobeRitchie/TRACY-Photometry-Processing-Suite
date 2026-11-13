@@ -91,7 +91,7 @@ _KIN_COMMON = (
 _KIN_TBIN = (
     "With a Temporal bin above 0, frames are first averaged into bins of "
     "that many seconds, so each bin (not each frame) is one data point. "
-    "This stops thousands of near-identical neighbouring frames from "
+    "This stops thousands of near-identical neighboring frames from "
     "making a weak relationship look significant.")
 
 
@@ -106,7 +106,7 @@ ENTRIES: tuple = (
        place.""",
        see=("tab:Processing",)),
     _e("tab:Processing", "Processing", "Project > Processing",
-       """Turns raw photometry files into analysed signals, one subject at a
+       """Turns raw photometry files into analyzed signals, one subject at a
        time or a whole folder at once.""",
        calc="""For each recording TRACY separates the LED states (415, 470,
        570 nm), fits and removes photobleaching to get dF/F, removes the
@@ -142,7 +142,7 @@ ENTRIES: tuple = (
     _e("tab:Behavioral Data", "Behavioral Data", "Data > Behavioral Data",
        """A table of behavior measurements per subject from the tracked
        position: time in each zone, entries into each zone, distance
-       travelled, speed and decisions. No photometry is involved.""",
+       traveled, speed and decisions. No photometry is involved.""",
        calc="""Each frame is assigned to the zone the animal is in. Very
        short zone visits are merged into the visit before them and short
        tracking gaps are bridged, so a point flickering across a boundary
@@ -268,10 +268,10 @@ ENTRIES: tuple = (
 
        Noise: how much of the variance is frame-to-frame jitter.
 
-       Dropout: penalises signals that mostly spike downward or have
-       extreme outliers, the mark of a loose fibre or connector.
+       Dropout: penalizes signals that mostly spike downward or have
+       extreme outliers, the mark of a loose fiber or connector.
 
-       Motion: penalises a signal that closely follows the 415 nm channel
+       Motion: penalizes a signal that closely follows the 415 nm channel
        or loses most of its variance when 415 is removed, and sudden level
        shifts.
 
@@ -403,7 +403,7 @@ ENTRIES: tuple = (
     _e("viz:Zone Averages", "Zone Averages", _VIZ,
        """One bar per zone type: the average signal while the animal was in
        that zone.""",
-       calc="""Every frame is labelled with the zone the animal is in. The
+       calc="""Every frame is labeled with the zone the animal is in. The
        z-scores of all frames in each zone category are averaged per
        channel. With several subjects each animal is one dot and the bar is
        the mean with SEM across animals.""",
@@ -503,7 +503,7 @@ ENTRIES: tuple = (
        beside it draw them.""",
        calc="""The two channels' z-scored traces for the full session are
        compared with the chosen Method. In Subject mode each subject is
-       analysed on its own; in Group mode each subject is analysed and the
+       analyzed on its own; in Group mode each subject is analyzed and the
        results are averaged within each series. The "Long Session" and
        "Short Assay" presets set window lengths suited to recordings of
        tens of minutes or of a few minutes.""",
@@ -526,7 +526,7 @@ ENTRIES: tuple = (
        signed, so -1 means the channels move opposite to each other.""",
        read="""A peak in the spectrum says the regions share a rhythm at
        that frequency. The table's Mean Coherence and Mean Correlation
-       summarise the same curves.""",
+       summarize the same curves.""",
        see=("term:Coherence", "term:Welch vs Morlet wavelet",
             "coh:Wavelet Spectrogram")),
     _e("coh:Power Spectra", "Power Spectra", _COH_WS,
@@ -551,7 +551,7 @@ ENTRIES: tuple = (
        see=("coh:Visualize Coherence", "coh:Epoch Spectrogram")),
     _e("coh:Band Bars (whole session)", "Band Bars (whole session)",
        _COH_WS,
-       "Whole-session coherence summarised as one bar per frequency band.",
+       "Whole-session coherence summarized as one bar per frequency band.",
        calc="""The static coherence spectrum is averaged over the
        frequencies inside each band from the Frequency bands list. One bar
        per subject or series; group bars are the mean with SEM.""",
@@ -596,7 +596,7 @@ ENTRIES: tuple = (
        calc="""Coherence is computed for each subject separately, exactly
        as on the Whole Session or By Bout page ("Comparison type" picks
        which). Subjects are then divided into series by the "Split series
-       by" column, and each series is summarised as the mean with SEM
+       by" column, and each series is summarized as the mean with SEM
        across its subjects. The optional test (t-test or Mann-Whitney U)
        compares series using one value per subject.""",
        see=("coh:Plot Spectra (groups)", "coh:Plot Band Bars (groups)",
@@ -726,7 +726,7 @@ ENTRIES: tuple = (
        explained by where the animals went or how much they moved.""",
        see=("term:Spatial transient metrics",
             "spike:Analyze Spikes by Zone")),
-    _e("spatial:distance", "Distance from centre (transients)", _SPA,
+    _e("spatial:distance", "Distance from center (transients)", _SPA,
        """The chosen transient metric against distance from the arena
        center (straight-line, |X| or |Y|).""",
        calc="""Frames are grouped into distance bins and the metric is
@@ -887,7 +887,7 @@ ENTRIES: tuple = (
        frames first. Bins with too few frames are hidden.""",
        read="""A rising curve means the animal is more likely to make that
        move when the signal is high. Because every frame is scored and
-       neighbouring frames are nearly identical, this curve looks more
+       neighboring frames are nearly identical, this curve looks more
        certain than it is; the event outputs are the stricter test.""",
        see=("dec:Explore vs avoid (center)", "tab:Decision Probability")),
     _e("dec:Explore vs avoid (center)", "Explore vs avoid (center)", _DEC,
@@ -1118,7 +1118,7 @@ ENTRIES: tuple = (
        "Kinematic–Signal coupling by zone", _KIN,
        """One bar per zone: how strongly speed (or acceleration) and the
        signal are correlated while the animal is in that zone.""",
-       calc="""Frames are labelled by zone. Within each zone the
+       calc="""Frames are labeled by zone. Within each zone the
        correlation between the chosen kinematic ("Zone-plot kinematic") and
        the z-score is computed.""",
        read="Compare bars to see where movement and signal are most tied."),
@@ -1177,7 +1177,7 @@ ENTRIES: tuple = (
        see=("viz:Z-scored",)),
     _e("term:dF/F", "dF/F", "Processing, Visualization",
        """Change in fluorescence relative to baseline, in percent. It
-       removes differences in overall brightness between fibres and
+       removes differences in overall brightness between fibers and
        animals.""",
        calc="100 x (F - baseline) / baseline, where baseline is the fitted bleaching curve.",
        aliases=("delta F over F", "deltaF/F", "normalized"),
@@ -1225,7 +1225,7 @@ ENTRIES: tuple = (
 
        Max and Min: highest and lowest z-score in the window.
 
-       First derivative: the steepest change between neighbouring samples,
+       First derivative: the steepest change between neighboring samples,
        in z per second.
 
        AUC: area between the trace and zero, in z x seconds. "+only" counts

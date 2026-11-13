@@ -177,3 +177,41 @@ def test_distance_plot_and_curves_use_the_bin_width():
     fig = Figure()
     app.plot_distance_from_center(fig, data, 's1')
     assert [t.get_text() for t in fig.axes[0].get_xticklabels()][:2] == ['0-5', '5-10']
+
+
+RANGES = '5-10,10-15,15-20,20-25,25-30,35-40'
+
+
+def test_distance_ranges_match_a_direct_mean_over_each_range():
+    app, data = _ramp_app(RANGES)
+    table = app._distance_table(data, 'distance_averages_x')
+    assert sorted(table) == [5.0, 10.0, 15.0, 20.0, 25.0, 35.0]
+    dist = data['beh_synced'][:, 6 + N_CH + 3]
+    for lo, hi in app._distance_ranges():
+        mask = (dist >= lo) & (dist < hi)
+        assert table[lo]['G0_n'] == mask.sum()
+        if mask.any():
+            assert np.isclose(table[lo]['G0_mean'], dist[mask].mean())
+
+
+def test_distance_ranges_merge_stored_bins_without_beh_synced():
+    app, data = _ramp_app(RANGES)
+    exact = app._distance_table(data, 'distance_averages_x')
+    legacy = {k: v for k, v in data.items() if k != 'beh_synced'}
+    merged = app._distance_table(legacy, 'distance_averages_x')
+    assert sorted(merged) == sorted(exact)
+    for lo in exact:
+        if exact[lo]['G0_n']:
+            assert merged[lo]['G0_n'] == exact[lo]['G0_n']
+            assert np.isclose(merged[lo]['G0_mean'], exact[lo]['G0_mean'])
+
+
+def test_distance_plot_and_curves_use_the_ranges():
+    from matplotlib.figure import Figure
+    app, data = _ramp_app(RANGES)
+    xs, curves, means, _sems = app._distance_curves(['s1', 's2'], 'distance_averages_euclidean', 1)
+    assert xs == [0, 1, 2, 3, 4, 5] and len(curves) == 2 and len(means) == 6
+    fig = Figure()
+    app.plot_distance_from_center(fig, data, 's1')
+    assert [t.get_text() for t in fig.axes[0].get_xticklabels()] == [
+        '5-10', '10-15', '15-20', '20-25', '25-30', '35-40']

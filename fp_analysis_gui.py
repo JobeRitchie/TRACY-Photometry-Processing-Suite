@@ -42,7 +42,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.35.0"
+APP_VERSION = "1.36.0"
 APP_VERSION_DATE = "November 13, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -100,7 +100,7 @@ class _BoutRange:
 #
 # Naming conventions differ between experiments, so the pattern is chosen from
 # these presets (or typed by hand).  A separated suffix is the preferred style
-# because the session is explicit and can be a word — `2F_pre` / `2F_post` reads
+# because the session is explicit and can be a word: `2F_pre` / `2F_post` reads
 # in an exported table where `2FA` / `2FB` does not.  The underscore patterns
 # split on the LAST separator, so `Mouse_1_pre` is animal `Mouse_1`, session
 # `pre`.
@@ -119,7 +119,7 @@ def split_subject_id(subject_id, pattern=DEFAULT_SESSION_PATTERN):
     The pattern must supply an ``animal`` group; ``session`` is optional.
     Anything that does not match -- or that matches with an empty animal --
     falls back to ``(subject_id, '')``, i.e. "this recording is its own
-    animal", which is the pre-existing behaviour.
+    animal", which is the pre-existing behavior.
     """
     sid = str(subject_id)
     if not pattern:
@@ -156,7 +156,7 @@ def derive_animal_map(subject_ids, pattern=DEFAULT_SESSION_PATTERN, overrides=No
     two independent mixed-model groups into one.
 
     ``overrides`` is ``{subject_id: animal_id}`` and always wins; an overridden
-    subject also counts towards adoption, so a hand-linked pair is honoured even
+    subject also counts towards adoption, so a hand-linked pair is honored even
     when the pattern finds nothing.
     """
     from collections import Counter
@@ -353,7 +353,7 @@ def factor_levels(subject_ids, subject_factors, factor, level_order=None,
                   include_declared=False):
     """Levels of *factor* present among *subject_ids*, in display order.
 
-    Display order is honoured first (it drives series order and colour
+    Display order is honored first (it drives series order and color
     assignment on every plot, so it must not be alphabetical by accident), then
     any remaining levels alphabetically, with FACTOR_UNASSIGNED last.
 
@@ -541,7 +541,7 @@ def facet_is_inert(selections, series_factor=GROUP_FACTOR):
 
     "Split the series factor, combine everything else" is what the app already
     did before factors existed, so it is the default the controls start in.
-    Recognising it lets the untouched case take the original code path verbatim
+    Recognizing it lets the untouched case take the original code path verbatim
     rather than an equivalent-looking reimplementation -- which matters because
     the two are not quite equivalent: groups may overlap, and a subject in two
     groups is drawn in both there but lands in exactly one facet series.
@@ -562,7 +562,7 @@ def facet_series_order(split_factors, levels_by_factor):
     """Every series label the split factors can produce, in display order.
 
     The cross-product is taken in each factor's declared level order, so series
-    order (and therefore colour assignment) is stable as subjects come and go
+    order (and therefore color assignment) is stable as subjects come and go
     rather than following whichever labels happen to be present.
     """
     if not split_factors:
@@ -591,7 +591,7 @@ def facet_series_order(split_factors, levels_by_factor):
 # become uneditable by being forgotten here.
 PARAM_GROUPS = [
     ("Input Files", [
-        ("Photometry files", "How subject files are recognised during batch processing.", [
+        ("Photometry files", "How subject files are recognized during batch processing.", [
             ('fpdata_pattern', "FPData name pattern",
              "Text that identifies a photometry file"),
             ('fpdata_suffix', "FPData suffix",
@@ -614,11 +614,11 @@ PARAM_GROUPS = [
     ]),
 
     ("Signal Processing", [
-        ("Recording bounds", "Which part of each recording is analysed.", [
+        ("Recording bounds", "Which part of each recording is analyzed.", [
             ('precut', "Precut (raw rows)",
              "Raw file rows trimmed from the start; rows / LED states = samples per channel (100 rows at 2 LEDs = 50 samples, 1.7 s at 30 Hz)"),
             ('maxlengthseconds', "Max recording length (s)",
-             "0 = analyse the whole recording"),
+             "0 = analyze the whole recording"),
             ('maxlength_from_first_raw_row', "Count max length from first raw row",
              "True / False; False counts from the first row kept after the precut "
              "or session start, True from the first row of the file (video frame 0)"),
@@ -628,7 +628,7 @@ PARAM_GROUPS = [
         ("Photobleaching correction", "Baseline curve divided out to get dF/F.", [
             ('detrend_auto_triexp', "Auto-select tri-exponential fit",
              "True / False - per channel, use a tri-exponential baseline when BIC "
-             "favours it over the bi-exponential"),
+             "favors it over the bi-exponential"),
         ]),
         ("Smoothing", "Applied as the final processing step.", [
             ('processing_rolling_avg_enabled', "Smoothing enabled",
@@ -700,11 +700,11 @@ PARAM_GROUPS = [
             ('y_calibration_method', "Y calibration method",
              "legacy | normalize_y_min | independent_y_scale"),
             ('distal_threshold', "Distal threshold (cm)",
-             "Distance from centre counted as distal open arm"),
+             "Distance from center counted as distal open arm"),
             ('zone_editor_sticky_edges', "Zone editor: sticky edges",
              "True = dragging an edge moves the zone edges flush with it"),
         ]),
-        # The question this dialog gets asked most. Kept in one block, labelled
+        # The question this dialog gets asked most. Kept in one block, labeled
         # by which analysis each pair actually drives, so it is clear that
         # changing the EPM value does not move the metrics table.
         ("Minimum time in zone to count as an entry",
@@ -747,14 +747,14 @@ PARAM_GROUPS = [
         ("Binning", "", [
             ('time_bin_size', "Time bin (s)", "0 = no binning"),
             ('spatial_bin_size', "Spatial bin (cm)", "Heatmap bin size"),
-            ('distance_bin_cm', "Distance bin (cm)", "Distance from centre plots; 1 = every cm"),
+            ('distance_bin_cm', "Distance bin (cm)", "Distance from center plots; 1 = every cm"),
             ('behav_distance_bin_cm', "Time-at-distance bin (cm)",
-             "Behavioral Data time at distance from centre; 1 = every cm"),
+             "Behavioral Data time at distance from center; 1 = every cm"),
         ]),
         ("Plot defaults", "", [
             ('series_factor', "Factor plotted as series", ""),
             ('bout_overlay_line_thickness', "Bout overlay line width (pt)", ""),
-            ('zero_line_color', "Time-zero line colour", "Hex, e.g. #808080"),
+            ('zero_line_color', "Time-zero line color", "Hex, e.g. #808080"),
             ('zero_line_width', "Time-zero line width (pt)", ""),
         ]),
     ]),
@@ -1548,7 +1548,7 @@ class ZoneEditor:
                 messagebox.showerror("Error", "Invalid zone dimensions: min must be less than max")
                 return
 
-            # Which neighbouring edges are flush with the edges about to move?
+            # Which neighboring edges are flush with the edges about to move?
             # Collected BEFORE the zone changes, while the old values still
             # identify the shared boundary.
             followers = []
@@ -1572,8 +1572,8 @@ class ZoneEditor:
             if color:
                 self.zones[self.selected_zone]['color'] = color
 
-            # Drag the flush neighbours along so the arena stays tiled, skipping
-            # any move that would turn a neighbour inside out.
+            # Drag the flush neighbors along so the arena stays tiled, skipping
+            # any move that would turn a neighbor inside out.
             for partners, value in followers:
                 for zone_name, edge_key in partners:
                     other = self.zones[zone_name]
@@ -1696,10 +1696,10 @@ class ZoneEditor:
 
     # -- Edge stickiness ----------------------------------------------
     # Zones in every template are a tiling: each boundary is stored twice, once
-    # as one zone's max and once as its neighbour's min.  Dragging only ever
+    # as one zone's max and once as its neighbor's min.  Dragging only ever
     # moved the edge under the cursor, so the two halves of a shared boundary
     # came apart and left a gap (or an overlap) that position samples then fall
-    # into.  With stickiness on, an edge takes its flush neighbours with it;
+    # into.  With stickiness on, an edge takes its flush neighbors with it;
     # with it off, edges move one at a time, which is what you want when
     # deliberately carving out a zone that is not meant to tile.
 
@@ -1726,9 +1726,9 @@ class ZoneEditor:
         """Edges of other zones sitting on this zone's edge_key boundary.
 
         The boundary is followed through each partner in turn, so a chain of
-        zones along one line moves as a unit: the EPM_Complex centre's y edges
+        zones along one line moves as a unit: the EPM_Complex center's y edges
         reach the distal closed arms through the proximal ones, which are the
-        only zones the centre itself touches."""
+        only zones the center itself touches."""
         found = []
         seen = {(zone_name, edge_key)}
         frontier = [(zone_name, edge_key)]
@@ -1743,7 +1743,7 @@ class ZoneEditor:
     def _direct_sticky_partners(self, zone_name, edge_key):
         """Edges of other zones on this boundary that adjoin this zone.
 
-        A neighbour only counts if it also adjoins this zone along the other
+        A neighbor only counts if it also adjoins this zone along the other
         axis (overlapping it or touching it), so a zone that happens to line up
         across the far side of the arena is left where it is."""
         zone = self.zones[zone_name]
@@ -1845,7 +1845,7 @@ class ZoneEditor:
 
         The old tolerance was 10% of the zone's own size, so a thin zone was
         nearly impossible to grab while a large one grabbed an edge from
-        several centimetres away."""
+        several centimeters away."""
         try:
             inverse = self.ax.transData.inverted()
             x0, y0 = inverse.transform((0.0, 0.0))
@@ -2038,7 +2038,7 @@ class ZoneEditor:
                 f"{n_position} processed subject(s)?\n\n"
                 f"Zone entries, entry-aligned bouts, zone averages, distance "
                 f"averages and Out/Back stats will be recomputed from the stored "
-                f"position track. Signal processing and behaviour bouts are not "
+                f"position track. Signal processing and behavior bouts are not "
                 f"affected.",
                 parent=self.parent):
             return
@@ -2097,7 +2097,7 @@ class ZoneEditor:
 
         # OFT section
         ttk.Label(bouts_frame,
-                  text="OFT / Custom Arena  —  used when maze type is Open Field Test or Custom Arena",
+                  text="OFT / Custom Arena  -  used when maze type is Open Field Test or Custom Arena",
                   font=('', 9, 'bold')).grid(
             row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
 
@@ -2127,7 +2127,7 @@ class ZoneEditor:
 
         # EPM section
         ttk.Label(bouts_frame,
-                  text="EPM  —  used when maze type is EPM / EPM_Complex",
+                  text="EPM  -  used when maze type is EPM / EPM_Complex",
                   font=('', 9, 'bold')).grid(
             row=4, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
 
@@ -2451,7 +2451,7 @@ class FPAnalysisGUI:
             'accent_blue': '#4a90e2',  # Light blue accent
             'accent_dark_blue': '#2c5aa0',  # Dark blue accent
             'text_light': '#e2e8f0',   # Light text for dark backgrounds
-            'text_muted': '#94a3b8',   # Muted grey-blue for secondary text
+            'text_muted': '#94a3b8',   # Muted gray-blue for secondary text
             'text_dark': '#1a202c'     # Dark text for light backgrounds
         }
         
@@ -2467,8 +2467,8 @@ class FPAnalysisGUI:
             # recorded on different rigs land in the same project.  Each
             # subject's window is converted to samples at that subject's own
             # rate when its bouts are extracted, and the stored traces are
-            # resampled onto one shared time axis when they are read back — so
-            # recordings at different rates can be analysed together.
+            # resampled onto one shared time axis when they are read back, so
+            # recordings at different rates can be analyzed together.
             'preboutseconds': 3.0,
             'postboutseconds': 3.0,
             # Derived from the seconds above at analysis_fps(); kept in params so
@@ -2476,7 +2476,7 @@ class FPAnalysisGUI:
             # _sync_bout_window_frames() whenever the seconds or the rates change.
             'preboutframes': 90,
             'postboutframes': 90,
-            # Longest stretch of a recording to analyse, in SECONDS measured
+            # Longest stretch of a recording to analyze, in SECONDS measured
             # from the first sample kept after the precut.  Seconds rather than
             # raw rows because a row count is a different duration at every
             # sampling rate (and at every LED-state count), so a cohort split
@@ -2499,7 +2499,7 @@ class FPAnalysisGUI:
             # boutframes arrive in, because that is what an experimenter reads
             # off the video.  A recording routinely starts before the animal is
             # in the apparatus and ends after it is lifted out, and those two
-            # stretches are tracking artefacts, not data: the position track
+            # stretches are tracking artifacts, not data: the position track
             # wanders outside the arena and drags the pixel->cm calibration
             # (which is fitted to the observed X range) with it, so the whole
             # session is squashed into a sub-rectangle of the real one.
@@ -2513,15 +2513,15 @@ class FPAnalysisGUI:
             # processing and stored per subject as 'photometry_fps'; read it via
             # get_fps() rather than reintroducing a hand-set global.
             # How a subject ID splits into animal + session, so repeated recordings
-            # of one animal can be recognised (see derive_animal_map).  Chosen from
+            # of one animal can be recognized (see derive_animal_map).  Chosen from
             # SESSION_PATTERN_PRESETS; the default splits on the last underscore
             # ('2F_post' -> animal '2F', session 'post') and is ignored unless it
             # actually groups subjects together.
             'session_pattern': DEFAULT_SESSION_PATTERN,
-            'animal_overrides': {},  # {subject_id: animal_id} — hand-linked exceptions
+            'animal_overrides': {},  # {subject_id: animal_id}: hand-linked exceptions
             # Factors for faceting: names, per-subject levels, and the display
             # order of each factor's levels (which drives series order and
-            # colour assignment, so it must not be alphabetical by accident).
+            # color assignment, so it must not be alphabetical by accident).
             # Group is an ordinary stored factor -- it is where subject grouping
             # now lives, replacing the old Groups tab.  Session and Animal are
             # still derived from the subject IDs rather than stored.
@@ -2539,12 +2539,12 @@ class FPAnalysisGUI:
             # subject (see _boutframe_fps_scaling); 'on' / 'off' force it.
             'boutframe_fps_scaling': 'auto',
             # Whether boutframes are shifted back by the offset between video
-            # frame 0 and the first analysed photometry sample.  'auto' decides
+            # frame 0 and the first analyzed photometry sample.  'auto' decides
             # per subject from the timeline its bouts are sliced from (see
             # _boutframe_start_correction); 'on' / 'off' force it for everyone.
             'boutframe_start_correction': 'auto',
             'boutframe_manual_shift': 0,  # Manual frame shift applied after scaling (positive = shift forward, negative = shift backward)
-            # How rows in a raw TTL file (timestamp,value — no header) map to bouts:
+            # How rows in a raw TTL file (timestamp,value; no header) map to bouts:
             #   'pairs_start'    = onset/offset pairs; keep onsets only (rows 0,2,4…) → start-only bouts [LEGACY DEFAULT]
             #   'single'         = one row per bout (each row is a bout onset) → start-only bouts
             #   'pairs_startend' = onset/offset pairs; emit TTL__start AND TTL__end → start/end bouts
@@ -2568,8 +2568,8 @@ class FPAnalysisGUI:
             # Binning parameters
             'time_bin_size': 60,  # seconds (0 = no binning)
             'spatial_bin_size': 2,  # cm for heatmap binning
-            'distance_bin_cm': 1,  # cm bins for the distance-from-centre plots
-            'behav_distance_bin_cm': 1,  # cm bins for time at distance from centre
+            'distance_bin_cm': 1,  # cm bins for the distance-from-center plots
+            'behav_distance_bin_cm': 1,  # cm bins for time at distance from center
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
             # User's names for channels, {designation: name} e.g. {'G0': 'BLA'}.
@@ -2577,16 +2577,16 @@ class FPAnalysisGUI:
             'channel_labels': {},
             # Baseline window, also in seconds; 0 means "half the pre-bout window".
             'baseline_seconds': 0.0,
-            'baseline_frames': 45,  # derived from baseline_seconds — see _sync_bout_window_frames
+            'baseline_frames': 45,  # derived from baseline_seconds; see _sync_bout_window_frames
             # How much of a decay must be visible before Tau/t½ report a value.
-            # 'strict'     — a full time constant (1-1/e) must be observed; fewest
+            # 'strict'     - a full time constant (1-1/e) must be observed; fewest
             #                values, least extrapolation.
-            # 'balanced'   — at least a half-decay must be observed (default).
-            # 'permissive' — accepts partial decays; most values, most biased.
+            # 'balanced'   - at least a half-decay must be observed (default).
+            # 'permissive' - accepts partial decays; most values, most biased.
             'decay_strictness': 'balanced',
             # Photobleaching baseline for dF/F.  Off: always bi-exponential.
             # On: each channel is also fitted with a tri-exponential, kept only
-            # when BIC on 1-s binned residuals favours it (see fit_bleach_baseline).
+            # when BIC on 1-s binned residuals favors it (see fit_bleach_baseline).
             # Helps recordings whose decay has a fast (seconds) component on top
             # of the usual two, e.g. heavy patch-cord autofluorescence.
             'detrend_auto_triexp': False,
@@ -2653,7 +2653,7 @@ class FPAnalysisGUI:
             # Time-zero marker on every peri-event graph (Visualization tab).
             # Historically a 2 pt red dashed line on traces and a 2 pt yellow one
             # on the heatmaps, which dominated the data it was annotating; a thin
-            # grey line is the default now and both are user-configurable via
+            # gray line is the default now and both are user-configurable via
             # Advanced Graph Settings.
             'zero_line_color': '#808080',
             'zero_line_width': 0.8,
@@ -2732,7 +2732,7 @@ class FPAnalysisGUI:
             'bout_epoch_pre_sec': 10.0,
             'bout_epoch_post_sec': 10.0,
             'bout_epoch_max_bouts': 0,
-            # Minimum bout length an epoch must have to be analysed. For a
+            # Minimum bout length an epoch must have to be analyzed. For a
             # zone entry it is the time the animal must remain in the target
             # zone from the entry onward; for a scored behavior it is the
             # bout's own start-to-end duration, which needs boutframes with end
@@ -3258,7 +3258,7 @@ class FPAnalysisGUI:
             messagebox.showinfo(
                 "UI Scale",
                 "Interface scale updated.\n\n"
-                "Some panels only re-measure when rebuilt — restart TRACY for the "
+                "Some panels only re-measure when rebuilt; restart TRACY for the "
                 "change to apply everywhere.")
         except Exception:
             pass
@@ -3385,7 +3385,7 @@ class FPAnalysisGUI:
         # capped at what is left and the buttons are still above the fold, so
         # the v1.9.0 "actions never scroll away" guarantee is unchanged.
         #
-        # This is not only cosmetic. Pinned to the bottom of a maximised window,
+        # This is not only cosmetic. Pinned to the bottom of a maximized window,
         # a ttk.Menubutton's menu has no room to drop: Bout Analysis measured
         # 172 px below the Plot button for a 264 px menu, and Tk answers that by
         # throwing the menu to the top of the display, far from the button.
@@ -3670,7 +3670,7 @@ class FPAnalysisGUI:
                     wanted = table[key]
                     break
         if wanted is None:
-            # An unrecognised plot type shows everything. Hiding a control the
+            # An unrecognized plot type shows everything. Hiding a control the
             # user needs is worse than showing one they do not.
             wanted = set(clusters)
         wanted = set(wanted) | always
@@ -4043,7 +4043,7 @@ class FPAnalysisGUI:
     #
     # A hard `wraplength` is a promise about how wide the pane will be. When it
     # is wrong the label does not wrap early, it makes its container wider than
-    # the window -- which is how a paragraph of grey help text ends up pushing
+    # the window -- which is how a paragraph of gray help text ends up pushing
     # the controls beside it off the right edge at a larger UI scale. These two
     # methods clamp every wrapping label to the width it was actually given,
     # while never widening one past the width its author chose.
@@ -4246,11 +4246,11 @@ class FPAnalysisGUI:
     def create_welcome_tab(self):
         """Welcome/Landing page tab.
 
-        Everything here is one centred block of type. Its natural height is
+        Everything here is one centered block of type. Its natural height is
         ~750 px at the default density and ~880 px at Large, both taller than
         the tab area of a 1366x768 laptop, so the block is measured against the
         window and scaled down to fit rather than having its top and bottom
-        silently cropped by the centring.
+        silently cropped by the centering.
         """
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="Welcome")
@@ -4307,7 +4307,7 @@ class FPAnalysisGUI:
         # Active-development reminder: Tracy ships frequent updates, so nudge
         # users to check for them regularly via the System Check tab.
         line(version_frame,
-             "🔄 Tracy is in active development — check for updates "
+             "🔄 Tracy is in active development; check for updates "
              "regularly in the 'System Check' tab", 11, muted, pady=(8, 0))
 
         # Live update-availability badge. Driven by the startup update check
@@ -4371,8 +4371,8 @@ class FPAnalysisGUI:
         tab_outer = ttk.Frame(self.project_notebook)
         self.project_notebook.add(tab_outer, text="Setup")
         self.place_tab_help(tab_outer, 'Setup')
-        # This tab's content is ~820 px tall — more than the viewport on a
-        # 1366x768 laptop — so host it in a scrolling viewport rather than
+        # This tab's content is ~820 px tall, more than the viewport on a
+        # 1366x768 laptop, so host it in a scrolling viewport rather than
         # letting the lower controls fall off the bottom of the screen.
         tab = self.make_scrollable(tab_outer)
 
@@ -4483,7 +4483,7 @@ class FPAnalysisGUI:
         ttk.Label(frame,
                   text="When one animal is recorded more than once, the subject IDs usually say so.\n"
                        "Telling TRACY how they are built lets it treat those recordings as repeated\n"
-                       "measures of one animal instead of separate animals — which is what mixed\n"
+                       "measures of one animal instead of separate animals, which is what mixed\n"
                        "models (FLMM) need in order not to understate their error bars.",
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(600), justify='left').pack(anchor='w', pady=(0, 5))
@@ -4525,7 +4525,7 @@ class FPAnalysisGUI:
         ttk.Label(frame,
                   text="Z-score each animal against all of its sessions together instead of each\n"
                        "session on its own, so a 2 z-score transient means the same thing on both\n"
-                       "days. This rescales the z-scores already computed — it is exact and exactly\n"
+                       "days. This rescales the z-scores already computed; it is exact and exactly\n"
                        "reversible, so no reprocessing is needed. Animals with one session are left\n"
                        "alone, as are subjects processed before the moments were recorded.",
                   foreground='gray', font=('Segoe UI', 8),
@@ -4574,7 +4574,7 @@ class FPAnalysisGUI:
         frame.pack(fill='both', expand=True, padx=5, pady=5)
 
         ttk.Label(frame,
-                  text="Where each recording's real session begins and ends, numbered in VIDEO frames —\n"
+                  text="Where each recording's real session begins and ends, numbered in VIDEO frames,\n"
                        "the same frames boutframes are scored in.  Everything before the start frame and\n"
                        "after the end frame is dropped: the photometry, the position track, and any bouts\n"
                        "scored there.  Frames are converted to the recording's own sampling rate, so the\n"
@@ -4592,7 +4592,7 @@ class FPAnalysisGUI:
 
         ttk.Label(frame,
                   text="Trimming happens while the raw file is read, so these take effect on the next "
-                       "Process run — re-extracting bouts alone will not move data that is already "
+                       "Process run; re-extracting bouts alone will not move data that is already "
                        "processed.  The recording-length cap is applied AFTER the start bound, so "
                        "600 s means 600 s of real session.",
                   foreground='#a05000', font=('Segoe UI', 8),
@@ -5071,7 +5071,7 @@ class FPAnalysisGUI:
         if no_bounds:
             shown = ', '.join(no_bounds[:12]) + ('...' if len(no_bounds) > 12 else '')
             msg.append(f"\n{len(no_bounds)} subject(s) in the project got no bounds "
-                       f"and will be analysed in full: {shown}")
+                       f"and will be analyzed in full: {shown}")
         self.log_message('  ' + ' '.join(msg).replace('\n', ' '))
         messagebox.showinfo("Import complete", '\n'.join(msg))
 
@@ -5280,7 +5280,7 @@ class FPAnalysisGUI:
         messagebox.showinfo(
             "Pooled Z-Scoring",
             f"{'Applied' if enable else 'Reverted'} for {len(changed)} subject(s).\n\n"
-            "Z-scores, behaviour-synced traces and cached bouts were rescaled; "
+            "Z-scores, behavior-synced traces and cached bouts were rescaled; "
             "plots and exports will use the new scale.")
 
     def _pooled_status_text(self):
@@ -5321,7 +5321,7 @@ class FPAnalysisGUI:
 
         lines = []
         if not subjects:
-            lines.append("No processed subjects yet — process or load a project to preview.")
+            lines.append("No processed subjects yet; process or load a project to preview.")
         else:
             try:
                 re.compile(pattern) if pattern else None
@@ -5345,7 +5345,7 @@ class FPAnalysisGUI:
                 lines.append(f"{len(subjects)} recording(s); these IDs encode no repeated "
                              "sessions, so each is treated as its own animal.")
                 lines.append("(A split is only used when it actually groups recordings "
-                             "together — this guards against a pattern that merely "
+                             "together; this guards against a pattern that merely "
                              "chops the last letter off unrelated IDs.)")
             lines.append("")
             width = max((len(a) for a in by_animal), default=6)
@@ -5432,7 +5432,7 @@ class FPAnalysisGUI:
         
         # The path column takes the slack, so the entries grow with the window
         # instead of asking for a fixed character count that a narrow one or a
-        # large font cannot honour.
+        # large font cannot honor.
         for _grid in (input_frame, self.single_frame, self.batch_frame):
             _grid.grid_columnconfigure(1, weight=1)
 
@@ -5861,7 +5861,7 @@ class FPAnalysisGUI:
                   foreground='#0060a0').pack(side='left')
 
         ttk.Label(reextract_frame,
-                  text="Updates bout-aligned traces for all subjects using stored FP signals\u2014"
+                  text="Updates bout-aligned traces for all subjects using stored FP signals, "
                        "no full reprocessing required.",
                   foreground='gray', wraplength=self.ui_px(620),
                   justify='left').pack(side='left', padx=(20, 0))
@@ -6028,7 +6028,7 @@ class FPAnalysisGUI:
 
         ttk.Label(excl_tab,
                   text="Exclude bouts by duration or by proximity to the preceding bout.  This is a "
-                       "non-destructive filter: the boutframes file is never modified — the rules are "
+                       "non-destructive filter: the boutframes file is never modified; the rules are "
                        "applied to every subject when bouts are (re-)extracted.  Click "
                        "“Apply Settings & Re-extract Bouts” above to update results.",
                   foreground='gray', wraplength=self.ui_px(720), justify='left').pack(anchor='w', padx=10, pady=(8, 4))
@@ -6207,7 +6207,7 @@ class FPAnalysisGUI:
         header.append("Rules: " + (", ".join(rules) if rules else "(none active)"))
         if not any_end and (self.params.get('bout_exclude_min_duration', 0) > 0
                             or self.params.get('bout_exclude_max_duration', 0) > 0):
-            header.append("NOTE: duration rules have no effect — this file has no end frames.")
+            header.append("NOTE: duration rules have no effect; this file has no end frames.")
         header.append("")
         header.append(f"TOTAL: {total_before - total_after} of {total_before} bouts removed "
                       f"({total_after} kept)")
@@ -6323,7 +6323,7 @@ class FPAnalysisGUI:
                   wraplength=self.ui_px(250), justify='left').pack(
             anchor='w', pady=(self.ui_px(3), 0))
 
-        # Time at distance from centre: binned at view time from the samples
+        # Time at distance from center: binned at view time from the samples
         # Calculate Metrics keeps, so changing the bin needs no recalculation.
         dist_frame = ttk.LabelFrame(settings, text="Time at distance from center", padding=5)
         dist_frame.pack(fill='x', pady=(self.ui_px(6), 0))
@@ -6424,11 +6424,11 @@ class FPAnalysisGUI:
         self._register_tab_mousewheel(tab, canvas, scrollable_frame)
 
         ttk.Label(scrollable_frame,
-                  text="A factor is any way of dividing subjects — Group, Session, Drug, Sex, Day.\n"
+                  text="A factor is any way of dividing subjects: Group, Session, Drug, Sex, Day.\n"
                        "Graphing tabs can combine a factor's levels, split into one series per level, or\n"
                        "filter to a single level, and splitting two factors at once gives the cross-product\n"
                        "(\"Fentanyl × Post\"). Your experimental groups are the levels of whichever factor is\n"
-                       "marked “plotted as series” — Group by default, but rename it or press 'Plot as series'\n"
+                       "marked “plotted as series”: Group by default, but rename it or press 'Plot as series'\n"
                        "on another. Session and Animal are derived from the subject IDs; a level assigned here\n"
                        "overrides the derived one for that subject.",
                   foreground='gray', font=('Segoe UI', 8),
@@ -6465,7 +6465,7 @@ class FPAnalysisGUI:
             ("Plot as series", self.set_series_factor),
         ], cols=2, style='Compact.TButton')
 
-        # Level display order drives series order and colour assignment on every
+        # Level display order drives series order and color assignment on every
         # plot, so it is user-controlled rather than alphabetical by accident.
         level_frame = ttk.LabelFrame(left_panel, text="Levels (plot order)", padding=5)
         level_frame.pack(fill='both', expand=True, pady=(6, 0))
@@ -6579,7 +6579,7 @@ class FPAnalysisGUI:
                        self.factor_tree.get_children())).pack(side='left')
 
         ttk.Label(right_panel,
-                  text="New levels are created by typing one in the box — it does not have to exist yet. "
+                  text="New levels are created by typing one in the box; it does not have to exist yet. "
                        "Click a column heading to sort by it (again to reverse); factor columns sort in "
                        "level plot order. Double-click or F2 edits a cell; Ctrl+V pastes a block from "
                        "Excel starting at the clicked cell, Ctrl+C copies the selected rows, Delete "
@@ -6681,7 +6681,7 @@ class FPAnalysisGUI:
 
         if not subjects:
             self.factor_status_label.config(
-                text="No processed subjects yet — process or load a project.")
+                text="No processed subjects yet; process or load a project.")
         else:
             self.factor_status_label.config(
                 text=f"{len(subjects)} subject(s) · {len(factors)} factor(s). "
@@ -6836,7 +6836,7 @@ class FPAnalysisGUI:
             messagebox.showinfo(
                 "Derived Factor",
                 f"'{factor}' is derived automatically and cannot be deleted.\n\n"
-                "It disappears on its own when nothing produces it — Session when "
+                "It disappears on its own when nothing produces it: Session when "
                 "the IDs encode no sessions, Animal when no animal has more than "
                 "one recording.")
             return
@@ -7325,7 +7325,7 @@ class FPAnalysisGUI:
         columns = self._factor_columns()
         if not anchor or anchor[1] not in columns:
             messagebox.showinfo("No Cell Chosen",
-                                "Click a cell first — Delete clears that column "
+                                "Click a cell first: Delete clears that column "
                                 "for the selected rows.")
             return 'break'
         factor = anchor[1]
@@ -7847,7 +7847,7 @@ class FPAnalysisGUI:
                 clusters[name] = frame
             return frame
 
-        # Plot type — always visible; it is what drives everything else.
+        # Plot type: always visible; it is what drives everything else.
         type_box = cluster('plot_type', always=True)
         ttk.Label(type_box, text="Plot Type:").grid(row=0, column=0, sticky='w')
         self.plot_type_var = tk.StringVar(value="corrected")
@@ -7936,7 +7936,7 @@ class FPAnalysisGUI:
                   wraplength=self.ui_px(250), justify='left').grid(
                       row=5, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
-        # Behaviour selection for bout plots.
+        # Behavior selection for bout plots.
         beh_box = cluster('behavior')
         ttk.Label(beh_box, text="Behavior:").grid(row=0, column=0, sticky='w')
         self.behavior_var = tk.StringVar()
@@ -8018,7 +8018,7 @@ class FPAnalysisGUI:
                   wraplength=self.ui_px(250), justify='left').grid(
             row=4, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
-        # Distance bin: view-time re-binning of the distance-from-centre curves.
+        # Distance bin: view-time re-binning of the distance-from-center curves.
         dist_box = cluster('distance')
         ttk.Label(dist_box, text="Distance bin (cm):").grid(row=0, column=0, sticky='w')
         self.distance_bin_var = tk.StringVar(value=f"{self.params.get('distance_bin_cm', 1):g}")
@@ -8026,7 +8026,8 @@ class FPAnalysisGUI:
         dist_entry.grid(row=0, column=1, sticky='w', padx=(4, 0))
         dist_entry.bind('<Return>', lambda e: self.root.after_idle(self.generate_plot))
         ttk.Label(dist_box,
-                  text="Averages the signal in bins this wide (5 = 0-5, 5-10, ... cm). "
+                  text="A width (5 = 0-5, 5-10, ... cm) or your own ranges "
+                       "(5-10, 10-15, 20-40). "
                        "Applies to the plot and its CSV export; no reprocess needed. "
                        "Press Enter to redraw.",
                   foreground='gray', font=('Segoe UI', 8),
@@ -8087,7 +8088,7 @@ class FPAnalysisGUI:
                   wraplength=self.ui_px(250), justify='left').grid(
                       row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
-        # Bouts Overlay behaviour picker. None -> follow the Behavior dropdown
+        # Bouts Overlay behavior picker. None -> follow the Behavior dropdown
         # (single behavior); otherwise a set of names chosen in the pop-up.
         overlay_box = cluster('overlay')
         self.viz_overlay_behaviors = None
@@ -8176,7 +8177,7 @@ class FPAnalysisGUI:
             value=str(self.params.get('zero_line_color', '#808080')))
         self.zero_line_width_var = tk.StringVar(
             value=str(self.params.get('zero_line_width', 0.8)))
-        # The "Pick" button doubles as the colour preview; it only exists while
+        # The "Pick" button doubles as the color preview; it only exists while
         # the settings window is open, so the trace is registered once here.
         self.zero_line_swatch = None
         self.zero_line_color_var.trace_add(
@@ -8216,7 +8217,7 @@ class FPAnalysisGUI:
 
         # The three analysis modes live in a notebook in the Output zone, each
         # with its own options, actions and results. The left column holds only
-        # what all three share -- who is analysed, which channels, which method,
+        # what all three share -- who is analyzed, which channels, which method,
         # and the frequency bands -- so those stop being repeated per mode.
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
@@ -8452,7 +8453,7 @@ class FPAnalysisGUI:
                    command=lambda: self.epoch_min_bout_var.set(
                        self.bout_epoch_post_var.get())).grid(row=4, column=2, padx=3)
         ttk.Label(bout_params_frame,
-                  text="Drops epochs that ended too soon — time in zone for a zone "
+                  text="Drops epochs that ended too soon: time in zone for a zone "
                        "entry, bout duration for a\nscored behavior (needs boutframes "
                        "with end frames). 0 = use the detection thresholds alone.",
                   foreground='gray', font=('Segoe UI', 8), justify='left').grid(
@@ -8499,7 +8500,7 @@ class FPAnalysisGUI:
                         variable=self._grp_tab_mode_var, value="By Bout",
                         command=self._toggle_grp_tab_mode).pack(side='left', padx=4)
 
-        # Behavior selector — only visible in By-Bout sub-mode (row 2)
+        # Behavior selector: only visible in By-Bout sub-mode (row 2)
         self._grp_bout_params_row = ttk.Frame(grp_tab)
         self._grp_bout_params_row.grid(row=2, column=0, columnspan=4, sticky='w', pady=(0, 4))
         ttk.Label(self._grp_bout_params_row, text="Behavior:").pack(side='left', padx=(0, 4))
@@ -8538,7 +8539,7 @@ class FPAnalysisGUI:
                                            exportselection=False)
         self.grp_comp_listbox.pack(side='left', fill='both', expand=True)
         grp_lb_sb.config(command=self.grp_comp_listbox.yview)
-        # Alias — both backends read from the same widget
+        # Alias: both backends read from the same widget
         self.beg_groups_listbox = self.grp_comp_listbox
 
         self._make_facet_controls(grp_sel_frame, 'coherence_groups').pack(
@@ -8562,7 +8563,7 @@ class FPAnalysisGUI:
         ttk.Checkbutton(grp_stats_frame, text="Overlay individual subject traces",
                         variable=self.grp_comp_show_traces_var).pack(side='left', padx=8)
 
-        # Buttons row (row 5) — swapped by _toggle_grp_tab_mode
+        # Buttons row (row 5): swapped by _toggle_grp_tab_mode
         self._grp_ws_btns = ttk.Frame(grp_tab)
         self._grp_ws_btns.grid(row=5, column=0, columnspan=4, sticky='ew', pady=(4, 0))
         self.button_grid(self._grp_ws_btns, (
@@ -8584,7 +8585,7 @@ class FPAnalysisGUI:
             ("💾 Export", self.export_beg_comparison),
             ("📋 Prism Copy/Paste", self.export_beg_prism)))
 
-        # Status label (row 6) — shared
+        # Status label (row 6): shared
         self.grp_comp_status_var = tk.StringVar(value="No group comparison run yet.")
         self.beg_status_var = self.grp_comp_status_var  # alias
         ttk.Label(grp_tab, textvariable=self.grp_comp_status_var,
@@ -8593,7 +8594,7 @@ class FPAnalysisGUI:
 
         grp_tab.columnconfigure(1, weight=1)
 
-        # ── Initialise ────────────────────────────────────────────────────
+        # ── Initialize ────────────────────────────────────────────────────
         self._refresh_grp_comp_listbox()
         self._toggle_grp_tab_mode()
         self.update_conn_listbox()
@@ -8693,7 +8694,7 @@ class FPAnalysisGUI:
         """
         Automatically tests Morlet and Welch parameter combinations on the
         first available subject pair and scores each by spectral structure
-        (dynamic range × spectral variance, penalising ceiling/floor effects).
+        (dynamic range × spectral variance, penalizing ceiling/floor effects).
         Opens a results window with a preview plot and Apply buttons.
         """
         if not self.processed_data:
@@ -8734,7 +8735,7 @@ class FPAnalysisGUI:
             dyn   = float(np.max(c) - np.min(c))
             var   = float(np.var(c))
             mean  = float(np.mean(c))
-            # Penalise ceiling (>0.8) and floor (<0.05)
+            # Penalize ceiling (>0.8) and floor (<0.05)
             ceiling = float(np.mean(c > 0.8)) * 0.5
             floor_p = float(np.mean(c < 0.05)) * 0.3
             return max(0.0, dyn * 0.5 + var * 3.0 - ceiling - floor_p)
@@ -8821,7 +8822,7 @@ class FPAnalysisGUI:
             tree.heading(col, text=col)
             tree.column(col, width=w, anchor='center')
 
-        # Colour top 3 Morlet and top 3 Welch
+        # Color top 3 Morlet and top 3 Welch
         tree.tag_configure('top_morlet', background='#d4ecd4')
         tree.tag_configure('top_welch',  background='#d4d4ec')
 
@@ -8904,7 +8905,7 @@ class FPAnalysisGUI:
         right = ttk.Frame(paned, padding=4)
         paned.add(right, weight=2)
 
-        ttk.Label(right, text="Coherence spectra — top 5 configurations",
+        ttk.Label(right, text="Coherence spectra: top 5 configurations",
                   font=('Segoe UI', 9, 'bold')).pack(anchor='w')
 
         fig = Figure(figsize=(6, 4.5), dpi=96)
@@ -9093,7 +9094,7 @@ class FPAnalysisGUI:
         return bands
 
     def _coh_freq_axis_range(self, freqs):
-        """Frequency limits for a coherence plot, honouring Plot Axis Ranges.
+        """Frequency limits for a coherence plot, honoring Plot Axis Ranges.
 
         The spectrogram panels used to pin the y-axis to the analysis range
         (``static_fmin``/``static_fmax``), so narrowing "Freq axis min/max" in
@@ -9122,10 +9123,10 @@ class FPAnalysisGUI:
     def _apply_coh_freq_axis(self, ax, freqs):
         """Set a spectrogram's log Hz axis to the requested window and label it.
 
-        Narrowing the window is what makes the labelling matter: under a
+        Narrowing the window is what makes the labeling matter: under a
         decade, matplotlib's log locator offers a single major tick, and these
         panels blank the minor labels -- so a narrowed axis read "1" and
-        nothing else.  Inside that range the minor ticks are labelled instead.
+        nothing else.  Inside that range the minor ticks are labeled instead.
         """
         import matplotlib.ticker as mticker
 
@@ -9272,7 +9273,7 @@ class FPAnalysisGUI:
             msg = (f"{n_grp} group(s) processed.  "
                    f"Click 'Plot Spectra Comparison' or 'Plot Band Comparison' to visualize.")
             self.grp_comp_status_var.set(msg)
-            self.log_message(f"Group coherence comparison complete — {n_grp} group(s).")
+            self.log_message(f"Group coherence comparison complete, {n_grp} group(s).")
             if not self.group_coherence_results:
                 messagebox.showwarning("No Results",
                     "No subjects could be processed. Check that groups are defined "
@@ -9286,7 +9287,7 @@ class FPAnalysisGUI:
         behavioral zone category, compared across the selected groups.
 
         For every subject the two selected channels and the tracked position are
-        read from the aligned beh_synced matrix; frames are labelled by zone
+        read from the aligned beh_synced matrix; frames are labeled by zone
         category and static coherence is computed on the in-zone samples of each
         category.  Bars show the mean spectral coherence per zone, grouped.
         (In-zone frames are concatenated before the spectral estimate, so treat
@@ -9412,7 +9413,7 @@ class FPAnalysisGUI:
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
         fig.tight_layout()
-        self._embed_plot_window(fig, f"Zone Coherence — {ch1}-{ch2}", "1000x650")
+        self._embed_plot_window(fig, f"Zone Coherence: {ch1}-{ch2}", "1000x650")
         self.log_message(
             f"Zone coherence computed for {ch1}-{ch2} across {len(groups)} group(s), "
             f"{len(categories)} zone(s).")
@@ -9872,7 +9873,7 @@ class FPAnalysisGUI:
                         'n_bouts_available': n_avail,
                     }
                     q.put(('log',
-                           f"  {subj}: {n_used}/{n_avail} bouts — "
+                           f"  {subj}: {n_used}/{n_avail} bouts, "
                            f"mean pre={np.mean(pre_m):.4f}, post={np.mean(post_m):.4f}"))
 
                 if group_entry:
@@ -9888,10 +9889,10 @@ class FPAnalysisGUI:
 
         def _on_done():
             n_grp = len(self.beg_results)
-            msg = (f"{n_grp} group(s) processed — behavior: '{behavior}'.  "
+            msg = (f"{n_grp} group(s) processed, behavior: '{behavior}'.  "
                    f"Click a plot button to visualize.")
             self.beg_status_var.set(msg)
-            self.log_message(f"Bout-epoch group comparison complete — {n_grp} group(s).")
+            self.log_message(f"Bout-epoch group comparison complete, {n_grp} group(s).")
             if not self.beg_results:
                 messagebox.showwarning("No Results",
                     "No subjects could be processed. Check that groups are defined "
@@ -9926,7 +9927,7 @@ class FPAnalysisGUI:
         """
         Plot grand-mean coherence spectra (baseline vs post-onset) for each
         group side by side, with an all-group overlay beneath.  Post-onset is
-        solid and in the group colour; the baseline it is read against is
+        solid and in the group color; the baseline it is read against is
         dashed.
         """
         if not hasattr(self, 'beg_results') or not self.beg_results:
@@ -10021,7 +10022,7 @@ class FPAnalysisGUI:
         ax_ov.set_ylim(ymin, ymax)
         ax_ov.set_xlabel('Frequency (Hz)', fontsize=10)
         ax_ov.set_ylabel('Coherence', fontsize=10)
-        ax_ov.set_title('All Groups Overlay — Grand Mean ± SEM  '
+        ax_ov.set_title('All Groups Overlay: Grand Mean ± SEM  '
                         '(solid = post-onset, dashed = baseline)',
                         fontsize=10, fontweight='bold')
         ax_ov.legend(fontsize=7, ncol=min(n_grp * 2, 6))
@@ -10237,7 +10238,7 @@ class FPAnalysisGUI:
         ]
         if not active_idx:
             messagebox.showwarning("No Data",
-                "No frequency band data found — the current frequency range may not overlap the defined bands.")
+                "No frequency band data found: the current frequency range may not overlap the defined bands.")
             return
         bands   = [bands[i] for i in active_idx]
         n_band  = len(bands)
@@ -10740,7 +10741,7 @@ class FPAnalysisGUI:
         vars_['static_nperseg_sec'] = row(f1, 'Welch window (s)',      'static_nperseg_sec', 2, 'longer = finer freq resolution')
         ttk.Label(f1,
                   text=('\u26a0  Rule of thumb: window \u2265 2 \u00d7 (1 / Freq min)  '
-                        '\u2014  e.g., Freq min = 0.05 Hz  \u2192  window \u2265 40 s.  '
+                        '-  e.g., Freq min = 0.05 Hz  \u2192  window \u2265 40 s.  '
                         'A window that is too short will underestimate coherence at low frequencies.'),
                   foreground='#b05800', font=('Segoe UI', 8),
                   wraplength=self.ui_px(430)).grid(row=3, column=0, columnspan=3, sticky='w', padx=4, pady=(0, 4))
@@ -10793,7 +10794,7 @@ class FPAnalysisGUI:
         vars_['freq_xmin'] = row(f5, 'Freq axis min (Hz)',  'freq_xmin', 1,
                                  'spectra x-axis and spectrogram Hz axis')
         vars_['freq_xmax'] = row(f5, 'Freq axis max (Hz)',  'freq_xmax', 2,
-                                 '0 = use the analysed range')
+                                 '0 = use the analyzed range')
         vars_['coh_ymin']  = row(f5, 'Coherence Y min',    'coh_ymin',  3)
         vars_['coh_ymax']  = row(f5, 'Coherence Y max',    'coh_ymax',  4)
         ttk.Separator(f5, orient='horizontal').grid(row=5, column=0, columnspan=3, sticky='ew', pady=4)
@@ -10837,7 +10838,7 @@ class FPAnalysisGUI:
 
         def _open_band_manager():
             dlg.destroy()
-            # The freq band manager is on the main tab — just scroll there
+            # The freq band manager is on the main tab; just scroll there
             messagebox.showinfo("Tip",
                 "Use the Frequency Bands section on the Coherence tab to add, "
                 "edit, remove, or reorder bands.", parent=self.root)
@@ -10914,7 +10915,7 @@ class FPAnalysisGUI:
     #  Zone-entry epochs for coherence                                      #
     # ------------------------------------------------------------------ #
     #  The coherence tabs are onset-driven: everything they do needs a list of
-    #  frame indices to centre a pre/post window on.  Zone entries are already
+    #  frame indices to center a pre/post window on.  Zone entries are already
     #  detected during processing (detect_zone_entries -> entry_frames), so they
     #  can feed that same machinery provided they are (a) offered in the
     #  behavior dropdown under a name that cannot collide with a real behavior,
@@ -10966,8 +10967,8 @@ class FPAnalysisGUI:
 
         This is the zone the *onset frame itself* lands in, which is not always
         the zone the entry is named after: 'center_to_open' and the explore /
-        avoid decisions are all timestamped at a CENTRE entry, so their dwell is
-        time spent in the centre before the animal commits.  Reading it as the
+        avoid decisions are all timestamped at a CENTER entry, so their dwell is
+        time spent in the center before the animal commits.  Reading it as the
         open arm instead would measure a zone the animal is not in yet and
         reject every epoch.
         """
@@ -10994,7 +10995,7 @@ class FPAnalysisGUI:
     def _zone_labels_for(self, subject, data):
         """Per-frame zone classification for a processed subject.
 
-        Cached on the app rather than on the subject dict, which is serialised
+        Cached on the app rather than on the subject dict, which is serialized
         into the project file, and keyed by the zone geometry so that editing
         zones invalidates it without anyone having to remember to clear it.
         """
@@ -11209,7 +11210,7 @@ class FPAnalysisGUI:
 
         The zone-entry filter measures how long the animal stayed in the zone;
         the equivalent question for a scored bout is its own start-to-end
-        duration, so both arms of an epoch analysis honour the same field.
+        duration, so both arms of an epoch analysis honor the same field.
         ``lengths`` is filtered alongside ``onsets`` rather than after they are
         coerced to ints, because coercion drops rows and would otherwise pair a
         bout with the next bout's duration.  A start-only file has no lengths to
@@ -11364,7 +11365,7 @@ class FPAnalysisGUI:
                 "No Behavior Data",
                 "No processed bout data found and no boutframes file is set.\n"
                 "Process your subjects first, or browse for the boutframes file "
-                "in the Input Setup tab.")
+                "on the Processing tab.")
             return
         try:
             behaviors.update(self.boutframes_behavior_columns(boutframes_file))
@@ -11448,7 +11449,7 @@ class FPAnalysisGUI:
         _is_zone = self._zone_entry_epoch_key(behavior) is not None
         _len_label = "min time in zone" if _is_zone else "min bout length"
         self.log_message(
-            f"Bout epoch coherence — behavior='{behavior}', "
+            f"Bout epoch coherence: behavior='{behavior}', "
             f"pre={pre_sec}s, post={post_sec}s, max_bouts={max_bouts if max_bouts else 'all'}, method={coh_method}"
             + (f", {_len_label}={_min_bout:g}s" if _min_bout > 0 else ""))
         if 0 < _min_bout < post_sec:
@@ -11598,7 +11599,7 @@ class FPAnalysisGUI:
                     'mean_post_coh':  float(np.mean(post_coh_mean)),
                 }
                 q.put(('log',
-                      f"  {subject}: {n_bouts_used}/{n_bouts_available} bouts used — "
+                      f"  {subject}: {n_bouts_used}/{n_bouts_available} bouts used, "
                        f"mean pre={np.mean(pre_coh_mean):.4f}, "
                        f"mean post={np.mean(post_coh_mean):.4f}"))
                 n_processed += 1
@@ -11676,7 +11677,7 @@ class FPAnalysisGUI:
         if has_groups:
             # ── GROUP MODE ────────────────────────────────────────────
             # Left: one spectrum per group (grand mean ± SEM)
-            # Right: bar chart — mean pre vs post per group
+            # Right: bar chart, mean pre vs post per group
             fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(13, 5))
             palette_post = plt.cm.tab10(np.linspace(0.05, 0.95, n_groups))
             bar_w = 0.5
@@ -11730,7 +11731,7 @@ class FPAnalysisGUI:
             ax1.grid(True, axis='y', alpha=0.3)
 
         elif len(subjects) <= 4:
-            # ── SUBJECT MODE — individual panels ─────────────────────
+            # ── SUBJECT MODE: individual panels ─────────────────────
             ncols = len(subjects)
             fig, axes = plt.subplots(1, ncols, figsize=(4.5 * ncols, 4.8), squeeze=False)
             ax_list = axes[0]
@@ -11760,7 +11761,7 @@ class FPAnalysisGUI:
                 ax.legend(fontsize=7)
                 ax.grid(True, alpha=0.3)
         else:
-            # ── SUBJECT MODE — grand mean + per-subject bars ──────────
+            # ── SUBJECT MODE: grand mean + per-subject bars ──────────
             n_subj = len(subjects)
             fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -11812,7 +11813,7 @@ class FPAnalysisGUI:
         fig.tight_layout(rect=[0, 0, 1, 0.94])
 
         self._embed_plot_window(
-            fig, "Bout Epoch Coherence — Baseline vs. Post-Onset", "1200x720")
+            fig, "Bout Epoch Coherence: Baseline vs. Post-Onset", "1200x720")
 
     def visualize_bout_epoch_spectrogram(self):
         """Peri-event time\u2013frequency coherence heatmap for bout epoch analysis.
@@ -11820,7 +11821,7 @@ class FPAnalysisGUI:
         For each selected subject, extracts the pre+post signal window around
         every bout onset, computes the Morlet CWT instantaneous coherence, and
         averages across bouts to produce a mean freq\u00d7time matrix that is
-        displayed as a colour-mapped heatmap with onset at t=0.
+        displayed as a color-mapped heatmap with onset at t=0.
         """
         if not hasattr(self, 'bout_epoch_coherence_results') \
                 or not self.bout_epoch_coherence_results:
@@ -12039,7 +12040,7 @@ class FPAnalysisGUI:
             r0   = subject_mean_matrices[valid_subjects[0]]
             n_total_bouts = sum(subject_mean_matrices[s]['n_used'] for s in valid_subjects)
             title = (
-                f'Peri-Onset Wavelet Coherence \u2014 Grand Mean '
+                f'Peri-Onset Wavelet Coherence: Grand Mean '
                 f'(n={len(valid_subjects)} subjects, {n_total_bouts} total bouts) '
                 f'| {r0["behavior"]} | {r0["ch1"]}\u2194{r0["ch2"]}'
             )
@@ -12049,7 +12050,7 @@ class FPAnalysisGUI:
             fig.tight_layout(pad=1.5)
 
             win, cw = self._embed_plot_window(
-                fig, "Bout Epoch Wavelet Coherence — Grand Mean", "1300x550")
+                fig, "Bout Epoch Wavelet Coherence: Grand Mean", "1300x550")
 
         else:
             # ── Individual panels ─────────────────────────────────────
@@ -12060,7 +12061,7 @@ class FPAnalysisGUI:
             for plot_idx, subj in enumerate(valid_subjects, start=1):
                 m = subject_mean_matrices[subj]
                 title = (
-                    f'Peri-Onset Wavelet Coherence \u2014 {subj} | {m["behavior"]} '
+                    f'Peri-Onset Wavelet Coherence: {subj} | {m["behavior"]} '
                     f'| n={m["n_used"]} bouts | {m["ch1"]}\u2194{m["ch2"]}'
                 )
                 ax = fig.add_subplot(n_plots, 1, plot_idx)
@@ -12300,7 +12301,7 @@ class FPAnalysisGUI:
         ttk.Label(win,
                   text="Tab-separated. Copy a block (or the lot) straight into "
                        "Prism or Excel, or save it as a file.\n"
-                       "Lines starting with # are notes \u2014 they are not part "
+                       "Lines starting with # are notes; they are not part "
                        "of any table.",
                   font=('Segoe UI', 9), justify='left').pack(
             pady=(8, 4), padx=10, anchor='w')
@@ -12399,14 +12400,14 @@ class FPAnalysisGUI:
 
         r0 = next(iter(self.beg_results.values()))
         meta = self._coh_meta_common(r0['ch1'], r0['ch2'], r0['method'], {
-            'title': "Bout-epoch coherence by group \u2014 baseline vs post-onset",
+            'title': "Bout-epoch coherence by group: baseline vs post-onset",
             'behavior': r0['behavior'],
             'window': f"baseline {r0['pre_sec']:g}s before onset, "
                       f"post {r0['post_sec']:g}s after",
         })
         text = self._coherence_prism_text(series, epochs, meta)
         self._show_tsv_export_window(
-            "Prism Export \u2014 Bout-Epoch Group Coherence", text,
+            "Prism Export: Bout-Epoch Group Coherence", text,
             f"coherence_group_prepost_{r0['behavior']}.txt")
         self.log_message("Bout-epoch group coherence: Prism export opened.")
 
@@ -12437,14 +12438,14 @@ class FPAnalysisGUI:
         meta = self._coh_meta_common(
             r0['ch1'], r0['ch2'],
             self.conn_params.get('coherence_method', 'Welch'), {
-                'title': "Bout-epoch coherence by subject \u2014 baseline vs post-onset",
+                'title': "Bout-epoch coherence by subject: baseline vs post-onset",
                 'behavior': r0['behavior'],
                 'window': f"baseline {r0['pre_sec']:g}s before onset, "
                           f"post {r0['post_sec']:g}s after{dwell}",
             })
         text = self._coherence_prism_text(series, epochs, meta)
         self._show_tsv_export_window(
-            "Prism Export \u2014 Bout Epoch Coherence", text,
+            "Prism Export: Bout Epoch Coherence", text,
             f"coherence_bout_epoch_{r0['behavior']}.txt")
         self.log_message("Bout epoch coherence: Prism export opened.")
 
@@ -12479,7 +12480,7 @@ class FPAnalysisGUI:
         })
         text = self._coherence_prism_text(series, epochs, meta)
         self._show_tsv_export_window(
-            "Prism Export \u2014 Whole-Session Group Coherence", text,
+            "Prism Export: Whole-Session Group Coherence", text,
             "coherence_whole_session_by_group.txt")
         self.log_message("Group coherence: Prism export opened.")
 
@@ -12635,7 +12636,7 @@ class FPAnalysisGUI:
             messagebox.showwarning("No Spectra", "No valid spectra could be computed.")
             return
 
-        # ── Colour palette ─────────────────────────────────────────────
+        # ── Color palette ─────────────────────────────────────────────
         import matplotlib.cm as cm
         palette = ['#1f77b4', '#d62728', '#2ca02c', '#ff7f0e',
                    '#9467bd', '#8c564b', '#e377c2', '#17becf']
@@ -12685,14 +12686,14 @@ class FPAnalysisGUI:
 
         # Overall title
         fig.suptitle(
-            f"Power Spectral Density   \u2014   {ch1} vs {ch2}\n"
+            f"Power Spectral Density   -   {ch1} vs {ch2}\n"
             f"Welch window = {nperseg_sec:.0f}s  |  "
             f"freq resolution = {fs / nfft:.4f} Hz  |  "
             f"range {fmin}\u2013{fmax} Hz",
             fontsize=9)
 
         win, canvas = self._embed_plot_window(
-            fig, f"Power Spectral Density — {ch1} vs {ch2}",
+            fig, f"Power Spectral Density: {ch1} vs {ch2}",
             f"{min(fig_w * 100, 1600)}x{min(fig_h * 100 + 60, 900)}")
 
     def visualize_connectivity(self):
@@ -12857,7 +12858,7 @@ class FPAnalysisGUI:
         bands = self._bands_overlapping(r0['pre_freqs'])
         if not bands:
             messagebox.showwarning("No Bands",
-                "None of the frequency bands overlap the analysed frequency "
+                "None of the frequency bands overlap the analyzed frequency "
                 "range.\n\nEdit the bands on the Coherence tab, or widen "
                 "Freq min/max in Coherence Settings.")
             return
@@ -12929,7 +12930,7 @@ class FPAnalysisGUI:
         fig.tight_layout(rect=[0, 0, 1, 0.94])
 
         win, canvas = self._embed_plot_window(
-            fig, "Bout Epoch Coherence \u2014 Frequency-Band Bars", "1200x700")
+            fig, "Bout Epoch Coherence: Frequency-Band Bars", "1200x700")
 
     def visualize_static_band_bars(self):
         """Whole-session static coherence per frequency band, one bar per series.
@@ -12971,7 +12972,7 @@ class FPAnalysisGUI:
         bands = self._bands_overlapping(ref_freqs)
         if not bands:
             messagebox.showwarning("No Bands",
-                "None of the frequency bands overlap the analysed frequency "
+                "None of the frequency bands overlap the analyzed frequency "
                 "range.\n\nEdit the bands on the Coherence tab, or widen "
                 "Freq min/max in Coherence Settings.")
             return
@@ -13024,7 +13025,7 @@ class FPAnalysisGUI:
         fig.tight_layout(rect=[0, 0, 1, 0.94])
 
         self._embed_plot_window(
-            fig, "Whole-Session Coherence \u2014 Frequency-Band Bars", "1200x700")
+            fig, "Whole-Session Coherence: Frequency-Band Bars", "1200x700")
 
     # ------------------------------------------------------------------ #
     #  Wavelet Coherence Spectrogram (time × frequency heatmap)           #
@@ -13033,7 +13034,7 @@ class FPAnalysisGUI:
         """Open an interactive window showing a time–frequency coherence heatmap.
 
         Plots the sliding-coherence matrix (freq × time) produced by either the
-        Welch or Morlet Wavelet method as a colour-mapped spectrogram, matching
+        Welch or Morlet Wavelet method as a color-mapped spectrogram, matching
         the style shown in the attached reference figure.
         """
         if not self.connectivity_results:
@@ -13182,11 +13183,11 @@ class FPAnalysisGUI:
             fig   = Figure(figsize=(13, 4.5), dpi=100)
             ax    = fig.add_subplot(1, 1, 1)
             _draw_spectrogram(ax, common_times, all_freqs, mean_coh,
-                              f'Wavelet Coherence — Grand Mean (n={n_valid} subjects)')
+                              f'Wavelet Coherence: Grand Mean (n={n_valid} subjects)')
             fig.tight_layout(pad=1.5)
 
             win, cw = self._embed_plot_window(
-                fig, "Wavelet Coherence Spectrogram — Grand Mean", "1300x550")
+                fig, "Wavelet Coherence Spectrogram: Grand Mean", "1300x550")
 
         else:
             # ── Individual panels path ────────────────────────────────
@@ -13199,7 +13200,7 @@ class FPAnalysisGUI:
                 times   = sd['times']
                 freqs   = sd['freqs']
                 coh_tf  = sd['coh_tf']
-                title   = f'Wavelet Coherence \u2014 {name}' if n_plots > 1 else 'Wavelet Coherence'
+                title   = f'Wavelet Coherence: {name}' if n_plots > 1 else 'Wavelet Coherence'
                 ax      = fig.add_subplot(n_plots, 1, plot_idx)
                 _draw_spectrogram(ax, times, freqs, coh_tf, title)
 
@@ -13436,7 +13437,7 @@ class FPAnalysisGUI:
         tab = ttk.Frame(self.data_notebook)
         self.data_notebook.add(tab, text="Bout Analysis")
 
-        # ── Initialise all BooleanVars / StringVars ───────────────────────
+        # ── Initialize all BooleanVars / StringVars ───────────────────────
         self.bout_analysis_by_var        = tk.StringVar(value="Subject")
         self.bout_analysis_behavior_var  = tk.StringVar()
         self.bout_analysis_channel_var   = tk.StringVar(value="G0")
@@ -13568,7 +13569,7 @@ class FPAnalysisGUI:
         ttk.Button(actions, text="⚙ Settings…",
                    command=self._open_bout_settings).pack(fill='x', pady=(self.ui_px(4), 0))
 
-        # Plot ▾ — all graph types live behind one dropdown
+        # Plot ▾: all graph types live behind one dropdown
         # No arrow in the label: a full-width Menubutton already draws its own,
         # and two of them read as a rendering bug.
         # direction='right' posts the menu beside the button, into the wide
@@ -13610,14 +13611,14 @@ class FPAnalysisGUI:
                    command=self.run_bout_statistics).pack(
             fill='x', pady=(self.ui_px(4), 0))
 
-        # Export ▾ — both export paths behind one dropdown
+        # Export ▾: both export paths behind one dropdown
         export_mb = ttk.Menubutton(actions, text="Export", direction='right')
         export_menu = tk.Menu(export_mb, tearoff=0)
         export_menu.add_command(label="Metrics Table (Excel)…",
                                 command=self.export_bout_metrics)
         export_menu.add_command(label="All Behaviors → unified Excel (current settings)…",
                                 command=self.export_bout_metrics_all)
-        export_menu.add_command(label="Plot Data — copy/paste (Prism, Excel)…",
+        export_menu.add_command(label="Plot Data: copy/paste (Prism, Excel)…",
                                 command=self.export_bout_order_data)
         export_menu.add_command(label="Binned Progression, all behaviors → Excel (current settings)…",
                                 command=self.export_binned_progression_all)
@@ -14439,7 +14440,7 @@ class FPAnalysisGUI:
                 for i in self.spike_listbox.curselection()], False
 
     def _spike_subject_to_series(self):
-        """``{subject: series label}`` for labelling spike rows, plots and exports.
+        """``{subject: series label}`` for labeling spike rows, plots and exports.
 
         These sites used to build the map by walking ``self.groups``, which
         knows nothing about a facet -- so a run split on two factors was
@@ -14518,14 +14519,14 @@ class FPAnalysisGUI:
             subjects_to_analyze = list(selected_items)
             for subject in subjects_to_analyze:
                 subject_to_group[subject] = "N/A"
-        else:  # Group mode — the series come from the facet column
+        else:  # Group mode: the series come from the facet column
             for group_name in selected_items:
                 group_members = self._series_members(group_name)
                 for member in group_members:
                     subject_to_group[member] = self._join_group_labels(
                         subject_to_group.get(member), group_name)
                 subjects_to_analyze.extend(group_members)
-            # A subject in two selected groups is analysed once, not twice.
+            # A subject in two selected groups is analyzed once, not twice.
             subjects_to_analyze = list(dict.fromkeys(subjects_to_analyze))
 
         if not subjects_to_analyze:
@@ -15065,8 +15066,8 @@ class FPAnalysisGUI:
     def _spike_export_channels(self, subject, active_channels, excluded_channels):
         """Channel designations to export for one subject, in checkbox order.
 
-        Iterates the channels actually present in ``spike_data`` — which is keyed
-        by each subject's real designation (``G0``, ``R4``, ...) — rather than the
+        Iterates the channels actually present in ``spike_data``, which is keyed
+        by each subject's real designation (``G0``, ``R4``, ...), rather than the
         literal ``['G0', 'G1']`` these exports used to loop.  On a red-channel or
         mixed cohort that literal matched neither the stored spike data nor the
         exclusion keys, so the export came out empty and unfiltered at once.
@@ -15325,7 +15326,7 @@ class FPAnalysisGUI:
         self._embed_plot_window(fig, "Spike Analysis Visualization", "1200x800")
     
     def _plot_spike_metrics(self, fig):
-        """Plot spike analysis metrics — channel-agnostic (handles G0/G1/G2/R0/Ch0 etc.)"""
+        """Plot spike analysis metrics, channel-agnostic (handles G0/G1/G2/R0/Ch0 etc.)"""
         # Determine active channels from spike_channel_vars; fall back to all results channels
         if hasattr(self, 'spike_channel_vars') and self.spike_channel_vars:
             active_channels = [ch for ch, var in self.spike_channel_vars.items() if var.get()]
@@ -15403,7 +15404,7 @@ class FPAnalysisGUI:
                 ax1.scatter(np.full(len(data_rate[label]), i) + jitter, data_rate[label],
                             alpha=0.6, s=50, color=dot_color, edgecolors='black', linewidth=0.5, zorder=3)
             ax1.set_ylabel('Transient Rate (per min)', fontsize=11)
-            ax1.set_title(f'{ch_name} — Transient Rate', fontsize=12, fontweight='bold')
+            ax1.set_title(f'{ch_name}: Transient Rate', fontsize=12, fontweight='bold')
             ax1.set_xticks(x)
             ax1.set_xticklabels(labels, rotation=45, ha='right')
             ax1.grid(True, alpha=0.3, axis='y')
@@ -15422,7 +15423,7 @@ class FPAnalysisGUI:
                     ax2.scatter(np.full(len(valid_vals), i) + jitter, valid_vals,
                                 alpha=0.6, s=50, color=dot_color, edgecolors='black', linewidth=0.5, zorder=3)
             ax2.set_ylabel('Mean Amplitude (dF/F)', fontsize=11)
-            ax2.set_title(f'{ch_name} — Mean Amplitude', fontsize=12, fontweight='bold')
+            ax2.set_title(f'{ch_name}: Mean Amplitude', fontsize=12, fontweight='bold')
             ax2.set_xticks(x)
             ax2.set_xticklabels(labels, rotation=45, ha='right')
             ax2.grid(True, alpha=0.3, axis='y')
@@ -15430,7 +15431,7 @@ class FPAnalysisGUI:
         fig.tight_layout()
     
     def _plot_single_subject_spikes(self, fig, subject):
-        """Plot photometry trace with spike markers for a single subject — channel-agnostic."""
+        """Plot photometry trace with spike markers for a single subject, channel-agnostic."""
         # Active channels from spike_channel_vars; fall back to all in spike_data
         if hasattr(self, 'spike_channel_vars') and self.spike_channel_vars:
             active_channels = {ch for ch, var in self.spike_channel_vars.items() if var.get()}
@@ -15471,10 +15472,10 @@ class FPAnalysisGUI:
             if trace is None:
                 ax.text(0.5, 0.5, f'No signal for {ch_name}', transform=ax.transAxes,
                         ha='center', va='center')
-                ax.set_title(f'{subject} — {ch_name}', fontsize=12, fontweight='bold')
+                ax.set_title(f'{subject}: {ch_name}', fontsize=12, fontweight='bold')
                 continue
             self._draw_spike_trace(ax, trace, fps, spike_data[ch_name],
-                                   f'{subject} — {ch_name}', kind=kind)
+                                   f'{subject}: {ch_name}', kind=kind)
 
         fig.tight_layout()
 
@@ -15632,7 +15633,7 @@ class FPAnalysisGUI:
             [f"{g} (n={max((len(data[g][p]) for p in phases), default=0)})" for g in groups],
             rotation=20, ha='right')
         ax.set_ylabel('Transient rate (per min)')
-        ax.set_title(f"Transient rate by bout phase — {behavior}\n(pre/post window = {win_sec:g}s)",
+        ax.set_title(f"Transient rate by bout phase: {behavior}\n(pre/post window = {win_sec:g}s)",
                      fontsize=11, fontweight='bold')
         ax.legend(title='Phase', fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
@@ -15641,7 +15642,7 @@ class FPAnalysisGUI:
                     fontsize=8, color='#444',
                     bbox=dict(boxstyle='round', fc='white', ec='#ccc', alpha=0.8))
         fig.tight_layout()
-        self._embed_plot_window(fig, f"Spikes by Bout Phase — {behavior}", "1000x650")
+        self._embed_plot_window(fig, f"Spikes by Bout Phase: {behavior}", "1000x650")
 
     def _spike_bout_windows(self, subject, behavior, min_dwell_sec=0.0):
         """``[(onset, end_or_None), ...]`` in photometry samples for one subject.
@@ -15772,7 +15773,7 @@ class FPAnalysisGUI:
 
     SPATIAL_PLOTS = (
         ('breakdown', "Rate breakdown (zone / still-moving / time)"),
-        ('distance', "Distance from centre"),
+        ('distance', "Distance from center"),
         ('speed', "Speed tuning"),
         ('scatter', "Transient scatter (x/y)"),
         ('trace3d', "3D trace across the maze"),
@@ -15815,7 +15816,7 @@ class FPAnalysisGUI:
         """Per subject-channel arrays on the behavior grid.
 
         Uses the detections Run Spike Analysis stored, so counts match the
-        results table.  Each record holds x/y (cm), |x|/|y| from centre,
+        results table.  Each record holds x/y (cm), |x|/|y| from center,
         smoothed speed, the row rate, a transient count per row, a
         time-in-transient mask (peak +/- half its half-height width), the
         amplitude at each transient row, the zone category per row and the
@@ -15975,8 +15976,8 @@ class FPAnalysisGUI:
         return cols, table
 
     def _spatial_distance_profiles(self, recs):
-        """``(bin centres, {(subject, channel, category): values})`` of the
-        chosen metric against distance from centre."""
+        """``(bin centers, {(subject, channel, category): values})`` of the
+        chosen metric against distance from center."""
         o = self._spatial_opts()
         metric = o['metric'].get()
         axis = o['axis'].get()
@@ -16056,7 +16057,7 @@ class FPAnalysisGUI:
 
         The view for a difference that holds everywhere: if one group's rate
         is lower in every zone, at rest and moving, in every time block and
-        after equalising the time budget, the effect is not explained by
+        after equalizing the time budget, the effect is not explained by
         where the animals went or how much they moved.
         """
         cols, table = self._spatial_breakdown_table(recs)
@@ -16284,7 +16285,7 @@ class FPAnalysisGUI:
             panels = len(set((k[1], k[2]) for k in prof))
             fig = Figure(figsize=(13, 3.8 * int(np.ceil(panels / 3)) + 0.6), dpi=100)
             self._plot_spatial_lines(
-                fig, xs, prof, f"{o['axis'].get()} distance from centre (cm)",
+                fig, xs, prof, f"{o['axis'].get()} distance from center (cm)",
                 key_fn=lambda k: (k[1], k[2]),
                 title_fn=lambda p: f"{p[0]}" + (f": {p[1]}" if split else ""))
         elif kind == 'speed':
@@ -16312,7 +16313,7 @@ class FPAnalysisGUI:
         if not self._spike_results_in_sync():
             return None
         if not self.zones:
-            messagebox.showinfo("No Zones", "Spatial transient plots need zones (Zones tab).")
+            messagebox.showinfo("No Zones", "Spatial transient plots need zones (Settings > Zone Editor).")
             return None
         recs = self._spatial_records()
         if not recs:
@@ -16420,7 +16421,7 @@ class FPAnalysisGUI:
         p = panels['breakdown'] = ttk.LabelFrame(body, text="Rate breakdown", padding=pad)
         row(p, 0, "Time block (min)", ttk.Spinbox(p, from_=0.5, to=60, increment=0.5,
                                                   textvariable=o['block_min'], width=6))
-        p = panels['distance'] = ttk.LabelFrame(body, text="Distance from centre", padding=pad)
+        p = panels['distance'] = ttk.LabelFrame(body, text="Distance from center", padding=pad)
         row(p, 0, "Axis", ttk.Combobox(p, textvariable=o['axis'], state='readonly', width=10,
                                        values=['Euclidean', '|X|', '|Y|']))
         row(p, 1, "Bin (cm)", ttk.Spinbox(p, from_=0.5, to=20, increment=0.5,
@@ -16439,7 +16440,7 @@ class FPAnalysisGUI:
                                          textvariable=o['alpha'], width=6))
         row(p, 1, "Dot size", ttk.Spinbox(p, from_=1, to=60, increment=1,
                                           textvariable=o['size'], width=6))
-        row(p, 2, "Colour by", ttk.Combobox(p, textvariable=o['color_by'], state='readonly',
+        row(p, 2, "Color by", ttk.Combobox(p, textvariable=o['color_by'], state='readonly',
                                             width=10, values=['series', 'amplitude']))
         row(p, 3, "", ttk.Checkbutton(p, text="Show path", variable=o['show_path']))
         row(p, 4, "", ttk.Checkbutton(p, text="Divide by time spent (rate map per series)",
@@ -16462,7 +16463,7 @@ class FPAnalysisGUI:
                                                     textvariable=o['end_min'], width=6))
         for key in ('scatter', 'trace3d'):
             r = len(panels[key].grid_slaves(column=0))
-            row(panels[key], r, "Colour map", ttk.Combobox(
+            row(panels[key], r, "Color map", ttk.Combobox(
                 panels[key], textvariable=o['cmap'], state='readonly', width=10,
                 values=['plasma', 'viridis', 'magma', 'inferno', 'turbo', 'coolwarm']))
 
@@ -16959,7 +16960,7 @@ TRACY is a fiber-photometry analysis suite for behavioral neuroscience
 (currently v{v}). It takes raw photometry recordings plus optional behavior /
 position tracking and turns them into normalized signals, bout-aligned traces,
 spectral coherence, transient (spike) metrics, decision-probability curves and
-kinematics — all from one project workspace.
+kinematics, all from one project workspace.
 
 Use the navigation list on the left to jump to a topic. A typical first-time
 path is: read 'Required Files', set up a project on the Project tab, then run
@@ -16984,7 +16985,7 @@ for zone, heatmap and kinematics analyses). Processing also runs without this.
 > {SubjectID}ABELposition.csv
 Columns: frame, timestamp, X, Y -- where 'frame' is the VIDEO frame number and
 'timestamp' is video elapsed seconds, because ABEL never sees the photometry
-rig's computer clock. TRACY recognises the 'ABELposition' marker in the filename
+rig's computer clock. TRACY recognizes the 'ABELposition' marker in the filename
 and aligns the track by video frame, using the same conversion it applies to
 boutframes, so an ABEL position file and an ABEL boutframes workbook from the
 same project land on the signal together. Set 'Boutframes video FPS' to your
@@ -17017,7 +17018,7 @@ What that buys you:
   split and compare days inside one project.
 • Mixed models put the random intercept on the ANIMAL, so an animal's repeated
   days are not counted as independent subjects.
-• Boutframes can stay in one workbook — see 'Required Files & Naming'.
+• Boutframes can stay in one workbook; see 'Required Files & Naming'.
 
 The ID pattern is chosen on the Factors tab (default: split on the last
 underscore).  tools/combine_sessions.py turns one folder per session into a
@@ -17031,8 +17032,8 @@ How it works:
 TRACY finds the pattern in a filename and strips everything from the pattern
 onward to recover the SubjectID; trailing separators are removed.
 
-• FPData Pattern / Suffix — identifies the photometry file (default 'FPData' / '0.csv').
-• Timestamp Pattern / Suffix — identifies the behavior file; use '|' for
+• FPData Pattern / Suffix: identifies the photometry file (default 'FPData' / '0.csv').
+• Timestamp Pattern / Suffix: identifies the behavior file; use '|' for
   alternatives (default 'ComputerTS|AnimalPosition' / '0.csv').
 
 Examples:
@@ -17055,63 +17056,63 @@ multi-channel handling with per-channel wavelength routing).
   bad channels from analyses non-destructively.
 """),
             ("Recommended Workflow", """
-1. Project — create or open a project; all results and parameters are saved here.
-2. Processing — point TRACY at your data folder, confirm file-naming, and run.
+1. Project: create or open a project; all results and parameters are saved here.
+2. Processing: point TRACY at your data folder, confirm file-naming, and run.
    Single-subject or batch modes are available.
-3. Bout Frames — (optional) import / edit boutframes or TTLs and align them to
+3. Bout Frames: (optional) import / edit boutframes or TTLs and align them to
    the photometry timeline.
-4. Factors — declare how your design divides subjects (Group, Drug, Sex, Day)
+4. Factors: declare how your design divides subjects (Group, Drug, Sex, Day)
    and assign each subject its levels. Group is what the graphing tabs plot as
    series; every tab can also split or filter on any other factor.
-5. Analysis tabs (Data group) — Behavioral, Visualization, Coherence, Spike,
+5. Analysis tabs (Data group): Behavioral, Visualization, Coherence, Spike,
    Bout Analysis, Decision Probability, Kinematics.
-6. Export — most tabs export plots (PNG/SVG) and the underlying data (CSV/XLSX).
+6. Export: most tabs export plots (PNG/SVG) and the underlying data (CSV/XLSX).
 """),
             ("Tab Guide", """
 Project group:
-• Project — create / load projects and manage the workspace.
-• Processing — batch-process raw files into normalized signals.
-• Bout Frames — import, edit and time-align behavioral bouts / TTLs.
-• Factors — define the factors that divide your subjects and assign levels.
+• Project: create / load projects and manage the workspace.
+• Processing: batch-process raw files into normalized signals.
+• Bout Frames: import, edit and time-align behavioral bouts / TTLs.
+• Factors: define the factors that divide your subjects and assign levels.
   Experimental groups are the levels of the built-in Group factor.
-• Exclusions — exclude specific subject/channel combinations from analyses.
+• Exclusions: exclude specific subject/channel combinations from analyses.
 
 Data group:
-• Behavioral Data — per-subject behavioral metrics tables.
-• Visualization — traces, z-scores, bout overlays, heatmaps, zone averages,
+• Behavioral Data: per-subject behavioral metrics tables.
+• Visualization: traces, z-scores, bout overlays, heatmaps, zone averages,
   out/back movement and more, by subject or group.
-• Coherence — spectral / wavelet coherence and rolling correlation between
+• Coherence: spectral / wavelet coherence and rolling correlation between
   channels, including bout-epoch (peri-event) analyses.
-• Spike Analysis — detect calcium transients; check the threshold on the
+• Spike Analysis: detect calcium transients; check the threshold on the
   representative trace; rate, amplitude and width by zone; export for Prism.
-• Bout Analysis — quantify signal around bout onsets/offsets and bout windows.
-• Decision Probability — signal-conditioned probability of behavioral outcomes
+• Bout Analysis: quantify signal around bout onsets/offsets and bout windows.
+• Decision Probability: signal-conditioned probability of behavioral outcomes
   (e.g. explore vs. retreat).
-• Kinematics (BETA) — relate velocity / acceleration / position to the signal.
+• Kinematics (BETA): relate velocity / acceleration / position to the signal.
 
 Info group:
-• Overview — this page.
-• Glossary — every graph, tab and term: what it shows and how it is
+• Overview: this page.
+• Glossary: every graph, tab and term: what it shows and how it is
   calculated. The "?" on each tab opens the entry for the selected graph.
-• Changelog — version history.
-• System Check — verify Python dependencies and environment.
+• Changelog: version history.
+• System Check: verify Python dependencies and environment.
 """),
             ("Tips & Troubleshooting", """
 Common issues:
-✗ 'No timestamp file found' — make sure a ComputerTS, AnimalPosition or
+✗ 'No timestamp file found': make sure a ComputerTS, AnimalPosition or
   ABELposition file exists, or proceed without behavior data.
-✗ ABEL position track looks stretched — 'Boutframes video FPS' does not match
+✗ ABEL position track looks stretched: 'Boutframes video FPS' does not match
   the camera; the processing log reports the rate the file implies.
-✗ 'File not found' — confirm the file naming matches your Processing-tab patterns.
-✗ 'No boutframes sheet' — the worksheet name must equal the SubjectID exactly.
-✗ 'Biexponential fit failed' — signal may be noisy; TRACY falls back to a
+✗ 'File not found': confirm the file naming matches your Processing-tab patterns.
+✗ 'No boutframes sheet': the worksheet name must equal the SubjectID exactly.
+✗ 'Biexponential fit failed': signal may be noisy; TRACY falls back to a
   linear fit automatically.
-✗ NaNs in output — usually a timestamp-synchronization problem between files.
+✗ NaNs in output: usually a timestamp-synchronization problem between files.
 
 Tips:
 • Use Plot Trace on Spike Analysis to tune detection before a full run.
 • Drag the divider on split tabs (e.g. Spike Analysis) to resize panes.
-• 'Export Plot' saves PNG/TIFF at 600 dpi, or PDF/SVG/EPS as true vector —
+• 'Export Plot' saves PNG/TIFF at 600 dpi, or PDF/SVG/EPS as true vector;
   pick a vector format for Prism or Illustrator so it never pixelates.
 • On a Bouts Overlay, 'Export Overlay Data (xlsx)' writes the graph itself as
   numbers: the trace, a ribbon column per behavior, a highlight column per
@@ -17134,28 +17135,40 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
         """Concise, human-readable version history shown on the Changelog subtab."""
         return f"""
 ╔════════════════════════════════════════════════════════════════════════════════╗
-║                              TRACY  —  CHANGELOG                                ║
+║                              TRACY  -  CHANGELOG                                ║
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Info > Glossary: a searchable entry for every graph type, tab
+  • New: Visualization: Distance from Center plots and exports take
+    your own distance ranges (5-10, 10-15, 20-40) as well as a bin
+    width.
+  • Change: Wording pass across the app, glossary and README: American
+    spelling throughout and plainer punctuation in labels, messages
+    and this changelog.
+  • Fix: Three messages pointed at tabs that no longer exist; they
+    now name the Processing tab and Settings > Zone Editor. The README
+    names the real FLMM export menu item.
+
+Version 1.35.0  •  November 13, 2026
+────────────────────────────────────────────────────────────────────────────────
+  • New: Info > Glossary: a searchable entry for every graph type, tab
     and recurring term, saying what it shows, how it is calculated and
     how to read it, with links between related entries.
-  • New — Every tab has a "?" that opens the glossary at the graph
+  • New: Every tab has a "?" that opens the glossary at the graph
     selected there (or the tab's own explainer), with a Back button to
     return. Kinematics "Explain this plot" opens the same entries.
-  • New — Behavioral Data: "Time at Distance from Center" summaries
+  • New: Behavioral Data: "Time at Distance from Center" summaries
     (Euclidean, X, Y) show seconds spent in each distance bin, with a
     bin width or your own ranges, and "Export Time at Distance".
-  • New — Legends on group plots show each series' n.
-  • Change — Behavioral Data: Calculate Metrics keeps every subject; the
+  • New: Legends on group plots show each series' n.
+  • Change: Behavioral Data: Calculate Metrics keeps every subject; the
     selection and "Apply exclusions" are read when results are shown, so
     changing either no longer needs a recalculation.
 
 Version 1.34.0  •  November 12, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Analyses that pair position with photometry no longer score
+  • Fix: Analyses that pair position with photometry no longer score
     rows the photometry never recorded. In projects processed before the
     sync fix, every behavior row after the recording ended carried one
     repeated sample, so Zone Averages, Distance from Center, Out/Back,
@@ -17163,44 +17176,44 @@ Version 1.34.0  •  November 12, 2026
     Behavioral Data metrics averaged invented signal (zone means moved by
     up to 1 z where the camera long outran the photometry). Stored
     averages are rebuilt on first use; no reprocessing needed.
-  • Fix — Max recording length now cuts the behavior tracking at the same
+  • Fix: Max recording length now cuts the behavior tracking at the same
     point as the photometry (it used to trim the photometry only). Takes
     effect when a subject is reprocessed.
-  • New — Edit Parameters > Recording bounds > "Count max length from
+  • New: Edit Parameters > Recording bounds > "Count max length from
     first raw row". Off (default): the cap counts from the first row kept
     after the precut or session start. On: from the first row of the
     file (video frame 0), as projects made with the old frame cap were.
-  • New — Decision Probability event outputs: "Explore vs avoid
+  • New: Decision Probability event outputs: "Explore vs avoid
     (center)", "Signal vs P(explore)" and "Distal turn-back", scored one
     row per decision with a circular-shift null, plus an Excel export
     (center decisions, excursions, subject summary, group tests).
-  • Fix — Transient rate by zone: time in zone was measured against an
+  • Fix: Transient rate by zone: time in zone was measured against an
     inflated row rate and included unrecorded video, so rates were off by
     up to 2x.
-  • Fix — Bout AUC in the metrics table, its exports and First vs Last is
-    now in z·s (it was z·samples, about 30x larger) and labelled so.
-  • Fix — Connectivity "Mean Correlation" is the signed mean r; it was
+  • Fix: Bout AUC in the metrics table, its exports and First vs Last is
+    now in z·s (it was z·samples, about 30x larger) and labeled so.
+  • Fix: Connectivity "Mean Correlation" is the signed mean r; it was
     the mean of |r|, which showed anticorrelated channels as correlated.
     Group-mode summary, time-series and frequency exports are no longer
     empty.
-  • Fix — Behavioral Data: zone visits are debounced and tracking gaps
+  • Fix: Behavioral Data: zone visits are debounced and tracking gaps
     bridged before time, entries and decisions are counted; arm entries
     are counted per category; percentages are of tracked time; new
     Analyzed_Duration_sec and Percent_Tracked columns; time-bin export
     columns are in time order.
-  • Fix — Exports and labels: "Distance from Center (Euclidean)" exports
+  • Fix: Exports and labels: "Distance from Center (Euclidean)" exports
     the Euclidean table (it wrote X and Y); the spike summary names the
     signal its amplitudes are in instead of calling them z-scores; the
     kinematics "xcorr_peak_r" is the strongest correlation of either
-    sign; a subject in two selected groups is labelled with both; the
+    sign; a subject in two selected groups is labeled with both; the
     averaged bout-metrics export no longer applies a bout range twice;
     Kinematics and Position Heatmap read the right column for channels
-    past the second; Precut is labelled in raw rows, which is what it
+    past the second; Precut is labeled in raw rows, which is what it
     counts.
 
 Version 1.33.0  •  November 12, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Distance from Center plots take a user-defined distance bin.
+  • New: Distance from Center plots take a user-defined distance bin.
     Visualization > "Distance bin (cm)": type 5 for 0-5, 5-10, ... cm bins
     (2.5 and other widths work too) and press Enter. Applies to the X/Y
     and Euclidean plots, for one subject, several, or a group comparison,
@@ -17212,7 +17225,7 @@ Version 1.33.0  •  November 12, 2026
 
 Version 1.32.1  •  November 11, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — The repository's LICENCE.pdf is now the UNC Copyright and
+  • Fix: The repository's LICENCE.pdf is now the UNC Copyright and
     Permission Notice (UNC Ref 26-0137): free non-commercial use, with
     commercial licensing through the UNC Office of Technology
     Commercialization. It previously held the internal copyright
@@ -17220,66 +17233,66 @@ Version 1.32.1  •  November 11, 2026
 
 Version 1.32.0  •  November 11, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Channel names. Processing > Channel Processing Options >
+  • New: Channel names. Processing > Channel Processing Options >
     "Channel Names..." lets you name each channel (G0 = BLA, R0 = OFC).
     The name replaces the G/R/Ch label in plots, channel pickers, tables
     and exports (headers, sheet names, file names). Saved with the
     project; project files keep the designation, so names can be changed
     at any time without reprocessing.
-  • New — Photobleaching correction can auto-detect when a
+  • New: Photobleaching correction can auto-detect when a
     tri-exponential baseline fits better than the bi-exponential (per
     channel, chosen by BIC). Off by default; helps steep early bleaching.
 
 Version 1.31.1  •  November 6, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Compare Across Bouts takes custom bout bins. "Bouts per bin"
+  • New: Compare Across Bouts takes custom bout bins. "Bouts per bin"
     accepts a list such as 1-2, 4-5 (one averaged line per item; bouts in
     no item are left out) as well as a plain number. Titles, exported
     column names and metadata show the bins as typed.
-  • Fix — Compare Across Bouts numbered bouts from 1 under a Max bouts
+  • Fix: Compare Across Bouts numbered bouts from 1 under a Max bouts
     range; with 40-50 they are now bouts 40 to 50.
 
 Version 1.31.0  •  November 6, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Max bouts accepts a range. Type 40-50 for bouts 40 to 50, 5- for
+  • New: Max bouts accepts a range. Type 40-50 for bouts 40 to 50, 5- for
     bout 5 onward, or a plain number / all as before. Works across
     Visualization plots and exports, Bout Analysis metrics and exports,
     bouts across time, binned progression and FLMM; bout numbers and CSV
     column names keep their true numbers (bout40, not bout1).
-  • New — Zone entries are bout behaviors. Center / Corner / Edge Entry
+  • New: Zone entries are bout behaviors. Center / Corner / Edge Entry
     (OFT) and the EPM entry types appear as "Zone - ..." in the Bout
     Analysis and Visualization behavior lists. Existing projects pick them
     up without reprocessing. They have no end frame, so only onset-aligned
     windows apply.
-  • Fix — DigitalIOs events are placed through SystemTimestamp (the shared
+  • Fix: DigitalIOs events are placed through SystemTimestamp (the shared
     hardware clock) instead of ComputerTimestamp, which could sit 0.4-2.3 s
     off the FPData file's clock. Plain TTL files are unchanged.
 
 Version 1.30.0  •  October 27, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Every Visualization plot and export covers however many channels
+  • New: Every Visualization plot and export covers however many channels
     a recording has (G0–G4, R4…), following the channel checkboxes. Zone
     Averages, Distance from Center (X/Y and Euclidean) and Out/Back were
     computed for the first two channels only; they now cover all of them,
     for one subject, several subjects and group comparisons, and in their
     CSV exports. Projects processed earlier fill in the missing channels
-    from their saved data the first time they are plotted — no reprocessing.
-  • New — Extracted Bouts, Zone Entry Bouts and Compare Across Bouts draw
+    from their saved data the first time they are plotted; no reprocessing.
+  • New: Extracted Bouts, Zone Entry Bouts and Compare Across Bouts draw
     one row per ticked channel, and the figure grows to fit. Charts and
     CSV columns name each subject's real channel (a red cohort shows R4,
     not G0); channels past G1 get their own colors.
-  • New — All Behaviors → Bout Metrics writes a sheet per behavior for
+  • New: All Behaviors → Bout Metrics writes a sheet per behavior for
     every channel; the Decision Probability channel list, the Show Bout #
     list and spike export metadata cover every channel too.
-  • Fix — Compare Across Bouts with many bout bins: a per-bin legend (80+
+  • Fix: Compare Across Bouts with many bout bins: a per-bin legend (80+
     entries at one bout per bin) buried the panels. Past 12 bins a color
     bar keys bout order; group plots keep one legend entry per group.
-  • Fix — Group plot titles no longer sit on top of the first panel's
+  • Fix: Group plot titles no longer sit on top of the first panel's
     title (Zone Entry, Distance from Center, Out/Back).
 
 Version 1.29.2  •  October 27, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Visualization → Export CSV writes bout traces for every ticked
+  • Fix: Visualization → Export CSV writes bout traces for every ticked
     channel. Extracted Bouts and Zone Entry Bouts exported only the first
     two channels (G0/G1), so G2–G4 on a five-channel rig were dropped, and
     Compare Across Bouts stopped at two. Export columns name each subject's
@@ -17287,187 +17300,187 @@ Version 1.29.2  •  October 27, 2026
 
 Version 1.29.1  •  October 27, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Processing is much faster on long sessions. Lining behavior up
+  • Fix: Processing is much faster on long sessions. Lining behavior up
     with photometry searched the whole photometry clock once per behavior
     frame, so time grew with the square of session length (a 40-minute
     session spent minutes there). It now uses a sorted lookup that picks
     exactly the same samples; processed output is unchanged.
-  • Fix — The bi-exponential bleaching fit runs on block averages of at
+  • Fix: The bi-exponential bleaching fit runs on block averages of at
     most 10,000 points and is still evaluated on every sample. Processing
     of five test sessions went from 128 s to 18 s; dF/F and z-score move by
     at most 0.0004 SD (r = 1.000000), bout metrics by at most 0.0001 SD.
-  • Change — Signal Linkage: the SG window is set in seconds (default 2 s)
+  • Change: Signal Linkage: the SG window is set in seconds (default 2 s)
     so one value means the same on 20 Hz and 30 Hz rigs. Reliability now
     correlates bout traces smoothed with that window, and rate/latency use
     half of it so fast rises are timed on the rise, not the decay.
-  • Fix — Signal Integrity's channel selector follows Group mode, where the
+  • Fix: Signal Integrity's channel selector follows Group mode, where the
     subject list's own selection is hidden.
 
 Version 1.29.0  •  October 26, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — FLMM runs every ticked behavior at once. Signal ≠ 0, across bouts,
+  • New: FLMM runs every ticked behavior at once. Signal ≠ 0, across bouts,
     between groups and the interaction now fit each ticked behavior × channel
     in one run; Behavior and Channel dropdowns switch panels, and "Summary of
     all panels" lists each one's significant windows. Exports gain a Behavior
     column for these runs.
-  • New — Finished FLMM runs are cached for the session. Plot ▾ →
+  • New: Finished FLMM runs are cached for the session. Plot ▾ →
     Time-Course Statistics (FLMM-style) now holds "New analysis…" and the 10
     most recent results, which reopen without refitting after Calculate
     Metrics or another plot has replaced them.
-  • New — Exclusions tab: "Import from Project..." carries another project's
+  • New: Exclusions tab: "Import from Project..." carries another project's
     channel exclusions over per animal. A channel comes across only when it
     was excluded on every day that animal was recorded; behavior exclusions
     are never carried.
-  • Fix — Plots are fitted to the plot area: text is drawn at one size on
+  • Fix: Plots are fitted to the plot area: text is drawn at one size on
     every plot, small figures are enlarged and oversized ones shrunk to fit.
     The plot-size preference is stored afresh ('plot_size'), since the old
     value compensated for unfitted figures and made fitted plots tiny.
-  • Fix — Control columns grow their scroll area when new controls appear
+  • Fix: Control columns grow their scroll area when new controls appear
     (a plot type's options, a subject list filled on load), so they are no
     longer cut off until the window is resized.
 
 Version 1.28.0  •  October 25, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Spatial Transients (Spike Analysis tab) shows where and when
+  • New: Spatial Transients (Spike Analysis tab) shows where and when
     transients happen. Rate breakdown compares groups over the whole session,
     each zone type, still vs moving, each time block and a same-time-budget
-    rate, with one dot per animal. Distance from centre (Euclidean, |X| or
+    rate, with one dot per animal. Distance from center (Euclidean, |X| or
     |Y|) can include or exclude zone types, split by zone type and correct
     for speed and session time. Speed tuning, a one-dot-per-transient scatter
     (or rate map) and a 3D trace of the path with boosted transients round it
     out. Metrics: transients/min, time in transient, amplitude. Tables export
     for Prism.
-  • New — Out/Back: "Show Velocity Histogram" plots the outward open-arm
+  • New: Out/Back: "Show Velocity Histogram" plots the outward open-arm
     velocity the threshold applies to, and the share of frames each threshold
     keeps, updating as the threshold changes.
 
 Version 1.27.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Mirror-FDR smoothing is adjustable ("Smoothing (ms)", default 70 ms,
+  • New: Mirror-FDR smoothing is adjustable ("Smoothing (ms)", default 70 ms,
     0 turns it off). It adds to the processing low-pass filter. Tested down to
     20 ms rises, 70 ms costs no recall and cuts noise detections, so it stays.
-  • Fix — In Mirror-FDR mode the representative trace now draws the smoothed
+  • Fix, In Mirror-FDR mode the representative trace now draws the smoothed
     signal the detector scores, with the raw signal faint behind it. Peaks
     whose one-frame raw tips crossed the threshold line looked missed.
 
 Version 1.26.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Detection Settings show only the chosen method's options. MAD keeps
+  • New: Detection Settings show only the chosen method's options. MAD keeps
     threshold, prominence and per-subject/whole-dataset MAD; Mirror-FDR shows
     its FDR target, baseline window and burst-aware switch. Width and interval
     filters apply to both.
-  • New — The Mirror-FDR baseline window is adjustable (default 20 s). Make it
+  • New: The Mirror-FDR baseline window is adjustable (default 20 s). Make it
     several times longer than the slowest transient.
-  • New — Burst-aware scoring, on by default, counts an event that starts while
+  • New: Burst-aware scoring, on by default, counts an event that starts while
     the previous one is still decaying. On test recordings it finds 84% of
     slow-decay events instead of 72%. Live channels typically report ~25% more
     events than with 1.25.0; turn it off for strict single-event counts.
-  • Change — The default Mirror-FDR target is now 10% (was 5%). It finds more
-    small events and GRAB-NE startle responses (31% of trials, was 19%); dead fibres
+  • Change: The default Mirror-FDR target is now 10% (was 5%). It finds more
+    small events and GRAB-NE startle responses (31% of trials, was 19%); dead fibers
     still read ~0.3 events/min. Projects that saved 5% keep it.
 
 Version 1.25.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Spike Analysis offers Mirror-FDR detection beside the MAD threshold.
+  • New: Spike Analysis offers Mirror-FDR detection beside the MAD threshold.
     Downward excursions serve as the noise null: each recording's threshold is
     set where they are at most the target share (default 5%) of upward ones,
     measured above a local 20 s baseline. On pure noise it finds ~0.1 events/min
-    where the MAD threshold finds 12-31, and it separates dead from live fibres
+    where the MAD threshold finds 12-31, and it separates dead from live fibers
     (AUC 0.97 vs 0.09). Adapted from Dombeck et al. (2007); the tab cites it.
-  • New — With Mirror-FDR, amplitude is the height above the local baseline,
+  • New, With Mirror-FDR, amplitude is the height above the local baseline,
     and the representative trace draws that baseline and threshold with the
     estimated false-detection rate. A channel with nothing that stands out from
     noise is reported as such. MAD remains the default.
 
 Version 1.24.0  •  October 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Spike Analysis shows a representative trace again (removed in 1.4.0):
+  • New: Spike Analysis shows a representative trace again (removed in 1.4.0):
     the signal with the detection threshold, median baseline and every detected
     transient marked. Pick subject, channel and a time window; it is drawn after
     each run. "Export Trace for Prism (CSV)" saves it as a Prism XY table.
-  • New — "Export for Prism (CSV)" writes one Column table per metric (rate,
+  • New: "Export for Prism (CSV)" writes one Column table per metric (rate,
     count, amplitude, width), per-zone Grouped tables, a by-subject key and the
     detection settings. A run split by two factors (e.g. Sex × Treatment) also
     gets Grouped tables with the first factor as rows, ready for two-way ANOVA.
-  • New — Analyze Spikes by Zone reports amplitude and width as well as rate,
+  • New: Analyze Spikes by Zone reports amplitude and width as well as rate,
     for every channel. It now uses the run's own detections, so zone counts add
     up to the results table; it used to re-detect on z-scored G0/G1 only.
     Sub-zones pool as total transients over total time. The zone-binned export
     gains count, amplitude and width columns.
-  • New — Spikes by Bout Phase accepts zone entries ("Zone: …") as well as
+  • New: Spikes by Bout Phase accepts zone entries ("Zone: …") as well as
     scored behaviors, with a minimum time in zone; "During" is the visit itself.
-  • Fix — Ticking "Apply exclusions" after a spike run left Visualize Spike Data
+  • Fix: Ticking "Apply exclusions" after a spike run left Visualize Spike Data
     showing every channel while Export Results dropped the excluded ones, so
     group means disagreed. Plots and exports now offer to re-run first.
-  • Fix — Run Spike Analysis uses the parameters as typed; it previously ran on
+  • Fix: Run Spike Analysis uses the parameters as typed; it previously ran on
     the last values applied with "Apply Parameters".
-  • Fix — The single-subject spike plot placed markers in seconds on a minutes
+  • Fix: The single-subject spike plot placed markers in seconds on a minutes
     axis, so they sat off their peaks.
-  • Fix — The Behavioral Data export message reported 0 subjects excluded when
+  • Fix: The Behavioral Data export message reported 0 subjects excluded when
     the exclusions were applied at calculation; it now names them.
-  • Fix — Moving the centre of an EPM complex layout in the zone editor now
+  • Fix: Moving the center of an EPM complex layout in the zone editor now
     carries the distal arms along with the proximal ones.
 
 Version 1.23.0  •  October 20, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — "All Behaviors → unified Excel" adds each bout's onset (s) and scored
+  • New: "All Behaviors → unified Excel" adds each bout's onset (s) and scored
     length (s and samples); averaged sheets add the mean bout length. Lengths
     stay paired with the right bout when earlier bouts were dropped at the
     recording edge, and are blank for start-only boutframes.
-  • Fix — Bout-order FLMM numbered bouts by list position, so a bout dropped at
+  • Fix: Bout-order FLMM numbered bouts by list position, so a bout dropped at
     extraction (window past the recording start) renumbered every later one and
     the second approach was modeled as bout 1. It now uses the true bout number.
-  • New — Bout-order FLMM plots the observed traces by bout number (mean ± SEM
+  • New: Bout-order FLMM plots the observed traces by bout number (mean ± SEM
     across animals) and reports each group's own slope and mean beside the
     tested term. Effects read as treatment − control when a control group is
-    recognisable. A time range limits which seconds enter the model.
-  • New — Export ▾ → "FLMM data export (Excel)" saves every model term, the
+    recognizable. A time range limits which seconds enter the model.
+  • New: Export ▾ → "FLMM data export (Excel)" saves every model term, the
     per-bout input matrix, and observed vs model-predicted traces per bout
     number. The PDF report is now "FLMM plot export (PDF)".
 
 Version 1.22.0  •  October 19, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — TTL bouts landed late without a behavior file. The recording-start
+  • Fix: TTL bouts landed late without a behavior file. The recording-start
     correction shifted TTL events that were already matched by clock, so a
     response 20 s after a tone showed at ~21.7 s. Reprocess to regenerate the
     TTL boutframes.
 
 Version 1.21.0  •  October 18, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Signal Integrity now weighs event-locked signal. Each channel's bouts
+  • New: Signal Integrity now weighs event-locked signal. Each channel's bouts
     are tested against the same onsets shifted to random points in the recording
-    (corrected for the number of behaviours tested); a clear response raises the
+    (corrected for the number of behaviors tested); a clear response raises the
     score to at least 70, rising to 90, and never lowers it. Channels on rigs
     whose 415 tracks 470 closely (r ~0.99) were all pinned at 42.9 even when they
     responded at every bout. A response counts as movement only when 415 responds
     as strongly or the channel is tangled. The table adds Recording and Events
     columns (* = raised by events), the single-subject view adds the mean bout
     response with 415 overlaid, and the export and auto-exclude show both.
-  • New — Sparse fast GCaMP transients count as signal. Spikes that return to
+  • New: Sparse fast GCaMP transients count as signal. Spikes that return to
     baseline within 1-2 s read as noise to the slow/fast and high-frequency
     measures; upward spikes that clearly outnumber downward ones (noise crosses
     both ways equally) now credit Dynamics and Noise. Counts appear in the
     dashboard and export.
-  • Change — Behaviour no longer counts against a recording. Sustained shifts
-    that start at a bout are not penalised, and negative skew on a channel with
+  • Change: Behavior no longer counts against a recording. Sustained shifts
+    that start at a bout are not penalized, and negative skew on a channel with
     a credited response is not read as dropouts.
-  • Fix — Recordings with no 415 nm channel stored the signal in its place and
+  • Fix: Recordings with no 415 nm channel stored the signal in its place and
     scored 12.5 as a "perfect tangle"; they are now assessed as a sensor.
-  • New — Session bounds take a "Trim end": frames counted back from the end of
+  • New: Session bounds take a "Trim end": frames counted back from the end of
     the photometry recording (a negative End frame is read as a trim). "Measure
     Lengths" reads each raw file's photometry length so trims resolve before
     processing, and imports accept a trim column.
-  • Change — Recording-start boutframe correction and boutframe FPS scaling are
+  • Change: Recording-start boutframe correction and boutframe FPS scaling are
     auto / on / off. Auto applies the start correction only when bouts are cut
     from the photometry grid; with a behavior/position file the rows are already
     clock-matched video frames, and shifting them put startle 2.5 s late.
-  • Fix — Bouts resampled onto a different-rate axis keep their edge points
+  • Fix: Bouts resampled onto a different-rate axis keep their edge points
     instead of leaving the first/last sample blank.
-  • Fix — The launcher finds a working Python instead of trusting "python" on PATH.
+  • Fix: The launcher finds a working Python instead of trusting "python" on PATH.
 
 Version 1.20.1  •  September 15, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Raw files that are Excel workbooks under a .csv name now load. A Bonsai
+  • Fix: Raw files that are Excel workbooks under a .csv name now load. A Bonsai
     CSV opened in Excel and saved as a workbook keeps its .csv name, and reading
     it as text failed with "'utf-8' codec can't decode bytes". FPData, position/
     timestamp, ABEL position and TTL files are now identified by their leading
@@ -17476,76 +17489,76 @@ Version 1.20.1  •  September 15, 2026
 
 Version 1.20.0  •  September 9, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — A Bouts Overlay can be exported as a graphing workbook. "Export Plot
+  • New: A Bouts Overlay can be exported as a graphing workbook. "Export Plot
     Data" wrote the plain z-scored session and dropped every bout marker, so the
-    one thing the plot is for — signal with the scored behavior on it — had to be
+    one thing the plot is for (signal with the scored behavior on it) had to be
     rebuilt by hand in Prism. "Export Overlay Data (xlsx)" now writes the graph
     itself as numbers: a Trace sheet carrying the trace, a ribbon column per
     behavior and a highlight column per channel × behavior; a Ribbon_steps sheet
     giving each bout its own two-point column so a connecting line cannot bridge
     between bouts; a Bouts sheet listing every bout's adjusted frames, raw video
     frames and times; and a README naming which columns to paste for each kind of
-    graph. The spans it writes are the same spans the plot shades — both read one
-    shared routine — so the file and the figure cannot disagree.
-  • New — The Data Exclusions tab flows its subject rows into as many columns as
-    the window is wide. A row is about a fifth of a maximised window, so a
+    graph. The spans it writes are the same spans the plot shades; both read one
+    shared routine, so the file and the figure cannot disagree.
+  • New: The Data Exclusions tab flows its subject rows into as many columns as
+    the window is wide. A row is about a fifth of a maximized window, so a
     ninety-subject project showed roughly twenty-five of them down one column
     with three quarters of the width empty. Extra columns appear only once the
     list actually overflows, and the subjects still read in order down each
     column.
-  • Fix — Whole-folder processing finds the TTL/DigitalIOs companion whose index
+  • Fix: Whole-folder processing finds the TTL/DigitalIOs companion whose index
     differs from the FPData file's. The name was built by copying the FPData
     file's own trailing suffix, so BG21FPData.csv looked for BG21TTL.csv, missed
-    BG21TTL0.csv sitting beside it, and reported "no TTL/DigitalIOs file" — the
+    BG21TTL0.csv sitting beside it, and reported "no TTL/DigitalIOs file": the
     same pair that worked in single-file mode, where the file is browsed to by
     hand. Lookup now tries the literal swap first, then any TTL/DigitalIOs file
     carrying the same subject prefix with an arbitrary index, and the FPData
     browse button auto-fills the field the same way.
-  • Fix — Scrolling tabs reach content that grew after they were laid out. A
+  • Fix: Scrolling tabs reach content that grew after they were laid out. A
     canvas window item given an explicit height stops tracking the frame it
     holds, so a subject list rebuilt for a bigger project, or a taller advanced
-    settings page, ran past a scroll region still describing the shortest one —
+    settings page, ran past a scroll region still describing the shortest one,
     unreachable, with no scrollbar offering to reach it. The Processing,
     Factors and Data Exclusions viewports now re-measure on demand.
-  • Fix — "Binned Progression" no longer drops whole groups. A bout that
-    realignment padded with NaN — clipped at the recording edge, or extracted
-    with a shorter window — made peak, mean and AUC return NaN for that bout,
+  • Fix: "Binned Progression" no longer drops whole groups. A bout that
+    realignment padded with NaN (clipped at the recording edge, or extracted
+    with a shorter window) made peak, mean and AUC return NaN for that bout,
     which poisoned its bin mean and every other bin of that subject. The metrics
     are NaN-aware now, and AUC integrates the samples that exist at their true
     spacing rather than scoring a padded window as a short one. A subject whose
     group could not be resolved also gets its own "Unassigned" series instead of
     being averaged into whichever group sorted first.
-  • Fix — "Export Plot Data" says why it found nothing. The graphs draw from the
+  • Fix: "Export Plot Data" says why it found nothing. The graphs draw from the
     synchronized behavior matrix while that export reads the per-wavelength
     arrays and keeps each channel only at its own wavelength, so it can come up
     empty on a subject whose plot looks full. The warning now names the gate per
-    subject and channel — which arrays exist, what wavelength each designation
-    resolves to, which boxes are unticked, what is excluded — and points at the
+    subject and channel (which arrays exist, what wavelength each designation
+    resolves to, which boxes are unticked, what is excluded) and points at the
     overlay export, which is not subject to those gates.
 
 Version 1.19.0  •  September 2, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — The zone editor keeps the arena tiled while an edge is dragged. Zone
+  • New: The zone editor keeps the arena tiled while an edge is dragged. Zone
     templates are stored as a tiling: every boundary appears twice, once as one
-    zone's max and once as its neighbour's min. Only the edge under the pointer
-    used to move, so dragging the OFT centre opened a gap between it and the
-    surrounding edge zones — and a position sample landing in that gap belongs to
+    zone's max and once as its neighbor's min. Only the edge under the pointer
+    used to move, so dragging the OFT center opened a gap between it and the
+    surrounding edge zones, and a position sample landing in that gap belongs to
     no zone at all. Both halves of a shared boundary now move together, with a
     "Sticky edges" toggle (remembered between sessions, and editable in Edit
     Processing Parameters) for zone sets that are deliberately not a tiling.
-  • New — Whole zones can be dragged, not only resized. The middle of a zone is a
+  • New: Whole zones can be dragged, not only resized. The middle of a zone is a
     move handle, the pointer shows which handle it is about to grab, and a click
-    that lands on nothing no longer leaves the previous handle armed — which is
+    that lands on nothing no longer leaves the previous handle armed, which is
     what made the next mouse move silently resize whatever had been dragged last.
-  • New — "Compare Across Bouts" can order bout rows and export columns by bout
+  • New: "Compare Across Bouts" can order bout rows and export columns by bout
     number instead of by subject. The default keeps every bout of one subject
     together with subjects blocked by group, which reads one animal at a time;
     "Order bouts by: Bout number" instead puts bout 1 of every subject side by
     side, then bout 2, and so on, which is how a within-session drift is read
     across a whole cohort. Heatmaps gain per-ordinal row blocks and labels, the
     wide-format export reorders its columns to match, and averaging within
-    subject — which leaves no ordinal to block on — keeps the original layout.
-  • New — The Coherence tab's minimum epoch length applies to scored behaviors,
+    subject, which leaves no ordinal to block on, keeps the original layout.
+  • New: The Coherence tab's minimum epoch length applies to scored behaviors,
     not only zone entries. A two second bout of grooming measured with a ten
     second post window is mostly coherence in whatever the animal did next, the
     same objection that the minimum-time-in-zone filter answers for an entry. The
@@ -17553,20 +17566,20 @@ Version 1.19.0  •  September 2, 2026
     carrying END frames; a start-only file has no length to measure, so there the
     onsets pass through untouched rather than all being rejected, and the log
     says so. The setting is saved with the project and reported in the exports.
-  • Fix — A click in the zone editor now selects the zone drawn under the pointer.
+  • Fix: A click in the zone editor now selects the zone drawn under the pointer.
     TRACY runs DPI-aware, so Tk's pixels are physical device pixels; matplotlib's
     Tk backend assumes otherwise and re-rendered the figure 1.5x larger than its
     widget at 150% Windows scaling. The arena was cropped at the right and bottom
-    edges while every click was still multiplied by that 1.5 — on a 150% display,
+    edges while every click was still multiplied by that 1.5: on a 150% display,
     clicking the middle of the OFT arena selected edge_left, and clicking a
     corner zone selected nothing at all.
-  • Fix — The edge grab distance is a constant ~8 screen pixels rather than 10% of
+  • Fix: The edge grab distance is a constant ~8 screen pixels rather than 10% of
     each zone's own size, which made a thin zone nearly impossible to grab while
-    a large one grabbed an edge from several centimetres away. Corners beat
+    a large one grabbed an edge from several centimeters away. Corners beat
     edges and edges beat interiors, so a boundary shared by two zones is grabbed
     as a boundary instead of selecting whichever zone came first in the
     dictionary, and a small zone nested inside a large one stays reachable.
-  • Fix — The zone editor's drag options and instructions no longer fall off the
+  • Fix: The zone editor's drag options and instructions no longer fall off the
     bottom of a short window: a figure canvas asks for its full figsize in pixels,
     which on a scaled display is taller than the editor window itself. Loading a
     template now also updates the maze width field, which kept the previous
@@ -17574,10 +17587,10 @@ Version 1.19.0  •  September 2, 2026
 
 Version 1.18.0  •  September 1, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Zone entries can drive the Coherence tab. Every epoch analysis there
-    needs a list of onsets to centre a pre/post window on, and only scored
+  • New: Zone entries can drive the Coherence tab. Every epoch analysis there
+    needs a list of onsets to center a pre/post window on, and only scored
     behaviors could supply them, so coherence around an open-arm entry could not
-    be asked for at all — even though the entries were already detected during
+    be asked for at all, even though the entries were already detected during
     processing. Entries now sit in the same picker as behaviors and resolve
     through one shared onset path, with a minimum-time-in-zone filter of their
     own. That filter is not detection's duration threshold under another name:
@@ -17585,51 +17598,51 @@ Version 1.18.0  •  September 1, 2026
     fraction of a second, while an epoch asks whether the animal was still there
     for the whole post window. An entry left after two seconds, measured with a
     ten second window, is mostly coherence in whatever zone came next.
-  • New — Coherence results paste straight into Prism. The copy/save blocks build
-    a Grouped table per frequency band — one column per group × epoch, animals as
-    replicates down the rows — and XY tables for the spectra themselves, which is
+  • New: Coherence results paste straight into Prism. The copy/save blocks build
+    a Grouped table per frequency band (one column per group × epoch, animals as
+    replicates down the rows), and XY tables for the spectra themselves, which is
     the shape Prism expects rather than one that has to be transposed by hand
-    first. A static band-bar plot summarises the same numbers on screen.
-  • New — "Compare Across Bouts" bins bouts by their ordinal. A dozen bouts across
+    first. A static band-bar plot summarizes the same numbers on screen.
+  • New: "Compare Across Bouts" bins bouts by their ordinal. A dozen bouts across
     a handful of animals used to draw as a dozen individual lines, which is a pile
     rather than a result; "Bouts per bin: 3" collapses that to bouts 1–3, 4–6, ...
     as mean ± SEM, with the individual traces still available underneath as an
     overlay. The z-scored traces behind the plot now export to CSV, which they
     could not do at all before.
-  • New — Binned Progression exports every behavior in one workbook. The view
+  • New: Binned Progression exports every behavior in one workbook. The view
     could only export whatever was on screen, so six scored behaviors meant six
     plot-then-export round trips with the bin size and max-bouts settings typed in
     again each time. One run now writes one sheet per behavior × channel, computed
     from the same helper the plot draws from, with the current settings applied to
     all of them.
-  • New — Edit Processing Parameters is grouped into tabs with a search box
+  • New: Edit Processing Parameters is grouped into tabs with a search box
     instead of one long undifferentiated list. Parameters that answer the same
-    question sit together — in particular the three separate pairs of "how long
+    question sit together, in particular the three separate pairs of "how long
     must the animal stay in a zone for it to count as an entry?", which drive EPM
     detection, OFT/Custom detection and the Behavioral Data metrics table, and
     which were previously indistinguishable from one another. The grouping is a
     layout hint and never a filter: a parameter the table has not heard of still
     gets an editor, on a catch-all "Other" tab.
-  • New — The thresholds that decide what is on screen are editable beside the
+  • New: The thresholds that decide what is on screen are editable beside the
     plot. The Visualization tab carries the entry duration and refractory pair the
     current maze type actually uses, and the Out/Back minimum velocity; the
     Behavioral Data tab carries the metrics-table pair. Applying re-runs detection
     over the stored position track for every processed subject and redraws in
-    seconds — retuning any of these previously meant a full reprocess from the
+    seconds; retuning any of these previously meant a full reprocess from the
     source files.
-  • New — The window fits itself to the screen it is on. Three measured passes run
+  • New: The window fits itself to the screen it is on. Three measured passes run
     on resize: the notebook tab row gives up padding and then type size, each only
     as far as an overflow actually requires (ttk does not wrap, scroll or elide a
-    too-wide tab row — it cuts each label off, which is how "Decision Probability"
+    too-wide tab row; it cuts each label off, which is how "Decision Probability"
     became "Decision Probabili" on a 1366 px screen); the settings columns are
     sized from what their contents really request; and wrapped help text is
     re-wrapped to the width it ended up with rather than an assumed one.
-  • Fix — "Freq axis min/max (Hz)" moved the coherence line plots but left every
+  • Fix: "Freq axis min/max (Hz)" moved the coherence line plots but left every
     spectrogram unchanged, because the heatmaps pinned their axis to the ANALYSIS
     range instead. Both now read the same setting, intersected with the
     frequencies actually computed: a log axis cannot show a minimum of 0, and
     stretching past the data only adds blank space.
-  • Fix — Decision probability read the wrong column for a one-channel subject
+  • Fix: Decision probability read the wrong column for a one-channel subject
     designated G1. The slot a second channel would occupy holds a kinematics field
     for that subject, so the curve was computed against elapsed time. The column
     is now resolved from the subject's own channel designation. Two further things
@@ -17638,9 +17651,9 @@ Version 1.18.0  •  September 1, 2026
     mixed cohort was scanned over a different number of seconds than a 30 Hz one;
     and the per-frame look-ahead is now a prefix sum, which stops the whole
     analysis growing with the window length.
-  • Fix — The kinematics binned-signal curves ("Signal by acceleration bin" and
-    its velocity and distance siblings) exported group means only — four columns,
-    one row per bin — so the animals behind the error bars never left the GUI. The
+  • Fix: The kinematics binned-signal curves ("Signal by acceleration bin" and
+    its velocity and distance siblings) exported group means only (four columns,
+    one row per bin), so the animals behind the error bars never left the GUI. The
     table now follows the Bout Analysis plot-data layout, one row per animal with
     mean / SEM / n underneath, and those summary rows are the values the error
     bars are actually drawn from rather than a second computation that can drift
@@ -17648,15 +17661,15 @@ Version 1.18.0  •  September 1, 2026
 
 Version 1.17.0  •  August 24, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Each subject can be given the real START and END of its session, in
+  • New: Each subject can be given the real START and END of its session, in
     Settings > Session Start/End. A rig is started before the animal is in the
     apparatus and stopped after it is lifted out, and those two stretches are not
     merely uninteresting: the position track leaves the arena there, and pixel→cm
     calibration is fitted to the OBSERVED X range, so a few seconds of the animal
     being carried past the camera rescales the entire session and moves every zone
-    boundary with it. Bounds are numbered in VIDEO frames — the same frames
-    boutframes are scored in, and the number an experimenter can read off the video
-    — and are converted to each recording's own sampling rate, so one number means
+    boundary with it. Bounds are numbered in VIDEO frames (the same frames
+    boutframes are scored in, and the number an experimenter can read off the video)
+    and are converted to each recording's own sampling rate, so one number means
     the same moment on every rig. Everything outside them is dropped: photometry,
     the position track (ABEL tracks included), and any bouts scored there. Bounds
     are applied BEFORE the recording-length cap, so a 600 s cap is 600 s of real
@@ -17667,21 +17680,21 @@ Version 1.17.0  •  August 24, 2026
     trimming happens as the raw file is read and takes effect on the next Process
     run. An end frame at or before its start is refused rather than emptying the
     recording, and the log names the raw rows actually kept.
-  • Fix — Reopening a project could land every bout at the wrong place in the
+  • Fix: Reopening a project could land every bout at the wrong place in the
     signal. The offset between video time zero and photometry sample 0 was measured
     from the raw file, which is never saved, so a reloaded project silently fell
-    back to estimating it as precut / LED-state count — a row count, not a time —
+    back to estimating it as precut / LED-state count (a row count, not a time)
     and re-extracted bouts against a different origin than the one they were first
     cut on. The measured offset, and the rows actually trimmed from the head, are
     now written with the project and read back.
-  • Fix — In a cohort recorded at two sampling rates, "Compare Across Bouts" came
+  • Fix, In a cohort recorded at two sampling rates, "Compare Across Bouts" came
     back empty while every per-subject plot looked right. A stored bout did not
     remember the rate its samples are spaced at, so on reload a slower subject's
-    window was read at the project's FASTEST rate — a 20 Hz subject's 5 s window
-    read as 3.3 s — and the analysis window ran off the end of the trace into
+    window was read at the project's FASTEST rate (a 20 Hz subject's 5 s window
+    read as 3.3 s), and the analysis window ran off the end of the trace into
     padding. The rate is now saved per bout entry, and projects saved earlier are
     repaired on load from the subject's own recording rate, with no re-extraction.
-  • Fix — A single missing sample inside an analysis window turned that bout's
+  • Fix: A single missing sample inside an analysis window turned that bout's
     peak, mean and AUC into NaN, and one NaN poisoned the pooled mean for every
     other subject at that bout number. Slower subjects in a mixed-rate project
     always carry one, because resampling onto a faster axis cannot produce the
@@ -17690,11 +17703,11 @@ Version 1.17.0  •  August 24, 2026
 
 Version 1.16.0  •  August 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Position tracks exported by ABEL are read directly. Drop
+  • New: Position tracks exported by ABEL are read directly. Drop
     {{SubjectID}}ABELposition.csv beside the FPData file and TRACY finds it like any
-    other position file. It cannot be synchronised like one: ABEL never sees the
+    other position file. It cannot be synchronized like one: ABEL never sees the
     photometry rig's computer clock, so its timestamps are video-relative, and the
-    generic path would have fallen back to aligning both recordings from t=0 —
+    generic path would have fallen back to aligning both recordings from t=0,
     swallowing the precut and any camera/photometry start delay without a word.
     ABEL files are instead aligned by VIDEO FRAME, through the identical transform
     boutframes already use, so an ABEL position track and an ABEL boutframes workbook
@@ -17704,28 +17717,28 @@ Version 1.16.0  •  August 23, 2026
     reports how many. If the file's own timestamps imply a different frame rate than
     "Boutframes video FPS", the log names both numbers and the stretch factor rather
     than silently trusting either.
-  • New — Zone changes can be applied without reprocessing. The Zone Editor has a
+  • New: Zone changes can be applied without reprocessing. The Zone Editor has a
     "Save & Recalculate" button, and Settings > Recalculate Position Analyses runs the
     same thing on its own after a change made elsewhere. Saving zones alone only
-    edited the definitions — already-processed subjects kept the results derived from
+    edited the definitions; already-processed subjects kept the results derived from
     the OLD zones until something recomputed them, which meant a full reprocess from
     the source files just to try a different boundary. Zone entries, entry-aligned
-    bouts, zone averages, distance-from-centre averages and the Out/Back stats are now
+    bouts, zone averages, distance-from-center averages and the Out/Back stats are now
     re-derived in place from the stored position track and saved with the project.
-    Signal processing and behaviour bouts are untouched, because none of them depend
+    Signal processing and behavior bouts are untouched, because none of them depend
     on where the zones are.
-  • Change — Processing stores the uncalibrated pixel track next to each subject
+  • Change: Processing stores the uncalibrated pixel track next to each subject
     ({{SubjectID}}_position_px.csv). Calibration rewrites the X/Y columns from pixels to
-    centimetres in place, so without this snapshot the origin and scale the zones are
+    centimeters in place, so without this snapshot the origin and scale the zones are
     really defined against were gone, and a changed maze width or Y-calibration method
     could not be re-applied to processed data. Projects saved by an earlier version
     have no snapshot: their zone results still recalculate, but a calibration change
     needs a full reprocess, and those subjects are named in the summary instead of
     being quietly rescaled.
-  • Change — The maximum recording length is set in SECONDS, not raw rows. The old
+  • Change: The maximum recording length is set in SECONDS, not raw rows. The old
     cap counted deinterleaved frames and doubled them on the assumption of a two-state
     interleave, so one number meant a different duration at every sampling rate and
-    LED configuration — it could trim a fast rig hard while never firing on a slow one,
+    LED configuration; it could trim a fast rig hard while never firing on a slow one,
     and a cohort split across rigs was cut to different lengths. The cap is now read
     straight off the raw timestamp column, measured from the first sample kept after
     the precut, and rows are cut at the first sample past it so the interleave stays
@@ -17734,10 +17747,10 @@ Version 1.16.0  •  August 23, 2026
 
 Version 1.15.0  •  August 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Change — The Bout Analysis window is set in seconds, like every other bout setting.
+  • Change: The Bout Analysis window is set in seconds, like every other bout setting.
     "Window Start Frame" / "Window End Frame" were sample counts, so the span the
-    metrics were computed over meant a different duration on every rig — 150 samples
-    is 5.0 s at 30 Hz but 7.5 s at 20 Hz — and one number could not describe the same
+    metrics were computed over meant a different duration on every rig (150 samples
+    is 5.0 s at 30 Hz but 7.5 s at 20 Hz), and one number could not describe the same
     window for a cohort recorded on two of them. The dialog now asks for "Window start
     (s)" and "Window end (s)", shows the sample equivalent underneath as you type, and
     each consumer converts at the rate of the data it is about to slice: the shared
@@ -17745,32 +17758,32 @@ Version 1.15.0  •  August 23, 2026
     whole-bout and offset-aligned styles. The window is also saved with the project
     now instead of resetting on every launch. Its default, 0 to 5 s, is the old
     default at the usual 30 Hz.
-  • Fix — Bouts whose window ran past the start or end of the recording were kept as
+  • Fix: Bouts whose window ran past the start or end of the recording were kept as
     short traces and NaN-padded back to full length downstream. That drew a blank tail
     on the heatmap row and dropped the subject out of the group mean part-way along the
     x-axis. Such bouts are now excluded at extraction, with a count in the log, and any
-    NaN inside a window — a sync gap, a channel that stops early — rejects that trace
+    NaN inside a window (a sync gap, a channel that stops early) rejects that trace
     instead of being averaged over. Projects saved before this drop the short rows on
     load, so no re-extraction is needed.
-  • Fix — "Analyze Spikes by Zone" ignored the Exclusions tab. A channel the spike
+  • Fix: "Analyze Spikes by Zone" ignored the Exclusions tab. A channel the spike
     results table and both exports had already dropped was still detected and plotted
-    per zone. It now honours the same "Apply exclusions" toggle, asking about the
+    per zone. It now honors the same "Apply exclusions" toggle, asking about the
     channel SLOT so a cohort designated R4/R5 is matched as well as G0/G1, and says so
     when a subject is excluded on every channel rather than emptying it silently.
-  • Fix — Reopening a project made whole-bout and offset-aligned metrics fall back to
+  • Fix: Reopening a project made whole-bout and offset-aligned metrics fall back to
     the onset window. Bouts are dropped per channel during extraction, so a channel's
     trace list is not parallel to the onset/end frames; the map between them was built
     at extraction but never saved. It is now written with the project and kept in step
     with any rows dropped on load.
-  • Change — "Apply exclusions" on the Spike Analysis tab moved next to the buttons it
+  • Change: "Apply exclusions" on the Spike Analysis tab moved next to the buttons it
     governs. That tab's settings column is the tallest in the app, which pushed the
     toggle roughly 400 px below the fold on a 900 px window, where it read as missing.
 
 Version 1.14.0  •  August 22, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — The bout window is set in seconds, not samples. A sample count is a
+  • New: The bout window is set in seconds, not samples. A sample count is a
     different duration on every rig, so cohorts recorded at different rates could not
-    be analysed together: 200 samples is 10.0 s at 19.94 Hz but 6.7 s at 29.99 Hz, and
+    be analyzed together: 200 samples is 10.0 s at 19.94 Hz but 6.7 s at 29.99 Hz, and
     every trace was drawn on one rate's axis, which stretched the faster rig's data by
     1.5x and smeared the combined average. Each subject's window is now converted to
     samples at that subject's OWN rate when its bouts are extracted, and stored traces
@@ -17778,148 +17791,148 @@ Version 1.14.0  •  August 22, 2026
     both rigs land at the same time. Set "Pre-bout seconds", "Post-bout seconds" and
     "Baseline seconds"; the old frame counts still exist but are derived, recomputed
     for you and hidden from the parameter dialog. Projects saved before this keep the
-    window the duration it always had — the seconds are rebuilt from the stored frames
+    window the duration it always had; the seconds are rebuilt from the stored frames
     at that project's own rate rather than adopting this build's default.
-  • Fix — Processing could freeze on the first subject with no error and no timeout.
-    The photobleaching fit ran on unnormalised signal while the solver's step sizes and
+  • Fix: Processing could freeze on the first subject with no error and no timeout.
+    The photobleaching fit ran on unnormalized signal while the solver's step sizes and
     convergence tolerances are absolute, so a rig reporting raw detector counts (~1e4
     rather than ~1) failed the strict fit and fell into a retry whose bounds were
-    infinite — a search that never converged. The fit now runs in normalised units, so
+    infinite: a search that never converged. The fit now runs in normalized units, so
     it behaves the same whether a rig reports counts, volts or dF/F; the retry's search
     region is finite; and the evaluation budget is capped against signal length, so a
     fit always returns rather than running indefinitely. Reaching a cap falls back to a
     linear detrend and says so, instead of hanging.
-  • Fix — Signals that brighten over a session were silently linear-detrended. The
+  • Fix: Signals that brighten over a session were silently linear-detrended. The
     biexponential's initial guess was never checked against its own bounds, so a rising
     signal produced a guess the fitter rejected outright, and because the caller
     catches every error the whole channel quietly lost its bleaching correction. The
     guess is now clipped into the bounds and the channel is fitted properly. The
     fallback warning also names the actual cause rather than just "fit failed".
-  • Fix — "Mixed Bout Windows" warned about windows that were in fact identical.
+  • Fix: "Mixed Bout Windows" warned about windows that were in fact identical.
     Durations were compared exactly, so sub-sample differences between subjects
     recorded at slightly different rates (14.995 s vs 15.001 s) read as distinct
     windows. The comparison now allows a per-subject tolerance of one sample.
-  • Fix — Pre/post bout durations were reported against the wrong rate in mixed-rate
+  • Fix: Pre/post bout durations were reported against the wrong rate in mixed-rate
     projects. Traces are stored on the shared analysis axis, but the plot labels read
     the modal subject rate, so a 15 s window displayed as ~22 s. Both now use the
     shared axis rate.
 
 Version 1.13.0  •  August 20, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Bout markers sat in the wrong place whenever the photometry recording started
+  • Fix: Bout markers sat in the wrong place whenever the photometry recording started
     after the video. The correction subtracted only the precut trim (precut ÷ LED
     states), so any delay between the camera rolling and the recording starting was
-    left in — 4200 frames, 210 s, on one ASR session. It now reads the acquisition
+    left in: 4200 frames, 210 s, on one ASR session. It now reads the acquisition
     clock of the first retained sample, which covers the delay and the trim together.
     Re-extract to benefit.
-  • Fix — Boutframe scaling is on by default. Boutframes are numbered in video frames
+  • Fix: Boutframe scaling is on by default. Boutframes are numbered in video frames
     and the signals are indexed in photometry samples, so this is a unit conversion,
     not a preference: with it off every index was stretched by video_fps ÷ photometry
     _fps, an error that grows with time until late bouts fall past the end of the
     recording and are dropped without a word. Rounding now happens once at the end
     rather than at each step.
-  • Fix — A sync marker counted as an LED channel. Startup rows in state 7 inflated
+  • Fix: A sync marker counted as an LED channel. Startup rows in state 7 inflated
     n_led_states, which mis-scaled the boutframe correction and trimmed the interleave
     to the wrong multiple; states above 4 are ignored now, as the deinterleave already
     did. The boutframe preview table also runs the real transform, so the "Scaled
     Frame" column can no longer disagree with what extraction uses.
-  • Fix — Behavior frames outside the photometry recording were filled with the nearest
-    sample. Nearest-neighbour matching has no notion of "out of range", so a session
+  • Fix: Behavior frames outside the photometry recording were filled with the nearest
+    sample. Nearest-neighbor matching has no notion of "out of range", so a session
     whose FP started late carried thousands of copies of one value that read as a flat
-    but genuine trace — and bouts scored there were extracted from signal that was
+    but genuine trace, and bouts scored there were extracted from signal that was
     never recorded. Those rows stay blank now, the processing log says how many, and
     the Bouts Overlay shades the uncovered stretch. Projects processed before this
     recompute coverage when they are plotted, so no reprocess is needed to see it.
-  • Fix — Bout overlay markers drifted from the trace they annotate. The signal was
+  • Fix: Bout overlay markers drifted from the trace they annotate. The signal was
     plotted against the behavior file's own frame column while the markers were row
-    indices, which agree only when that column is 0, 1, 2… — a 1-based or gap-
+    indices, which agree only when that column is 0, 1, 2…: a 1-based or gap-
     containing column shifted every marker. Onsets and ends are also saved with the
     project now, so the overlay marks where the traces were actually cut rather than
     re-deriving positions from the boutframes workbook and the current settings, and
     it still draws when that workbook sits on a drive that is not mounted.
-  • Fix — 570-only subjects were reported as having 470 data. The wavelength flags
+  • Fix: 570-only subjects were reported as having 470 data. The wavelength flags
     treated the legacy combined arrays as evidence of green, so a red-only recording
     was offered a channel it does not have. Channel names also fall back to the
     computed designation map instead of "Ch0"/"Ch1", and the Visualization channel
     list counts channels the same way the rest of the app does.
-  • Fix — Exports labelled channels G0/G1 whatever the cohort's designations were.
+  • Fix: Exports labeled channels G0/G1 whatever the cohort's designations were.
     Out/Back, zone averages, distance averages, zone bouts and bout exports now carry
     each subject's real channel name in the column headers and channel column.
-  • New — Time-zero line style (Advanced Graph Settings). The onset/entry marker was a
+  • New: Time-zero line style (Advanced Graph Settings). The onset/entry marker was a
     2 pt red dashed line on traces and a 2 pt yellow one on heatmaps, heavy enough to
     dominate the data it was annotating. One setting now covers every peri-event graph,
-    traces and heatmaps alike — a thin grey line by default, any colour name or hex
+    traces and heatmaps alike: a thin gray line by default, any color name or hex
     value, and width 0 to hide it altogether. It saves and loads with the project.
-  • Change — Bout Analysis controls. Max bouts/subject and the first/last-X limiter sit
+  • Change: Bout Analysis controls. Max bouts/subject and the first/last-X limiter sit
     with the other settings, "Settings…" moved into the sticky actions row where it
     stays reachable, and switching between the subject and group selectors re-measures
     the panel so the settings below it are not clipped out of view in a short window.
-  • Fix — The in-app updater failed on a PC with no git identity configured. It ran
+  • Fix: The in-app updater failed on a PC with no git identity configured. It ran
     "git pull", which needs a committer identity for the merge it may make and treats
-    git's background repack — which Windows antivirus and sync clients routinely block
-    from renaming a pack file — as a failure of the update itself. It now fetches and
+    git's background repack, which Windows antivirus and sync clients routinely block
+    from renaming a pack file, as a failure of the update itself. It now fetches and
     fast-forwards with that maintenance disabled, carries its own identity, checks that
     the app folder really landed on the downloaded commit before restarting, and
     explains a "Permission denied" as the file-locking problem it is.
 
 Version 1.12.0  •  August 7, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Exclusions did nothing on cohorts not designated G0/G1. Around 25 plot and
+  • Fix: Exclusions did nothing on cohorts not designated G0/G1. Around 25 plot and
     export sites asked for the literal channel names "G0"/"G1", so on an R4/R5 cohort
     ticking a box had no effect. Two spike exports were worse and emitted nothing at
     all; the position-heatmap export read the wrong columns for any channel past the
     first two. All of these now resolve the subject's real designation.
-  • Fix — Bout metrics could be measured over the neighbouring bout's window. A bout
+  • Fix: Bout metrics could be measured over the neighboring bout's window. A bout
     rejected on one channel shifted that channel's traces out of step with the frame
     lists, so every later bout was measured one window off. Affects whole/offset
-    styles on recordings containing a flat or all-NaN bout. Re-extract to benefit —
+    styles on recordings containing a flat or all-NaN bout. Re-extract to benefit;
     existing bout stores carry no index map.
-  • Fix — Group-mode coherence never ran. It looked group names up in the per-subject
+  • Fix: Group-mode coherence never ran. It looked group names up in the per-subject
     data, found nothing, and stopped with "Channel Not Available" before starting.
     Power spectra also resolved membership from a copy taken at processing time, so
     they went stale as soon as groups were edited.
-  • Fix — Exclusions were applied inconsistently across tabs. Behavioral Data had
+  • Fix: Exclusions were applied inconsistently across tabs. Behavioral Data had
     three different definitions of "excluded", so its table, plot and CSV could report
     three different n; Spike Analysis filtered even with the toggle off, and pooled
     excluded channels into the threshold the surviving ones were judged against; FLMM
     pairwise dropped the setting entirely; and group-level Out/Back and bout-length
     plots applied no filter though their exports did. Single-subject plots stay
-    unfiltered by design — that is how you judge whether an exclusion was right.
-  • Fix — Exclusions carried over into the next project. They were not cleared on New
+    unfiltered by design; that is how you judge whether an exclusion was right.
+  • Fix: Exclusions carried over into the next project. They were not cleared on New
     Project, so two projects sharing subject IDs silently inherited each other's, and
     the Exclusions tab could show checkboxes belonging to a project you had closed.
-  • New — "Split series by" on Coherence, Spike Analysis and Signal Linkage. All three
+  • New: "Split series by" on Coherence, Spike Analysis and Signal Linkage. All three
     now list the subject pool with a facet column beside it, as the other five tabs
-    do. Spike results and exports are labelled by the split rather than by plain group
+    do. Spike results and exports are labeled by the split rather than by plain group
     names. Signal Linkage, which had no grouping at all, computes each series
-    separately — permutation null included — and starts fully combined, so an existing
+    separately, permutation null included, and starts fully combined, so an existing
     workflow is unchanged until you split it.
-  • New — Exclusions on Kinematics and Signal Linkage. Kinematics reads the Behavioral
+  • New: Exclusions on Kinematics and Signal Linkage. Kinematics reads the Behavioral
     Data channel, since it is computed from tracked position; Signal Linkage reads the
-    photometry channel it is analysing. Every "Apply exclusions" toggle now persists
+    photometry channel it is analyzing. Every "Apply exclusions" toggle now persists
     with the project instead of resetting on load.
-  • Fix — Factor levels differing only in whitespace ("Hi " and "Hi") split a cohort
+  • Fix: Factor levels differing only in whitespace ("Hi " and "Hi") split a cohort
     into two series and halved each n. Level names are now trimmed everywhere they can
     be set, including imported factor sets. Facet selections no longer leak from one
     tab to another, and derived Session/Animal factors stay available when a tab
     narrows its selection.
-  • Change — Layout. Control columns no longer leave a screen of dead space below the
+  • Change: Layout. Control columns no longer leave a screen of dead space below the
     settings, so Actions sits under the controls rather than pinned to the bottom of a
     tall display. Bout Analysis gives the graph the room instead of splitting the pane
-    three ways, and its Plot menus open sideways — at some display scales they missed
+    three ways, and its Plot menus open sideways; at some display scales they missed
     fitting below by a pixel and Tk threw them to the top of the screen.
 
 Version 1.11.0  •  August 7, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Factors replace Groups. A project is now described by as many factors as it
-    needs — Group, Sex, Session, Treatment, Dose — each with its own levels, edited on
+  • New: Factors replace Groups. A project is now described by as many factors as it
+    needs (Group, Sex, Session, Treatment, Dose), each with its own levels, edited on
     the Factors tab in a spreadsheet-style table: click a cell to type, Tab/Enter and
     the arrow keys to move, paste a block straight from Excel, Ctrl+Z to undo, and
     click a column header to sort. Factor sets can be saved, loaded and imported from
-    another project. Existing projects are migrated on load — your old groups become
-    the levels of a "Group" factor — and a notice explains what happened if a subject
+    another project. Existing projects are migrated on load: your old groups become
+    the levels of a "Group" factor, and a notice explains what happened if a subject
     had been in more than one group.
-  • New — Split series by (every graphing tab). With "Plot by: Group" the subject list
+  • New: Split series by (every graphing tab). With "Plot by: Group" the subject list
     is now the pool being plotted, and the "Split series by" column decides how that
     pool divides. Left alone it splits on Group and combines the rest, which is one
     series per group exactly as before. Set Session to split instead and you get one
@@ -17927,62 +17940,62 @@ Version 1.11.0  •  August 7, 2026
     single level to filter the pool down to it. Deselecting a subject drops it from
     whichever series it belongs to without editing the design, so it is a plot-level
     exclusion you can undo by reselecting.
-  • New — Repeated sessions of one animal. Encode the session in the subject ID
+  • New: Repeated sessions of one animal. Encode the session in the subject ID
     (CAB01_Alcohol, CAB01_Fentanyl) and TRACY splits every ID into animal + session,
     offers Session and Animal as factors on every tab, and keys mixed-model random
     intercepts on the animal, so several days from one animal are no longer treated as
     independent subjects. tools/combine_sessions.py merges one folder per session into
     a combined project and a merged boutframes workbook.
-  • New — Pooled z-scoring across an animal's sessions (Processing). Z-scoring each
-    session on its own leaves an animal's days on different amplitude scales — on one
+  • New: Pooled z-scoring across an animal's sessions (Processing). Z-scoring each
+    session on its own leaves an animal's days on different amplitude scales: on one
     two-day pair the same channel's SDs were 1.23 and 4.53, so "2 z-scores" meant
     something different on each day. Pooling z-scores an animal against all its
     sessions together. It is applied as an exact affine rescale rather than a
     reprocess, so it works on an already-loaded project, is numerically identical to
     recomputing from the corrected trace, and can be switched back off.
-  • New — Session-aware boutframes. A workbook may now key its worksheets by animal
+  • New: Session-aware boutframes. A workbook may now key its worksheets by animal
     and tag each row with a Session (or Day) column, instead of needing one sheet per
     recording. A sheet named for the recording itself still takes precedence, and
     single-session workbooks are unaffected.
-  • Fix — Sampling rate was assumed to be 30 Hz. It is now read from the recording
+  • Fix: Sampling rate was assumed to be 30 Hz. It is now read from the recording
     itself, per subject. Any dataset recorded at another rate had every
-    seconds-denominated result scaled by the ratio — tau, half-decay, AUC over time,
-    zone-entry durations and kinematic velocity — which on a ~20 Hz recording was a
+    seconds-denominated result scaled by the ratio (tau, half-decay, AUC over time,
+    zone-entry durations and kinematic velocity), which on a ~20 Hz recording was a
     1.5× error. Re-run affected analyses to pick up the corrected values.
-  • New — Decay-fit strictness (Bout Analysis → Settings). Strict / Balanced /
+  • New: Decay-fit strictness (Bout Analysis → Settings). Strict / Balanced /
     Permissive trades how many bouts report a Tau against how much of the decay must
     actually be observed before a time constant is trusted. The peak search is also
     limited to the first half of the window, so a larger unrelated event later in the
     window can no longer hijack the measurement.
-  • New — FLMM factor models. Fit every behavior against a reference, per channel,
+  • New: FLMM factor models. Fit every behavior against a reference, per channel,
     with a pre-run dialog spelling out the model about to be fit, and the same channel
     selector, peak-effect button, exports and PDF report as the time-course fit.
-  • Change — Every graphing tab rebuilt on one layout. Selection, Settings, Actions
-    and Output now sit in the same place on all eight tabs: who is analysed at the top
+  • Change: Every graphing tab rebuilt on one layout. Selection, Settings, Actions
+    and Output now sit in the same place on all eight tabs: who is analyzed at the top
     of the control column, the settings beneath it, the actions pinned at the foot
     where they can no longer scroll out of reach, and the plot in the remaining space.
     Long action rows wrap into a grid, which also fixes buttons that were clipped off
-    the right edge and unreachable — Coherence → Whole Session → Export among them.
-  • Change — Options that do not apply to the current plot are hidden rather than
+    the right edge and unreachable: Coherence → Whole Session → Export among them.
+  • Change: Options that do not apply to the current plot are hidden rather than
     shown and quietly ignored. Kinematics showed seven parameter entries for all
     nineteen analyses though most read two of them; Visualization behaves the same
     way. Settings that do still take effect are deliberately left visible.
-  • Fix — Signal Integrity was unusable on a large selection. Scoring is now cached
+  • Fix: Signal Integrity was unusable on a large selection. Scoring is now cached
     per subject, so re-plotting a 62-subject dashboard no longer repeats a minute of
     work in a frozen window, and the table's height grows with the number of rows
     instead of overlapping into an unreadable smear past ~40 subjects. Progress is
     reported while it runs.
-  • Fix — A shorter plot drawn after a tall one could appear as an empty panel. The
+  • Fix: A shorter plot drawn after a tall one could appear as an empty panel. The
     output pane kept the scroll position from the previous figure, so the new plot was
-    drawn correctly but above the view — indistinguishable from Generate doing
+    drawn correctly but above the view, indistinguishable from Generate doing
     nothing. The pane now returns to the top when the plot changes.
-  • Fix — TRACY would not start under Python 3.14 / Tcl 9. Variable traces used a Tcl
+  • Fix: TRACY would not start under Python 3.14 / Tcl 9. Variable traces used a Tcl
     command removed in Tcl 9, so startup failed with `bad option "variable"` before
     the window appeared.
 
 Version 1.10.1  •  July 27, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Bout Analysis decay metrics (Tau and Half-Decay t½) were not fitting the
+  • Fix: Bout Analysis decay metrics (Tau and Half-Decay t½) were not fitting the
     decay. Four faults compounded: the baseline was read from the leading tenth of the
     window, which in longer windows swallowed the rising edge and flipped clean upward
     transients upside-down (the "peak" landing on frame 0); fits that did not describe
@@ -17994,10 +18007,10 @@ Version 1.10.1  •  July 27, 2026
     wrong. On a 29-subject dataset, tau is now stable across 5/10/30 s windows
     (0.32/0.37/0.36 s where it previously ran 0.37→1.23 s), and a decay of known rate
     is recovered exactly.
-  • Change — Tau and t½ now report N/A instead of a number when the window cannot
+  • Change: Tau and t½ now report N/A instead of a number when the window cannot
     support the measurement: the deflection is within noise, the signal never
     appreciably decays, less than one full time constant is visible, or the fit does
-    not match the data. Expect more N/A cells than before — those rows were previously
+    not match the data. Expect more N/A cells than before; those rows were previously
     filled with unconstrained extrapolations. The peak is located on a lightly smoothed
     copy, so a single noisy sample can no longer define it, and the fit stops where the
     transient ends rather than running to the end of the window, so a later spontaneous
@@ -18005,82 +18018,82 @@ Version 1.10.1  •  July 27, 2026
 
 Version 1.10.0  •  July 23, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Bout plots ignored your channel selection. Every group / multi-subject and
+  • Fix: Bout plots ignored your channel selection. Every group / multi-subject and
     bout-order plot was hardwired to the first two green channels, so ticking a red
     (570 nm) channel such as R4/R5 still produced G0/G1 plots. All of those views now
     resolve the actual channel checkboxes, plot the channels you picked, label the
     axes/titles/heatmaps with the real designation, and apply per-channel exclusions
     to the right channel.
-  • Fix — "Compare Across Bouts" stopped short. A length pre-filter dropped later and
+  • Fix: "Compare Across Bouts" stopped short. A length pre-filter dropped later and
     edge-clipped bouts before they were ever measured, so a group's line ended after
     the first couple of bouts even though the metrics table listed the rest. Bouts are
     now validated the same way in both paths.
-  • New — Compare Channels (Bout Analysis → Plot ▾ → "Compare Channels (within
+  • New: Compare Channels (Bout Analysis → Plot ▾ → "Compare Channels (within
     groups)"). Overlays each channel's mean ± SEM peri-onset trace, one panel per
     group, so channels can be compared in the GUI rather than only in the export.
-  • New — Plot Size setting (Settings → Plot Size). Embedded figures now render
+  • New: Plot Size setting (Settings → Plot Size). Embedded figures now render
     deliberately compact instead of filling the window, and the size is adjustable
     from Tiny (50%) to Huge (200%). Scaling moves fonts and layout together, so plots
     stay legible at any size. Remembered between sessions.
-  • Fix — Wide plots could not be fully seen. Pop-out plot windows now have BOTH
+  • Fix: Wide plots could not be fully seen. Pop-out plot windows now have BOTH
     scrollbars and render the figure at its natural width (Shift+wheel scrolls
     horizontally), so many-panel figures such as whole-session coherence can be
     scrolled through instead of being squeezed to fit; the window itself is clamped to
     your screen.
-  • New — Zone Coherence (Coherence → group comparison → "Zone Coherence"). Computes
+  • New: Zone Coherence (Coherence → group comparison → "Zone Coherence"). Computes
     coherence between two channels separately for the frames spent in each behavioral
     zone category and compares them across groups, with per-subject points and SEM.
-  • Fix — Coherence frequency bands reverted to the defaults every restart. Custom
+  • Fix: Coherence frequency bands reverted to the defaults every restart. Custom
     bands are now saved as you add/edit/remove/reorder them and restored at startup.
     The settings file is merged rather than overwritten, so saving one preference no
     longer wipes the others.
-  • New — Spikes by Bout Phase (Spike Analysis → "Spikes by Bout Phase"). Compares
+  • New: Spikes by Bout Phase (Spike Analysis → "Spikes by Bout Phase"). Compares
     transient rate before / during / after a behavior's bouts, per group, using the
     detected transients and the extracted onset/end frames, with a Friedman test
     across the three phases where n allows.
-  • Fix — Spike plots and exports showed subjects you had not selected. Every spike
+  • Fix: Spike plots and exports showed subjects you had not selected. Every spike
     visualization and export (summary, time-binned, zone-binned, by-zone) now honors
     the current subject/group selection instead of including whatever was left in
     memory from an earlier run.
-  • Change — Spike-by-zone plots aggregate sub-zones by their zone category instead of
+  • Change: Spike-by-zone plots aggregate sub-zones by their zone category instead of
     guessing from up/down/left/right name patterns, so the four OFT corners (or any
     template's matching sub-zones) roll up under one bar instead of being listed
     separately. Custom zones without a category are still shown individually.
-  • Change — Signal-integrity auto-exclude now asks first. Instead of silently
+  • Change: Signal-integrity auto-exclude now asks first. Instead of silently
     excluding, it opens a review window listing every evaluated subject/channel with
     its score; below-threshold channels are pre-ticked, and you can untick one to keep
     it (useful for preserving n in a small group) or tick an above-threshold channel
     to drop it anyway. Only what you leave ticked is applied.
-  • Change — Decision Probability is no longer EPM-only. New "Decision Zones" From/To
+  • Change: Decision Probability is no longer EPM-only. New "Decision Zones" From/To
     selectors let you define the transition for any arena (EPM, OFT, custom); the
     outcome checkboxes, plot legends, and stats labels rename themselves to match the
     chosen zones (defaults remain closed → open / open → closed for EPM).
-  • Fix — The Decision Probability and Signal Linkage control columns are now
+  • Fix: The Decision Probability and Signal Linkage control columns are now
     scrollable, so their advanced options and Run buttons stay reachable on short
     (768p) screens.
-  • Fix (internal) — Replaced the deprecated matplotlib colormap lookups that emit
+  • Fix (internal): Replaced the deprecated matplotlib colormap lookups that emit
     warnings (and are slated for removal) on current matplotlib versions.
 
 Version 1.9.0  •  July 21, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix (accessibility) — Buttons at the bottom of tabs and dialogs were unreachable
+  • Fix (accessibility): Buttons at the bottom of tabs and dialogs were unreachable
     on low-resolution monitors. On a 1366x768 or 1600x900 laptop the content simply
-    ran off the bottom of the screen with no way to scroll to it — the Zone Editor's
+    ran off the bottom of the screen with no way to scroll to it: the Zone Editor's
     "Save & Apply" being the clearest case, where it sat below an expanding zone list
     and was always the first thing pushed off-screen. Action buttons in the Zone
     Editor and in the tall dialogs are now pinned to the bottom of their window
     BEFORE any expanding content, so they always keep their space, and the settings
     above them scroll. The Setup, Kinematics and System Check tabs, whose content
     was 90-220 px taller than a 768p viewport, now scroll as well.
-  • Change — Interface is more compact everywhere. TRACY now picks a UI density from
+  • Change: Interface is more compact everywhere. TRACY now picks a UI density from
     your screen height at startup (tighter on short screens), shrinking all fonts,
-    buttons, tabs, spinboxes and padding together — a standard button drops from
+    buttons, tabs, spinboxes and padding together: a standard button drops from
     113x37 to 95x27 px, so noticeably more fits on screen. Override it under
     Settings → Interface Scale (75%-115%); the choice is remembered between sessions.
-  • Fix — Dialogs no longer open larger than the desktop. Every window with a fixed
-    size is now clamped to the usable screen area and centred, instead of extending
+  • Fix: Dialogs no longer open larger than the desktop. Every window with a fixed
+    size is now clamped to the usable screen area and centered, instead of extending
     past the bottom edge on smaller displays.
-  • New — Signal Linkage tab (BETA, Data → Signal Linkage). Measures how tightly
+  • New: Signal Linkage tab (BETA, Data → Signal Linkage). Measures how tightly
     each behavior's onset is coupled to a rapid change in signal: it takes the
     peri-onset derivative (Savitzky-Golay dF/dt) and tests the peak against a
     random-onset permutation null, so you can tell a genuine onset-locked
@@ -18088,7 +18101,7 @@ Version 1.9.0  •  July 21, 2026
     configurable search / baseline / response windows, a reliability threshold
     and permutation count, and reports a coupling index + verdict, a
     copy-to-clipboard table, and a figure.
-  • New — Random-shuffle control bouts ("Random Shuffle…" on the Bout Analysis
+  • New: Random-shuffle control bouts ("Random Shuffle…" on the Bout Analysis
     controls). Generates pseudo-random, non-overlapping "null" bouts for every
     subject as a control behavior for the FLMM stats. Bouts are placed in
     photometry-frame space, kept clear of the session edges by the pre/post
@@ -18096,33 +18109,33 @@ Version 1.9.0  •  July 21, 2026
     a realistic spread of durations (p10–p90 of that subject's real scored
     bouts). Seedable for reproducibility; written back into the boutframes
     file(s) with a .bak backup. Raw signal is never modified.
-  • New — FLMM report export. FLMM time-course results (per-behavior and pairwise)
+  • New: FLMM report export. FLMM time-course results (per-behavior and pairwise)
     can be exported to a PDF/CSV report with peak-effect tables, figures, and a
     method & references block that spells out the FUI / fastFMM basis, the joint
     simultaneous-band multiplicity handling, and the across-family FDR axis.
-  • Change — Long FLMM and Signal Linkage analyses now run on a worker thread
+  • Change: Long FLMM and Signal Linkage analyses now run on a worker thread
     behind a live progress bar with a Cancel button, so the app stays responsive
     (and interruptible) during the heavy pairwise and permutation computations.
-  • Fix — "Clear Subject Data" (Project Setup) now works. The dialog's action
+  • Fix: "Clear Subject Data" (Project Setup) now works. The dialog's action
     buttons never appeared because of an undefined-frame error, so there was no
     way to confirm a deletion. The buttons are restored, and clearing a subject
-    now permanently removes it and all of its processed data — z-score / dF /
-    corrected traces, behavior, spikes, and bout folders — from both memory and
+    now permanently removes it and all of its processed data (z-score / dF /
+    corrected traces, behavior, spikes, and bout folders) from both memory and
     disk, and rewrites the project so it no longer reappears on reload. Prefix-safe
     (clearing "DR22" leaves "DR220" untouched). Raw input files are never touched.
 
 Version 1.7.0  •  July 4, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Pairwise behavior comparison for the FLMM-style time-course stats (Bout
+  • New: Pairwise behavior comparison for the FLMM-style time-course stats (Bout
     Analysis → Plot ▾ → "Time-Course Statistics" → "Pairwise matrix"). A popup with
     behavior and channel checkboxes lets you compare every selected behavior against
     every other. Each pair is tested with a global sup-t (max-statistic) functional
-    Wald test — the p-value companion of the simultaneous confidence band, which
-    corrects across the whole peri-event window — and the pair p-values are then
+    Wald test (the p-value companion of the simultaneous confidence band, which
+    corrects across the whole peri-event window), and the pair p-values are then
     Benjamini-Hochberg FDR-corrected. Results render as a manuscript-ready
-    lower-triangular significance matrix (colour = −log₁₀ FDR p, stars per cell, grey
+    lower-triangular significance matrix (color = −log₁₀ FDR p, stars per cell, gray
     = ns) with a copy-to-clipboard table. Pure-Python engine; no R required.
-  • New — Pairwise comparison runs "within channel" (one behavior × behavior matrix
+  • New: Pairwise comparison runs "within channel" (one behavior × behavior matrix
     per selected channel) or "same behavior across channels" (each behavior compared
     between channels, e.g. G0 vs G1, as a compact per-behavior panel). Multiple
     panels are viewed one at a time with a channel/behavior selector; the
@@ -18130,37 +18143,37 @@ Version 1.7.0  •  July 4, 2026
 
 Version 1.6.0  •  June 29, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix (correctness) — Single-channel (G0-only) recordings no longer show a phantom
+  • Fix (correctness): Single-channel (G0-only) recordings no longer show a phantom
     G1 series in Zone Averages, Distance from Center (X / Y / Euclidean), and
     Out/Back plots. Channel availability is now read from the actual photometry
     channel count instead of the raw column width, so a kinematics column (e.g.
     elapsed time) can no longer be mistaken for a second channel. NOTE: projects
     saved before this fix must be reprocessed to clear already-stored phantom G1
     values.
-  • Fix — Plots no longer render wider than the window. The on-screen width is now
+  • Fix: Plots no longer render wider than the window. The on-screen width is now
     capped to the available pixel width (not just a fixed inch limit), so dense
-    multi-subject graphs — e.g. the Signal Integrity dashboard — shrink to fit
+    multi-subject graphs, e.g. the Signal Integrity dashboard, shrink to fit
     instead of overflowing on smaller or DPI-scaled displays.
-  • New — Signal Integrity graph is cached. Re-viewing it (e.g. after switching plot
+  • New: Signal Integrity graph is cached. Re-viewing it (e.g. after switching plot
     types and back) reuses the computed figure instantly instead of rerunning the
     expensive scoring; the cache refreshes automatically when the selection,
     settings, or processed data change.
-  • Change — Signal Integrity "Apply to Exclude" now evaluates only the currently
+  • Change: Signal Integrity "Apply to Exclude" now evaluates only the currently
     selected groups/subjects on the Visualization tab rather than the entire loaded
     dataset, with a note on the control indicating the scoped behavior.
 
 Version 1.5.0  •  June 21, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Signal Integrity scoring rebuilt from the ground up. A signal-fluctuation
+  • New: Signal Integrity scoring rebuilt from the ground up. A signal-fluctuation
     SNR (sf-SNR) now drives the score, with explicit gating so genuinely bad
     recordings score below 50 instead of being flattered by the old weighting.
     Per-channel metrics are computed by a single shared engine and reported
     consistently in both the single-subject and multi-subject views.
-  • New — "Sensor (ignore 415nm)" toggle on the Signal Integrity tab. GRAB-type
+  • New: "Sensor (ignore 415nm)" toggle on the Signal Integrity tab. GRAB-type
     sensors (e.g. GRABDA) carry a 415 nm channel that is not a true motion control,
     so when enabled the 415-based correlation / motion terms are dropped from the
     score. Applies to both single- and multi-subject integrity views.
-  • Fix (correctness) — Behavior / position files without headers are now classified
+  • Fix (correctness): Behavior / position files without headers are now classified
     by column CONTENT, not by column count. TRACY distinguishes a real X/Y
     AnimalPosition track from a sequential frame index and from a timestamp-only
     file. Previously blank or constant X/Y columns could be misread as real
@@ -18169,87 +18182,87 @@ Version 1.5.0  •  June 21, 2026
 
 Version 1.4.1  •  June 18, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Gridlines on/off toggle for plots. Every plot's navigation toolbar now
+  • New: Gridlines on/off toggle for plots. Every plot's navigation toolbar now
     has a "Grid" checkbox (also in Advanced Graph Settings); toggling it instantly
     shows/hides gridlines on all open graphs and applies to new ones.
-  • Fix — Processing summary bout count was wrong (counted channel/alias/metadata
+  • Fix: Processing summary bout count was wrong (counted channel/alias/metadata
     dict keys, e.g. 27 instead of 15). It now reports the true number of extracted
     bouts per behavior.
-  • Fix — Behavioral Data tab plots rendered half off-screen to the right. The
+  • Fix: Behavioral Data tab plots rendered half off-screen to the right. The
     scrollable content is now pinned to the visible width so the wide metrics
     table can't push centered plots out of view.
-  • Change — Auto-saves after processing / bout re-extraction now show the
+  • Change: Auto-saves after processing / bout re-extraction now show the
     responsive "Saving Project" progress window (no more silent freeze) instead of
     saving invisibly; no extra completion popup. The summary also appears
     immediately rather than waiting on the disk save.
 
 Version 1.4.0  •  June 17, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — UI & graphing cohesion overhaul. All plots now render at a consistent,
+  • New: UI & graphing cohesion overhaul. All plots now render at a consistent,
     capped, centered size instead of stretching across the window, share one
     matplotlib style (fonts/colors/grid), and pop-outs open in a uniform
     scrollable window. Control panels size to their content so button labels are
     no longer clipped (including at higher Windows display scaling).
-  • Change — Spike Analysis no longer has the in-tab "Live Preview" pane. The tab
+  • Change: Spike Analysis no longer has the in-tab "Live Preview" pane. The tab
     is now a single, clean column (parameters → selection → results); spike plots
     open via "Visualize Spike Data" / "Analyze Spikes by Zone", matching how the
     other analysis tabs graph.
-  • New — Processing summary popup is far more informative: each successfully
+  • New: Processing summary popup is far more informative: each successfully
     processed subject lists what was produced (channels, wavelengths,
     frames/duration, position data, bouts), failures show the full traceback, and
     a "Copy report" button copies the whole summary to the clipboard.
-  • New — Rebuilt the Info → Overview page with a clickable section navigator and
+  • New: Rebuilt the Info → Overview page with a clickable section navigator and
     concise, up-to-date documentation (multi-channel, file naming, per-tab guide,
     troubleshooting).
-  • Fix — In-app updater is more robust: if "git pull" fails because local/untracked
+  • Fix: In-app updater is more robust: if "git pull" fails because local/untracked
     files would be overwritten, it now sets them aside in a recoverable git stash
     and retries automatically. Failures are reported clearly (with the git output)
     instead of a generic message, and the app is left unchanged on failure.
 
 Version 1.3.0  •  June 17, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Full multi-channel support: TRACY now identifies, labels, and analyzes
+  • New: Full multi-channel support: TRACY now identifies, labels, and analyzes
     ANY number of photometry channels (green and red, with any region index such
     as R4/R5), not just G0/G1. Channels are read from the recording's column
     headers and used consistently everywhere.
-  • Fix — Exclusions tab now lists EVERY detected channel. Previously channels
+  • Fix: Exclusions tab now lists EVERY detected channel. Previously channels
     were filtered against a fixed list that stopped at R2, so higher-numbered red
     channels (R3/R4/R5…) were silently missing and could not be excluded.
-  • Fix — Channel selectors are now built from the channels actually present, with
+  • Fix: Channel selectors are now built from the channels actually present, with
     correct G/R labels, across the Connectivity/Coherence, Signal Integrity,
     Visualization and Bout Analysis tabs (previously hard-coded to G0/G1/R1 or
     mislabeled red channels as "G").
-  • Fix (correctness) — Per-channel wavelength routing. In recordings that
+  • Fix (correctness): Per-channel wavelength routing. In recordings that
     interleave 470 nm and 560 nm, red channels' bout / behavior / zone traces were
     being taken from the 470 nm frames. Each channel now uses its OWN wavelength
     (green → 470 nm, red → 560 nm). Deinterleaving was verified sample-for-sample
     against the raw LED-state data.
-  • Fix — The behavior-synced data now supports any channel count. Previously the
+  • Fix: The behavior-synced data now supports any channel count. Previously the
     5th and later channels collided with the elapsed-time / velocity / distance
     columns, silently corrupting bout, zone and kinematics analysis beyond four
     channels. The kinematics columns were moved after the photometry channels;
     existing projects load unchanged (behavior files are remapped by column name).
-  • Fix — Bouts now save and reload per channel, so red / high-index channels
+  • Fix: Bouts now save and reload per channel, so red / high-index channels
     survive a save/reload (previously only G0/G1 bouts were persisted).
 
 Version 1.2.2  •  June 3, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — FLMM time-course statistics (Bout Analysis → Plot ▾ → "Time-Course
+  • New: FLMM time-course statistics (Bout Analysis → Plot ▾ → "Time-Course
     Statistics"): Functional Linear Mixed Model (FUI) analysis of the whole
     peri-event window. A per-timepoint mixed model (random intercept per subject)
     gives an effect trace β(t) with pointwise and multiple-comparison-corrected
     *simultaneous* confidence bands, so you can see WHEN an effect is significant.
-  • New — Reference points for the time-course: signal ≠ 0, across bouts, between
+  • New: Reference points for the time-course: signal ≠ 0, across bouts, between
     groups, bout-order × group, a behavior contrast (one behavior as the 0-point
     vs another or all-others pooled), and a factor model (ALL behaviors vs a
-    chosen reference behavior in one model — one panel per contrast).
-  • New — Optional exact engine: when R + the fastFMM package are installed, TRACY
+    chosen reference behavior in one model, one panel per contrast).
+  • New: Optional exact engine: when R + the fastFMM package are installed, TRACY
     runs the real fui() for bit-exact results; otherwise a pure-Python engine is
     used (β(t) matches R lme4/fastFMM to ~1e-14; bands within ~5–10%). Adds a
     statsmodels dependency.
-  • Validation — "Validation Tests/" runs the analysis on the bundled Sample Data,
+  • Validation: "Validation Tests/" runs the analysis on the bundled Sample Data,
     and "flmm_validation/" documents a head-to-head comparison against R fastFMM.
-  • Fix — Bout windows: peri-event plots, exports and stats now stay correctly
+  • Fix: Bout windows: peri-event plots, exports and stats now stay correctly
     aligned when you reprocess or re-extract with different pre/post-bout frames.
     Each subject's bouts remember the window they were extracted with, and every
     plot/export realigns them to the current window before drawing or averaging,
@@ -18259,11 +18272,11 @@ Version 1.2.2  •  June 3, 2026
 
 Version 1.2.1  •  June 2, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • Fix — Visualization: "Extracted Bouts" / "Zone Entry Bouts" no longer render a
+  • Fix: Visualization: "Extracted Bouts" / "Zone Entry Bouts" no longer render a
     giant figure when many single subjects are selected. These plots collapse all
     subjects into a fixed trace+heatmap layout, so they're now sized by channel
     count instead of subject count.
-  • Fix — "Apply Settings & Re-extract Bouts" now works for TTL-derived bouts (and
+  • Fix: "Apply Settings & Re-extract Bouts" now works for TTL-derived bouts (and
     other auto-generated boutframes). Each subject remembers the boutframes file
     its bouts came from, so changing pre/post-bout frames and re-extracting is
     correctly reflected in the visualization (previously re-extraction could find
@@ -18272,30 +18285,30 @@ Version 1.2.1  •  June 2, 2026
 
 Version 1.2.0  •  June 2, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Bout Analysis export "All Behaviors → unified Excel (current settings)":
+  • New: Bout Analysis export "All Behaviors → unified Excel (current settings)":
     applies the current settings (subjects/groups, metrics, window, max bouts,
     averaging, exclusions) to every behavior at once and writes one workbook with
     a sheet per behavior x channel, plus an Export Settings sheet. No need to
     calculate each behavior first.
-  • Fix — Visualization: legends no longer cover the plotted data; every graph now
+  • Fix: Visualization: legends no longer cover the plotted data; every graph now
     opens headroom and anchors the legend clear of the traces.
-  • Fix — Visualization "Distance from Center" (X/Y and Euclidean): plots no longer
+  • Fix: Visualization "Distance from Center" (X/Y and Euclidean): plots no longer
     fail silently (blank panel) on legacy/reloaded projects; distance bins are read
     robustly and a plotting error now shows in-panel instead of leaving it blank.
 
 Version 1.1.0  •  June 1, 2026
 ────────────────────────────────────────────────────────────────────────────────
-  • New — Bout-length analysis: bin bouts by their duration and compare
+  • New: Bout-length analysis: bin bouts by their duration and compare
     peak/avg/AUC across length bins ("Bars by Bout Length" in Bout Analysis and
     a "Bout Length Bins" peri-event plot in Visualization), with an editable
     length-bin editor. Requires boutframes with start AND end frames.
-  • New — Start/end boutframes: support boutframes files with Behavior__start /
+  • New: Start/end boutframes: support boutframes files with Behavior__start /
     Behavior__end columns, plus three metric processing styles (onset-aligned
     window, whole bout, offset-aligned window).
-  • New — Bout-exclusion engine: non-destructive filter that drops bouts by
+  • New: Bout-exclusion engine: non-destructive filter that drops bouts by
     minimum/maximum duration or by proximity to the previous bout; the
     boutframes file is never modified (re-extract to apply).
-  • New — Editable zone-entry transition thresholds (minimum duration in zone +
+  • New: Editable zone-entry transition thresholds (minimum duration in zone +
     refractory) under Visualization → Advanced Graph Settings, with one-click
     recompute (no full reprocess needed).
   • Bout Analysis: action buttons consolidated into "Plot" and "Export" dropdown
@@ -18313,7 +18326,7 @@ Version 1.0.1  •  May 31, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • UI: decluttered tabs, consistent spacing, and fixed text that was cut off or
     squished at smaller window sizes.
-  • Graphs: dynamic figure sizing — plots now scale to the data and the window
+  • Graphs: dynamic figure sizing, plots now scale to the data and the window
     instead of always stretching to full width.
   • Added this Changelog (under Info) and a single in-app version number.
   • Info tab rewritten to accurately describe every analysis tab and feature.
@@ -19062,7 +19075,7 @@ SUPPORTED FILE FORMATS:
        (rows index 0, 2, 4 …).  10 rows → 5 bouts.
 
      ▸ One row per bout (onset only)
-       Each row is a single bout onset — use this when the offset rows
+       Each row is a single bout onset; use this when the offset rows
        have already been stripped (e.g. by the Decombobulator with
        "Preserve bout-end TTL" OFF).  5 rows → 5 bouts.
        NOTE: choosing the wrong mode here is the usual cause of only
@@ -19210,7 +19223,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     @keeps_channel_designations
     def save_project_config(self, quiet=False):
-        """Write project_config.json and the .tracy file only — no subject data.
+        """Write project_config.json and the .tracy file only, no subject data.
 
         Settings-only edits (parameters, zones, groups, exclusions, bout offsets,
         boutframe shifts, file paths) all live in these two small JSON files.
@@ -19932,7 +19945,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.boutframes_video_fps_var.set(str(self.params.get('boutframes_video_fps', 30)))
 
             # Animal/session ID style, so a reopened project shows the pattern it
-            # was analysed with rather than the build-time default.
+            # was analyzed with rather than the build-time default.
             if hasattr(self, 'session_pattern_var'):
                 _pat = self._session_pattern()
                 _label_by_pattern = {v: k for k, v in SESSION_PATTERN_PRESETS.items()}
@@ -20020,7 +20033,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             self.log_message(f"  Could not populate boutframes editor: {e}")
                     elif saved_bf:
                         self.log_message(
-                            f"  Boutframes file not found: {saved_bf} — re-select it via "
+                            f"  Boutframes file not found: {saved_bf}; re-select it via "
                             f"Browse on the Processing tab to use the editor.")
             if 'ttl_file' in config:
                 self.ttl_path_var.set(config['ttl_file'])
@@ -20110,7 +20123,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                 if stored_bf:
                                     subject_data['boutframes_file'] = stored_bf
                                 # Restore the per-channel z-scoring moments. Absent
-                                # for projects processed before they were recorded —
+                                # for projects processed before they were recorded;
                                 # those subjects simply cannot be pooled until they
                                 # are reprocessed.
                                 stored_zs = metadata.get('zscore_stats')
@@ -20583,7 +20596,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                         # Regenerate Out/Back movement stats for projects saved before
                         # 'outback' was persisted. Recompute zones from the synced
-                        # behaviour array and rebuild the stats so older projects don't
+                        # behavior array and rebuild the stats so older projects don't
                         # silently lose this metric on reload.
                         if ('outback' not in subject_data and 'beh_synced' in subject_data
                                 and subject_data.get('has_position')):
@@ -21037,7 +21050,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 f"Subjects: {', '.join(selected_subjects)}\n\n"
                 f"This permanently deletes their processed data, bouts and\n"
                 f"figures from the project (in memory and on disk).\n"
-                f"Your raw input files are NOT touched — you can reprocess\n"
+                f"Your raw input files are NOT touched; you can reprocess\n"
                 f"these subjects to add them back.\n\n"
                 f"This cannot be undone.",
                 icon='warning',
@@ -21092,7 +21105,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Clears the subject from every in-memory store and deletes its files
         under the project's processed/ (metadata, z-score/dff/corrected CSVs,
         behavior, spike data, and the bouts/ + entry_bouts/ folders) and any
-        subject-prefixed files in figures/. RAW INPUT FILES ARE NOT TOUCHED —
+        subject-prefixed files in figures/. RAW INPUT FILES ARE NOT TOUCHED;
         only the project's processed output is removed, so the subject can be
         reprocessed to add it back. The caller is responsible for persisting the
         updated project config (e.g. via save_project) and refreshing displays.
@@ -21174,8 +21187,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # sync silently discards.
         derived = {'preboutframes', 'postboutframes', 'baseline_frames'}
 
-        # Structured params (dict/list) — e.g. bout_overlay_colors,
-        # factor_definitions — are edited via their own dialogs, not as free
+        # Structured params (dict/list), e.g. bout_overlay_colors,
+        # factor_definitions, are edited via their own dialogs, not as free
         # text, and str()'ing a dict here would break the parser on Save.
         editable = {k: v for k, v in self.params.items()
                     if not isinstance(v, (dict, list)) and k not in derived}
@@ -21204,7 +21217,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         notebook.pack(side=tk.TOP, fill='both', expand=True, padx=8, pady=(0, 6))
 
         def add_row(parent, key, label, hint, row_index):
-            """One parameter: label, editor, and a grey `key - hint` note."""
+            """One parameter: label, editor, and a gray `key - hint` note."""
             value = editable[key]
             holder = ttk.Frame(parent)
             holder.grid(row=row_index, column=0, sticky='ew', pady=1)
@@ -21346,7 +21359,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         else:
                             raise ValueError(f"{key} must be True or False")
                     elif isinstance(current, (int, float)):
-                        # Numeric parameter — a typed decimal point promotes to float.
+                        # Numeric parameter: a typed decimal point promotes to float.
                         self.params[key] = float(value_str) if '.' in value_str else int(value_str)
                     else:
                         # Strings (file naming patterns, method choices) and any
@@ -21400,7 +21413,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     self.processing_savgol_poly_var.set(str(self.params['processing_savgol_polyorder']))
 
                 # Auto-save project to persist parameter changes. Only the
-                # settings files need rewriting — editing parameters here does
+                # settings files need rewriting; editing parameters here does
                 # not touch any processed subject array (the new values apply on
                 # the next process / re-extract), so a full save_project() would
                 # rewrite the whole cohort's CSVs unchanged.
@@ -21527,10 +21540,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         The rate is measured from the recording's own timestamps during
         processing (see process_fp_data) and stored per subject as
-        'photometry_fps'.  It is never a user setting — a hand-set global was
-        the historical source of silently analysing 20 Hz data at 30 Hz.
+        'photometry_fps'.  It is never a user setting: a hand-set global was
+        the historical source of silently analyzing 20 Hz data at 30 Hz.
 
-        Pass *subject* whenever the caller is working on one subject — either its
+        Pass *subject* whenever the caller is working on one subject: either its
         subject ID or its processed_data entry, whichever the caller already has.
         Group and dataset-level callers omit it and get the rate shared by the
         processed subjects, or the most common rate if they disagree; a
@@ -21561,7 +21574,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     f"({', '.join(f'{r:g} Hz x{n}' for r, n in sorted(counts.items()))}). "
                     "The bout window is set in seconds and stored traces are resampled "
                     f"onto a shared {shared:g} Hz axis, so these can be "
-                    "analysed together. Any other frame-denominated setting (spike width, "
+                    "analyzed together. Any other frame-denominated setting (spike width, "
                     "smoothing window) still means a different duration per rate.")
             return shared
 
@@ -21591,7 +21604,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         The window is stored in seconds; this is the only place it becomes a
         sample count.  Pass a subject (id or processed entry) whenever the
-        caller is extracting from that subject's own array — its rate is what
+        caller is extracting from that subject's own array; its rate is what
         the indices must be in.  Omit it for the shared analysis axis.
         """
         fs = self.get_fps(subject) if subject is not None else self.analysis_fps()
@@ -21625,8 +21638,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Push the stored analysis window back into its entry boxes.
 
         The boxes are the source of truth while the Bout Analysis tab is in use,
-        so anything that writes params behind them — opening a project, the
-        parameter editor — has to refresh them or its value is discarded on the
+        so anything that writes params behind them (opening a project, the
+        parameter editor) has to refresh them or its value is discarded on the
         next read.
         """
         if not hasattr(self, 'window_start_sec_var'):
@@ -21652,7 +21665,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         Many callers read ``params['preboutframes']`` directly and mean "the
         shared plotting axis", so those stay in params rather than being chased
-        through the whole file — they are just no longer what the user sets.
+        through the whole file; they are just no longer what the user sets.
         """
         pre, post, base = self.bout_window_samples()
         self.params['preboutframes'] = pre
@@ -21689,7 +21702,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Adopt a project saved before the window was specified in seconds.
 
         Such a project has frames but no seconds; convert once, at the rate that
-        project was analysed with, so its windows keep the duration they had.
+        project was analyzed with, so its windows keep the duration they had.
         """
         p = self.params
         if p.get('preboutseconds') is None or p.get('postboutseconds') is None:
@@ -21747,7 +21760,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         an animal contributes two sessions, grouping by subject ID declares those
         repeated measures independent, which understates the standard errors and
         makes the test anticonservative.  Where the IDs encode no repeats this is
-        identical to the previous subject-keyed behaviour.
+        identical to the previous subject-keyed behavior.
 
         Takes *log* so worker threads can route the message through their
         progress queue rather than touching Tk.
@@ -21954,7 +21967,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if overlaps:
             # Naming every overlapping subject is noise once there are dozens;
             # the useful fact is the rule that resolved them.
-            sample = ("" if len(overlaps) > 4 else " — " + ", ".join(
+            sample = ("" if len(overlaps) > 4 else ": " + ", ".join(
                 f"{sid} ({'/'.join(gs)})" for sid, gs in overlaps.items()))
             overlap_note = (
                 f"{len(overlaps)} subject(s) were in more than one group{sample}. "
@@ -21966,7 +21979,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 "These groups ended up empty because every member was claimed by "
                 f"an earlier group: {', '.join(lost)}.\n\n"
                 "Overlapping groups like these are usually one design expressed "
-                "the long way — a Sex factor and a Drug factor, say, rather than "
+                "the long way: a Sex factor and a Drug factor, say, rather than "
                 "a group per combination. Create them with 'New…' on the Factors "
                 "tab and any graphing tab can then split or cross them, which is "
                 "what the old overlapping groups were standing in for.\n\n")
@@ -22018,11 +22031,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """``[(series_label, [subject_id, ...])]`` for *subject_pool*, in plot order.
 
         Empty series are dropped, so a level nobody is at does not occupy a
-        colour or a legend entry.
+        color or a legend entry.
         """
         labels, split_factors = self.facet(subject_pool, selections)
         # Same universe as the labels above, or a narrowed pool would be
-        # ordered against a factor model it was not labelled with. Series that
+        # ordered against a factor model it was not labeled with. Series that
         # end up with no members are dropped below, so taking levels from the
         # whole project only affects their order, not which ones appear.
         assignments = self.get_subject_factors(self._factor_universe(subject_pool))
@@ -22218,7 +22231,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if missing:
                 for s in members:
                     skipped[s] = ("no stored z-scoring moments (processed before they "
-                                  "were recorded — reprocess to enable pooling)")
+                                  "were recorded; reprocess to enable pooling)")
                 continue
 
             keys = set()
@@ -22228,7 +22241,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for key in sorted(keys):
                 per_session = [self.processed_data[s]['zscore_stats'].get(key) for s in members]
                 if any(st is None for st in per_session):
-                    continue        # channel absent from one session — cannot pool it
+                    continue        # channel absent from one session; cannot pool it
                 pooled = pool_moments(per_session)
                 if pooled is None:
                     continue
@@ -22326,7 +22339,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if enable:
             affines, skipped = self.compute_pooled_affines(ids)
             for sid, reason in sorted(skipped.items()):
-                messages.append(f"{sid}: skipped — {reason}")
+                messages.append(f"{sid}: skipped, {reason}")
             for sid in ids:
                 data = self.processed_data[sid]
                 if data.get('zscore_pooled'):
@@ -22556,7 +22569,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         trace, so the number of downward peaks at least t high estimates how
         many upward peaks at least t high are noise. The threshold is the
         lowest t (never under 2 noise SD) at which downward/upward <= q.
-        Validated on dead vs live KORKO fibres (AUC 0.97 vs 0.09 for the MAD
+        Validated on dead vs live KORKO fibers (AUC 0.97 vs 0.09 for the MAD
         threshold) and on injected ground truth; see SPIKE_MIRROR_FDR_SOURCE.
 
         Returns the detect_spikes dict, with amplitudes measured above the
@@ -22677,7 +22690,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             global_mads:     dict {ch_name: mad} for whole-dataset mode (preferred)
             global_mad_g0:   Legacy per-G0 MAD (used when global_mads is None)
             global_mad_g1:   Legacy per-G1 MAD (used when global_mads is None)
-            use_exclusions:  Honour the Exclusions checkboxes.  ``None`` reads the
+            use_exclusions:  Honor the Exclusions checkboxes.  ``None`` reads the
                              tab's "Apply exclusions" toggle, which is the point:
                              this used to filter unconditionally, so turning the
                              toggle off still dropped excluded channels here even
@@ -22741,7 +22754,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         Args:
             subject_id:     Subject identifier
-            use_exclusions: Honour the Exclusions checkboxes.  ``None`` reads the
+            use_exclusions: Honor the Exclusions checkboxes.  ``None`` reads the
                             Spike Analysis tab's "Apply exclusions" toggle.
 
         Uses the detections Run Spike Analysis stored in ``spike_data``, so the
@@ -22911,7 +22924,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.update_dec_prob_subjects()
             self.update_conn_listbox()
 
-            # Show the colour-coded summary popup of what processed / failed /
+            # Show the color-coded summary popup of what processed / failed /
             # warned FIRST, so the user gets immediate feedback. It reads only
             # in-memory results, so it's fast and doesn't need to wait on the
             # disk auto-save below. Guarded so a display hiccup never breaks the
@@ -23225,7 +23238,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return " · ".join(parts)
 
     def show_processing_summary(self):
-        """Display a colour-coded popup summarising the processing results.
+        """Display a color-coded popup summarizing the processing results.
 
         Green = succeeded, red = failed, amber = warnings (fallbacks applied,
         missing companion files, file-structure deviations).  Adapts to both
@@ -23246,7 +23259,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ordered.append(item)
             return ordered
 
-        # --- Gather and normalise the collected data -----------------------
+        # --- Gather and normalize the collected data -----------------------
         processed_subjects = _unique_preserve(summary.get('subjects_processed', []))
         failed_subjects = summary.get('subjects_failed', [])
         tracebacks = summary.get('failure_tracebacks', {})
@@ -23274,16 +23287,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Missing companion files (with the consequence spelled out succinctly).
         companion_items = []
         for s in missing_behavior:
-            companion_items.append(f"{s} — no timestamp/behaviour file (behaviour sync skipped)")
+            companion_items.append(f"{s}: no timestamp/behavior file (behavior sync skipped)")
         for s in missing_ttl:
-            companion_items.append(f"{s} — no TTL/DigitalIOs file (auto boutframes skipped)")
+            companion_items.append(f"{s}: no TTL/DigitalIOs file (auto boutframes skipped)")
         for s in no_position_data:
-            companion_items.append(f"{s} — no position (X/Y) data (zone analysis unavailable)")
+            companion_items.append(f"{s}: no position (X/Y) data (zone analysis unavailable)")
 
         total_warn = (len(structure_items) + len(companion_items) + len(fallbacks)
                       + len(collisions) + len(unresolved))
 
-        # --- Overall status -> banner colour & headline -------------------
+        # --- Overall status -> banner color & headline -------------------
         if n_failed > 0 or n_processed == 0:
             status = 'bad'
         elif total_warn > 0:
@@ -23303,7 +23316,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if status == 'good':
                 headline = f"All {n_processed} subject(s) processed successfully"
             elif status == 'warn':
-                headline = f"Processed {n_processed} subject(s) — {total_warn} warning(s)"
+                headline = f"Processed {n_processed} subject(s), {total_warn} warning(s)"
             else:
                 headline = f"{n_failed} failed · {n_processed} processed of {n_found} file(s)"
         else:
@@ -23312,7 +23325,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if status == 'good':
                 headline = f"{subj} processed successfully"
             elif status == 'warn':
-                headline = f"{subj} processed — {total_warn} warning(s)"
+                headline = f"{subj} processed, {total_warn} warning(s)"
             else:
                 headline = (f"{subj} failed to process" if n_failed
                             else "Processing did not complete")
@@ -23431,7 +23444,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                      fg='#1e7e34', font=('Segoe UI', 9, 'italic'),
                      anchor='w', padx=4, pady=4).pack(fill='x')
 
-        # Size the canvas to its content (capped), then centre the window.
+        # Size the canvas to its content (capped), then center the window.
         inner.update_idletasks()
         canvas.configure(height=min(inner.winfo_reqheight(), 460))
 
@@ -23725,8 +23738,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 f"(expected at column 3)")
 
         # Per-channel designation (e.g. G0/G1/R0) read from the column headers, so a
-        # subject recorded on region 1 is labelled "G1" instead of defaulting to "G0".
-        # Only honour header names that look like real designations (G/R + digit);
+        # subject recorded on region 1 is labeled "G1" instead of defaulting to "G0".
+        # Only honor header names that look like real designations (G/R + digit);
         # otherwise leave channel_names unset so downstream falls back to positional Ch#.
         detected_channel_names = None
         if has_text_header:
@@ -23742,11 +23755,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 result['channel_names'] = detected_channel_names
                 self.log_message(f"  Channel designations from header: {detected_channel_names}")
             elif hasattr(self, 'processing_summary'):
-                # Header present but no recognizable G/R designation — a deviation
+                # Header present but no recognizable G/R designation: a deviation
                 # from the expected FPData layout (e.g. G0/G1/R0 column names).
                 self.processing_summary.setdefault('structure_warnings', []).append(
                     f"{subject_id}: FPData header lacks G/R channel designation "
-                    f"(expected e.g. G0/G1/R0) — using positional Ch#")
+                    f"(expected e.g. G0/G1/R0), using positional Ch#")
 
         if num_photometry_cols == 0:
             raise ValueError("No photometry data columns found in FPData file")
@@ -23842,13 +23855,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             f"timestamp={'yes' if ts_idx is not None else 'MISSING'})")
                         if ts_idx is None:
                             self.log_message(
-                                "    Warning: no timestamp column in position file — "
+                                "    Warning: no timestamp column in position file, "
                                 "behavior↔FP synchronization will be unavailable for this subject.")
                             if hasattr(self, 'processing_summary'):
                                 self.processing_summary.setdefault('fallbacks_used', []).append(
                                     f"{subject_id}: position file has no timestamp column")
                     else:
-                        # Named columns but no recognized X/Y names — fall back to
+                        # Named columns but no recognized X/Y names; fall back to
                         # content-based classification (same logic as the no-header
                         # path) instead of trusting the column count.
                         beh_data = df_beh.apply(pd.to_numeric, errors='coerce').values
@@ -23864,7 +23877,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                        else f"col{info['ts_idx']}")
                             self.log_message(
                                 f"  No usable position data ({beh_data.shape[1]} column(s); "
-                                f"no coordinate-like X/Y pair found) — treating file as "
+                                f"no coordinate-like X/Y pair found), treating file as "
                                 f"per-frame timestamps ({ts_desc}) for FP alignment only.")
                             if hasattr(self, 'processing_summary'):
                                 self.processing_summary['no_position_data'].append(subject_id)
@@ -23887,7 +23900,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                    else f"col{info['ts_idx']}")
                         self.log_message(
                             f"  No usable position data ({beh_data.shape[1]} column(s); "
-                            f"no coordinate-like X/Y pair found) — treating file as "
+                            f"no coordinate-like X/Y pair found), treating file as "
                             f"per-frame timestamps ({ts_desc}) for FP alignment only.")
                         if hasattr(self, 'processing_summary'):
                             self.processing_summary['no_position_data'].append(subject_id)
@@ -23937,7 +23950,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 else:
                     self.log_message(
                         f"  Session bounds would drop every position frame "
-                        f"({_n_drop}) — bounds ignored for the position track. "
+                        f"({_n_drop}); bounds ignored for the position track. "
                         f"Check that they are numbered in video frames.")
 
         result['raw'] = fp_raw
@@ -23980,7 +23993,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                              f"photometry frames trimmed")
             self.log_message(
                 f"  Session bounds: start frame {_sb_start} "
-                f"({_sb_start / _vfps:.1f} s) to {_end_txt} @ {_vfps:g} fps video — "
+                f"({_sb_start / _vfps:.1f} s) to {_end_txt} @ {_vfps:g} fps video; "
                 f"kept raw rows {_start_row}:{_end_row} of {_n_raw_before} "
                 f"(precut alone would have kept {precut}:{_n_raw_before})")
 
@@ -24244,11 +24257,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             result['zscore_570'] = zscore_570
             processed_wavelengths.append('570')
         
-        # Build the "primary" default matrices used by the behaviour-synced
+        # Build the "primary" default matrices used by the behavior-synced
         # pipeline (bouts, zone/kinematics) and exports.  Each channel is taken
         # from the wavelength matrix matching its G/R designation so green
         # channels carry their 470 nm signal and red channels their 560/570 nm
-        # signal — instead of forcing every channel onto a single wavelength.
+        # signal, instead of forcing every channel onto a single wavelength.
         for _key in ('data', 'dff', 'corrected', 'zscore'):
             combined = self._combine_by_wavelength(result, _key)
             if combined is not None:
@@ -24323,7 +24336,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             if has_position:
                 # Snapshot the UNCALIBRATED pixel coordinates, row-aligned to
                 # beh_synced, before process_position_data rewrites cols 2/3 in
-                # place with centimetres. Without this the pixel origin and scale
+                # place with centimeters. Without this the pixel origin and scale
                 # are gone, so a later maze-width or Y-calibration change could
                 # not be re-applied without re-reading the position file.
                 # See recalculate_position_analyses().
@@ -24768,7 +24781,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def fit_bleach_baseline(self, x, y, label=""):
         """Bleaching baseline for dF/F: bi-exponential, or tri-exponential when
-        the auto-select setting is on and BIC favours it."""
+        the auto-select setting is on and BIC favors it."""
         if not getattr(self, 'params', {}).get('detrend_auto_triexp', False):
             return self.fit_biexponential(x, y)
         fitted_bi, popt_bi = self.fit_biexponential(x, y, return_params=True)
@@ -24798,7 +24811,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def fit_triexponential(self, x, y, popt_bi):
         """Tri-exponential baseline y = a e^-bx + c e^-dx + e e^-fx + offset,
         seeded from a bi-exponential fit (popt_bi, in fit_biexponential's
-        normalised units).  The extra term covers a fast decay of a few seconds
+        normalized units).  The extra term covers a fast decay of a few seconds
         (rate up to 2000 per session length).  Raises ValueError if the result
         is unusable as a dF/F denominator."""
         def triexp(x, a, b, c, d, e, f, offset):
@@ -24857,7 +24870,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not np.all(np.isfinite(y)):
             raise ValueError("signal contains non-finite samples")
 
-        # Fit in a normalised y as well.  The model is linear in a, c and
+        # Fit in a normalized y as well.  The model is linear in a, c and
         # offset, so shifting y by y_min and dividing by its range maps the
         # solution exactly -- (a/s, b, c/s, d, (offset-y_min)/s) describes the
         # same curve -- and the bounds below carry over unchanged because they
@@ -24866,7 +24879,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # absolute, so on raw detector counts (~1e4) the solver can wander for
         # tens of thousands of iterations without converging.  That reached the
         # user as a frozen GUI rather than an error, because the retry below
-        # used to be unbounded.  Normalising makes the fit behave the same way
+        # used to be unbounded.  Normalizing makes the fit behave the same way
         # whether the rig reports counts, volts or dF/F.
         y_min = float(np.min(y))
         y_range = float(np.max(y) - y_min)
@@ -24890,7 +24903,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ]
 
         # Set bounds to ensure reasonable parameter values
-        # Allow fast rate up to 50, slow rate up to 10.  In normalised units
+        # Allow fast rate up to 50, slow rate up to 10.  In normalized units
         # y_range is 1, so the amplitude ceiling of y_range*2 becomes 2.
         bounds = (
             [0, 0.1, 0, 0.01, -np.inf],          # Lower bounds
@@ -24942,7 +24955,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                               maxfev=self._fit_nfev_cap(len(y_norm),
                                                         self.FIT_RETRY_MAX_NFEV))
 
-        # Undo the y normalisation
+        # Undo the y normalization
         fitted = biexp(x_norm, *popt) * scale + y_min
 
         # Callers divide by this curve to get dF/F, so a baseline that is
@@ -24954,7 +24967,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             raise ValueError("biexponential baseline crosses zero; "
                              "unusable as a dF/F denominator")
 
-        # Return fitted values (plus normalised-unit parameters on request,
+        # Return fitted values (plus normalized-unit parameters on request,
         # used to seed fit_triexponential)
         if return_params:
             return fitted, popt
@@ -25015,7 +25028,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def _looks_like_frame_index(col):
         """True if a numeric column is a (near-)sequential row/frame index.
 
-        Frame columns look like 1,2,3,... or 0,1,2,... — integer-valued,
+        Frame columns look like 1,2,3,... or 0,1,2,...: integer-valued,
         strictly increasing, step of ~1, starting at 0 or 1. This lets us tell
         the row-number column apart from a time-of-day timestamp column (which is
         also increasing but holds large non-unit-step floats).
@@ -25032,7 +25045,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def _looks_like_position_col(col, min_frac=0.5):
         """True if a numeric column looks like an X/Y coordinate track.
 
-        A real position track is well-populated, non-constant, and — crucially —
+        A real position track is well-populated, non-constant, and, crucially,
         reverses direction (the animal moves back and forth). Monotonic columns
         (frame indices, time-of-day / hardware clocks) only ever increase, so the
         direction-reversal test rejects them. Sparse marker columns (e.g. a column
@@ -25054,7 +25067,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def _standardize_behavior_array(self, beh_data):
         """Classify the columns of an un-named behavior/position file by content.
 
-        Acquisition files come in several shapes — a full AnimalPosition file
+        Acquisition files come in several shapes: a full AnimalPosition file
         ([frame, timestamp, X, Y, hw-clock]), a ComputerTS file that is really
         just [frame, timestamp] with blank/sparse trailing columns, or a single
         bare timestamp column. Rather than guess from the column *count* (which
@@ -25153,7 +25166,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         Derived from the two recordings' own sampling intervals rather than a
         fixed constant, because the pair can be anything from 15 Hz photometry
-        against a 30 fps camera to a 1 Hz behavioural score. Two sample periods
+        against a 30 fps camera to a 1 Hz behavioral score. Two sample periods
         of the coarser of the two absorbs jitter and a whole dropped sample
         while still being far smaller than the gaps this is meant to catch.
         Falls back to a permissive value when either interval is unusable, so
@@ -25172,7 +25185,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         steps = [s for s in (_step(fp_ts), _step(beh_ts)) if s]
         if not steps:
-            return float('inf')     # cannot tell -- keep the old behaviour
+            return float('inf')     # cannot tell -- keep the old behavior
         return 2.0 * max(steps)
 
     def _trim_behavior_to_photometry_end(self, beh_synced, zscore_data):
@@ -25308,7 +25321,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     f"plot: a consistent non-zero peak lag across subjects indicates a residual offset."
                 )
             else:
-                # Absolute (shared-clock) matching — the robust path. Report the
+                # Absolute (shared-clock) matching: the robust path. Report the
                 # apparent start offset between the two files so a delay is visible.
                 start_offset = float(beh_min - fp_min)
                 self.log_message(
@@ -25318,11 +25331,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 )
         elif valid_mask.sum() <= 1:
             self.log_message(
-                "    Sync warning: position file has no usable timestamp column — "
+                "    Sync warning: position file has no usable timestamp column, "
                 "FP signal could not be aligned to behavior for this subject."
             )
 
-        # Nearest-neighbour matching has no notion of "out of range": for a
+        # Nearest-neighbor matching has no notion of "out of range": for a
         # behavior frame recorded before the photometry started (or after it
         # stopped) argmin still returns the first/last FP sample, so the whole
         # uncovered stretch was filled with one repeated value that reads as a
@@ -25361,7 +25374,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                    f"{match_tol:.3g}); left blank rather than filled with the "
                    f"nearest edge sample.")
             if pct >= 1.0:
-                msg += (" Bouts scored in that stretch have no signal behind them — "
+                msg += (" Bouts scored in that stretch have no signal behind them: "
                         "check that the FP and behavior files cover the same session.")
             self.log_message(msg)
 
@@ -25372,7 +25385,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             n_unique = len(set(matched_indices))
             if n_unique / len(matched_indices) < 0.05:
                 self.log_message(
-                    f"    Warning: Photometry synchronization may be incorrect — "
+                    f"    Warning: Photometry synchronization may be incorrect, "
                     f"{n_unique} unique FP frame(s) matched across {len(matched_indices)} "
                     f"behavior frames. Check that behavior and FP files share the same session."
                 )
@@ -25519,11 +25532,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             position_px: Optional (n, 2) array of the ORIGINAL pixel coordinates,
                 row-aligned to beh_synced. Calibration overwrites cols 2/3 in
                 place, so re-running this on an already-processed array would
-                otherwise treat centimetres as pixels. Pass the snapshot taken
+                otherwise treat centimeters as pixels. Pass the snapshot taken
                 during processing to re-calibrate from the true source values.
             calibrate: When False, cols 2/3 are left exactly as they are and only
-                velocity / distance / distance-from-centre are recomputed. Used
-                when no pixel snapshot exists, so stale centimetres are reused
+                velocity / distance / distance-from-center are recomputed. Used
+                when no pixel snapshot exists, so stale centimeters are reused
                 rather than silently rescaled.
 
         Returns:
@@ -25551,7 +25564,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 beh_synced[:, 3] = px[:, 1]
             else:
                 self.log_message(
-                    f"    Pixel snapshot ignored — shape {px.shape} does not match "
+                    f"    Pixel snapshot ignored: shape {px.shape} does not match "
                     f"{beh_synced.shape[0]} behavior rows; calibrating from the "
                     f"existing coordinates instead.")
 
@@ -25571,8 +25584,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         x_range = (np.max(valid_x) - np.min(valid_x)) if len(valid_x) > 0 else 0.0
         if not calibrate:
             self.log_message(
-                "    Position calibration skipped by request — reusing the existing "
-                "centimetre coordinates; velocity/distance recomputed.")
+                "    Position calibration skipped by request, reusing the existing "
+                "centimeter coordinates; velocity/distance recomputed.")
         elif len(valid_x) > 0 and len(valid_y) > 0 and x_range > 0:
             # Calculate conversion ratio
             x_min = np.min(valid_x)
@@ -25580,7 +25593,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             x_range = x_max - x_min
             conversion_ratio = maze_width / x_range
 
-            # Y calibration — method is user-selectable in Analysis Settings
+            # Y calibration: method is user-selectable in Analysis Settings
             y_min_obs = np.min(valid_y)
             y_cal_method = self.params.get('y_calibration_method', 'legacy')
 
@@ -25607,7 +25620,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             beh_synced[:, 2] = (x_coords - x_min) * conversion_ratio  # X in cm
             beh_synced[:, 3] = (y_coords - y_offset) * y_ratio         # Y in cm
         else:
-            # Unusable position data — leave X/Y as-is and skip calibration so the
+            # Unusable position data; leave X/Y as-is and skip calibration so the
             # rest of processing (and the photometry signal) can still complete.
             reason = (
                 "X column is empty" if len(valid_x) == 0
@@ -25616,7 +25629,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 else "X pixel range is zero (no movement / single value)"
             )
             self.log_message(
-                f"    Position calibration skipped — {reason} "
+                f"    Position calibration skipped: {reason} "
                 f"(valid samples: X={len(valid_x)}, Y={len(valid_y)}). "
                 f"Position/velocity/zone metrics will be unavailable for this "
                 f"subject; the photometry signal is unaffected."
@@ -26143,7 +26156,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             exits_to_closed = True
                             break
                         elif zones[j] not in center_zones:
-                            break  # Exited to unknown / other zone — unresolved
+                            break  # Exited to unknown / other zone: unresolved
 
                     if exits_to_open:
                         if (i - last_explore_frame) >= min_time_between_frames:
@@ -26240,7 +26253,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Determine available photometry channels from the CHANNEL COUNT, not the
         # raw column count: kinematics columns sit after the channels, so a
         # single-channel subject still has >7 columns and column 7 is actually a
-        # kinematics field — reading it as G1 produces a phantom second channel.
+        # kinematics field: reading it as G1 produces a phantom second channel.
         if n_channels is None:
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
         # Calculate averages for each zone, for every channel slot, over the
@@ -26270,7 +26283,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             Three dictionaries (X-axis, Y-axis, Euclidean) with distance bins and z-score averages
         """
         # Channel availability is derived from the channel count (cols 6..6+N-1),
-        # NOT the raw width — kinematics columns follow the channels, so column 7
+        # NOT the raw width: kinematics columns follow the channels, so column 7
         # is a kinematics field for single-channel subjects, not a real G1.
         if n_channels is None:
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
@@ -26336,8 +26349,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         imports) the stored 1 cm bins are merged, weighted by their n.
         """
         table = data.get(data_key) or {}
+        ranges = self._distance_ranges()
         width = self._distance_bin_width()
-        if width == 1.0:
+        if not ranges and width == 1.0:
             return table
         beh = data.get('beh_synced')
         n_ch = self._beh_channel_count(data)
@@ -26347,15 +26361,61 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             dist = {'x': x, 'y': y}.get(self.DISTANCE_AXIS_FIELD.get(data_key))
             if dist is None:
                 dist = np.sqrt(x ** 2 + y ** 2)
+            if ranges:
+                # Explicit ranges: lo <= distance < hi, keyed by lo.
+                valid = ~np.isnan(dist) & self._recorded_rows(beh)
+                with np.errstate(invalid='ignore'):
+                    return {lo: self._slot_value_stats(
+                                beh, valid & (dist >= lo) & (dist < hi), n_ch,
+                                {'distance': lo}, ('mean', 'n'))
+                            for lo, hi in ranges}
             return self._distance_bin_stats(beh, dist, n_ch, width)
-        return self._merge_distance_bins(table, width)
+        return self._merge_distance_bins(table, width, ranges)
+
+    @staticmethod
+    def _parse_distance_ranges(text):
+        """``[(lo, hi), ...]`` sorted by lo from "5-10, 10-15, ...", else None.
+
+        A single number is a bin width, not a range; anything unparseable,
+        or two ranges starting at the same distance, also returns None.
+        """
+        text = str(text)
+        if '-' not in text:
+            return None
+        ranges = []
+        try:
+            for part in text.replace(';', ',').split(','):
+                if not part.strip():
+                    continue
+                lo, hi = (float(v) for v in part.split('-'))
+                if not (0 <= lo < hi):
+                    return None
+                ranges.append((lo, hi))
+        except ValueError:
+            return None
+        if len({lo for lo, _hi in ranges}) != len(ranges):
+            return None
+        return sorted(ranges) or None
+
+    def _distance_ranges(self):
+        """Explicit ranges typed in the Visualization distance bin box, else None."""
+        var = getattr(self, 'distance_bin_var', None)
+        try:
+            return self._parse_distance_ranges(var.get()) if var is not None else None
+        except tk.TclError:
+            return None
 
     @classmethod
-    def _merge_distance_bins(cls, table, width):
-        """Merge stored 1 cm bins into ``width``-cm bins (n-weighted means)."""
-        sums = {}
+    def _merge_distance_bins(cls, table, width, ranges=None):
+        """Merge stored 1 cm bins into ``width``-cm bins or ``ranges`` (n-weighted means)."""
+        sums = {lo: {} for lo, _hi in ranges or ()}
         for dist, values in cls._sorted_distance_bins(table):
-            edge = round(np.floor(dist / width) * width, 6)
+            if ranges:
+                edge = next((lo for lo, hi in ranges if lo <= dist < hi), None)
+                if edge is None:
+                    continue
+            else:
+                edge = round(np.floor(dist / width) * width, 6)
             acc = sums.setdefault(edge, {})
             for key, mean in values.items():
                 if not key.endswith('_mean') or mean is None or np.isnan(mean):
@@ -26374,8 +26434,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return merged
 
     def _distance_plot_x(self, edges, width=None):
-        """Where to draw each bin: its lower edge at 1 cm (as before), else its centre."""
+        """Where to draw each bin: its lower edge at 1 cm (as before), else its center."""
         if width is None:
+            ranges = self._distance_ranges()
+            if ranges:
+                # Explicit ranges may gap or overlap, so they sit at even steps.
+                order = {lo: i for i, (lo, _hi) in enumerate(ranges)}
+                return [order.get(float(e), i) for i, e in enumerate(edges)]
             width = self._distance_bin_width()
         if width == 1.0:
             return list(edges)
@@ -26384,6 +26449,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def _label_distance_bins(self, ax, xs, width=None):
         """Tick each wide bin with its range (0-5, 5-10, ...)."""
         if width is None:
+            ranges = self._distance_ranges()
+            if ranges:
+                ax.set_xticks(range(len(ranges)))
+                ax.set_xticklabels([f'{lo:g}-{hi:g}' for lo, hi in ranges],
+                                   rotation=45 if len(ranges) > 8 else 0,
+                                   ha='right' if len(ranges) > 8 else 'center')
+                return
             width = self._distance_bin_width()
         if width == 1.0 or not len(xs) or len(xs) > 24:
             return
@@ -26532,13 +26604,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def _outback_outward_velocity(self, beh_synced, zones, open_zones, fps=None):
         """The open-arm frames Out/Back detection considers, and each one's Y
-        velocity signed so that positive means moving away from the centre.
+        velocity signed so that positive means moving away from the center.
 
-        Open arms run along Y, so the outward direction flips at the centre
+        Open arms run along Y, so the outward direction flips at the center
         line: up is outward in the upper arm, down in the lower one. A frame is
         Out when this value exceeds the velocity threshold and Back when it is
         below minus the threshold; everything in between is ignored. Frames on
-        the centre line itself have no outward direction and are left out, as
+        the center line itself have no outward direction and are left out, as
         are frames with no Y position. A frame whose previous Y is missing has
         velocity 0, so it is considered but always falls inside the threshold.
 
@@ -26598,7 +26670,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Pop out the distribution of outward open-arm velocity that the
         Out/Back threshold is applied to, pooled over the processed cohort.
 
-        The left panel is the signed velocity (positive = away from the centre)
+        The left panel is the signed velocity (positive = away from the center)
         with the ignored band shaded; the right panel is the share of open-arm
         frames each threshold would keep. Both follow the threshold box live,
         so the value can be chosen against the data before it is applied.
@@ -26791,9 +26863,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Return (cx, cy) for the 'Center' zone (case-insensitive), or maze midpoint.
 
         Looks for a zone whose name is exactly 'center' (case-insensitive) and returns
-        the geometric centre of that zone rectangle.  Falls back to maze_width/2 for
-        both axes when no such zone exists, preserving the previous behaviour for EPM
-        and OFT templates where the centre zone is symmetrically placed.
+        the geometric center of that zone rectangle.  Falls back to maze_width/2 for
+        both axes when no such zone exists, preserving the previous behavior for EPM
+        and OFT templates where the center zone is symmetrically placed.
         """
         maze_width = self.params['maze_width_cm']
         # Find a zone named 'center' (case-insensitive)
@@ -26802,7 +26874,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 cx = (zone_data['x_min'] + zone_data['x_max']) / 2.0
                 cy = (zone_data['y_min'] + zone_data['y_max']) / 2.0
                 return cx, cy
-        # Fall back to geometric centre of the arena
+        # Fall back to geometric center of the arena
         return maze_width / 2.0, maze_width / 2.0
 
     def _behav_view(self):
@@ -26890,7 +26962,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             
             # Store results for export
             self.behavioral_results = []
-            # Per-subject distance-from-centre samples over the analysed
+            # Per-subject distance-from-center samples over the analyzed
             # session, binned at view time (see _time_at_distance).
             self.behav_distance_samples = {}
 
@@ -26917,7 +26989,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 y_coords = beh_synced[:, 3]
                 velocity = (beh_synced[:, _vel_col]
                             if beh_synced.shape[1] > _vel_col else np.zeros(len(beh_synced)))
-                # Distance from centre X/Y sit at kinematics +3/+4.
+                # Distance from center X/Y sit at kinematics +3/+4.
                 if beh_synced.shape[1] > _vel_col + 3:
                     dist_x, dist_y = beh_synced[:, _vel_col + 2], beh_synced[:, _vel_col + 3]
                 else:
@@ -26931,7 +27003,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     else:
                         zones.append('unknown')
                 
-                # Analyse the recorded session, not the whole behavior file. The
+                # Analyze the recorded session, not the whole behavior file. The
                 # camera often runs on for minutes after the photometry stops, by
                 # a different amount for every animal, and every time, entry and
                 # distance metric scales with however long that happened to be.
@@ -27696,7 +27768,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ttk.Label(plot_frame, text="No metrics available to visualize.\nPlease calculate behavioral metrics first.",
                      font=('Segoe UI', 12)).pack(expand=True)
     
-    # ---------------------------------------------- Time at distance from centre
+    # ---------------------------------------------- Time at distance from center
     TIME_AT_DISTANCE_PREFIX = '[Summary] Time at Distance from Center'
     TIME_AT_DISTANCE_AXES = (('Euclidean', 'euclidean'), ('X', 'x'), ('Y', 'y'))
 
@@ -27719,21 +27791,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         _behav_distance_bin_width; anything unparseable also returns None.
         """
         var = getattr(self, 'behav_distance_bin_var', None)
-        text = str(var.get()) if var is not None else ''
-        if '-' not in text:
-            return None
-        ranges = []
-        try:
-            for part in text.replace(';', ',').split(','):
-                if not part.strip():
-                    continue
-                lo, hi = (float(v) for v in part.split('-'))
-                if not (0 <= lo < hi):
-                    return None
-                ranges.append((lo, hi))
-        except ValueError:
-            return None
-        return ranges or None
+        return self._parse_distance_ranges(var.get()) if var is not None else None
 
     def _behav_distance_bin_width(self):
         """The Behavioral Data distance bin in cm; 1 when unset or invalid."""
@@ -27811,7 +27869,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return series
 
     def _plot_time_at_distance(self, plot_frame, metric, is_group_mode):
-        """Time spent at each distance from centre: subjects as thin traces, mean ± SEM on top."""
+        """Time spent at each distance from center: subjects as thin traces, mean ± SEM on top."""
         axis_name = metric[metric.rfind('(') + 1:].rstrip(')')
         axis = dict(self.TIME_AT_DISTANCE_AXES).get(axis_name, 'euclidean')
         width = self._behav_distance_bin_width()
@@ -28657,7 +28715,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """``{lowercased sheet name: real sheet name}`` for *path*, cached.
 
         Cached on (path, mtime) because bout extraction resolves a sheet once
-        per recording per behaviour, and opening the workbook just to list its
+        per recording per behavior, and opening the workbook just to list its
         sheets is far more expensive than reading one.
         """
         try:
@@ -28775,7 +28833,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         The Boutframes tab picks a *sheet*, but the per-subject shift, the
         photometry rate and the session length it previews against are
         properties of a *recording*.  With one sheet per animal that is a
-        one-to-many map, so *behaviour* breaks the tie: the recording whose
+        one-to-many map, so *behavior* breaks the tie: the recording whose
         session actually scored it.
         """
         candidates = [sid for sid in self.processed_data
@@ -28794,7 +28852,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return sorted(candidates)[0]
 
     def boutframes_behavior_columns(self, path):
-        """Every behaviour column name in the workbook, session tags excluded."""
+        """Every behavior column name in the workbook, session tags excluded."""
         names = set()
         with pd.ExcelFile(path) as xl:
             for sheet in xl.sheet_names:
@@ -28806,14 +28864,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def iter_boutframes_recordings(self, path):
         """Yield ``(label, subject_id_or_None, DataFrame)`` per recording in *path*.
 
-        Reports that summarise a whole workbook (the exclusion preview) have to
+        Reports that summarize a whole workbook (the exclusion preview) have to
         work one recording at a time, not one sheet at a time: a per-animal
         sheet holds several sessions, and rules like the proximity gap are
         meaningless applied across a boundary between two different days.
 
         Recording IDs come from the processed project when there is one, so the
         rows are attributed to real subjects.  With nothing processed yet the
-        sheets are split on their session column and labelled for display only,
+        sheets are split on their session column and labeled for display only,
         which is enough for a preview.
         """
         index = self._boutframes_sheet_index(path)
@@ -28893,9 +28951,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         has_end_any : bool
             True if at least one behavior carries end frames.
         """
-        # A session tag is metadata about the row, not a behaviour scored in it;
-        # without this it would come back as a behaviour called "Session" whose
-        # frames are all NaN, and show up in every behaviour dropdown.
+        # A session tag is metadata about the row, not a behavior scored in it;
+        # without this it would come back as a behavior called "Session" whose
+        # frames are all NaN, and show up in every behavior dropdown.
         cols = [c for c in df.columns
                 if str(c).strip().lower() not in cls.BOUTFRAMES_SESSION_COLUMNS]
         end_map = {}      # base_name_lower -> end column
@@ -29239,7 +29297,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return self._bout_timeline(subject_id) == 'photometry'
 
     def _photometry_start_offset_samples(self, subject_id):
-        """Samples between video time zero and the first analysed photometry sample.
+        """Samples between video time zero and the first analyzed photometry sample.
 
         Boutframes are numbered from the start of the *video*, but the signal
         arrays start at the first photometry sample that survived processing.
@@ -29303,7 +29361,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         the signal arrays are indexed in photometry samples at the recording's
         own rate, and their sample zero is not video time zero.  Both a rate
         conversion and a start offset are therefore required.  Skipping the rate
-        conversion stretches every index by ``video_fps / photometry_fps`` — an
+        conversion stretches every index by ``video_fps / photometry_fps``: an
         error that grows with time and pushes late bouts past the end of the
         recording, where the extraction loops drop them silently.
 
@@ -29408,7 +29466,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Uses a *jittered grid*: the range is split into ``n`` equal bins and one
         start is drawn per bin, jittered by a bounded amount so that two adjacent
         starts can never come closer than *min_spacing*.  This guarantees both
-        properties the user asked for — the bouts are spread across the whole
+        properties the user asked for: the bouts are spread across the whole
         session (one per bin) and are non-overlapping (bounded jitter).
 
         Returns a float array of length ``min(n, feasible_max)`` sorted ascending.
@@ -29421,7 +29479,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if n == 1:
             return np.array([lo + span / 2.0])
         bin_w = span / n
-        # Bounded jitter: consecutive bin centres are bin_w apart and each moves
+        # Bounded jitter: consecutive bin centers are bin_w apart and each moves
         # by at most j, so the closest two starts can be is bin_w - 2j = min_spacing.
         j = max(0.0, (bin_w - min_spacing) / 2.0)
         centers = lo + bin_w * (np.arange(n) + 0.5)
@@ -29434,7 +29492,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Rules (only when ``bout_exclude_enabled``):
           * duration: drop bouts whose (end - start) is < min or > max (needs end).
           * proximity: drop a bout that begins fewer than ``min_gap`` frames after
-            the previous *kept* bout's end (or its start, for start-only files —
+            the previous *kept* bout's end (or its start, for start-only files,
             i.e. a minimum time between bout starts).
 
         Returns (start_kept, end_kept_or_None, n_excluded).  Inputs/outputs are
@@ -29627,7 +29685,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # bout_idx indexes the CHANNEL'S trace list, which skips bouts rejected
         # as all-NaN or invalid; onset_frames/end_frames keep every bout. Map
         # across before indexing, or every bout after the first rejection is
-        # measured over its neighbour's window.
+        # measured over its neighbor's window.
         frame_idx = self._original_bout_index(bouts_beh, channel, bout_idx,
                                               len(starts))
         if frame_idx is None:
@@ -30064,9 +30122,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # Stored bouts carry the pre/post window they were extracted with
     # ('_prebout'/'_postbout', added by extract_bouts).  The plotters all assume
     # a single global window (onset at self.params['preboutframes'], total length
-    # pre+post).  When the live params differ from a stored bout's window — the
+    # pre+post).  When the live params differ from a stored bout's window (the
     # user changed pre/post without re-extracting, or only some subjects were
-    # reprocessed — that assumption silently misaligns traces and pulls in the
+    # reprocessed), that assumption silently misaligns traces and pulls in the
     # wrong samples.  These helpers re-position each stored trace so its onset
     # lands on the *current* window, padding with NaN where the stored window
     # doesn't reach and cropping where it overruns.
@@ -30098,7 +30156,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         *src_fs* is the rate the trace was sampled at.  When it differs from the
         axis rate the trace is first resampled onto the axis's sample spacing
-        about its own onset — without that, a 30 Hz recording drawn on a 20 Hz
+        about its own onset; without that, a 30 Hz recording drawn on a 20 Hz
         axis is stretched by 1.5x and its peak lands at the wrong time.  The
         onset is the anchor, so pre and post both keep their duration.
         """
@@ -30199,7 +30257,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         current pre/post settings.
 
         Either case means the bout plots realign (NaN-pad / crop) some subjects
-        onto the current axis, so they silently show truncated / blank regions —
+        onto the current axis, so they silently show truncated / blank regions,
         the classic "zero data" symptom of a partial reprocess.  Logged every
         time; the modal popup is shown only when the situation changes so it
         doesn't nag on every plot.
@@ -30243,7 +30301,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             "edges of the plot, and mixed windows can misalign the average. "
             "Set the desired pre/post window and click "
             "“⟲ Apply Settings & Re-extract Bouts”, then re-plot.")
-        self.log_message("  Warning: mixed bout-extraction windows — " + "; ".join(lines))
+        self.log_message("  Warning: mixed bout-extraction windows: " + "; ".join(lines))
 
         sig = tuple((L, tuple(sorted(lengths[L]))) for L in distinct) + (cur_total,)
         if getattr(self, '_mixed_window_warn_sig', None) != sig:
@@ -30554,7 +30612,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def open_random_shuffle_dialog(self):
         """Dialog to generate a set of pseudo-random, non-overlapping bouts for
-        every processed subject — a control/"null" behavior for the FLMM analysis.
+        every processed subject, a control/"null" behavior for the FLMM analysis.
 
         Bouts are placed in photometry-frame space (where the extraction window
         lives), kept clear of the session edges by the pre/post window, spread
@@ -30624,7 +30682,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         dlg.resizable(False, False)
 
         intro = ("Generates non-overlapping, session-spanning random bouts for all "
-                 f"{len(subjects)} processed subject(s) — a control 'null' behavior "
+                 f"{len(subjects)} processed subject(s), a control 'null' behavior "
                  "for the FLMM comparison.  Bouts are kept clear of the session edges "
                  "by the pre/post window.")
         ttk.Label(dlg, text=intro, wraplength=self.ui_px(420), justify='left',
@@ -30725,7 +30783,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='right', padx=(0, 8))
 
         dlg.update_idletasks()
-        # Centre over the main window
+        # Center over the main window
         try:
             x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
             y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
@@ -30740,8 +30798,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Do the actual generation + write for :meth:`open_random_shuffle_dialog`.
 
         Each bout is given a random length in ``[dur_min, dur_max]`` (end-format
-        only).  Spacing and the edge margin are computed from ``dur_max`` — the
-        longest a bout can be — so the non-overlap, exclusion-survival, and
+        only).  Spacing and the edge margin are computed from ``dur_max`` (the
+        longest a bout can be), so the non-overlap, exclusion-survival, and
         no-truncation guarantees hold no matter which length each bout draws.
         """
         import shutil
@@ -30820,7 +30878,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                f"'{name}' column is replaced.")
         if n_final < n_req:
             msg += (f"\n\nNote: requested {n_req} but only {n_final} fit every "
-                    "session at this spacing — using the common maximum.")
+                    "session at this spacing, using the common maximum.")
         if not messagebox.askyesno("Confirm Random Bouts", msg):
             return
 
@@ -30995,7 +31053,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ws.cell(ri, ci, v)
 
     def _on_bout_subject_selected(self, event=None):
-        """Called when subject changes in the boutframes editor — refresh both subtabs."""
+        """Called when subject changes in the boutframes editor; refresh both subtabs."""
         self.load_bout_subject(event)
         self._populate_preview_behavior_combo()
         self.refresh_scaled_preview()
@@ -31022,7 +31080,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         def _resolve_boutframes(sid):
             """Boutframes file to re-extract this subject from: the one its bouts
-            were originally extracted from (recorded during processing — this is
+            were originally extracted from (recorded during processing; this is
             the merged/TTL-derived file when a TTL source was used), falling back
             to the path configured in the UI."""
             per = self.processed_data.get(sid, {}).get('boutframes_file')
@@ -31107,7 +31165,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                 # Refresh the behavior selectors on the other tabs so behaviors
                 # added since the last selection (e.g. a random-shuffle control,
-                # or any newly-scored column) become selectable immediately —
+                # or any newly-scored column) become selectable immediately,
                 # without the user having to reopen the project or re-pick a
                 # subject.  These read live from processed_data but only rebuild
                 # their value lists when explicitly refreshed.
@@ -31371,7 +31429,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
 
         # The combo lists worksheets; the rate, shift and session length below
-        # belong to the recording that sheet holds this behaviour for.
+        # belong to the recording that sheet holds this behavior for.
         subject = self.boutframes_recording_for_sheet(
             boutframes_file, sheet, behavior) or sheet
 
@@ -31454,7 +31512,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if session_len > 0:
             pct_raw = 100 * raw_frames.max() / session_len if len(raw_frames) > 0 else 0
             pct_scaled = 100 * scaled_frames.max() / session_len if len(scaled_frames) > 0 else 0
-            info += f"  |  Session: {session_len} frames — last raw bout at {pct_raw:.1f}%, last scaled at {pct_scaled:.1f}%"
+            info += f"  |  Session: {session_len} frames, last raw bout at {pct_raw:.1f}%, last scaled at {pct_scaled:.1f}%"
 
         self.preview_info_label.config(text=info, foreground=info_color)
 
@@ -31480,12 +31538,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if session_len > 0:
             ax.axvline(session_len, color='black', linewidth=1.5, linestyle='--', label=f'Session end ({session_len})')
 
-        # Raw frames — row 1 (top)
+        # Raw frames: row 1 (top)
         if n_raw > 0:
             ax.eventplot(raw_frames, lineoffsets=1.0, linelengths=0.6,
                          colors='steelblue', linewidths=1.2, label=f'Raw ({n_raw} bouts)')
 
-        # Scaled frames — row 0 (bottom)
+        # Scaled frames: row 0 (bottom)
         if n_scaled > 0:
             ax.eventplot(scaled_frames, lineoffsets=0.0, linelengths=0.6,
                          colors='tomato', linewidths=1.2, label=f'Scaled ({n_scaled} bouts)')
@@ -31651,7 +31709,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 # A project saved before the bout window was specified in
                 # seconds carries only the frame counts.  Clear the seconds so
                 # _migrate_bout_window_to_seconds rebuilds them from those
-                # frames at that project's rate — keeping the window the
+                # frames at that project's rate, keeping the window the
                 # duration it has always been, rather than silently adopting
                 # this build's 3 s default.
                 if 'preboutseconds' not in loaded_params and 'preboutframes' in loaded_params:
@@ -31756,7 +31814,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # See generate_plot: a scoring pass pumps the event loop, so the button
         # that started it can be clicked again while it runs.
         if getattr(self, '_integrity_busy', False):
-            self.log_message("Still scoring — ignoring.")
+            self.log_message("Still scoring: ignoring.")
             return
         # Validate threshold
         try:
@@ -31790,7 +31848,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Collect every evaluated subject/channel with its score, rather than
         # silently excluding.  The user then reviews the scores in a confirmation
         # window and decides per channel whether to honor or ignore the
-        # auto-exclude — useful when group n is small and a poorer channel is
+        # auto-exclude: useful when group n is small and a poorer channel is
         # worth keeping.
         candidates = []  # (subject, channel, score, already_excluded)
         rescued_by_events = set()
@@ -32045,7 +32103,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def _reflow_exclusion_rows(self, _event=None):
         """Lay the subject rows out in as many columns as the tab is wide.
 
-        A row is about a fifth of a maximised window, so a single column showed
+        A row is about a fifth of a maximized window, so a single column showed
         ~25 of a ninety-subject project and left the rest behind a long scroll
         with three quarters of the width empty.
         """
@@ -32746,7 +32804,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Label(wf, text="(seconds relative to bout onset; negative=before, positive=after)",
                   foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', pady=(3, 0))
         # Seconds are the setting, but the sample count is what a reader used to
-        # typing frames needs in order to recognise the window they had.  Bound
+        # typing frames needs in order to recognize the window they had.  Bound
         # to the entries rather than traced on the variables, which would keep
         # firing at this label long after the dialog is gone.
         win_hint = ttk.Label(wf, text="", foreground='gray', font=('Segoe UI', 8))
@@ -33154,7 +33212,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fig.set_dpi(dpi)
         fig.set_size_inches(w_px / dpi, h_px / dpi, forward=False)
 
-        # Honour the global gridline toggle before drawing (and remember this
+        # Honor the global gridline toggle before drawing (and remember this
         # figure so the toggle can live-update it later).
         self._apply_gridlines_to_figure(fig)
         self._prune_plot_canvases()
@@ -33197,8 +33255,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         A newly generated plot is a new thing to look at and is drawn from the
         top down, but Tk keeps the viewport's pixel offset across the change of
-        content. After a tall figure — the multi-subject Signal Integrity table
-        runs past 20 inches — the zone is still scrolled a thousand pixels down
+        content. After a tall figure (the multi-subject Signal Integrity table
+        runs past 20 inches), the zone is still scrolled a thousand pixels down
         when a shorter plot replaces it, so the plot renders perfectly into an
         area nobody is looking at and reads as Generate having done nothing.
 
@@ -33371,7 +33429,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         # Position Heatmap renders one panel per subject (a true grid).
         # NOTE: "Extracted Bouts" and "Zone Entry Bouts" are deliberately NOT
-        # grid-sized here — their multi/group plots collapse all subjects into a
+        # grid-sized here; their multi/group plots collapse all subjects into a
         # fixed 1- or 2-row trace+heatmap layout, so they are sized by channel
         # count in generate_plot (see _viz_bout_channel_rows) instead.
         if "Position Heatmap" in plot_type:
@@ -33455,7 +33513,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             legend_labels = [t.get_text() for t in leg.get_texts()]
             if len(legend_labels) != len(labels):
                 # The legend was built from proxy entries (e.g. one per group
-                # while a colour bar keys the bins); keep them.
+                # while a color bar keys the bins); keep them.
                 handles = list(getattr(leg, 'legend_handles', None)
                                or getattr(leg, 'legendHandles', []))
                 labels = legend_labels
@@ -33487,9 +33545,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Return the subjects currently selected on the Visualization tab.
 
         Honors Group vs Subject mode (in Group mode the members of the faceted
-        series are expanded, de-duplicated, order preserved — which drops any
+        series are expanded, de-duplicated, order preserved, which drops any
         subject the pool listbox has deselected). Returns an empty list if
-        nothing is selected. Does not show error dialogs — callers that need
+        nothing is selected. Does not show error dialogs; callers that need
         user feedback handle the empty case themselves.
         """
         selected_subjects = []
@@ -33534,7 +33592,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # also delivers any Generate clicks queued during it. Re-entering would
         # start a second scoring pass on top of the first.
         if getattr(self, '_integrity_busy', False):
-            self.log_message("Still scoring the previous plot — ignoring.")
+            self.log_message("Still scoring the previous plot: ignoring.")
             return
         # Get selected subjects or groups
         if self.plot_by_var.get() == "Group":
@@ -33604,7 +33662,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 return
 
         # Warn if the selected subjects' stored bouts span mismatched extraction
-        # windows (a partial reprocess) — these plots realign onto the current
+        # windows (a partial reprocess); these plots realign onto the current
         # window, so otherwise some subjects silently show blank/truncated data.
         if any(t in plot_type for t in
                ("Extracted Bouts", "Compare Across Bouts", "Bouts Overlay")):
@@ -33627,7 +33685,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         if any(t in plot_type for t in ("Extracted Bouts", "Zone Entry Bouts")):
             # These collapse every selected subject into a fixed 1- or 2-row
-            # trace+heatmap layout, so size by channel count, not subject count —
+            # trace+heatmap layout, so size by channel count, not subject count;
             # otherwise selecting many subjects inflates the figure until it
             # fills the screen.
             rows = self._viz_bout_channel_rows(valid_subjects)
@@ -33888,7 +33946,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Open color chooser
         color = colorchooser.askcolor(color=current_color, title=f"Choose {position.title()} Color")
-        if color[1]:  # If a color was selected (not cancelled)
+        if color[1]:  # If a color was selected (not canceled)
             var.set(color[1])
     
     def get_heatmap_colormap(self):
@@ -33947,7 +34005,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     # ── Time-zero marker ────────────────────────────────────────────────
     # Every peri-event graph draws a dashed line at t=0 (bout onset / zone
-    # entry). Colour and weight come from one setting so the trace panels and
+    # entry). Color and weight come from one setting so the trace panels and
     # their heatmaps cannot drift apart, and so a user who wants the marker out
     # of the way of the data can turn it down once instead of per plot.
     ZERO_LINE_DEFAULT_COLOR = '#808080'
@@ -34006,7 +34064,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         self._update_zero_line_swatch()
 
     def _update_zero_line_swatch(self):
-        """Tint the colour preview button next to the time-zero colour entry."""
+        """Tint the color preview button next to the time-zero color entry."""
         btn = getattr(self, 'zero_line_swatch', None)
         if btn is None:
             return
@@ -34020,7 +34078,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             pass
 
     def pick_zero_line_color(self):
-        """Colour picker for the time-zero marker."""
+        """Color picker for the time-zero marker."""
         current = str(self.zero_line_color_var.get()).strip() or self.ZERO_LINE_DEFAULT_COLOR
         if not mcolors.is_color_like(current):
             current = self.ZERO_LINE_DEFAULT_COLOR
@@ -34029,7 +34087,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         except ValueError:
             initial = self.ZERO_LINE_DEFAULT_COLOR
         _rgb, hex_col = colorchooser.askcolor(
-            color=initial, title="Time-Zero Line Colour",
+            color=initial, title="Time-Zero Line Color",
             parent=getattr(self, 'graph_settings_window', None) or self.root)
         if hex_col:
             self.zero_line_color_var.set(hex_col)
@@ -34181,18 +34239,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         This is what "Save & Recalculate" in the Zone Editor runs. Everything it
         recomputes is a pure function of (position track + zones + params):
 
-          * calibration of X/Y into cm, velocity, distance, distance-from-centre
+          * calibration of X/Y into cm, velocity, distance, distance-from-center
           * zone-entry detection and the entry-aligned photometry bouts
           * per-zone photometry averages
-          * distance-from-centre averages (X, Y, Euclidean)
+          * distance-from-center averages (X, Y, Euclidean)
           * open-arm Out/Back movement stats
 
-        Signal processing (dF/F, z-scoring), behaviour bouts and boutframes are
+        Signal processing (dF/F, z-scoring), behavior bouts and boutframes are
         untouched, because none of them depend on where the zones are.
 
         Calibration can only be redone for subjects that carry a pixel snapshot
         (``position_px``), written during processing and saved with the project.
-        Subjects processed by an older version keep their existing centimetre
+        Subjects processed by an older version keep their existing centimeter
         coordinates: their zone results are still recomputed, but a changed maze
         width or Y-calibration method cannot be applied to them, and they are
         reported back as needing a full reprocess.
@@ -34238,7 +34296,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         self.log_message(
                             f"    Stored pixel track does not line up with "
                             f"{beh.shape[0]} behavior rows -- keeping the existing "
-                            f"centimetre coordinates.")
+                            f"centimeter coordinates.")
 
                 # Work on a copy so a failure part-way through cannot leave the
                 # subject with half-rewritten kinematics.
@@ -34438,7 +34496,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         ttk.Label(zero_frame,
                   text='Applies to every peri-event graph (Extracted Bouts, Zone Entry Bouts, '
                        'Compare Across Bouts, Bout Length Bins), traces and heatmaps alike. '
-                       'A name ("grey", "red") or a hex value both work; set the width to 0 to '
+                       'A name ("gray", "red") or a hex value both work; set the width to 0 to '
                        'hide the marker.',
                   foreground='gray', font=('Segoe UI', 8),
                   wraplength=self.ui_px(560), justify='left').grid(
@@ -34540,24 +34598,24 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             row=0, column=0, columnspan=4, sticky='w', padx=5, pady=(0, 6))
 
         # EPM thresholds
-        ttk.Label(entry_frame, text="EPM — min duration in open arm (s):").grid(
+        ttk.Label(entry_frame, text="EPM - min duration in open arm (s):").grid(
             row=1, column=0, sticky='w', padx=5, pady=2)
         epm_dur_var = tk.StringVar(value=str(self.params.get('min_open_arm_duration', 2.0)))
         ttk.Spinbox(entry_frame, from_=0.1, to=10.0, increment=0.1, width=7,
                     textvariable=epm_dur_var, format='%.1f').grid(row=1, column=1, padx=5, pady=2, sticky='w')
-        ttk.Label(entry_frame, text="EPM — min time between entries (s):").grid(
+        ttk.Label(entry_frame, text="EPM - min time between entries (s):").grid(
             row=1, column=2, sticky='w', padx=15, pady=2)
         epm_ref_var = tk.StringVar(value=str(self.params.get('min_time_between_entries', 3.0)))
         ttk.Spinbox(entry_frame, from_=0.1, to=30.0, increment=0.5, width=7,
                     textvariable=epm_ref_var, format='%.1f').grid(row=1, column=3, padx=5, pady=2, sticky='w')
 
         # OFT / Custom Arena thresholds
-        ttk.Label(entry_frame, text="OFT / Custom — min duration in zone (s):").grid(
+        ttk.Label(entry_frame, text="OFT / Custom - min duration in zone (s):").grid(
             row=2, column=0, sticky='w', padx=5, pady=2)
         oft_dur_var = tk.StringVar(value=str(self.params.get('oft_min_entry_duration', 0.5)))
         ttk.Spinbox(entry_frame, from_=0.1, to=10.0, increment=0.1, width=7,
                     textvariable=oft_dur_var, format='%.1f').grid(row=2, column=1, padx=5, pady=2, sticky='w')
-        ttk.Label(entry_frame, text="OFT / Custom — min time between entries (s):").grid(
+        ttk.Label(entry_frame, text="OFT / Custom - min time between entries (s):").grid(
             row=2, column=2, sticky='w', padx=15, pady=2)
         oft_ref_var = tk.StringVar(value=str(self.params.get('oft_min_time_between_entries', 1.0)))
         ttk.Spinbox(entry_frame, from_=0.1, to=30.0, increment=0.5, width=7,
@@ -34690,8 +34748,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             # Fallback to two-channel legacy
             num_channels = 2
 
-        # Create checkboxes labelled with the real channel designation (G0/R4/…)
-        # so every channel — regardless of count or region index — is selectable.
+        # Create checkboxes labeled with the real channel designation (G0/R4/…)
+        # so every channel, regardless of count or region index, is selectable.
         for ch in range(num_channels):
             var = tk.IntVar(value=1 if ch < 2 else 0)
             cb = ttk.Checkbutton(self.viz_channel_check_frame,
@@ -34778,7 +34836,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             slots.append((ch_slot, key, self.get_channel_name(data, ch_slot)))
         return slots
 
-    # First two match the colours G0/G1 always had in these plots.
+    # First two match the colors G0/G1 always had in these plots.
     SLOT_COLORS = ('blue', 'green', '#d62728', '#9467bd', '#ff7f0e',
                    '#8c564b', '#e377c2', '#17becf', '#bcbd22', '#7f7f7f')
 
@@ -35206,13 +35264,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """
         Calculate an overall signal-integrity score (0-100) from a metrics dict.
 
-        Philosophy (rebuilt from labelled good/bad/tangled example data):
+        Philosophy (rebuilt from labeled good/bad/tangled example data):
           - The recording must contain REAL biological dynamics (slow events), not
             just noise. This is the dominant term (`sf_snr` -> dynamics).
           - High-frequency noise, dropout/spike artifacts, and (for GCaMP) motion /
-            fibre-tangle each independently drag the score down.
+            fiber-tangle each independently drag the score down.
           - A single catastrophic failure GATES the score low even if every other
-            dimension looks clean — the old purely-additive score let good
+            dimension looks clean: the old purely-additive score let good
             sub-scores mask fatal problems, so bad data could never fall below ~50.
 
         Sensor mode (`sensor=True`) ignores the 415 nm isosbestic entirely: the
@@ -35247,7 +35305,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         var_removed = metrics.get('var_removed', 0.0) or 0.0
         shifts = metrics.get('sustained_shifts_count', 0) or 0
 
-        # Dynamics (real signal) — breakpoints differ by mode because the sensor
+        # Dynamics (real signal): breakpoints differ by mode because the sensor
         # assessment series is the raw flattened signal (no motion correction to
         # shrink it), so its slow/fast ratio sits higher than GCaMP's corrected one.
         if sensor:
@@ -35281,7 +35339,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             noise = max(noise, transient)
 
         # Dropout / spike artifacts: genuine transients are positively skewed, so
-        # only penalise NEGATIVE skew (dropouts) and extreme kurtosis paired with
+        # only penalize NEGATIVE skew (dropouts) and extreme kurtosis paired with
         # non-positive skew (spike artifacts, not real sharp calcium events).
         dropout = 100.0
         if skew < -0.5:
@@ -35323,7 +35381,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                   sensor=False, zscore_signal=None, event_ts=None, fp_ts=None):
         """
         Compute the full signal-integrity metric set + overall score for a single
-        fibre channel. Single source of truth for both the single- and
+        fiber channel. Single source of truth for both the single- and
         multi-subject Signal Integrity views, the export, and the auto-exclude.
         """
         from scipy.stats import linregress
@@ -35360,9 +35418,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Baseline/step shifts: iso reference for GCaMP (motion), signal for sensor
         shift_ref = signal if sensor else isosbestic
         sustained_shifts = self.detect_sustained_shifts(shift_ref, fps=fps)
-        # A shift that starts at a bout is the behaviour's own response (drinking,
+        # A shift that starts at a bout is the behavior's own response (drinking,
         # approach and the like move the signal for tens of seconds), not a
-        # fibre or connector artifact, so it is counted apart and not penalised.
+        # fiber or connector artifact, so it is counted apart and not penalized.
         # event_ts are bout-onset timestamps on the fp_ts clock.
         sustained_shifts, n_locked = self._split_event_locked_shifts(
             sustained_shifts, event_ts, fp_ts, fps)
@@ -35409,7 +35467,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         return rest, len(shifts) - len(rest)
 
     def _is_offset_copy(self, behavior, bouts):
-        """True for a behaviour generated from another by a bout offset."""
+        """True for a behavior generated from another by a bout offset."""
         suffixes = tuple('_' + str(o.get('label')) for o in (getattr(self, 'bout_offsets', None) or [])
                          if isinstance(o, dict) and o.get('label'))
         b = str(behavior)
@@ -35438,7 +35496,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # channels were "Bad". These helpers measure that response against a null
     # built from the same recording, so it can vouch for a channel the trace-
     # wide score would have thrown away. They only ever RAISE a score: a
-    # channel with no event response is not penalised, because a null response
+    # channel with no event response is not penalized, because a null response
     # is a result, not a fault.
     INTEGRITY_EVENT_MIN_BOUTS = 3
     INTEGRITY_EVENT_SHUFFLES = 200
@@ -35465,9 +35523,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         The null shifts the WHOLE onset set by one random lag (circularly), which
         keeps the bouts' spacing and clustering and the trace's own slow drift,
-        so only the alignment to behaviour is destroyed. Returns the observed
-        peak, its z against the null, and the mean trace. On the labelled
-        control behaviours in the FP projects (Blank startle trials, Random and
+        so only the alignment to behavior is destroyed. Returns the observed
+        peak, its z against the null, and the mean trace. On the labeled
+        control behaviors in the FP projects (Blank startle trials, Random and
         No Behavior bouts) this z came out N(0, 1) and never reached 4.
         """
         x = np.asarray(x, dtype=float)
@@ -35535,12 +35593,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def integrity_event_evidence(self, data, ch_idx, ch_name, iso_flat=None, fp_ts=None,
                                  r415=None):
-        """Strongest event-locked response on one channel, across its behaviours.
+        """Strongest event-locked response on one channel, across its behaviors.
 
         Tested on the z-scored trace the bout analyses use (beh_synced). The best
-        behaviour's z is Bonferroni-corrected for the number tested, so a project
-        with many behaviours does not find one by chance. When the 415 trace is
-        given (GCaMP mode) the same test is run on it. Real behaviour often moves
+        behavior's z is Bonferroni-corrected for the number tested, so a project
+        with many behaviors does not find one by chance. When the 415 trace is
+        given (GCaMP mode) the same test is run on it. Real behavior often moves
         415 too (blood flow and oxygenation change both wavelengths), and the
         trace tested has already had 415 regressed out, so a 415 response alone
         proves nothing. It is called movement only when 415 responds at least as
@@ -35577,7 +35635,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         for behavior, entry in bouts.items():
             if str(behavior).startswith('_') or not isinstance(entry, dict):
                 continue
-            # Behaviours generated by bout offsets are shifted copies of real ones.
+            # Behaviors generated by bout offsets are shifted copies of real ones.
             if self._is_offset_copy(behavior, bouts):
                 continue
             onsets = self._integrity_bout_onsets(entry, ch_idx, ch_name, x)
@@ -35652,17 +35710,17 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     def integrity_event_summary(events):
         """One sentence a user can act on, for the dashboard and the export."""
         if not events:
-            return (f'No behaviour with {FPAnalysisGUI.INTEGRITY_EVENT_MIN_BOUTS}+ bouts; '
+            return (f'No behavior with {FPAnalysisGUI.INTEGRITY_EVENT_MIN_BOUTS}+ bouts; '
                     'event-locked signal not assessed.')
         what = (f"{events['behavior']} ({events['n_bouts']} bouts): response z = {events['z_adj']:.1f} "
                 f"vs shuffled onsets")
         if events['n_behaviors'] > 1:
-            what += f", corrected for {events['n_behaviors']} behaviours"
+            what += f", corrected for {events['n_behaviors']} behaviors"
         if events.get('blocked_by_415'):
             return what + (f' -- but 415 responds as strongly (z = {events["iso_z"]:.1f}) or the channel '
                            'is tangled, so it may be movement; score not raised.')
         if events['z_adj'] >= FPAnalysisGUI.INTEGRITY_EVENT_Z:
-            also = (f' 415 also responds (z = {events["iso_z"]:.1f}), as real behaviour often does.'
+            also = (f' 415 also responds (z = {events["iso_z"]:.1f}), as real behavior often does.'
                     if (events.get('iso_z') or 0) >= FPAnalysisGUI.INTEGRITY_EVENT_Z else '')
             return what + ' -- clear event-locked signal.' + also
         return what + ' -- no clear event-locked response.'
@@ -35841,7 +35899,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # otherwise grow upward into the last row.
         legend_y = max(y_pos - 0.01, 0.06)
         ax.text(0.03, legend_y, 'Sub-scores (0-100, higher=better): Dynamics=real slow signal vs noise | Noise=high-freq cleanliness | Dropout=artifact-free | Motion=415/baseline stability (GCaMP only)\n'
-                'Recording = whole-trace score | Events = strongest bout-locked response, z vs shuffled onsets (corrected for behaviours tested; "415" = not credited: 415 responds as strongly or the channel is tangled; — = under 3 bouts) | * = Score raised by a clear event-locked response',
+                'Recording = whole-trace score | Events = strongest bout-locked response, z vs shuffled onsets (corrected for behaviors tested; "415" = not credited: 415 responds as strongly or the channel is tangled; — = under 3 bouts) | * = Score raised by a clear event-locked response',
                fontsize=legend_fontsize, style='italic', transform=ax.transAxes, wrap=True, va='top')
         
         # Add scroll hint if many entries
@@ -36015,7 +36073,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             except Exception as e:
                 self.log_message(f"    Event-locked integrity skipped for {metrics['channel']}: {e}")
                 events = None
-            # Negative skew reads as fibre dropouts, but a channel with a credited
+            # Negative skew reads as fiber dropouts, but a channel with a credited
             # response may simply spend long stretches inhibited. Spike artifacts
             # are still caught by the kurtosis rule, which the clamp leaves alone.
             metrics['skew_waived'] = False
@@ -36080,7 +36138,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Everything shown here is derived from the SAME unified metric engine that
         produces the score (compute_channel_integrity / _extract_signal_integrity_metrics),
         so the panels, the numbers and the score can never disagree. The view
-        focuses on the SELECTED channel and honours the 'Sensor (ignore 415nm)'
+        focuses on the SELECTED channel and honors the 'Sensor (ignore 415nm)'
         toggle. Assessment is always done on photobleaching-flattened data.
         """
         from matplotlib.gridspec import GridSpec
@@ -36181,11 +36239,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     f"Recording {recording_score:.0f}   ·   Events {self._integrity_events_cell(events)}")
         if chosen.get('no_isosbestic'):
             mode_str = 'No 415nm recorded (assessed as sensor)'
-        ax_head.text(0.5, 1.02, f'Signal Integrity — {subject_name}',
+        ax_head.text(0.5, 1.02, f'Signal Integrity: {subject_name}',
                      ha='center', va='center', fontsize=12, fontweight='bold',
                      color='#333333', transform=ax_head.transAxes)
         ax_head.text(0.5, 0.40,
-                     f'{ch_name} ({wl}nm) — Quality Score {score:.1f}/100  ({quality})    [{mode_str}]\n{comp_str}',
+                     f'{ch_name} ({wl}nm): Quality Score {score:.1f}/100  ({quality})    [{mode_str}]\n{comp_str}',
                      ha='center', va='center', fontsize=13, fontweight='bold',
                      color=score_color, transform=ax_head.transAxes,
                      bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
@@ -36213,7 +36271,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         ax_tr.set_xlabel('Time (s)', fontsize=9)
         ax_tr.set_ylabel('dF/F (%)', fontsize=9)
-        ax_tr.set_title(f'Assessed signal for {ch_name} — this is what the score sees '
+        ax_tr.set_title(f'Assessed signal for {ch_name}: this is what the score sees '
                         f'(photobleaching removed)', fontsize=10, fontweight='bold')
         ax_tr.legend(loc='upper right', fontsize=7.5, ncol=2, framealpha=0.85)
         ax_tr.grid(True, alpha=0.3)
@@ -36270,7 +36328,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                        transform=ax_ev.transAxes, fontsize=7.5, va='top', ha='left',
                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35))
         else:
-            ax_ev.text(0.5, 0.5, f'No behaviour with\n{self.INTEGRITY_EVENT_MIN_BOUTS}+ bouts',
+            ax_ev.text(0.5, 0.5, f'No behavior with\n{self.INTEGRITY_EVENT_MIN_BOUTS}+ bouts',
                        ha='center', va='center', transform=ax_ev.transAxes, fontsize=9, color='gray')
             ax_ev.set_title('Event response', fontsize=9.5, fontweight='bold')
         ax_ev.set_xlabel('Time from onset (s)', fontsize=9)
@@ -36318,15 +36376,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                      ('Dropout', drop), ('Motion', motion)) if v is not None]
         worst_name, worst_val = min(named, key=lambda kv: kv[1])
         reason = {
-            'Dynamics': 'weak real signal — recording is mostly noise / flat',
+            'Dynamics': 'weak real signal: recording is mostly noise / flat',
             'Noise': 'high-frequency noise dominates the signal',
             'Dropout': 'spike or dropout artifacts present',
-            'Motion': 'motion / fibre-tangle (415-correlated, baseline shifts)',
+            'Motion': 'motion / fiber-tangle (415-correlated, baseline shifts)',
         }[worst_name]
         if worst_val >= 80:
             verdict = 'All dimensions look healthy.'
         else:
-            verdict = f'Limiting factor: {worst_name} ({worst_val:.0f}) — {reason}.'
+            verdict = f'Limiting factor: {worst_name} ({worst_val:.0f}), {reason}.'
         if rescued:
             verdict = (f'Recording score {recording_score:.0f} ({verdict.rstrip(".")}), raised to '
                        f'{score:.0f}: the bouts carry a clear event-locked response.')
@@ -36495,7 +36553,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 swatches[beh] = sw
                 ttk.Label(row, text=beh).pack(side='left')
         else:
-            ttk.Label(dlg, text="(No behaviors found for the current selection — "
+            ttk.Label(dlg, text="(No behaviors found for the current selection; "
                                "thickness will still apply.)",
                       foreground='gray', font=('Segoe UI', 8)).pack(anchor='w', padx=12, pady=(10, 0))
 
@@ -36852,7 +36910,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             key = f'Ch{ch}'
             # Realign to the current window so changing pre/post (without
             # re-extracting) repositions the onset correctly instead of
-            # mislabelling the x-axis.
+            # mislabeling the x-axis.
             if key in bout_data:
                 bouts = self._entry_channel_bouts(bout_data, key, max_bouts)
             else:
@@ -36980,7 +37038,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         show_570 = self.show_570.get()
         apply_excl = self.use_exclusions_viz.get()
 
-        # First pass: collect data organised by channel name
+        # First pass: collect data organized by channel name
         # channel_cols[ch_name] = OrderedDict of col_label -> signal array
         # channel_time[ch_name] = longest time array seen for that channel
         channel_cols = {}
@@ -37068,7 +37126,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     # ------------------------------------------------------------------ #
     #  Prism reads a rectangle: one X column with Y columns beside it.  An
     #  overlay is a trace plus a set of spans, and a span has no single right
-    #  shape on an XY graph -- a raster under the trace and a coloured segment
+    #  shape on an XY graph -- a raster under the trace and a colored segment
     #  on it are both what people draw.  So the Trace sheet carries every shape
     #  side by side, and the Bouts sheet lists the spans themselves for anyone
     #  drawing the shading by hand.  One subject per file: bout frames are
@@ -37310,7 +37368,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             f'Subject: {subject}   Rows: {n_frames}   Row rate: {rate:g} Hz   '
             f'Bouts: {n_bouts}',
             f'Channels: {ch_list}',
-            f'Behaviours: {beh_list}',
+            f'Behaviors: {beh_list}',
             f'Boutframes file: {bf}',
             '',
             'SHEETS',
@@ -37346,7 +37404,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             '    Use the Ribbon_steps sheet instead. Each bout is its own two-point column',
             '    (its start and its end), so a line has nothing to bridge. Paste Time_s plus',
             '    the columns for the behaviors you want and format them as thick lines.',
-            '  Coloured bouts sitting on the trace:',
+            '  Colored bouts sitting on the trace:',
             "    Paste Time_s, then the <Ch>_z column, then that channel's <Ch>_<Behavior>",
             '    columns. The highlights overdraw the trace exactly where the shading is.',
             '  Shading drawn by hand:',
@@ -37359,7 +37417,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             '    where the video and photometry rates differ they land within a frame or two',
             '    of the workbook value, because the adjusted frame is a whole sample.',
             '  A blank cell means no data, not zero - leave it blank in Prism.',
-            '  Behaviours follow the overlay\'s own selection ("Select Behaviors...", or the',
+            '  Behaviors follow the overlay\'s own selection ("Select Behaviors...", or the',
             '    Behavior dropdown when no set is chosen).',
             '  On_trace = no marks a bout that falls outside the recorded rows; the plot does',
             '    not draw it either.',
@@ -37373,7 +37431,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         The embedded figure carries a deliberately small on-screen dpi (see
         _embed_plot_canvas); savefig's own dpi overrides it, so the file is
         written at PLOT_EXPORT_DPI regardless of the plot-size setting. PDF and
-        SVG are true vector — the sharpest option for Prism or Illustrator,
+        SVG are true vector, the sharpest option for Prism or Illustrator,
         since they never pixelate at any size.
         """
         if not hasattr(self, 'current_viz_figure') or self.current_viz_figure is None:
@@ -37737,7 +37795,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     data_key = 'zscore'
                     data_suffix = 'zscore'
                 elif "Extracted Bouts" in plot_type:
-                    # Handle extracted bouts separately — build wide-format dicts (one dict per behavior per subject)
+                    # Handle extracted bouts separately: build wide-format dicts (one dict per behavior per subject)
                     if 'bouts' not in data:
                         continue
 
@@ -37856,6 +37914,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                         dist_data = self._distance_table(data, axis_key)
                         bin_cm = self._distance_bin_width()
+                        range_hi = dict(self._distance_ranges() or [])
 
                         for ch_slot in self.get_selected_viz_channels(data):
                             if not self._slot_included(subject, ch_slot, data):
@@ -37872,7 +37931,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
                             # Add each distance as a column
                             for distance, metrics in sorted(dist_data.items()):
-                                span = (f'{int(distance)}' if bin_cm == 1.0
+                                span = (f'{distance:g}-{range_hi[distance]:g}' if range_hi
+                                        else f'{int(distance)}' if bin_cm == 1.0
                                         else f'{distance:g}-{distance + bin_cm:g}')
                                 row_data[f'dist_{span}cm_mean'] = metrics.get(f'G{ch_slot}_mean', float('nan'))
 
@@ -38287,7 +38347,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     "No data available for the selected channels/wavelengths.\n\n"
                     "The graphs draw from the synchronized behavior matrix, while "
                     "this export reads the per-wavelength arrays and keeps each "
-                    "channel only at its own wavelength — so it can come up "
+                    "channel only at its own wavelength, so it can come up "
                     "empty on a subject whose plot looks fine. What it found:\n\n"
                     + why +
                     "\n\nFor a Bouts Overlay, 'Export Overlay Data (xlsx)' reads "
@@ -39178,7 +39238,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self._label_distance_bins(ax, distances)
             ax.set_xlabel('Euclidean Distance from Center (cm)', fontsize=10)
             ax.set_ylabel(f'{ch_label} Average Z-score', fontsize=10)
-            ax.set_title(f'Euclidean Distance from Center — {ch_label}', fontsize=11, fontweight='bold')
+            ax.set_title(f'Euclidean Distance from Center: {ch_label}', fontsize=11, fontweight='bold')
             ax.axhline(0, color='k', linestyle='--', alpha=0.3)
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
@@ -39941,9 +40001,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         When average_within_subject is True, each subject contributes one row
         (its bout average). When False, every individual bout is its own row,
-        but the y-axis is still labelled once per subject (at the centre of
+        but the y-axis is still labeled once per subject (at the center of
         that subject's block of rows). With the "Bout number" order selected
-        those same bout rows are instead blocked by bout ordinal, labelled
+        those same bout rows are instead blocked by bout ordinal, labeled
         "Bout 1", "Bout 2", ...; averaging within subject leaves no ordinal to
         block on, so that combination keeps the group/subject layout. Returns
         (rows, ytick_positions, ytick_labels, block_row_counts)."""
@@ -39979,7 +40039,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     if bouts:
                         block_start = len(rows)
                         rows.extend(bouts)
-                        # Single label centred on this subject's block of bouts
+                        # Single label centered on this subject's block of bouts
                         ytick_positions.append((block_start + len(rows) - 1) / 2)
                         ytick_labels.append(subject[:8])
             group_row_counts.append(len(rows) - rows_before)
@@ -40392,7 +40452,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Draw one mean ± SEM trace per bout bin onto *ax*.
 
         ``all_bins`` is the bin order shared by every panel so a bin keeps the
-        same colour throughout the figure.  ``base_color`` shades the bins of a
+        same color throughout the figure.  ``base_color`` shades the bins of a
         single group; without one the bins run along viridis.
         """
         mean_width, trace_width, trace_alpha = self.get_trace_styling()
@@ -40477,11 +40537,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         fig.tight_layout()
 
     # Past this many bins a per-bin legend outgrows its panel, so the bins are
-    # keyed by a colour bar instead.
+    # keyed by a color bar instead.
     BOUT_BIN_LEGEND_MAX = 12
 
     def _bout_bin_key(self, fig, ax, series, all_bins, bin_size, line_styles):
-        """Colour-bar key for many bout bins, plus one legend entry per series."""
+        """Color-bar key for many bout bins, plus one legend entry per series."""
         n_bins = len(all_bins)
         if len(series) == 1 and series[0][1] is None:
             cmap = plt.cm.viridis
@@ -40560,7 +40620,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             detail = 'One trace per bout'
         self._render_bout_comparison(fig, [(None, None, collected)], slot_defs,
                                      behavior, self.get_fps(data), bin_size,
-                                     f'{subject} — {detail}')
+                                     f'{subject}: {detail}')
 
     def plot_bout_comparison_multi(self, fig, subjects):
         """Compare bout traces pooled across subjects, binned by bout number."""
@@ -40756,7 +40816,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         (e.g. G0 vs R4) can be compared within each group in the GUI.
 
         One subplot per group (or a single 'All' panel in Subject mode); one
-        coloured line per channel with mean ± SEM across subjects.  This mirrors
+        colored line per channel with mean ± SEM across subjects.  This mirrors
         the per-channel comparison that the bout export already offers, which the
         in-GUI views previously lacked."""
         in_group_mode = self.bout_analysis_by_var.get() == "Group"
@@ -40850,7 +40910,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.draw_zero_line(ax)
                 ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
                 ax.set_ylabel('Z-score', fontsize=10)
-                ax.set_title(f'{group_name}: {behavior} — channel comparison', fontsize=10,
+                ax.set_title(f'{group_name}: {behavior}, channel comparison', fontsize=10,
                              fontweight='bold')
                 ax.grid(True, alpha=0.3)
                 if any_line:
@@ -41032,7 +41092,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'groups_present': groups_present,
         }
 
-        # Respect metric checkboxes — same set used by Calculate Metrics
+        # Respect metric checkboxes: same set used by Calculate Metrics
         _all_metric_configs = [
             ('peak', 'Peak Z-Score',    f'{channel}: {behavior}\nPeak Response by Bout Number', '#2196F3',
              self.metric_max_post.get()),
@@ -41206,7 +41266,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                              f"Kendall's W={kendall_w:.4f}")
                         
                         if p_friedman < 0.05:
-                            results_lines.append(f"    ** Significant at p<0.05 — running post-hoc tests **")
+                            results_lines.append(f"    ** Significant at p<0.05, running post-hoc tests **")
                             # Post-hoc: pairwise Wilcoxon with Bonferroni correction
                             results_lines.append(f"  Pairwise Wilcoxon signed-rank with Bonferroni correction:")
                             n_comparisons = k * (k - 1) / 2
@@ -41281,7 +41341,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     # ==================== FLMM-style Time-Course Statistics ===============
     # Implements the engine of Functional Linear Mixed Models (the fastFMM
-    # R package) — "Fast Univariate Inference" (FUI):
+    # R package): "Fast Univariate Inference" (FUI):
     #   1. fit a linear mixed model  z(t) ~ predictors + (1|subject)  at every
     #      timepoint of the bout window (statsmodels MixedLM),
     #   2. smooth the coefficient trace beta(t) across time (Savitzky-Golay),
@@ -41372,7 +41432,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         comparison behavior(s), tagging each bout with its condition label.
 
         Returns (Z, subjects, conditions, orders, L) where ``conditions`` holds
-        ref_label / comp_label per bout — i.e. the 2-level factor whose baseline
+        ref_label / comp_label per bout, i.e. the 2-level factor whose baseline
         is the reference behavior. None if no usable data.
 
         ``max_bouts`` defaults to reading the Tk entry; a worker thread must pass
@@ -41631,15 +41691,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     sig2[t] = float(np.sum(ols.resid ** 2) / dof)
                     if use_mixed and not fallback_logged:
                         fallback_logged = True
-                        log("FLMM: mixed model did not converge at some timepoints "
-                            "— used OLS fallback there.")
+                        log("FLMM: mixed model did not converge at some timepoints; "
+                            "used OLS fallback there.")
                 except Exception:
                     continue
             eta[mask, t] = yt - Xt @ fp   # marginal residuals for the cluster cov
             betas_all[:, t] = fp
 
         if not use_mixed and reference != 'zero':
-            log("FLMM: single subject — random effect dropped (OLS).")
+            log("FLMM: single subject, random effect dropped (OLS).")
         return {
             'beta': beta, 'se': se, 'n_subjects': n_subjects,
             'X': X, 'subj_codes': subj_codes, 'coef_idx': coef_idx,
@@ -41712,7 +41772,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         a_i(t) = [ inv(X'V(t)^-1 X) X_i' V_i(t)^-1 eta_i(t) ]_k ; Cov = A'A,
         with V_i = sig2 I + tau2 11' (random intercept) inverted via
         Sherman-Morrison. Captures the across-time correlation of beta_hat(t)
-        induced by shared subjects/bouts — the input fastFMM uses for its band.
+        induced by shared subjects/bouts: the input fastFMM uses for its band.
 
         *contrast* (length-p) bands a linear combination of the coefficients
         instead of the coefficient of interest.
@@ -41815,7 +41875,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         logf = log or self.log_message
 
         n, L = Z.shape
-        # Grouping is by animal — see cluster_codes.
+        # Grouping is by animal; see cluster_codes.
         subj_codes, n_subjects, _ = self.cluster_codes(subjects, log=logf)
 
         levels = sorted(set(str(f) for f in factor))
@@ -41844,7 +41904,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         prog_every = max(1, L // 40)
         for t in range(L):
             if progress is not None and t % prog_every == 0:
-                progress(t / L, f"fitting mixed model — timepoint {t + 1}/{L}")
+                progress(t / L, f"fitting mixed model: timepoint {t + 1}/{L}")
             y = Z[:, t]
             mask = np.isfinite(y)
             if mask.sum() < p + 1:
@@ -41901,7 +41961,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
     def _flmm_factor_contribs(self, fitf):
         """Per-subject contributions A[k, s, t] to each factor coefficient's GLS
-        estimate — the building block of every across-time covariance.
+        estimate: the building block of every across-time covariance.
 
         a_i,k(t) is subject i's clustered (CR0) contribution to coefficient k, so
         A[k].T @ A[k] is the L×L covariance of coefficient k, and for any contrast
@@ -42129,7 +42189,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """Resolve the engine that will *actually* run, given the chosen analysis.
 
         Returns ``(engine, note)`` where ``note`` explains any override (None when
-        the request is honoured verbatim). Single source of truth for both the
+        the request is honored verbatim). Single source of truth for both the
         confirmation dialog and the run itself, so the dialog can never promise an
         engine the run won't use.
         """
@@ -42137,7 +42197,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             r_available = self._flmm_r_available()
         if reference in self._FLMM_PYTHON_ONLY_REFERENCES:
             if engine == 'r':
-                return 'python', ("The pairwise matrix has no fastFMM implementation — "
+                return 'python', ("The pairwise matrix has no fastFMM implementation: "
                                   "every pair is derived from one joint Python fit's "
                                   "coefficient covariance, which fui() does not return. "
                                   "It will run on the Python FUI engine.")
@@ -42181,7 +42241,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         meta = pd.DataFrame({
             # (1 | id) is the random intercept, so id must be the animal rather
-            # than the recording — see cluster_codes. Keeps the R engine's
+            # than the recording; see cluster_codes. Keeps the R engine's
             # grouping identical to the Python engine's.
             'id': self._animal_ids_for(subjects, log=log),
             'group': [str(g) if g is not None else 'NA' for g in groups],
@@ -42250,7 +42310,7 @@ cat("OK\n")
                 return None
             return beta, se, qn
         except Exception as e:
-            log(f"FLMM (R): backend error — {e}")
+            log(f"FLMM (R): backend error: {e}")
             return None
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -42276,7 +42336,7 @@ cat("OK\n")
         out_csv = os.path.join(tmpdir, 'out.csv')
         script_path = os.path.join(tmpdir, 'run.R')
 
-        # id is the (1 | id) random intercept — the animal, not the recording.
+        # id is the (1 | id) random intercept: the animal, not the recording.
         meta = pd.DataFrame({'id': self._animal_ids_for(subjects, log=log),
                              'fac': [str(f) for f in factor]})
         ydf = pd.DataFrame(Z, columns=[f'Y.{k+1}' for k in range(L)])
@@ -42331,7 +42391,7 @@ cat("OK\n")
                 labels[0] = '(Intercept)'
             return labels, np.array(betas), np.array(ses), qns
         except Exception as e:
-            log(f"FLMM (R factor): backend error — {e}")
+            log(f"FLMM (R factor): backend error: {e}")
             return None
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -42347,7 +42407,7 @@ cat("OK\n")
         ``behaviors`` (optional list) enables the Behavior-contrast option, which
         compares one behavior (the baseline / 0-point) against another behavior
         (or all other behaviors pooled).  ``channels`` populates the multi-select
-        channel list — the analysis is repeated for each ticked channel.
+        channel list: the analysis is repeated for each ticked channel.
         """
         behaviors = behaviors or []
         channels = list(channels or [])
@@ -42366,12 +42426,12 @@ cat("OK\n")
         opts = [
             ('zero', "Signal ≠ 0 over time   (mean z-score vs baseline)", True),
             ('across_bouts', "Across bouts   (effect of bout order, within subject)", can_acrossbouts),
-            ('between_groups', "Between groups   (group difference — needs 2 groups)", can_groups),
-            ('interaction', "Across-bouts × group   (interaction — needs 2 groups)",
+            ('between_groups', "Between groups   (group difference, needs 2 groups)", can_groups),
+            ('interaction', "Across-bouts × group   (interaction, needs 2 groups)",
              can_groups and can_acrossbouts),
             ('behavior_contrast', "Behavior contrast   (one behavior = 0-point vs another)",
              can_contrast),
-            ('factor', "Factor: ALL behaviors vs a reference (one model — matches fastFMM)",
+            ('factor', "Factor: ALL behaviors vs a reference (one model, matches fastFMM)",
              can_contrast),
             ('pairwise', "Pairwise matrix: every behavior vs every other (FDR-corrected)",
              can_contrast),
@@ -42463,7 +42523,7 @@ cat("OK\n")
                    command=lambda: _set_all_chans(True)).pack(side='left')
         ttk.Button(chan_btns, text="None", width=6,
                    command=lambda: _set_all_chans(False)).pack(side='left', padx=(4, 0))
-        ttk.Label(chan_btns, text="each ticked channel is analysed separately",
+        ttk.Label(chan_btns, text="each ticked channel is analyzed separately",
                   foreground='gray', font=('Segoe UI', 8)).pack(side='left', padx=(10, 0))
 
         # Engine selection
@@ -42472,7 +42532,7 @@ cat("OK\n")
             anchor='w', padx=12)
         engine_var = tk.StringVar(value=('r' if r_available else 'python'))
         r_radio = ttk.Radiobutton(
-            dlg, text="R fastFMM (exact)" + ("" if r_available else " — not detected"),
+            dlg, text="R fastFMM (exact)" + ("" if r_available else ", not detected"),
             variable=engine_var, value='r',
             state=('normal' if r_available else 'disabled'))
         r_radio.pack(anchor='w', padx=22, pady=1)
@@ -42496,7 +42556,7 @@ cat("OK\n")
 
         def _sync_engine_controls(*_):
             # The behavior picker feeds the factor model and the single-behavior
-            # analyses; grey it out for the contrast and pairwise views, which
+            # analyses; gray it out for the contrast and pairwise views, which
             # pick their behaviors elsewhere.
             ref = ref_var.get()
             is_factor = ref == 'factor'
@@ -42509,7 +42569,7 @@ cat("OK\n")
                     pass
             beh_head.configure(foreground=('' if uses_behs else 'gray'))
             beh_hint.configure(text=("one model over the ticked behaviors" if is_factor
-                                     else "each ticked behavior is analysed separately"
+                                     else "each ticked behavior is analyzed separately"
                                      if uses_behs
                                      else "not used by this analysis"))
             python_only = ref_var.get() in self._FLMM_PYTHON_ONLY_REFERENCES
@@ -42519,7 +42579,7 @@ cat("OK\n")
                     engine_var.set('python')
                 r_radio.configure(state='disabled')
                 engine_note.configure(
-                    text="This analysis has no fastFMM implementation — it always "
+                    text="This analysis has no fastFMM implementation; it always "
                          "runs on the Python FUI engine.")
             else:
                 if r_available:
@@ -42533,7 +42593,7 @@ cat("OK\n")
 
         ttk.Separator(dlg, orient='horizontal').pack(fill='x', padx=12, pady=8)
         pw_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(dlg, text="Pointwise only (skip simultaneous band — faster)",
+        ttk.Checkbutton(dlg, text="Pointwise only (skip simultaneous band, faster)",
                         variable=pw_var).pack(anchor='w', padx=22)
         # Analysis window: only these seconds enter the model and its bands.
         _fps = max(1e-9, float(self.get_fps()))
@@ -42620,7 +42680,7 @@ cat("OK\n")
 
     def _flmm_confirm_run(self, reference, engine, engine_note, rows):
         """Confirmation step shown after Run: spells out exactly what is about to
-        be computed and — critically — which engine will *actually* be used, so an
+        be computed and, critically, which engine will *actually* be used, so an
         analysis that silently falls back to Python can never be mistaken for a
         fastFMM result. Returns True to proceed."""
         dlg = tk.Toplevel(self.root)
@@ -42678,7 +42738,7 @@ cat("OK\n")
                                    use_exclusions=False):
         """Worker: fit ONE multi-level factor model for a single channel.
 
-        Returns (panel, warn). Runs off the main thread — every Tk-dependent value
+        Returns (panel, warn). Runs off the main thread; every Tk-dependent value
         must already be resolved by the caller and all messages go through ``q``.
         """
         logq = (lambda m: q.put(('log', m))) if q is not None else self.log_message
@@ -42707,7 +42767,7 @@ cat("OK\n")
         def _phase(frac_base, frac_span, label):
             if q is None:
                 return None
-            return self._phase_progress(q, f"{label} — {channel}",
+            return self._phase_progress(q, f"{label}: {channel}",
                                         base + span * frac_base, span * frac_span)
 
         coef_labels = betas_s = ses_s = c_stars = None
@@ -42727,7 +42787,7 @@ cat("OK\n")
                 backend_label = "R fastFMM (exact)"
             else:
                 engine_note = (f"{channel}: the R fastFMM factor run failed "
-                               f"(see Log) — fell back to the Python FUI engine.")
+                               f"(see Log); fell back to the Python FUI engine.")
                 logq(engine_note)
         if coef_labels is None:
             fitf = self._fit_factor_timecourse(
@@ -42759,7 +42819,7 @@ cat("OK\n")
         except _ProgressCancelled:
             raise
         except Exception as e:
-            logq(f"FLMM factor: peak-effect contrasts unavailable for {channel} — {e}")
+            logq(f"FLMM factor: peak-effect contrasts unavailable for {channel}: {e}")
 
         fps = self.get_fps()
         prebout = min(self.params['preboutframes'], L - 1)
@@ -42896,7 +42956,7 @@ cat("OK\n")
         channel = self.bout_analysis_channel_var.get()
 
         # Exclusions are per subject *and* channel, so they are applied inside the
-        # per-channel workers rather than once here — otherwise a multi-channel run
+        # per-channel workers rather than once here; otherwise a multi-channel run
         # would apply the dropdown channel's exclusion list to every channel.
         use_exclusions = bool(self.use_exclusions_bout.get())
         if use_exclusions and not self.get_included_subjects_for_channel(
@@ -42953,7 +43013,7 @@ cat("OK\n")
             reference, choice['engine'], r_available)
         ref_level = None
 
-        # Tk values the worker thread must never touch — resolve them up front.
+        # Tk values the worker thread must never touch; resolve them up front.
         max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
 
         who = (f"{len(selected_groups)} group(s): {', '.join(selected_groups)}"
@@ -43046,7 +43106,7 @@ cat("OK\n")
                     q=q, base=ci / C, span=1.0 / C, use_exclusions=use_exclusions,
                     time_range=choice.get('time_range'))
                 if panel is None:
-                    warns.append(f"{beh_label} — {warn}" if multi_beh else warn)
+                    warns.append(f"{beh_label}: {warn}" if multi_beh else warn)
                     continue
                 if panel.get('engine_note'):
                     warns.append(panel['engine_note'])
@@ -43149,7 +43209,7 @@ cat("OK\n")
                                        use_exclusions=False, time_range=None):
         """Worker: fit the single-coefficient time-course model for one channel.
 
-        Returns (panel, warn). Runs off the main thread — no Tk access.
+        Returns (panel, warn). Runs off the main thread; no Tk access.
         """
         logq = (lambda m: q.put(('log', m))) if q is not None else self.log_message
         prog = (self._phase_progress(q, f"Channel {channel}", base, span)
@@ -43224,7 +43284,7 @@ cat("OK\n")
                 c_star = 1.96 if pointwise_only else qn
                 backend_label = "R fastFMM (exact)"
             else:
-                engine_note = (f"{channel}: the R fastFMM run failed (see Log) — "
+                engine_note = (f"{channel}: the R fastFMM run failed (see Log), "
                                f"fell back to the Python FUI engine.")
                 logq(engine_note)
         if beta_s is None:      # python engine (chosen or fallback)
@@ -43356,7 +43416,7 @@ cat("OK\n")
         ax_top.axvline(0, color='r', ls='--', lw=1.5, label='Bout onset')
         ax_top.axhline(0, color='k', lw=0.6, alpha=0.4)
         ax_top.set_ylabel(f'{channel} Z-score')
-        ax_top.set_title(f'{channel}: {behavior} — FLMM-style time-course',
+        ax_top.set_title(f'{channel}: {behavior}, FLMM-style time-course',
                          fontweight='bold', fontsize=10)
         ax_top.legend(fontsize=8, loc='best')
         ax_top.grid(True, alpha=0.3)
@@ -43480,7 +43540,7 @@ cat("OK\n")
             a.legend(fontsize=7, loc='upper left')
             a.grid(True, alpha=0.3)
         axes[-1].set_xlabel('Time from bout onset (s)')
-        fig.suptitle(f'{panel["channel"]}: {panel["behavior"]} — bout-order FLMM',
+        fig.suptitle(f'{panel["channel"]}: {panel["behavior"]}, bout-order FLMM',
                      fontweight='bold', fontsize=10)
         fig.tight_layout()
         return fig
@@ -43523,7 +43583,7 @@ cat("OK\n")
                 ax.set_ylabel(f"β{j}(s)")
             ax.set_xlabel("Time from onset (s)")
             ax.grid(True, alpha=0.25)
-        fig.suptitle(f"{channel}: {behavior} — FLMM factor model", fontsize=10,
+        fig.suptitle(f"{channel}: {behavior}, FLMM factor model", fontsize=10,
                      fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.97])
         return fig
@@ -43531,7 +43591,7 @@ cat("OK\n")
     def _flmm_factor_stats_lines(self, coef_labels, ref_level, behavior, channel,
                                  Z, n_subjects, time_axis, betas_s, ses_s, c_stars,
                                  pointwise_only, backend_label):
-        """Summary text for the factor model — significant windows per coefficient."""
+        """Summary text for the factor model: significant windows per coefficient."""
         is_r = bool(backend_label) and backend_label.startswith("R fastFMM")
         n_bouts, L = Z.shape
         lines = ["=" * 70,
@@ -43571,7 +43631,7 @@ cat("OK\n")
             else:
                 lines.append("  no timepoints reached significance.")
         if is_r:
-            lines += ["", "Engine: real R fastFMM::fui — exact FUI inference."]
+            lines += ["", "Engine: real R fastFMM::fui, exact FUI inference."]
         else:
             lines += ["", "Pure-Python FUI: β(t) matches R lme4/fastFMM closely; bands",
                       "within ~5–11% of fastFMM. Select the R engine for exact bands."]
@@ -43647,7 +43707,7 @@ cat("OK\n")
             for j in range(i):
                 if progress is not None:
                     progress(len(pair_idx) / max(1, n_pairs_total),
-                             f"testing pairs — {len(pair_idx) + 1}/{n_pairs_total}")
+                             f"testing pairs: {len(pair_idx) + 1}/{n_pairs_total}")
                 x, y = levels[i], levels[j]
                 c = np.zeros(p_coef)
                 if x != ref_level:
@@ -43671,7 +43731,7 @@ cat("OK\n")
     def _flmm_subject_means(Z, subjects, factor, levels, L):
         """Per-subject mean trace for each factor level.
 
-        Returns ``{level: {subject: ndarray(L)}}`` — each subject's bouts of that
+        Returns ``{level: {subject: ndarray(L)}}``: each subject's bouts of that
         level averaged into one trace.  Used by the per-subject peak-effect plot,
         which reads each animal's z at the FLMM-defined peak time so behaviors with
         a real (transient/biphasic) effect separate from the shuffle control even
@@ -43727,7 +43787,7 @@ cat("OK\n")
         The peak time and significant window come from the behavior-vs-control
         contrast the FLMM already computed; each subject's value is that subject's
         own mean trace at that timepoint (so the sign gives the effect direction).
-        The control level itself is summarised over the union of all significant
+        The control level itself is summarized over the union of all significant
         windows to show the null distribution.
 
         Returns ``{ref_level, order, per_level, subjects}`` or None.
@@ -43810,10 +43870,10 @@ cat("OK\n")
         """Popup to pick behaviors (checkboxes), channels (checkboxes) and the
         comparison mode. Returns {behaviors, channels, mode} or None.
 
-        ``default_channels`` (optional) pre-ticks a whole set — used to carry the
+        ``default_channels`` (optional) pre-ticks a whole set: used to carry the
         channel selection forward from the reference-point dialog."""
         dlg = tk.Toplevel(self.root)
-        dlg.title("Pairwise Comparison — behaviors, channels, mode")
+        dlg.title("Pairwise Comparison: behaviors, channels, mode")
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(False, False)
@@ -43883,11 +43943,11 @@ cat("OK\n")
         mode_var = tk.StringVar(value='within')
         ttk.Radiobutton(
             mode_frame, variable=mode_var, value='within',
-            text="Within channel — behavior × behavior (one matrix per channel)"
+            text="Within channel: behavior × behavior (one matrix per channel)"
         ).pack(anchor='w', padx=14, pady=1)
         ttk.Radiobutton(
             mode_frame, variable=mode_var, value='across_channels',
-            text="Same behavior across channels — channel × channel (needs ≥2 channels)"
+            text="Same behavior across channels: channel × channel (needs ≥2 channels)"
         ).pack(anchor='w', padx=14, pady=1)
         ttk.Label(mode_frame,
                   text=("Global sup-t functional Wald test per pair, "
@@ -43949,7 +44009,7 @@ cat("OK\n")
         mode = choice['mode']
         behaviors = choice['behaviors']
         sel_channels = choice['channels']
-        # Resolve every Tk-dependent value on the main thread before threading —
+        # Resolve every Tk-dependent value on the main thread before threading;
         # the worker must not touch Tk variables.
         max_bouts = self._get_max_bouts_limit(self.bout_max_bouts_var.get())
         holder = {}
@@ -43974,7 +44034,7 @@ cat("OK\n")
             self._flmm_remember(store, 'pairwise', f"{len(behaviors)} behaviors")
             self._show_pairwise_panels(store)
 
-        subtitle = ("within channel — one matrix per channel" if mode == 'within'
+        subtitle = ("within channel: one matrix per channel" if mode == 'within'
                     else "same behavior across channels")
         self._run_with_progress("Pairwise comparison", worker, on_done_fn=on_done,
                                 cancelable=True, subtitle=subtitle)
@@ -44126,7 +44186,7 @@ cat("OK\n")
                 'n_subjects': len(set(subjects.tolist())),
                 'gls': A is not None,
                 'time': (np.arange(L) - prebout) / fps}
-        # Status only — never lower the bar (the last behavior already advanced it
+        # Status only: never lower the bar (the last behavior already advanced it
         # near 1.0); the final ('progress', 1.0) is emitted after the store builds.
         q.put(('status', "Correcting & preparing panels…"))
         q.put(('detail', ""))
@@ -44152,7 +44212,7 @@ cat("OK\n")
         beh_order = [b for b in behaviors if b in per_beh]
         n_tests = len(raw_records)
         # Forest panel only when EVERY behavior shares the same 2-channel pair;
-        # otherwise fall back to a per-behavior matrix so each panel is labelled
+        # otherwise fall back to a per-behavior matrix so each panel is labeled
         # with its own channel pair.
         distinct_pairs = {tuple(v['levels']) for v in per_beh.values()}
         forest = len(distinct_pairs) == 1 and len(next(iter(distinct_pairs))) == 2
@@ -44202,7 +44262,7 @@ cat("OK\n")
 
         top = ttk.Frame(self.bout_histogram_frame)
         # Peak-effect ("max difference") is available wherever the panels carry
-        # each animal's own trace — the within-channel pairwise matrix and the
+        # each animal's own trace: the within-channel pairwise matrix and the
         # factor model both do.
         has_peak = store.get('kind') in ('pairwise_within', 'factor') and any(
             p.get('subj_means') for p in store.get('panels', {}).values())
@@ -44243,7 +44303,7 @@ cat("OK\n")
             key = sel_var.get()
             if key not in store['panels'] and facets:
                 ttk.Label(holder, foreground='gray',
-                          text=f"No result for {key} — that behavior had no usable "
+                          text=f"No result for {key}; that behavior had no usable "
                                f"bouts on this channel (see the skipped-panel note).").pack(
                     padx=12, pady=24)
                 return
@@ -44266,7 +44326,7 @@ cat("OK\n")
         tested β(t) is significant, so every behavior can be scanned at once."""
         first = store['panels'][store['order'][0]]
         band = "pointwise 95%" if first['pointwise_only'] else "simultaneous 95%"
-        lines = [f"FLMM summary — {self._FLMM_REFERENCE_TITLES.get(first['reference'], first['reference'])}",
+        lines = [f"FLMM summary: {self._FLMM_REFERENCE_TITLES.get(first['reference'], first['reference'])}",
                  f"Significant windows of the tested β(t) ({band} band excludes 0)", ""]
         wb = max([len("Behavior")] + [len(b) for b in store.get('facet_behaviors', [])]) + 2
         lines.append(f"{'Behavior':<{wb}}{'Channel':<10}{'bouts':>7}{'subj':>6}"
@@ -44303,7 +44363,7 @@ cat("OK\n")
     def _build_flmm_peak_effect_figure(self, table, channel):
         """Horizontal violin+strip of each subject's signed peak z (read at the
         FLMM peak time within the significant window), one row per behavior with
-        the control last — a directional, FLMM-consistent replacement for the
+        the control last: a directional, FLMM-consistent replacement for the
         window-average that keeps significant behaviors distinct from the shuffle
         control.  FDR stars from the behavior-vs-control contrast annotate each row."""
         self._apply_plot_style()
@@ -44372,7 +44432,7 @@ cat("OK\n")
     def _export_flmm_peak_effect_csv(self, table, channel):
         """Write the per-subject peak-effect values (subjects × behaviors) plus a
         metadata block (peak time, FDR p, significant window) to CSV for GraphPad
-        etc.  Returns the path written, or None if cancelled."""
+        etc.  Returns the path written, or None if canceled."""
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(
             title="Export per-subject peak effect",
@@ -44419,7 +44479,7 @@ cat("OK\n")
         subjects = panel.get('_raw_subjects')
         factor = panel.get('_raw_factor')
         if Z is None or subjects is None or factor is None:
-            messagebox.showinfo("Peak effect", "Not enough data to summarise.")
+            messagebox.showinfo("Peak effect", "Not enough data to summarize.")
             return
         holder = {}
 
@@ -44469,11 +44529,11 @@ cat("OK\n")
             return
         table0 = self._flmm_peak_effect_table(panel)
         if table0 is None:
-            messagebox.showinfo("Peak effect", "Not enough data to summarise.")
+            messagebox.showinfo("Peak effect", "Not enough data to summarize.")
             return
 
         win = tk.Toplevel(self.root)
-        win.title(f"Per-subject peak effect — {key}")
+        win.title(f"Per-subject peak effect: {key}")
         win.transient(self.root)
 
         ctrl_row = ttk.Frame(win)
@@ -44562,12 +44622,12 @@ cat("OK\n")
                  "95% band: a period is significant where the band excludes 0. This",
                  "corrects across time WITHOUT a per-timepoint multiplicity penalty",
                  "[Cui 2022; Loewinger 2025]. The reported p is the sup-statistic",
-                 "companion — the smallest level at which the joint band first",
+                 "companion: the smallest level at which the joint band first",
                  "excludes 0 anywhere in the window.",
                  "",
                  "Coefficient-function covariance: subject-clustered (CR0) sandwich",
                  "[Liang & Zeger 1986]; with few subjects CR0 is mildly",
-                 "anticonservative [Cameron & Miller 2015] — use the R/fastFMM engine",
+                 "anticonservative [Cameron & Miller 2015]; use the R/fastFMM engine",
                  "for the exact analytic band. β(t) smoothing: Savitzky-Golay [1964]."]
         if family_note:
             lines += ["",
@@ -44588,9 +44648,9 @@ cat("OK\n")
         ``is_channel=True`` levels are channels for one behavior (``channel`` then
         names the behavior). ``fdr_family`` overrides the reported multiple-comparison
         family size in the subtitle when FDR was applied jointly across more than this
-        panel's pairs. Cell colour = −log10(FDR p) on a single-hue sequential ramp
-        (magnitude); non-significant cells are neutral grey (status); each cell is
-        direct-labelled with stars + the FDR p-value."""
+        panel's pairs. Cell color = −log10(FDR p) on a single-hue sequential ramp
+        (magnitude); non-significant cells are neutral gray (status); each cell is
+        direct-labeled with stars + the FDR p-value."""
         from matplotlib.patches import Rectangle
         from matplotlib.colors import LinearSegmentedColormap, Normalize
         from matplotlib.cm import ScalarMappable
@@ -44658,7 +44718,7 @@ cat("OK\n")
         n_family = result['n_pairs'] if fdr_family is None else fdr_family
         ax.set_title(
             f"global sup-t functional Wald · BH-FDR ({n_family} pairs)\n"
-            f"{n_subjects} subjects, {n_bouts} bouts · grey = ns · "
+            f"{n_subjects} subjects, {n_bouts} bouts · gray = ns · "
             f"* p<.05  ** p<.01  *** p<.001",
             fontsize=8, color='#444')
         fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -44668,8 +44728,8 @@ cat("OK\n")
                                    n_subjects, time_axis, is_channel=False,
                                    fdr_family=None):
         """Summary table: raw + FDR p, stars, and significant window for each pair.
-        ``is_channel`` swaps the behaviour/channel wording (channel × channel for a
-        single behaviour). ``fdr_family`` overrides the reported multiple-comparison
+        ``is_channel`` swaps the behavior/channel wording (channel × channel for a
+        single behavior). ``fdr_family`` overrides the reported multiple-comparison
         family size when FDR was applied jointly across more than this panel's pairs
         (defaults to this panel's own pair count)."""
         recs = result['records']
@@ -44696,7 +44756,7 @@ cat("OK\n")
                  f"{head}   |   {n_bouts} bouts, {n_subjects} subject(s), "
                  f"{len(time_axis)} timepoints",
                  f"Model baseline (reference level): {result['ref_level']}",
-                 "Test  : joint (simultaneous) 95% band over the window — a pair",
+                 "Test  : joint (simultaneous) 95% band over the window; a pair",
                  "        differs where the band of β_A(t)−β_B(t) excludes 0; p is the",
                  "        sup-statistic companion (max|β/se|).  H0: β_A(t)=β_B(t) ∀t.",
                  f"Correct: Benjamini-Hochberg FDR across {n_family} pair(s).",
@@ -44726,7 +44786,7 @@ cat("OK\n")
             lines += [
                 "Python FUI engine (no R). β(t) matches lme4/fastFMM closely; the joint",
                 "covariance is subject-clustered (CR0) and can run ~5–10% anticonservative",
-                "with few subjects — treat borderline FDR p near 0.05 with caution."]
+                "with few subjects; treat borderline FDR p near 0.05 with caution."]
         else:
             lines += [
                 "Few subjects (<3): delta-method + Bonferroni-across-time fallback",
@@ -44736,9 +44796,9 @@ cat("OK\n")
         return lines
 
     def _build_flmm_across_forest_figure(self, beh_order, per_beh, n_tests):
-        """Two-channel same-behavior comparison: one coloured cell per behavior
-        (channel A vs channel B), stacked as a single column — a compact
-        manuscript panel. Cell colour = −log10(FDR p); grey = ns; direct-labelled
+        """Two-channel same-behavior comparison: one colored cell per behavior
+        (channel A vs channel B), stacked as a single column, a compact
+        manuscript panel. Cell color = −log10(FDR p); gray = ns; direct-labeled
         with stars + p and the channel pair being contrasted."""
         from matplotlib.patches import Rectangle
         from matplotlib.colors import LinearSegmentedColormap, Normalize
@@ -44802,7 +44862,7 @@ cat("OK\n")
                      fontsize=11, fontweight='bold', y=0.99)
         ax.set_title(
             f"global sup-t functional Wald · BH-FDR ({n_tests} tests)\n"
-            f"grey = ns · * p<.05  ** p<.01  *** p<.001",
+            f"gray = ns · * p<.05  ** p<.01  *** p<.001",
             fontsize=8, color='#444')
         fig.tight_layout(rect=[0, 0, 1, 0.94])
         return fig
@@ -44827,7 +44887,7 @@ cat("OK\n")
         lines = ["=" * 74,
                  "SAME-BEHAVIOR ACROSS CHANNELS  (per behavior: Y ~ channel + (1|subj))",
                  f"Channels contrasted: {chan_a} vs {chan_b}",
-                 "Test  : joint (simultaneous) 95% band — significant where the band",
+                 "Test  : joint (simultaneous) 95% band, significant where the band",
                  "        of β(t) excludes 0; p is its sup-statistic (max|β/se|).",
                  f"Correct: Benjamini-Hochberg FDR across {n_tests} behavior test(s).",
                  "=" * 74,
@@ -44898,7 +44958,7 @@ cat("OK\n")
         is_r = bool(backend_label) and backend_label.startswith("R fastFMM")
         n_bouts, L = Z.shape
         lines = ["=" * 70,
-                 "FLMM TIME-COURSE  (Functional Linear Mixed Model — FUI)",
+                 "FLMM TIME-COURSE  (Functional Linear Mixed Model, FUI)",
                  f"Reference : {ref_titles.get(reference, reference)}",
                  f"Behavior  : {behavior}   |   Channel: {channel}",
                  f"Data      : {n_bouts} bouts, {n_subjects} subject(s), {L} timepoints",
@@ -45191,7 +45251,7 @@ cat("OK\n")
         sheets = {}
         first = plist[0]
         readme = [
-            f"FLMM time-course export — "
+            f"FLMM time-course export: "
             f"{', '.join(d['facet_behaviors']) if multi else first['behavior']}",
             f"Analysis : {self._FLMM_REFERENCE_TITLES.get(first['reference'], first['reference'])}",
             f"Channels : {', '.join(d.get('facet_channels') or order)}",
@@ -45211,20 +45271,20 @@ cat("OK\n")
                 readme.append(f"    excluded on {p['channel']} ({len(ex)}): "
                               + (', '.join(map(str, ex)) if ex else 'none'))
         readme += ["", "SHEETS",
-                   "Model_terms — one block per model term: beta(t), SE, 95% pointwise CI, "
+                   "Model_terms - one block per model term: beta(t), SE, 95% pointwise CI, "
                    "95% simultaneous band, significance flags.",
                    "           Tested = 1 marks the term the analysis was run to test.",
                    "           β(t) is smoothed (FUI step 2); the plot's lower panel(s) draw "
                    "exactly these columns.",
-                   "Input_bouts — every bout that entered the model (one row each), with "
+                   "Input_bouts - every bout that entered the model (one row each), with "
                    "subject, animal (the random-intercept unit), group",
                    "           and bout number; columns are seconds from onset.  All channels "
                    "are cut to the shortest bout so they share one time axis."]
         if obs:
             readme += [
-                "Observed_mean_per_bout — mean and SEM across animals at each bout number "
+                "Observed_mean_per_bout - mean and SEM across animals at each bout number "
                 "(each animal contributes its own bout k).",
-                "Model_fit_per_bout — the model's signal at bout k: mean term + slope × "
+                "Model_fit_per_bout - the model's signal at bout k: mean term + slope × "
                 "(k − center).  Compare to Observed_mean_per_bout.",
                 "",
                 "READING A BOUT-ORDER MODEL",
@@ -45241,32 +45301,32 @@ cat("OK\n")
                 "(e.g. only bout 1 differs) before reading a slope as a trend."]
         readme += [
             "", "GLOSSARY",
-            "FLMM — functional linear mixed model: a mixed model fit separately at every",
+            "FLMM - functional linear mixed model: a mixed model fit separately at every",
             "        time point of the bout window, so the result is a curve over time.",
-            "FUI — fast univariate inference, the FLMM method used here (Cui et al. 2022).",
-            "β(t) ('beta of t') — the model's estimate of one quantity at time t; the",
+            "FUI - fast univariate inference, the FLMM method used here (Cui et al. 2022).",
+            "β(t) ('beta of t') - the model's estimate of one quantity at time t; the",
             "        'beta' column.  What it measures depends on the Term: a signal level",
             "        in z, a difference between groups in z, or a slope in z per bout.",
-            "Slope (bout order) — how much the z-score changes per one more bout, at",
+            "Slope (bout order) - how much the z-score changes per one more bout, at",
             "        that time point.  Negative = the response gets smaller over bouts.",
-            "Random intercept — each animal gets its own baseline level, so animals",
+            "Random intercept - each animal gets its own baseline level, so animals",
             "        with many bouts do not dominate and bouts are not treated as",
             "        independent.",
-            "Bout number — the bout's position in that session (1 = first bout).",
-            "Centered — bout numbers are measured from their average, so 'Mean signal'",
+            "Bout number - the bout's position in that session (1 = first bout).",
+            "Centered - bout numbers are measured from their average, so 'Mean signal'",
             "        terms are the signal at the average bout number.",
-            "Pooled slope — the average of the two groups' slopes: is there a bout-order",
+            "Pooled slope - the average of the two groups' slopes: is there a bout-order",
             "        effect overall, regardless of group?",
-            "Slope difference — group B's slope minus group A's: does bout order matter",
+            "Slope difference - group B's slope minus group A's: does bout order matter",
             "        differently between the groups?  This is the interaction test.",
-            "SE — standard error of β(t).",
-            "Pointwise 95% CI — the range for β at a single time point considered alone.",
-            "Simultaneous 95% band — a wider band that holds for the whole curve at once,",
+            "SE - standard error of β(t).",
+            "Pointwise 95% CI - the range for β at a single time point considered alone.",
+            "Simultaneous 95% band - a wider band that holds for the whole curve at once,",
             "        correcting for testing every time point; a window is significant",
             "        where this band excludes 0.",
-            "c* — the multiplier that sets the simultaneous band width (1.96 = pointwise).",
-            "z-score — the photometry signal in standard deviations from baseline.",
-            "SEM — standard error of the mean across animals.",
+            "c* - the multiplier that sets the simultaneous band width (1.96 = pointwise).",
+            "z-score - the photometry signal in standard deviations from baseline.",
+            "SEM - standard error of the mean across animals.",
             "", "HOW THE SHEETS FIT TOGETHER",
             "1. Input_bouts is the raw material: every bout that went into the model.",
             "2. Model_terms is the statistics: what the model estimated from those bouts,",
@@ -45275,19 +45335,19 @@ cat("OK\n")
             "   traces: the data at bout 1, 2, 3 ... next to what the fitted line predicts.",
             "",
             "COLUMNS IN Model_terms",
-            "Term       — which quantity this row block describes (see its name).",
-            "Tested     — 1 = the term this analysis tests; 0 = shown to help read it.",
-            "Time_s     — seconds from bout onset.",
-            "beta       — the estimate at that time (z, or z per bout for a slope).",
-            "SE         — its standard error.",
-            "CI_lo/hi   — 95% confidence interval at that one time point.",
-            "simCI_lo/hi — 95% band for the whole curve at once (corrects for testing",
+            "Term       - which quantity this row block describes (see its name).",
+            "Tested     - 1 = the term this analysis tests; 0 = shown to help read it.",
+            "Time_s     - seconds from bout onset.",
+            "beta       - the estimate at that time (z, or z per bout for a slope).",
+            "SE         - its standard error.",
+            "CI_lo/hi   - 95% confidence interval at that one time point.",
+            "simCI_lo/hi - 95% band for the whole curve at once (corrects for testing",
             "             every time point); use this one to call a window significant.",
-            "sig_pointwise / sig_simultaneous — 1 where the matching interval excludes 0.",
+            "sig_pointwise / sig_simultaneous - 1 where the matching interval excludes 0.",
             "",
             "COLUMNS IN THE PER-BOUT SHEETS",
-            "Group, Bout_number — which bouts the row averages; Stat = mean or sem;",
-            "n_animals — animals with that bout number; the numbered columns are",
+            "Group, Bout_number - which bouts the row averages; Stat = mean or sem;",
+            "n_animals - animals with that bout number; the numbered columns are",
             "seconds from onset."]
         sheets['README'] = pd.DataFrame({'FLMM time-course export': readme})
         sheets['Model_terms'] = pd.concat(eff, ignore_index=True)
@@ -45389,7 +45449,7 @@ cat("OK\n")
                 return
             fig = self._build_flmm_peak_effect_figure(table, key)
         except Exception as e:
-            self.log_message(f"FLMM report: peak-effect panel '{key}' failed — {e}")
+            self.log_message(f"FLMM report: peak-effect panel '{key}' failed: {e}")
             return
         yield (f"{key}: per-subject peak effect vs {table['ref_level']}", fig,
                self._flmm_peak_effect_lines(table, key, panel))
@@ -45398,7 +45458,7 @@ cat("OK\n")
         """Text summary of the per-subject peak-effect table for the PDF report."""
         ref = table['ref_level']
         lines = [
-            f"Per-subject peak effect — {channel}",
+            f"Per-subject peak effect: {channel}",
             "",
             f"Control / reference level : {ref}",
             "Each animal's signed z at the group peak time inside that level's",
@@ -45436,10 +45496,10 @@ cat("OK\n")
         if d.get('make_fig') and d.get('order'):
             for key in d['order']:
                 if kind == 'pairwise_within':
-                    cap = f"Within channel — {key}"
+                    cap = f"Within channel: {key}"
                 elif kind == 'pairwise_across':
                     cap = ("Same behavior across channels" if key == '(all behaviors)'
-                           else f"Across channels — behavior: {key}")
+                           else f"Across channels, behavior: {key}")
                 else:
                     # factor / time-course: one panel per channel
                     panel = (d.get('panels') or {}).get(key, {})
@@ -45447,7 +45507,7 @@ cat("OK\n")
                            else f"{key}: {panel.get('behavior', d.get('behavior', ''))}")
                 yield cap, d['make_fig'](key), d['make_lines'](key)
                 # Every panel that carries per-subject traces also contributes its
-                # peak-effect ("max difference") figure — the readers always want it.
+                # peak-effect ("max difference") figure: the readers always want it.
                 for pcap, pfig, plines in self._flmm_peak_effect_report_panel(d, key):
                     yield pcap, pfig, plines
         else:
@@ -45474,7 +45534,7 @@ cat("OK\n")
         with PdfPages(path) as pdf:
             # ---- Title / methods page ----
             head = [
-                "TRACY — FLMM Time-Course Statistics", "",
+                "TRACY: FLMM Time-Course Statistics", "",
                 f"Analysis     : {pretty}",
                 f"Panels       : {len(panels)}",
                 f"Generated    : {datetime.datetime.now():%Y-%m-%d %H:%M}",
@@ -45490,7 +45550,7 @@ cat("OK\n")
                         pdf.savefig(fig, bbox_inches='tight')
                     except Exception as e:
                         self.log_message(f"FLMM report: could not add figure "
-                                         f"'{cap}' — {e}")
+                                         f"'{cap}': {e}")
                 self._pdf_text_page(pdf, [cap, "=" * len(cap), ""] + list(lines),
                                     title_lines=2)
         return len(panels)
@@ -46204,7 +46264,7 @@ cat("OK\n")
 
         # Data-driven starting guess: for a mono-exponential, log(y - c) falls
         # linearly with slope -1/tau.  The previous fixed guess (len/3) scaled
-        # with the window, so the optimiser settled in a different local minimum
+        # with the window, so the optimizer settled in a different local minimum
         # for every window length and tau tracked the window, not the signal.
         y = decay - c0
         mask = y > 0.2 * amp
@@ -46674,7 +46734,7 @@ cat("OK\n")
             if use_channel is not None:
                 channels = [use_channel]
             else:
-                # Pooled across subjects: honour exclusions per channel slot so the
+                # Pooled across subjects: honor exclusions per channel slot so the
                 # pooled n agrees with the other multi views.  The single-subject
                 # caller names its channel explicitly and stays unfiltered by design.
                 apply_excl = self.use_exclusions_viz.get()
@@ -46771,7 +46831,7 @@ cat("OK\n")
                 ax.set_axis_off()
                 continue
             self._plot_length_binned_axis(ax, bins, per_bin,
-                                          f'{subject} — {behavior}  |  {ch}  (by bout length)')
+                                          f'{subject}: {behavior}  |  {ch}  (by bout length)')
         fig.tight_layout()
 
     def plot_bout_length_bins_multi(self, fig, subjects):
@@ -46800,7 +46860,7 @@ cat("OK\n")
             return
         self._plot_length_binned_axis(
             ax, bins, per_bin,
-            f'{len(subjects)} subjects — {behavior}  (by bout length)')
+            f'{len(subjects)} subjects: {behavior}  (by bout length)')
         fig.tight_layout()
 
     def plot_bout_length_bars(self):
@@ -47026,7 +47086,7 @@ cat("OK\n")
         """Bin one behavior x channel's bouts into groups of ``bin_size`` and
         return the per-subject / per-group means the progression plot draws.
 
-        Shared by the on-screen plot and the all-behaviours export so both apply
+        Shared by the on-screen plot and the all-behaviors export so both apply
         the same window, max-bouts cap and realignment. Returns ``None`` when no
         subject has usable bouts for this combination.
         """
@@ -47363,7 +47423,7 @@ cat("OK\n")
                 pass
             return f"{v:.6f}"
 
-        # ── Normalise each data type onto a common (subject × x-axis) shape ──
+        # ── Normalize each data type onto a common (subject × x-axis) shape ──
         #   subject_data[subject][x_key][metric] = value (per-subject mean)
         if data_type == 'across_bouts':
             x_keys   = data['bout_numbers']
@@ -47389,7 +47449,7 @@ cat("OK\n")
             x_axis_name      = "bout-length bin"
             title_line = f"Response by bout length  |  {behavior}  |  {channel}"
         else:
-            messagebox.showinfo("No Data", "No recognised bout order data to export.")
+            messagebox.showinfo("No Data", "No recognized bout order data to export.")
             return
 
         has_groups = bool(subject_to_group)
@@ -47400,7 +47460,7 @@ cat("OK\n")
             return subject_data.get(subj, {}).get(xk, {}).get(m, None)
 
         lines = []
-        # Metadata header — kept above the tables, separated by a blank line so it
+        # Metadata header: kept above the tables, separated by a blank line so it
         # never lands inside a block you paste into Excel/Prism.
         lines.append(f"# {title_line}")
         lines.append(f"# Generated {datetime.datetime.now():%Y-%m-%d %H:%M}  |  "
@@ -47515,9 +47575,9 @@ cat("OK\n")
     def export_binned_progression_all(self):
         """Export the binned bout progression for ALL behaviors into one workbook.
 
-        Applies the current Bout Analysis settings — selected subjects/groups,
+        Applies the current Bout Analysis settings (selected subjects/groups,
         bouts-per-bin, max-bouts limit, analysis window, chosen metrics and
-        exclusions — to every behavior x channel that has bouts, so the numbers
+        exclusions) to every behavior x channel that has bouts, so the numbers
         match what "Plot > Binned Progression" would draw for each in turn.
         """
         import datetime
@@ -48418,7 +48478,7 @@ cat("OK\n")
                 results_lines.append(f"  One-way ANOVA: F={f_stat:.4f}, p={p_anova:.4f}, η²={eta_sq:.4f}")
                 
                 if p_anova < 0.05:
-                    results_lines.append(f"    ** Significant at p<0.05 — running post-hoc tests **")
+                    results_lines.append(f"    ** Significant at p<0.05, running post-hoc tests **")
                     # Tukey HSD post-hoc
                     try:
                         all_vals = np.concatenate(group_arrays)
@@ -48446,7 +48506,7 @@ cat("OK\n")
                     results_lines.append(f"  Kruskal-Wallis: H={h_stat:.4f}, p={p_kruskal:.4f}, ε²={epsilon_sq:.4f}")
                     
                     if p_kruskal < 0.05:
-                        results_lines.append(f"    ** Significant at p<0.05 — running post-hoc tests **")
+                        results_lines.append(f"    ** Significant at p<0.05, running post-hoc tests **")
                         # Dunn's post-hoc (pairwise Mann-Whitney with Bonferroni correction)
                         results_lines.append(f"  Pairwise Mann-Whitney with Bonferroni correction:")
                         n_comparisons = num_groups * (num_groups - 1) / 2
@@ -48938,7 +48998,7 @@ cat("OK\n")
         are read through ``_kept_indices`` because a bout dropped at the
         recording edge (or rejected on this channel) leaves the trace list
         shorter than onset_frames/durations; pairing by trace index would hand
-        every later bout its neighbour's length.  Length is blank for
+        every later bout its neighbor's length.  Length is blank for
         start-only boutframes, which carry no end to measure.
         """
         has_group = bool(subject_to_group)
@@ -49041,9 +49101,9 @@ cat("OK\n")
     def export_bout_metrics_all(self):
         """Export bout metrics for ALL behaviors (and channels) into one workbook.
 
-        Applies the current Bout Analysis settings — selected subjects/groups,
+        Applies the current Bout Analysis settings (selected subjects/groups,
         chosen metrics, analysis window, max-bouts limit, within-subject
-        averaging, and exclusions — to every behavior, writing one sheet per
+        averaging, and exclusions) to every behavior, writing one sheet per
         behavior x channel that has data plus an 'Export Settings' sheet.
 
         Unlike "Metrics Table (Excel)", this does not require pre-calculating
@@ -49223,7 +49283,7 @@ cat("OK\n")
             defaultextension=".xlsx",
             filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
             initialfile="all_behaviors_bout_metrics.xlsx",
-            title="Export All Behaviors — Bout Metrics")
+            title="Export All Behaviors: Bout Metrics")
         if not filename:
             return
 
@@ -49299,7 +49359,7 @@ cat("OK\n")
             mode_str = 'averaged within subject' if average_ws else 'individual bouts'
             self.log_message(
                 f"Exported all behaviors ({mode_str}) to {os.path.basename(filename)} "
-                f"— {len(to_write)} sheets")
+                f"({len(to_write)} sheets)")
             messagebox.showinfo(
                 "Export Complete",
                 f"Exported {len(to_write)} behavior x channel sheets ({mode_str}):\n"
@@ -49495,7 +49555,7 @@ cat("OK\n")
         a different account), git aborts with 'detected dubious ownership' and
         the in-app updater can't fetch or pull. If we hit that, add repo_dir to
         the user's GLOBAL git config safe.directory list (the only place git
-        honours it — it ignores the value from -c / repo-local config). Returns
+        honors it; it ignores the value from -c / repo-local config). Returns
         True if git can read the repo afterwards.
         """
         import subprocess
@@ -49516,7 +49576,7 @@ cat("OK\n")
         if ok:
             return True
         if 'dubious ownership' not in err.lower():
-            return True  # a different problem — don't touch global config
+            return True  # a different problem; don't touch global config
 
         def _add(val):
             try:
@@ -49688,7 +49748,7 @@ cat("OK\n")
             self._welcome_badge_blink_job = None
             return
         self._welcome_badge_blink_on = not self._welcome_badge_blink_on
-        # Blink by fading the text to the background colour and back.
+        # Blink by fading the text to the background color and back.
         color = '#e23b3b' if self._welcome_badge_blink_on else self.colors['bg_dark']
         badge.config(fg=color)
         self._welcome_badge_blink_job = self.root.after(
@@ -49767,7 +49827,7 @@ cat("OK\n")
                 # update applies without the user needing the command line.
                 if rc != 0:
                     self.system_text.insert(
-                        'end', "\nUpdate blocked by local changes — setting them "
+                        'end', "\nUpdate blocked by local changes, setting them "
                                "aside (recoverable git stash) and retrying...\n")
                     self.system_text.see('end')
                     self.root.update()
@@ -49782,7 +49842,7 @@ cat("OK\n")
                 # the stash above, so move the branch onto the fetched commit.
                 if rc != 0:
                     self.system_text.insert(
-                        'end', "\nLocal copy has diverged from GitHub — resetting "
+                        'end', "\nLocal copy has diverged from GitHub, resetting "
                                "it to the downloaded version...\n")
                     self.system_text.see('end')
                     self.root.update()
@@ -49814,7 +49874,7 @@ cat("OK\n")
                         "Update Installed",
                         "Update installed successfully.\n\n"
                         "Some local changes in the app folder were set aside into a "
-                        "git stash so the update could apply — they are NOT lost. "
+                        "git stash so the update could apply; they are NOT lost. "
                         "Run 'git stash pop' in the app folder to restore them.\n\n"
                         "The application will now restart.")
                 self.root.after(2000, self._restart_app)
@@ -49873,7 +49933,7 @@ cat("OK\n")
                 DETACHED_PROCESS = 0x00000008
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
                 # A detached process has no console, so give it null std
-                # handles — otherwise the relaunched app can crash the first
+                # handles; otherwise the relaunched app can crash the first
                 # time it writes to stdout/stderr.
                 subprocess.Popen(
                     args,
@@ -50335,7 +50395,7 @@ cat("OK\n")
 
         worker_fn receives a queue.Queue and puts tuples:
             ('status',   text)   – main stage line
-            ('detail',   text)   – secondary detail line (grey)
+            ('detail',   text)   – secondary detail line (gray)
             ('progress', frac)   – 0..1; switches the bar to determinate + shows %
             ('log',      text)   – forwarded to self.log_message (main thread)
         If ``cancelable`` the window shows a Cancel button and exposes
@@ -50389,7 +50449,7 @@ cat("OK\n")
             def _do_cancel():
                 cancel_event.set()
                 cancel_btn.configure(state='disabled')
-                status_var.set("Cancelling…")
+                status_var.set("Canceling…")
                 detail_var.set("finishing the current step, then stopping")
             cancel_btn = ttk.Button(foot, text="Cancel", command=_do_cancel)
             cancel_btn.pack(side='right')
@@ -50455,7 +50515,7 @@ cat("OK\n")
                         prog_win.destroy()
                         h = _result_holder[0]
                         if h is not None and h[0] == 'cancel':
-                            self.log_message(f"{title}: cancelled by user.")
+                            self.log_message(f"{title}: canceled by user.")
                         elif h is not None:
                             exc, tb = h
                             self.log_message(f"ERROR in analysis: {exc}\n{tb}")
@@ -50499,8 +50559,8 @@ cat("OK\n")
             messagebox.showwarning(
                 "No Data",
                 "No processed data found.\n"
-                "Process your subject files first (main Run Analysis button on "
-                "the Input Setup tab), then return here.")
+                "Process your subject files first ('Run Processing' on "
+                "the Processing tab), then return here.")
             return
 
         selected_items, group_mode = self._conn_selection()
@@ -50546,7 +50606,7 @@ cat("OK\n")
                 f"Make sure 'Process Green (470 nm)' was checked when the "
                 f"data was processed.\n\n"
                 f"If you have a single-fiber recording, please select the "
-                f"same channel for both (which is not allowed) — you need "
+                f"same channel for both (which is not allowed); you need "
                 f"two distinct signal sources for coherence analysis.")
             return
 
@@ -50851,7 +50911,7 @@ cat("OK\n")
     BEH_KIN_FIELDS = ('elapsed', 'velocity', 'dist', 'xc', 'yc')
 
     # Header a boutframes sheet uses to say which session each row was scored
-    # in.  Anything here is a tag, never a behaviour.  See
+    # in.  Anything here is a tag, never a behavior.  See
     # resolve_boutframes_sheet().
     BOUTFRAMES_SESSION_COLUMNS = ('session', 'day')
 
@@ -50948,7 +51008,7 @@ cat("OK\n")
         Multi-wavelength recordings interleave one green and one red sample per
         cycle, so the 470 and 570 deinterleaved matrices are row-aligned by cycle
         index.  The single-wavelength "primary" arrays (data/dff/corrected/zscore)
-        feed the behaviour-synced pipeline (bouts, zone/kinematics), so each
+        feed the behavior-synced pipeline (bouts, zone/kinematics), so each
         channel must carry its OWN wavelength here instead of all-470.
 
         ``base_key`` is one of data/dff/corrected/zscore.  'data' and 'dff' hold
@@ -51019,7 +51079,7 @@ cat("OK\n")
         Every wavelength matrix holds ALL photometry columns; a channel's real
         signal lives in the matrix matching its G/R designation (G→470nm,
         R→570nm) at column ``2 + position``.  The position is the channel's
-        index in the per-subject channel ordering — NOT the digit in its name
+        index in the per-subject channel ordering, NOT the digit in its name
         (e.g. 'R4' may be the 3rd column).  This resolves any number of
         channels with arbitrary region indices.
         """
@@ -51203,7 +51263,7 @@ cat("OK\n")
                                   'decision_probability').pack(
             fill='x', pady=(self.ui_px(6), 0))
 
-        # Initialise to the default mode
+        # Initialize to the default mode
         self._dec_prob_toggle_mode()
 
         # ── Settings ─────────────────────────────────────────────────────────
@@ -51452,7 +51512,7 @@ cat("OK\n")
     # ── Core computation ──────────────────────────────────────────────────────
 
     def _dec_prob_zone_codes(self, beh_synced):
-        """Vectorised zone classification for every row of ``beh_synced``.
+        """Vectorized zone classification for every row of ``beh_synced``.
 
         Returns ``(codes, index)``: ``codes[i]`` is the position of the frame's
         zone in ``self.zones`` and -1 marks a frame outside every zone or with a
@@ -51488,7 +51548,7 @@ cat("OK\n")
         so a dataset that mixes 20 Hz and 30 Hz recordings still scans the same
         number of seconds ahead for every animal.  The signal column is resolved
         from the subject's own channel designation rather than assumed, so a
-        one-channel subject labelled G1 reads its real trace instead of the
+        one-channel subject labeled G1 reads its real trace instead of the
         column that would hold a second channel.
         """
         data = self.processed_data.get(subject)
@@ -51563,8 +51623,8 @@ cat("OK\n")
         than silently dropped.
 
         Returns:
-            bin_centers, mean_prob, sem_prob, per_subject_probs, n_frames
-            — mean/SEM are NaN for bins no subject could fill.
+            bin_centers, mean_prob, sem_prob, per_subject_probs, n_frames;
+            mean/SEM are NaN for bins no subject could fill.
         """
         bin_edges   = np.asarray(bin_edges, dtype=float)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -51697,7 +51757,7 @@ cat("OK\n")
         furthest from the decision zone's middle), how far that was, where the
         animal went next, and for the same-place control the frames at which a
         *further-going* excursion of the same animal passed that distance on its
-        way out.  Returns None when the subject cannot be analysed.
+        way out.  Returns None when the subject cannot be analyzed.
         """
         data = self.processed_data.get(subject)
         if data is None or 'beh_synced' not in data or not data.get('has_position', False):
@@ -51843,7 +51903,7 @@ cat("OK\n")
 
         ``observed``: one value per subject; ``nulls``: subjects x shifts.  The
         null group mean is recomputed per shift over the same subjects, and the
-        p-value is two-sided about the null's own centre.
+        p-value is two-sided about the null's own center.
         """
         obs = np.asarray(observed, float)
         ok = np.isfinite(obs)
@@ -52150,7 +52210,7 @@ cat("OK\n")
             ax.legend(fontsize=7, framealpha=0.85)
         for ax in axs:
             ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
-        fig.suptitle(f"{mode} — {meta['channel']}", fontsize=12)
+        fig.suptitle(f"{mode}: {meta['channel']}", fontsize=12)
         fig.tight_layout()
         self.dec_prob_canvas_widget = self._embed_plot_canvas(fig, canvas_frame)
 
@@ -52602,13 +52662,13 @@ cat("OK\n")
                     continue
                 res = _anova2(data_bf, 'Group')
                 if res is None:
-                    lines.append(f"\n[{outcome.capitalize()}] \u2014 "
+                    lines.append(f"\n[{outcome.capitalize()}]: "
                                  f"insufficient data for ANOVA.\n")
                     continue
                 ph = _posthoc(res)
                 stats_out['anova_tables'].append(res)
                 stats_out['posthoc'][outcome] = ph
-                lines.append(f"\nTwo-Way ANOVA \u2014 {outcome.capitalize()} "
+                lines.append(f"\nTwo-Way ANOVA: {outcome.capitalize()} "
                              f"(Group \u00d7 Signal Bin,  N={res['N']})")
                 lines.append("  " + "\u2500" * 72)
                 lines.append("  Source                    SS          df   "
@@ -52642,7 +52702,7 @@ cat("OK\n")
                     ph = _posthoc(res)
                     stats_out['anova_tables'].append(res)
                     stats_out['posthoc']['explore_vs_retreat'] = ph
-                    lines.append(f"\nTwo-Way ANOVA \u2014 {gn}: "
+                    lines.append(f"\nTwo-Way ANOVA - {gn}: "
                                  f"Outcome \u00d7 Signal Bin  (N={res['N']})")
                     lines.append("  " + "\u2500" * 72)
                     lines.append("  Source                    SS          df   "
@@ -52662,11 +52722,11 @@ cat("OK\n")
                     else:
                         lines.append("  Post-hoc: no significant pairwise differences.")
                 else:
-                    lines.append(f"\n[{gn}] \u2014 insufficient data for ANOVA.\n")
+                    lines.append(f"\n[{gn}]: insufficient data for ANOVA.\n")
 
         if not lines:
             lines.append(
-                "\nNo ANOVA run \u2014 need \u22652 groups or both Explore+Retreat outcomes.\n"
+                "\nNo ANOVA run: need \u22652 groups or both Explore+Retreat outcomes.\n"
                 "Use Group mode with \u22652 groups, or enable both outcomes for a single group.")
         lines.append("")
         lines.append("* p<\u03b1   ** p<0.01   *** p<0.001   ns = not significant")
@@ -52715,7 +52775,7 @@ cat("OK\n")
                                          text="Statistics", padding=4)
             stats_outer.pack(fill='x', pady=(4, 0))
 
-        # ── Colour palettes ────────────────────────────────────────────────────
+        # ── Color palettes ────────────────────────────────────────────────────
         group_names = list(results.keys())
         n_groups    = max(len(group_names), 1)
         explore_colors = matplotlib.colormaps['tab10'](np.linspace(0.3, 0.7, n_groups))
@@ -52811,7 +52871,7 @@ cat("OK\n")
         ax.set_xlabel("dF/F (z-score)", fontsize=12)
         ax.set_ylabel("Probability", fontsize=12)
         ax.set_title(
-            f"Decision Probability \u2014 {channel} "
+            f"Decision Probability: {channel} "
             f"(look-ahead {lookahead_sec:.0f} s)", fontsize=12)
         ax.set_ylim(0, 1.05)
         ax.set_xlim(float(bin_edges[0]), float(bin_edges[-1]))
@@ -52983,7 +53043,7 @@ cat("OK\n")
     # Negative means the animal is slowing down; no heading is needed.
 
     # ================================================================== #
-    #  SIGNAL LINKAGE  —  peri-onset behavior/signal coupling analysis     #
+    #  SIGNAL LINKAGE  -  peri-onset behavior/signal coupling analysis     #
     # ================================================================== #
     #
     #  Quantifies how tightly a behavior's bout ONSET is coupled to a rapid
@@ -53005,7 +53065,7 @@ cat("OK\n")
     #                         "is it time-locked to onset or coincidental" test.
     #
     #  Verdict combines significance (permutation p) with consistency (r) so a
-    #  large-but-jittery population transient is not mislabelled as tight.
+    #  large-but-jittery population transient is not mislabeled as tight.
 
     SIG_LINK_COLORS = {
         'Tightly linked': '#2f9e44',
@@ -53280,7 +53340,7 @@ cat("OK\n")
             return
 
         # Exclusions are applied above, so the pool that reaches the facet is
-        # already the analysable one and no series can be built from subjects
+        # already the analyzable one and no series can be built from subjects
         # this channel excludes.
         series = self._sig_link_series(subs)
         series = [(label, members) for label, members in series if members]
@@ -53648,7 +53708,7 @@ cat("OK\n")
         """True when the facet column produced more than one series.
 
         The single-series case is the tab's whole history, so it keeps the
-        layout it had: no Series column, no legend, verdict-coloured bars.
+        layout it had: no Series column, no legend, verdict-colored bars.
         """
         return len(res.get('series') or []) > 1
 
@@ -53689,7 +53749,7 @@ cat("OK\n")
             txt.insert('end', f"  • {m['behavior']}  ", m['verdict'])
             txt.insert('end',
                        f"(Δ{m['delta']:+.2f} z, peak {m['peak_rate']:+.2f} z/s "
-                       f"at {lat:+.2f}s — {lead}; r={m['reliability']:.2f}, "
+                       f"at {lat:+.2f}s, {lead}; r={m['reliability']:.2f}, "
                        f"{pstr})\n", 'metric')
 
         for label, panel in panels:
@@ -53810,7 +53870,7 @@ cat("OK\n")
         ncol = min(3, max(1, len(show)))
         nrow = int(np.ceil(len(show) / ncol))
 
-        # One colour per series, so a series keeps the same colour in the
+        # One color per series, so a series keeps the same color in the
         # summary bar and in every trace panel.
         _palette = plt.cm.tab10(np.linspace(0, 0.9, max(len(panels), 1)))
         series_colors = {label: _palette[i]
@@ -53821,7 +53881,7 @@ cat("OK\n")
         gs = fig.add_gridspec(nrow + 1, ncol, height_ratios=[1.25] + [1] * nrow)
 
         # ── Summary bar: Linkage Index across all behaviors ──────────────
-        # Single series keeps the verdict-coloured bar this tab always drew;
+        # Single series keeps the verdict-colored bar this tab always drew;
         # a split fans each behavior into one bar per series instead, because
         # comparing the series is the whole point of having split them.
         axb = fig.add_subplot(gs[0, :])
@@ -53925,7 +53985,7 @@ cat("OK\n")
                 ax.spines[sp].set_visible(False)
 
         fig.suptitle(
-            f"Signal Linkage — channel {res['channel']}   "
+            f"Signal Linkage: channel {res['channel']}   "
             f"(dashed = onset · dotted = dF/dt peak · shaded = response window)",
             fontsize=10)
         return fig
@@ -53979,7 +54039,7 @@ cat("OK\n")
             settings_title="Analysis Settings", help_key='kinematics')
 
         # ── Selection ──────────────────────────────────────────────────────
-        # BETA badge — this tab is new/experimental. Kept modest: at 26 pt it
+        # BETA badge; this tab is new/experimental. Kept modest: at 26 pt it
         # cost ~50 px of a control column that already overflows short screens.
         tk.Label(selection, text="BETA", font=('Segoe UI', 13, 'bold'),
                  fg='white', bg='#e67e22', padx=8, pady=1).pack(
@@ -54093,7 +54153,7 @@ cat("OK\n")
         note = cluster('note')
         ttk.Label(note,
                   text="Temporal bin averages frames before correlating, so each "
-                       "bin (not each frame) is one datapoint — avoids inflated n "
+                       "bin (not each frame) is one datapoint: avoids inflated n "
                        "/ spurious significance. Set 0 to disable. "
                        "(Movement-onset stays at frame resolution.)",
                   foreground='gray', font=('TkDefaultFont', 7), justify='left',
@@ -54271,7 +54331,7 @@ cat("OK\n")
         of.pack(fill='x', pady=(0, 8))
         ttk.Checkbutton(of, text="Show acceleration as magnitude |Δspeed/dt|",
                         variable=v_accel_abs).pack(anchor='w')
-        ttk.Label(of, text="Off (default): signed — negative means decelerating.\n"
+        ttk.Label(of, text="Off (default): signed; negative means decelerating.\n"
                            "(The accelerating-vs-decelerating plot always uses the sign.)",
                   foreground='gray', font=('TkDefaultFont', 8)).pack(anchor='w')
         ttk.Checkbutton(of, text="Leave never-visited locations blank in arena maps",
@@ -54532,7 +54592,7 @@ cat("OK\n")
         bin_frames = int(round(bin_s * fps))
         n = len(k['vel'])
         if bin_s <= 0 or bin_frames <= 1 or n // max(1, bin_frames) < 2:
-            return k  # binning disabled or not enough data — use frames as-is
+            return k  # binning disabled or not enough data; use frames as-is
         nb = n // bin_frames
 
         def _agg(a):
@@ -54771,7 +54831,7 @@ cat("OK\n")
         info = ""
         if m.sum() > 5:
             r, p = stats.pearsonr(y2[m], sig[m])
-            ax.set_title(f"{rec['subject']} — {lab} vs {ch_label}   (Pearson r={r:.3f}, p={p:.1e})")
+            ax.set_title(f"{rec['subject']}: {lab} vs {ch_label}   (Pearson r={r:.3f}, p={p:.1e})")
             info = f"{rec['subject']}: Pearson r = {r:.3f} (p={p:.1e}), n={int(m.sum())}"
         # Export table
         self.kin_last_table = pd.DataFrame({'time_s': t, field: y2, 'signal': sig})
@@ -54884,7 +54944,7 @@ cat("OK\n")
             if len(la) < 3:
                 note = f"(n={len(la)}, need ≥3)"
             elif np.std(la) == 0:
-                note = f"(n={len(la)}, no spread — all peaks identical)"
+                note = f"(n={len(la)}, no spread; all peaks identical)"
             else:
                 tval, pval = stats.ttest_1samp(la, 0.0)
                 stat_lines.append(
@@ -55069,7 +55129,7 @@ cat("OK\n")
         fig._kin_no_tight = True
         info = f"{len(df)} subject(s); lag-free coupling metrics"
         if warnings:
-            info += "  ·  ⚠ weak coupling — see plot"
+            info += "  ·  ⚠ weak coupling, see plot"
         return fig, info
 
     # ── Binned signal curves (velocity / acceleration / distance) ────────────
@@ -55653,7 +55713,7 @@ cat("OK\n")
                 if len(vals) < 5:
                     ax.text(0.5, 0.5, "Not enough data", ha='center', va='center',
                             transform=ax.transAxes, color='gray')
-                    ax.set_title(f"{row_label} — {xlabel.split(' (')[0]}")
+                    ax.set_title(f"{row_label}: {xlabel.split(' (')[0]}")
                     continue
                 col = colors[ri % len(colors)]
                 mu, sd = float(np.mean(vals)), float(np.std(vals))

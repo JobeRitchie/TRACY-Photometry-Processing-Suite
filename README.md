@@ -1,11 +1,11 @@
-# TRACY — Fiber Photometry Analysis Suite
+# TRACY: Fiber Photometry Analysis Suite
 
 A desktop application for processing and analyzing fiber photometry recordings,
 with optional behavior synchronization and a broad set of built-in analyses.
 Built with Python/Tkinter; everything runs locally in a single GUI.
 
-*Created by Jobe Ritchie — Kash Lab, University of North Carolina at Chapel Hill.*
-Version 1.35.0.
+*Created by Jobe Ritchie, Kash Lab, University of North Carolina at Chapel Hill.*
+Version 1.36.0.
 
 ## Getting Started
 - Install [Git](https://git-scm.com/install/windows)
@@ -25,16 +25,16 @@ Version 1.35.0.
 
 ## Features
 
-- **Project management** — organized projects with automatic save/load of
+- **Project management**: organized projects with automatic save/load of
   parameters, processed data, groups, exclusions, and zone definitions.
-- **Signal processing pipeline** — LED-state deinterleaving, photobleaching
+- **Signal processing pipeline**: LED-state deinterleaving, photobleaching
   correction (biexponential), dF/F, isosbestic motion correction, and z-scoring.
   Single-subject or whole-folder batch processing with configurable file naming.
-- **Behavior synchronization** — aligns photometry to tracking/timestamp data;
+- **Behavior synchronization**: aligns photometry to tracking/timestamp data;
   derives velocity, distance traveled, zone occupancy, and zone entries.
-- **Bout extraction & analysis** — onset-aligned traces per behavior, with
+- **Bout extraction & analysis**: onset-aligned traces per behavior, with
   summary statistics and histograms by subject or group.
-- **FLMM time-course statistics** — Functional Linear Mixed Model (FUI) analysis
+- **FLMM time-course statistics**: Functional Linear Mixed Model (FUI) analysis
   of the whole peri-event window: a per-timepoint mixed model (random intercept
   per subject) yields an effect trace β(t) with pointwise and
   multiple-comparison-corrected *simultaneous* confidence bands, so you can see
@@ -46,26 +46,26 @@ Version 1.35.0.
   menu lists recent results, which reopen without refitting after another plot
   has replaced them. Bout-order models plot the observed
   traces by bout number and report each group's own slope beside the tested
-  term; **Export ▾ → Time-Course Stats — workbook** saves every term, the
+  term; **Export ▾ → FLMM data export (Excel)…** saves every term, the
   per-bout input matrix, and observed vs model-predicted traces per bout number.
-- **Coherence / connectivity** — spectral coherence between channels (Morlet
+- **Coherence / connectivity**: spectral coherence between channels (Morlet
   wavelet or Welch): static, sliding, bout-epoch, and group comparisons.
-- **Spike analysis** — MAD-based detection of calcium transients with rate,
+- **Spike analysis**: MAD-based detection of calcium transients with rate,
   amplitude, and width metrics.
-- **Decision probability** — explore-vs-retreat probability binned by z-score.
-- **Signal integrity** — per-subject quality metrics (SNR, CV, isosbestic
+- **Decision probability**: explore-vs-retreat probability binned by z-score.
+- **Signal integrity**: per-subject quality metrics (SNR, CV, isosbestic
   correlation, artifacts, photobleaching) with an overall quality score.
-- **Visualization** — raw / dF/F / motion-corrected / z-scored traces, bout
+- **Visualization**: raw / dF/F / motion-corrected / z-scored traces, bout
   overlays, position heatmaps, and more, with content-aware figure sizing.
 
 
 ## Input Files
 
-- **`{SubjectID}FPData0.csv`** — photometry data (frame, timestamps, LED state,
+- **`{SubjectID}FPData0.csv`**: photometry data (frame, timestamps, LED state,
   1–4 channels). *Required.*
-- **`{SubjectID}ComputerTS0.csv`** or **`{SubjectID}AnimalPosition0.csv`** —
+- **`{SubjectID}ComputerTS0.csv`** or **`{SubjectID}AnimalPosition0.csv`**:
   timestamps and optional X/Y position. *Optional* (enables behavior sync).
-- **`boutframes.xlsx`** — one worksheet per subject; columns are behaviors,
+- **`boutframes.xlsx`**: one worksheet per subject; columns are behaviors,
   values are onset frame numbers. *Optional* (enables bout-aligned analysis).
 
 File-name patterns and suffixes are configurable on the Processing tab, so
@@ -74,7 +74,7 @@ existing naming schemes do not need to be renamed.
 ### Repeated sessions
 
 When the same animal is recorded on several days, encode the session in the
-subject ID — `CAB01_AlcoholFPData.csv`, `CAB01_FentanylFPData.csv`. TRACY then
+subject ID: `CAB01_AlcoholFPData.csv`, `CAB01_FentanylFPData.csv`. TRACY then
 splits each ID into animal + session (pattern chosen on the Factors tab), offers
 **Session** and **Animal** as factors on every tab, and keys mixed-model random
 intercepts on the *animal* so repeated days are not treated as independent
@@ -105,8 +105,8 @@ python tools/combine_sessions.py PARENT --sessions Alcohol Fentanyl WaterSucrose
 Every graphing tab has a **Plot by: Subject / Group** switch. Both modes list
 subjects; what differs is what becomes a plotted series.
 
-- **Subject** — one series per selected subject.
-- **Group** — the list is the *pool* of subjects, and the **Split series by**
+- **Subject**: one series per selected subject.
+- **Group**: the list is the *pool* of subjects, and the **Split series by**
   column underneath decides how that pool divides. Left alone it splits on the
   Group factor and combines the rest, which is one series per group. Set
   `Session` to *split* instead and you get one series per session; set both and
@@ -115,7 +115,7 @@ subjects; what differs is what becomes a plotted series.
 
 Deselecting a subject in Group mode drops it from whichever series it belongs
 to. Nothing on the Factors tab changes, so it is a plot-level exclusion, not an
-edit to the design — reselect it and it comes back.
+edit to the design; reselect it and it comes back.
 
 ## Optional: exact FLMM via R / fastFMM
 
