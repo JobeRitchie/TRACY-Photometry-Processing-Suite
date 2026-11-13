@@ -117,3 +117,16 @@ def test_a_project_already_in_seconds_is_left_alone():
     app.params['maxlengthseconds'] = 45.0
     app._migrate_maxlength_to_seconds({'maxlengthseconds': 45.0, 'maxlengthframe': 3000})
     assert app.params['maxlengthseconds'] == 45.0
+
+
+@pytest.mark.parametrize("row_dt,n_rows", RATES)
+def test_cap_can_count_from_the_first_raw_row(tmp_path, row_dt, n_rows):
+    """Off: 20 s after the precut.  On: 20 s from row 0, so the precut comes
+    out of the 20 s and the recording ends at the cap on the video's clock."""
+    path = _raw_csv(tmp_path, row_dt, n_rows)
+    app = _app(20.0)
+    app.params['maxlength_from_first_raw_row'] = True
+    data = app.process_fp_data("s", path)
+    assert abs(_analysed_seconds(data) - (20.0 - 100 * row_dt)) < 0.5
+    default = _app(20.0).process_fp_data("s", path)
+    assert _analysed_seconds(default) > _analysed_seconds(data)

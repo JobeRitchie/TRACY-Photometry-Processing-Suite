@@ -40,7 +40,7 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.33.0"
+APP_VERSION = "1.34.0"
 APP_VERSION_DATE = "November 12, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
@@ -613,10 +613,13 @@ PARAM_GROUPS = [
 
     ("Signal Processing", [
         ("Recording bounds", "Which part of each recording is analysed.", [
-            ('precut', "Precut (samples)",
-             "Samples trimmed from the start of the recording"),
+            ('precut', "Precut (raw rows)",
+             "Raw file rows trimmed from the start; rows / LED states = samples per channel (100 rows at 2 LEDs = 50 samples, 1.7 s at 30 Hz)"),
             ('maxlengthseconds', "Max recording length (s)",
              "0 = analyse the whole recording"),
+            ('maxlength_from_first_raw_row', "Count max length from first raw row",
+             "True / False; False counts from the first row kept after the precut "
+             "or session start, True from the first row of the file (video frame 0)"),
             ('session_bounds_enabled', "Apply per-subject session bounds",
              "True / False; bounds are set under Processing > Session Start/End"),
         ]),
@@ -2476,6 +2479,9 @@ class FPAnalysisGUI:
             # across rigs would be trimmed to different lengths.  0 = no cap,
             # which is what the old frame cap amounted to in practice.
             'maxlengthseconds': 0.0,
+            # False: the cap counts from the first row kept (after the precut
+            # or session start).  True: from the first raw row (video frame 0).
+            'maxlength_from_first_raw_row': False,
             # Bout Analysis metric window, in SECONDS relative to the bout onset
             # (or the bout end, in offset style).  Negative = before, positive =
             # after.  In seconds for the same reason the bout window above is: a
@@ -2696,7 +2702,7 @@ class FPAnalysisGUI:
         self.use_exclusions_spike = tk.BooleanVar(value=False)
         self.use_exclusions_bout = tk.BooleanVar(value=False)
         self.use_exclusions_conn = tk.BooleanVar(value=False)
-        self.use_exclusions_dec_prob = tk.BooleanVar(value=False)
+        self.use_exclusions_dec_prob = tk.BooleanVar(value=True)
         self.use_exclusions_kin = tk.BooleanVar(value=False)
         self.use_exclusions_siglink = tk.BooleanVar(value=False)
         # Named once so saving, loading and resetting cannot drift apart as
@@ -10894,9 +10900,17 @@ class FPAnalysisGUI:
         el = np.asarray(beh[:, kb], dtype=float)
         ok = np.flatnonzero(np.isfinite(el))
         if len(ok) > 10:
-            span_s = (float(el[ok[-1]]) - float(el[ok[0]])) * 60.0   # elapsed is minutes
-            if span_s > 0:
-                return (ok[-1] - ok[0]) / span_s
+            # Measure between the first and last rows where the clock moves.
+            # In projects processed before the sync fix the elapsed time is
+            # frozen across every row the recording does not cover; counting
+            # those rows against the recorded span read a 30 Hz camera as
+            # anything up to 87 Hz.
+            moving = np.flatnonzero(np.diff(el[ok]) != 0)
+            if len(moving):
+                lo, hi = ok[moving[0]], ok[moving[-1] + 1]
+                span_s = (float(el[hi]) - float(el[lo])) * 60.0   # elapsed is minutes
+                if span_s > 0 and hi > lo:
+                    return (hi - lo) / span_s
         return fallback
 
     def _entry_frames_to_signal_index(self, subject, data, frames, log=None):
@@ -13153,6 +13167,14 @@ class FPAnalysisGUI:
                     corr_data = result.get('rolling_correlation', {})
                     n_points = len(corr_data.get('times', []))
                     ws.append([label, 'Rolling Correlation', '', f"{result['mean_correlation']:.4f}", n_points])
+
+                # Group runs keep one value per member rather than the keys above.
+                for subj, v in (result.get('static_coherence_by_subject') or {}).items():
+                    ws.append([f"{label} / {subj}", 'Static Coherence', f"{v:.4f}", '', ''])
+                for subj, v in (result.get('rolling_correlation_by_subject') or {}).items():
+                    n_points = len(((result.get('rolling_timeseries_by_subject') or {})
+                                    .get(subj) or {}).get('times', []))
+                    ws.append([f"{label} / {subj}", 'Rolling Correlation', '', f"{v:.4f}", n_points])
             
             # Auto-adjust columns
             for col in ws.columns:
@@ -13202,6 +13224,9 @@ class FPAnalysisGUI:
                         corr_data = result['rolling_correlation']
                         for t, r in zip(corr_data['times'], corr_data['r']):
                             writer.writerow([label, 'Correlation', f"{t:.2f}", f"{r:.4f}"])
+                    for subj, ts in (result.get('rolling_timeseries_by_subject') or {}).items():
+                        for t, r in zip(ts['times'], ts['r']):
+                            writer.writerow([f"{label} / {subj}", 'Correlation', f"{t:.2f}", f"{r:.4f}"])
             
             messagebox.showinfo("Success", f"Exported to {filepath}")
             self.log_message(f"Connectivity time-series exported to {filepath}")
@@ -13238,6 +13263,9 @@ class FPAnalysisGUI:
                         coh_data = result['static_coherence']
                         for freq, coh in zip(coh_data['freqs'], coh_data['coh']):
                             writer.writerow([label, f"{freq:.3f}", f"{coh:.4f}"])
+                    for subj, sp in (result.get('spectral_traces_by_subject') or {}).items():
+                        for freq, coh in zip(sp['freqs'], sp['coh']):
+                            writer.writerow([f"{label} / {subj}", f"{freq:.3f}", f"{coh:.4f}"])
             
             messagebox.showinfo("Success", f"Exported to {filepath}")
             self.log_message(f"Connectivity frequency data exported to {filepath}")
@@ -14330,8 +14358,11 @@ class FPAnalysisGUI:
             for group_name in selected_items:
                 group_members = self._series_members(group_name)
                 for member in group_members:
-                    subject_to_group[member] = group_name
+                    subject_to_group[member] = self._join_group_labels(
+                        subject_to_group.get(member), group_name)
                 subjects_to_analyze.extend(group_members)
+            # A subject in two selected groups is analysed once, not twice.
+            subjects_to_analyze = list(dict.fromkeys(subjects_to_analyze))
 
         if not subjects_to_analyze:
             messagebox.showinfo("No Data", "No subjects found for analysis")
@@ -14578,8 +14609,8 @@ class FPAnalysisGUI:
             
             # Write headers
             headers = ['Subject', 'Group', 'Channel', 'Total Spikes', 'Spike Rate (per min)', 
-                      'Mean Amplitude (Z-score)', 'Mean Width (frames)', 'Mean Width (ms)',
-                      'Total Duration (min)']
+                      'Mean Amplitude (detection signal units)', 'Mean Width (frames)',
+                      'Mean Width (ms)', 'Total Duration (min)', 'Detection Signal']
             ws.append(headers)
             
             # Write data - respecting exclusions, channel selection AND the
@@ -14618,7 +14649,9 @@ class FPAnalysisGUI:
                         round(channel_data['mean_amplitude'], 4) if not np.isnan(channel_data['mean_amplitude']) else "N/A",
                         round(channel_data['mean_width'], 2) if not np.isnan(channel_data['mean_width']) else "N/A",
                         round(mean_width_ms, 2) if not np.isnan(mean_width_ms) else "N/A",
-                        round(duration_min, 2) if not np.isnan(duration_min) else "N/A"
+                        round(duration_min, 2) if not np.isnan(duration_min) else "N/A",
+                        self.SPIKE_SIGNAL_KIND_LABELS.get(
+                            channel_data.get('signal_kind'), 'not recorded (re-run analysis)')
                     ]
                     ws.append(row)
             
@@ -16700,6 +16733,51 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • Fix — Analyses that pair position with photometry no longer score
+    rows the photometry never recorded. In projects processed before the
+    sync fix, every behavior row after the recording ended carried one
+    repeated sample, so Zone Averages, Distance from Center, Out/Back,
+    Position Heatmaps, Kinematics, Decision Probability and the
+    Behavioral Data metrics averaged invented signal (zone means moved by
+    up to 1 z where the camera long outran the photometry). Stored
+    averages are rebuilt on first use; no reprocessing needed.
+  • Fix — Max recording length now cuts the behavior tracking at the same
+    point as the photometry (it used to trim the photometry only). Takes
+    effect when a subject is reprocessed.
+  • New — Edit Parameters > Recording bounds > "Count max length from
+    first raw row". Off (default): the cap counts from the first row kept
+    after the precut or session start. On: from the first row of the
+    file (video frame 0), as projects made with the old frame cap were.
+  • New — Decision Probability event outputs: "Explore vs avoid
+    (center)", "Signal vs P(explore)" and "Distal turn-back", scored one
+    row per decision with a circular-shift null, plus an Excel export
+    (center decisions, excursions, subject summary, group tests).
+  • Fix — Transient rate by zone: time in zone was measured against an
+    inflated row rate and included unrecorded video, so rates were off by
+    up to 2x.
+  • Fix — Bout AUC in the metrics table, its exports and First vs Last is
+    now in z·s (it was z·samples, about 30x larger) and labelled so.
+  • Fix — Connectivity "Mean Correlation" is the signed mean r; it was
+    the mean of |r|, which showed anticorrelated channels as correlated.
+    Group-mode summary, time-series and frequency exports are no longer
+    empty.
+  • Fix — Behavioral Data: zone visits are debounced and tracking gaps
+    bridged before time, entries and decisions are counted; arm entries
+    are counted per category; percentages are of tracked time; new
+    Analyzed_Duration_sec and Percent_Tracked columns; time-bin export
+    columns are in time order.
+  • Fix — Exports and labels: "Distance from Center (Euclidean)" exports
+    the Euclidean table (it wrote X and Y); the spike summary names the
+    signal its amplitudes are in instead of calling them z-scores; the
+    kinematics "xcorr_peak_r" is the strongest correlation of either
+    sign; a subject in two selected groups is labelled with both; the
+    averaged bout-metrics export no longer applies a bout range twice;
+    Kinematics and Position Heatmap read the right column for channels
+    past the second; Precut is labelled in raw rows, which is what it
+    counts.
+
+Version 1.33.0  •  November 12, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • New — Distance from Center plots take a user-defined distance bin.
     Visualization > "Distance bin (cm)": type 5 for 0-5, 5-10, ... cm bins
@@ -22162,6 +22240,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             'method': 'mirror_fdr',
         }
 
+    SPIKE_SIGNAL_KIND_LABELS = {'corrected': 'motion-corrected dF/F',
+                                'dff': 'dF/F', 'zscore': 'z-score'}
+
     def analyze_spikes_for_subject(self, subject_id, global_mad_g0=None, global_mad_g1=None,
                                    global_mads=None, use_exclusions=None):
         """Perform spike analysis for a specific subject using the dynamic channel system.
@@ -22225,6 +22306,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
             g_mad = global_mads.get(ch_name)
             results[ch_name] = self.detect_spikes(signal, fps, global_mad=g_mad)
+            # Which trace the amplitudes are in the units of.
+            results[ch_name]['signal_kind'] = kind
 
         return results if results else None
     
@@ -22279,7 +22362,13 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         beh_rate = float(self._beh_row_rate(subject_id, data)) or fps
         labels_arr = np.asarray(labels, dtype=object)
         zone_names = [z for z in self.zones.keys() if z != 'unknown'] + ['unknown']
-        durations = {z: float(np.sum(labels_arr == z)) / beh_rate for z in zone_names}
+        # Time in zone counts only rows the photometry recorded: a spike can
+        # only be detected there, so the unrecorded tail is not exposure time.
+        recorded = self._recorded_rows(data['beh_synced'])
+        if len(recorded) != len(labels_arr):
+            recorded = np.ones(len(labels_arr), dtype=bool)
+        durations = {z: float(np.sum((labels_arr == z) & recorded)) / beh_rate
+                     for z in zone_names}
 
         results = {}
         for ch, det in detections.items():
@@ -23447,6 +23536,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                                         _total_frames)
         _sb_start, _sb_end = self._subject_session_bounds(subject_id, _total_frames)
         _n_raw_before = len(fp_raw)
+        # Clock of the very first raw row, for a length cap counted from there.
+        _raw_t0 = float(fp_raw[0, 1]) if len(fp_raw) else np.nan
         fp_raw = fp_raw[_start_row:_end_row, :]
         # The rows actually dropped from the head -- not the precut setting --
         # are what separates signal sample 0 from video frame 0, so every later
@@ -23468,14 +23559,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 f"kept raw rows {_start_row}:{_end_row} of {_n_raw_before} "
                 f"(precut alone would have kept {precut}:{_n_raw_before})")
 
+        # Whether the END of the recording was cut on purpose (length cap or a
+        # session end bound).  The behavior rows are cut at the same point after
+        # the sync, so the limit applies to the tracking as well as the signal.
+        _end_cut_on_purpose = _sb_end is not None
         max_seconds = float(self.params.get('maxlengthseconds', 0.0) or 0.0)
         if max_seconds > 0 and len(fp_raw) > 0:
-            elapsed = fp_raw[:, 1] - fp_raw[0, 1]
+            # By default the cap counts from the first row kept (after the
+            # precut / session start).  With 'maxlength_from_first_raw_row' it
+            # counts from the first row of the file, which is video frame 0 --
+            # the old frame cap's reference, so the recording ends at the cap
+            # on the video's own clock.
+            _cap_from_raw = bool(self.params.get('maxlength_from_first_raw_row', False))
+            _cap_t0 = _raw_t0 if (_cap_from_raw and np.isfinite(_raw_t0)) else fp_raw[0, 1]
+            elapsed = fp_raw[:, 1] - _cap_t0
             if np.all(np.isfinite(elapsed)) and elapsed[-1] > 0:
                 over = np.flatnonzero(elapsed > max_seconds)
                 if len(over):
                     n_before = len(fp_raw)
                     fp_raw = fp_raw[:over[0], :]
+                    _end_cut_on_purpose = True
+                    self.log_message(
+                        f"  Length cap counted from "
+                        f"{'the first raw row' if _cap_from_raw else 'the first kept row'}.")
                     self.log_message(
                         f"  Trimmed to the first {max_seconds:g} s "
                         f"({len(fp_raw)} of {n_before} raw rows)")
@@ -23777,6 +23883,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 beh_synced = self.synchronize_behavior(result['zscore'], beh_raw, has_position)
                 # One row per behavior-file (video) frame, photometry matched by clock.
                 result['bout_timeline'] = 'video'
+                if _end_cut_on_purpose:
+                    beh_synced, _n_cut = self._trim_behavior_to_photometry_end(
+                        beh_synced, result['zscore'])
+                    if _n_cut:
+                        self.log_message(
+                            f"  Behavior tracking cut at the same end point as the "
+                            f"photometry: {_n_cut} row(s) after it removed "
+                            f"({len(beh_synced)} kept)")
             result['beh_synced'] = beh_synced
             result['has_position'] = has_position
             
@@ -24635,6 +24749,39 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not steps:
             return float('inf')     # cannot tell -- keep the old behaviour
         return 2.0 * max(steps)
+
+    def _trim_behavior_to_photometry_end(self, beh_synced, zscore_data):
+        """Drop the behavior rows recorded after the photometry ends.
+
+        Used when the end of the recording was limited on purpose (the length
+        cap, or a session end bound): the limit used to reach the photometry
+        only, leaving minutes of tracking with no signal behind it for every
+        analysis to trip over.  Only the tail is cut -- bout frames are row
+        indices from the start, so the head must stay where it is.
+
+        Returns ``(beh_synced, rows_removed)``.
+        """
+        n = len(beh_synced)
+        if n == 0 or beh_synced.ndim != 2:
+            return beh_synced, 0
+        keep = n
+        cov = None
+        try:
+            cov = self._photometry_coverage_mask({'zscore': zscore_data}, beh_synced)
+        except Exception:
+            cov = None
+        if cov is not None and len(cov) == n and cov.any():
+            keep = int(np.flatnonzero(cov)[-1]) + 1
+        elif beh_synced.shape[1] > 6:
+            # Clocks that do not share an epoch: the last row holding a sample
+            # that is not just the final one repeated.
+            ok = np.flatnonzero(self._recorded_rows(beh_synced)
+                                & np.isfinite(np.asarray(beh_synced[:, 6], dtype=float)))
+            if len(ok):
+                keep = int(ok[-1]) + 1
+        if keep >= n:
+            return beh_synced, 0
+        return beh_synced[:keep], n - keep
 
     def synchronize_behavior(self, zscore_data, beh_raw, has_position=False):
         """Synchronize behavior timestamps with photometry data
@@ -25590,6 +25737,45 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
 
         return beh_synced, entry_frames_dict
     
+    GROUP_LABEL_SEPARATOR = ' + '
+
+    @classmethod
+    def _join_group_labels(cls, existing, group_name):
+        """Group label for a subject that may sit in several selected groups."""
+        if not existing or existing in ('N/A', 'Unknown'):
+            return group_name
+        parts = existing.split(cls.GROUP_LABEL_SEPARATOR)
+        return existing if group_name in parts else cls.GROUP_LABEL_SEPARATOR.join(
+            parts + [group_name])
+
+    @staticmethod
+    def _recorded_rows(beh, min_run=30):
+        """Boolean mask of the beh_synced rows that hold a recorded photometry sample.
+
+        Projects processed before the sync gained a matching tolerance carry the
+        first/last sample repeated across every behavior row the recording does
+        not cover (the camera routinely outruns the photometry by minutes).
+        Averaged as data, those rows put real positions behind one invented
+        value.  A leading or trailing run of one repeated value at least
+        ``min_run`` rows long (about a second) is that fill; the first and last
+        rows of the run are the real samples it was copied from.  All True for
+        reprocessed subjects, whose uncovered rows are NaN already.
+        """
+        beh = np.asarray(beh)
+        n = len(beh)
+        valid = np.ones(n, dtype=bool)
+        if beh.ndim != 2 or beh.shape[1] <= 6 or n < 3:
+            return valid
+        sig = np.asarray(beh[:, 6], dtype=float)
+        chg = np.flatnonzero(np.diff(sig) != 0)
+        if chg.size == 0:
+            return valid
+        if chg[0] + 1 >= min_run:
+            valid[:chg[0]] = False
+        if n - (chg[-1] + 1) >= min_run:
+            valid[chg[-1] + 2:] = False
+        return valid
+
     def _slot_value_stats(self, beh_synced, rows, n_channels, out, stats):
         """Per-channel statistics of ``beh_synced[rows]`` written into ``out``.
 
@@ -25632,9 +25818,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # kinematics field — reading it as G1 produces a phantom second channel.
         if n_channels is None:
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
-        # Calculate averages for each zone, for every channel slot.
+        # Calculate averages for each zone, for every channel slot, over the
+        # rows the photometry actually recorded (see _recorded_rows).
+        recorded = self._recorded_rows(beh_synced)
         for zone_name in self.zones.keys():
-            zone_frames = [i for i, z in enumerate(zones) if z == zone_name]
+            zone_frames = [i for i, z in enumerate(zones)
+                           if z == zone_name and recorded[i]]
 
             if zone_frames:
                 zone_data = self._slot_value_stats(
@@ -25682,13 +25871,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         Keyed by each bin's lower edge: bin ``k`` covers ``[k*w, (k+1)*w)``.
         The 1 cm default keeps the integer keys saved projects already hold.
         """
-        valid = ~np.isnan(distances)
-        if not valid.any():
+        # Bins are laid out over every tracked row so the axis does not change;
+        # a bin the recording never visited keeps its key with n = 0.
+        tracked = ~np.isnan(distances)
+        if not tracked.any():
             return {}
+        valid = tracked & self._recorded_rows(beh_synced)
         unit = float(bin_width) == 1.0
         index = np.floor(distances / float(bin_width))
         results = {}
-        for k in range(int(np.max(index[valid])) + 1):
+        for k in range(int(np.max(index[tracked])) + 1):
             edge = k if unit else round(k * float(bin_width), 6)
             results[edge] = self._slot_value_stats(
                 beh_synced, valid & (index == k), n_channels,
@@ -26129,6 +26321,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             n_channels = max(0, beh_synced.shape[1] - 6 - len(self.BEH_KIN_FIELDS))
         frames, outward = self._outback_outward_velocity(
             beh_synced, zones, open_zones, fps=fps)
+        # Only movements the photometry recorded (see _recorded_rows).
+        _rec = self._recorded_rows(beh_synced)[frames]
+        frames, outward = frames[_rec], outward[_rec]
         out_frames = frames[outward > velocity_threshold].tolist()
         back_frames = frames[outward < -velocity_threshold].tolist()
 
@@ -26299,9 +26494,29 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     else:
                         zones.append('unknown')
                 
-                total_frames = len(beh_synced)
+                # Analyse the recorded session, not the whole behavior file. The
+                # camera often runs on for minutes after the photometry stops, by
+                # a different amount for every animal, and every time, entry and
+                # distance metric scales with however long that happened to be.
+                if self.params.get('metrics_limit_to_photometry', True) and beh_synced.shape[1] > 6:
+                    try:
+                        _cov = np.flatnonzero(self._dec_signal_valid_mask(data, beh_synced, 6))
+                    except Exception:
+                        _cov = np.array([], dtype=int)
+                    if _cov.size > fps:
+                        _lo, _hi = int(_cov[0]), int(_cov[-1]) + 1
+                        zones = zones[_lo:_hi]
+                        x_coords, y_coords = x_coords[_lo:_hi], y_coords[_lo:_hi]
+                        velocity = velocity[_lo:_hi]
+
+                # One cleaned zone sequence feeds time, entries and decisions, so
+                # the three cannot disagree about what counted as a visit.
+                zones = self._clean_zone_sequence(
+                    zones, int(self.params.get('metrics_min_entry_duration', 0.5) * fps))
+
+                total_frames = len(zones)
                 total_time = total_frames / fps
-                
+
                 if not use_bins:
                     # Calculate metrics for entire session
                     metrics = self._calculate_session_metrics(zones, x_coords, y_coords, velocity, 
@@ -26353,10 +26568,52 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             messagebox.showerror("Error", error_msg)
             print(error_msg)
     
+    @staticmethod
+    def _clean_zone_sequence(zones, min_frames):
+        """Per-frame zone names with tracking gaps bridged and flicker removed.
+
+        An 'unknown' stretch (lost tracking) that starts and ends in the same
+        zone is given to that zone: the animal did not leave, and counting the
+        gap as an exit turns one visit into two.  A visit shorter than
+        ``min_frames`` is then absorbed into the visit before it, because a
+        tracked point resting on a boundary crosses it every few frames.
+        """
+        zones = list(zones)
+        n = len(zones)
+        if n == 0:
+            return zones
+
+        def runs():
+            out, s = [], 0
+            for i in range(1, n + 1):
+                if i == n or zones[i] != zones[s]:
+                    out.append((s, i))
+                    s = i
+            return out
+
+        rr = runs()
+        for k in range(1, len(rr) - 1):
+            s, e = rr[k]
+            if zones[s] == 'unknown' and zones[s - 1] == zones[e] != 'unknown':
+                zones[s:e] = [zones[e]] * (e - s)
+        if min_frames > 1:
+            for _ in range(3):
+                changed = False
+                for s, e in runs():
+                    if s > 0 and e - s < min_frames and zones[s] != 'unknown':
+                        zones[s:e] = [zones[s - 1]] * (e - s)
+                        changed = True
+                if not changed:
+                    break
+        return zones
+
     def _calculate_session_metrics(self, zones, x_coords, y_coords, velocity, fps, distal_threshold, total_time):
         """Calculate behavioral metrics for a session or time bin"""
         metrics = {}
-        
+        metrics['Analyzed_Duration_sec'] = len(zones) / fps if fps else 0
+        _n_tracked = sum(1 for z in zones if z != 'unknown')
+        metrics['Percent_Tracked'] = (_n_tracked / len(zones) * 100) if len(zones) else 0
+
         # Time in each zone (in seconds)
         zone_counts = {}
         for zone in zones:
@@ -26379,7 +26636,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             metrics['Time_in_Open_Arms_sec'] = open_time / fps
             metrics['Time_in_Closed_Arms_sec'] = closed_time / fps
             metrics['Time_in_Center_sec'] = center_time / fps
-            metrics['Percent_Time_Open'] = (open_time / len(zones) * 100) if zones else 0
+            # Of tracked time: frames with no position are not time off the arm.
+            metrics['Percent_Time_Open'] = (open_time / _n_tracked * 100) if _n_tracked else 0
             
             # For EPM_Complex, also provide proximal/distal breakdowns
             if maze_type == 'EPM_Complex':
@@ -26406,7 +26664,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             metrics['Time_in_Center_sec'] = center_time / fps
             metrics['Time_in_Corners_sec'] = corner_time / fps
             metrics['Time_in_Edges_sec'] = edge_time / fps
-            metrics['Percent_Time_Center'] = (center_time / len(zones) * 100) if zones else 0
+            metrics['Percent_Time_Center'] = (center_time / _n_tracked * 100) if _n_tracked else 0
         else:
             # Generic metrics - time in each zone (only for non-standard mazes)
             for zone_name, count in zone_counts.items():
@@ -26462,8 +26720,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             open_zones = [z for z in self.zones.keys() if self.zones[z].get('category') in ['open', 'open_proximal', 'open_distal']]
             closed_zones = [z for z in self.zones.keys() if self.zones[z].get('category') in ['closed', 'closed_proximal', 'closed_distal']]
             
-            metrics['Open_Arm_Entries'] = sum(zone_entries.get(zone, 0) for zone in open_zones)
-            metrics['Closed_Arm_Entries'] = sum(zone_entries.get(zone, 0) for zone in closed_zones)
+            # Arm entries are counted on the open/closed category, not per zone:
+            # summing per-zone entries counts a proximal -> distal step inside
+            # one arm as a second entry into it.
+            _open_set, _closed_set = set(open_zones), set(closed_zones)
+            _cat = ['open' if z in _open_set else 'closed' if z in _closed_set else z
+                    for z in zones]
+            _arm_entries = {'open': 0, 'closed': 0}
+            for i in range(1, len(_cat)):
+                if _cat[i] != _cat[i - 1] and _cat[i] in _arm_entries:
+                    _arm_entries[_cat[i]] += 1
+            metrics['Open_Arm_Entries'] = _arm_entries['open']
+            metrics['Closed_Arm_Entries'] = _arm_entries['closed']
 
             # Count explore vs avoid decisions
             # A decision occurs each time the mouse enters the center zone from a closed arm.
@@ -26645,7 +26913,11 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for subj_info in subject_data.values():
                 for metric_data in subj_info['bins'].values():
                     all_bins.update(metric_data.keys())
-            all_bins = sorted(all_bins)
+            # Numeric order: as strings, "60.0-120.0s" sorts after "540.0-600.0s".
+            def _bin_start(label):
+                m = re.match(r'^\s*(-?\d+(?:\.\d+)?)', str(label))
+                return (0, float(m.group(1)), str(label)) if m else (1, 0.0, str(label))
+            all_bins = sorted(all_bins, key=_bin_start)
             
             # Build rows with bins as columns
             rows = []
@@ -36522,9 +36794,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             for group_name in selected_groups:
                 group_members = self._series_members(group_name)
                 subjects.extend(group_members)
-                # Map subjects to their groups
+                # Map subjects to their groups. A subject in several selected
+                # groups is drawn in each of them, so its label names them all
+                # instead of only the last one listed.
                 for subj in group_members:
-                    subject_to_group[subj] = group_name
+                    subject_to_group[subj] = self._join_group_labels(
+                        subject_to_group.get(subj), group_name)
             
             # Remove duplicates while preserving order
             seen = set()
@@ -36674,7 +36949,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 messagebox.showinfo("Export Complete", 
                                    f"Signal integrity data exported successfully to:\n{filename}\n\n"
                                    f"Exported {len(export_rows)} channel(s) from {len(valid_subjects)} subject(s).\n"
-                                   f"Exclusions applied: {self.use_exclusions_viz.get()}")
+                                   "Every channel is listed: exclusions are not applied to this table.")
                 return
 
             # ── Position Heatmap: export averaged 2D matrix (Prism-friendly) ──────────
@@ -36726,7 +37001,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         x_coords = beh_synced[:, 2]
                         y_coords = beh_synced[:, 3]
                         z_scores = beh_synced[:, col_idx]
-                        valid_mask = ~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                        valid_mask = (~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                                      & self._recorded_rows(beh_synced))
                         if np.sum(valid_mask) == 0:
                             continue
 
@@ -36892,11 +37168,16 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 elif "Distance from Center" in plot_type:
                     # Export distance from center data - horizontal format with distances as columns
                     self._ensure_distance_averages(data, subject)
-                    if 'distance_averages_x' not in data and 'distance_averages_y' not in data:
+                    if not any(k in data for k in self.DISTANCE_AXIS_FIELD):
                         continue
 
                     # Process each axis and every selected channel
-                    for axis_name, axis_key in [('X', 'distance_averages_x'), ('Y', 'distance_averages_y')]:
+                    # The Euclidean plot exports the Euclidean table; it used to
+                    # fall into this branch by substring and write X and Y.
+                    _axes = ([('Euclidean', 'distance_averages_euclidean')]
+                             if "Euclidean" in plot_type else
+                             [('X', 'distance_averages_x'), ('Y', 'distance_averages_y')])
+                    for axis_name, axis_key in _axes:
                         if axis_key not in data:
                             continue
 
@@ -36980,7 +37261,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             continue
                         
                         z_scores = beh_synced[:, col_idx]
-                        valid = ~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                        valid = (~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                                 & self._recorded_rows(beh_synced))
                         
                         if np.sum(valid) == 0:
                             continue
@@ -37361,24 +37643,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         x_coords = beh_synced[:, 2]
         y_coords = beh_synced[:, 3]
         
-        if channel == "Ch0":
-            z_scores = beh_synced[:, 6]
-            title_suffix = "Ch0"
-        elif channel == "Ch1":
-            z_scores = beh_synced[:, 7]
-            title_suffix = "Ch1"
-        elif channel == "Ch2" and beh_synced.shape[1] > 8:
-            z_scores = beh_synced[:, 8]
-            title_suffix = "Ch2"
-        elif channel == "Ch3" and beh_synced.shape[1] > 9:
-            z_scores = beh_synced[:, 9]
-            title_suffix = "Ch3"
-        else:
-            z_scores = beh_synced[:, 6]  # Default to Ch0
-            title_suffix = "Ch0"
-        
+        _slot = self.channel_slot_index(channel)
+        if _slot >= max(1, self._beh_channel_count(data)):
+            _slot = 0
+        z_scores = beh_synced[:, 6 + _slot]
+        title_suffix = channel_label(self.get_channel_name(data, _slot))
+
         # Remove NaN values
-        valid = ~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+        valid = (~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                 & self._recorded_rows(beh_synced))
         x_coords = x_coords[valid]
         y_coords = y_coords[valid]
         z_scores = z_scores[valid]
@@ -37437,16 +37710,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         channel = self.channel_var.get()
         
         # Map channel name to column index
-        if channel == "Ch0":
-            col_idx = 6
-        elif channel == "Ch1":
-            col_idx = 7
-        elif channel == "Ch2":
-            col_idx = 8
-        elif channel == "Ch3":
-            col_idx = 9
-        else:
-            col_idx = 6  # Default to Ch0
+        col_idx = 6 + self.channel_slot_index(channel)
         
         # Get spatial bin size
         try:
@@ -37510,7 +37774,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 z_scores = beh_synced[:, col_idx]
                 
                 # Remove NaN values
-                valid = ~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                valid = (~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                         & self._recorded_rows(beh_synced))
                 x_coords = x_coords[valid]
                 y_coords = y_coords[valid]
                 z_scores = z_scores[valid]
@@ -37557,7 +37822,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 z_scores = beh_synced[:, col_idx]
                 
                 # Remove NaN values
-                valid = ~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                valid = (~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                         & self._recorded_rows(beh_synced))
                 x_coords = x_coords[valid]
                 y_coords = y_coords[valid]
                 z_scores = z_scores[valid]
@@ -37593,16 +37859,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         channel = self.channel_var.get()
         
         # Map channel name to column index
-        if channel == "Ch0":
-            col_idx = 6
-        elif channel == "Ch1":
-            col_idx = 7
-        elif channel == "Ch2":
-            col_idx = 8
-        elif channel == "Ch3":
-            col_idx = 9
-        else:
-            col_idx = 6  # Default to Ch0
+        col_idx = 6 + self.channel_slot_index(channel)
         
         # Get spatial bin size
         try:
@@ -37656,7 +37913,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 z_scores = beh_synced[:, col_idx]
                 
                 # Remove NaN values
-                valid = ~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                valid = (~(np.isnan(x_coords) | np.isnan(y_coords) | np.isnan(z_scores))
+                         & self._recorded_rows(beh_synced))
                 x_coords = x_coords[valid]
                 y_coords = y_coords[valid]
                 z_scores = z_scores[valid]
@@ -37977,10 +38235,21 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         """
         n_ch = self._beh_channel_count(data)
         beh = data.get('beh_synced')
-        if n_ch <= 2 or not isinstance(beh, np.ndarray) or beh.ndim != 2:
+        if not isinstance(beh, np.ndarray) or beh.ndim != 2:
+            return
+        # Averages stored by a build that scored the unrecorded rows (see
+        # _recorded_rows) are rebuilt once per load; the result is what the
+        # next save writes, so the project heals without a reprocess.
+        held_stale = []
+        if not data.get('_spatial_recorded_only'):
+            data['_spatial_recorded_only'] = True
+            if n_ch >= 1 and not self._recorded_rows(beh).all():
+                held_stale = [k for k in self.SPATIAL_STAT_KEYS if data.get(k)]
+        if n_ch <= 2 and not held_stale:
             return
         stale = [k for k in self.SPATIAL_STAT_KEYS
-                 if self._spatial_stats_missing_slot(data.get(k), n_ch - 1)]
+                 if k in held_stale
+                 or (n_ch > 2 and self._spatial_stats_missing_slot(data.get(k), n_ch - 1))]
         if not stale:
             return
         try:
@@ -44760,6 +45029,17 @@ cat("OK\n")
         except ValueError:
             return None
 
+    def _bout_segment_fs(self, subject):
+        """Rate of the samples _bout_analysis_segment returns, for integrating
+        them over time: the subject's own rate for the whole/offset styles
+        (cut from its recording), the shared analysis axis otherwise."""
+        if hasattr(self, 'boutframe_processing_style_var'):
+            style = self.boutframe_processing_style_var.get()
+        else:
+            style = self.params.get('boutframe_processing_style', 'onset')
+        fs = self.get_fps(subject) if style in ('whole', 'offset') else self.analysis_fps()
+        return float(fs) if fs and np.isfinite(fs) and fs > 0 else float(self.FPS_FALLBACK)
+
     def _trapz_compat(self, y, x=None, dx=1.0, axis=-1):
         """Compatibility wrapper for trapezoidal integration across NumPy versions."""
         trapezoid_fn = getattr(np, 'trapezoid', None)
@@ -44843,11 +45123,18 @@ cat("OK\n")
         self.bout_metrics_tree.delete(*self.bout_metrics_tree.get_children())
         
         # Create subject to group mapping (always check all groups for all subjects)
+        # In Group mode the label is the group(s) the user selected, not
+        # whichever group happens to come last in the project.
         subject_to_group = {}
-        for group_name, group_members in self.groups.items():
+        if self.bout_analysis_by_var.get() == "Group":
+            _label_groups = [(g, self._series_members(g)) for g in selected_groups]
+        else:
+            _label_groups = list(self.groups.items())
+        for group_name, group_members in _label_groups:
             for subject in selected_subjects:
                 if subject in group_members:
-                    subject_to_group[subject] = group_name
+                    subject_to_group[subject] = self._join_group_labels(
+                        subject_to_group.get(subject), group_name)
         
         # Define columns based on selected metrics
         columns = []
@@ -44867,11 +45154,11 @@ cat("OK\n")
         if calc_t_half:
             columns.append('t½ (seconds)')
         if calc_auc:
-            auc_label = 'AUC'
+            auc_label = 'AUC (z·s)'
             if auc_mode == 'above':
-                auc_label = 'AUC (+only)'
+                auc_label = 'AUC +only (z·s)'
             elif auc_mode == 'below':
-                auc_label = 'AUC (-only)'
+                auc_label = 'AUC -only (z·s)'
             columns.append(auc_label)
         
         self.bout_metrics_tree['columns'] = columns
@@ -45024,7 +45311,7 @@ cat("OK\n")
                     elif auc_mode == 'below':
                         auc_data[auc_data > 0] = 0  # Set positive values to 0
                     
-                    auc_val = self._trapz_compat(auc_data)
+                    auc_val = self._trapz_compat(auc_data) / self._bout_segment_fs(subject)
                     row_values.append(f"{auc_val:.3f}")
                     self.bout_metrics_data[combo_key]['metrics']['auc'].append(auc_val)
                     self.bout_metrics_data[combo_key]['by_subject'][subject]['auc'].append(auc_val)
@@ -45396,7 +45683,8 @@ cat("OK\n")
             'min_post': 'Min Post-Bout Z-Score',
             'max_deriv': 'Max First Derivative (Δz/s)',
             'tau': 'Tau (Decay Constant, seconds)',
-            't_half': 'Half-Decay Time t½ (seconds)'
+            't_half': 'Half-Decay Time t½ (seconds)',
+            'auc': 'AUC (z·s)'
         }
 
         for idx, metric_key in enumerate(metrics.keys(), 1):
@@ -47028,7 +47316,8 @@ cat("OK\n")
                             auc_data[auc_data < 0] = 0
                         elif auc_mode == 'below':
                             auc_data[auc_data > 0] = 0
-                        subject_data[subject][label]['auc'].append(self._trapz_compat(auc_data))
+                        subject_data[subject][label]['auc'].append(
+                            self._trapz_compat(auc_data) / self._bout_segment_fs(subject))
         
         if not subject_data:
             msg = f"No subjects have enough bouts (need \u2265{x_bouts})."
@@ -47729,12 +48018,14 @@ cat("OK\n")
             for g in (selected_groups if analysis_mode == 'Group' else []):
                 for s in self._series_members(g):
                     if s in selected_subjects:
-                        subject_to_group[s] = g
+                        subject_to_group[s] = self._join_group_labels(
+                            subject_to_group.get(s), g)
         else:
             for g_name, g_members in self.groups.items():
                 for s in selected_subjects:
                     if s in g_members:
-                        subject_to_group[s] = g_name
+                        subject_to_group[s] = self._join_group_labels(
+                            subject_to_group.get(s), g_name)
 
         # ── Ask for output filename ───────────────────────────────────────
         default_name = f"{behavior}_{channel_label(channel)}_bout_metrics.xlsx"
@@ -47767,7 +48058,12 @@ cat("OK\n")
                     for metric_key in metrics_data.get('metrics', {}).keys():
                         if metric_key in by_subject[subject]:
                             vals = np.array(by_subject[subject][metric_key])
-                            if current_max_bouts is not None:
+                            # The stored values were already limited when
+                            # the metrics were calculated; limiting a range
+                            # (e.g. 40-50) a second time left nothing.  Only
+                            # narrow here when they were calculated on all bouts.
+                            if (current_max_bouts is not None and self._get_max_bouts_limit(
+                                    str(metrics_data.get('max_bouts_setting', 'all'))) is None):
                                 vals = self._slice_bouts(vals, current_max_bouts)
                             vals = vals[~np.isnan(vals)]
                             row[metric_key] = np.mean(vals) if len(vals) > 0 else np.nan
@@ -48048,7 +48344,8 @@ cat("OK\n")
                             auc_data[auc_data < 0] = 0
                         elif auc_mode == 'below':
                             auc_data[auc_data > 0] = 0
-                        val = float(self._trapz_compat(auc_data))
+                        val = float(self._trapz_compat(auc_data)
+                                    / self._bout_segment_fs(subject))
                     row[label] = val
                     if not (isinstance(val, float) and np.isnan(val)):
                         subj_store[key].append(val)
@@ -48099,11 +48396,11 @@ cat("OK\n")
             messagebox.showerror("Error", "Please select at least one metric in Settings.")
             return
 
-        auc_label = 'AUC'
+        auc_label = 'AUC (z·s)'
         if auc_mode == 'above':
-            auc_label = 'AUC (+only)'
+            auc_label = 'AUC +only (z·s)'
         elif auc_mode == 'below':
-            auc_label = 'AUC (-only)'
+            auc_label = 'AUC -only (z·s)'
         metric_specs = []
         if calc_avg:   metric_specs.append(('avg_post',  'Avg Post-Bout'))
         if calc_max:   metric_specs.append(('max_post',  'Max Post-Bout'))
@@ -48146,12 +48443,14 @@ cat("OK\n")
             for g in selected_groups:
                 for s in self._series_members(g):
                     if s in base_subjects:
-                        subject_to_group[s] = g
+                        subject_to_group[s] = self._join_group_labels(
+                            subject_to_group.get(s), g)
         else:
             for g_name, members in self.groups.items():
                 for s in base_subjects:
                     if s in members:
-                        subject_to_group[s] = g_name
+                        subject_to_group[s] = self._join_group_labels(
+                            subject_to_group.get(s), g_name)
 
         average_ws       = self.bout_average_within_subject.get()
         apply_exclusions = self.use_exclusions_bout.get()
@@ -49632,6 +49931,22 @@ cat("OK\n")
             'morlet_w':         float(cp.get('morlet_w', 6.0)),
         }
     
+    @staticmethod
+    def _mean_rolling_r(corr):
+        """Signed mean of a rolling correlation, reported as r.
+
+        Windows stored as Fisher z are averaged in z and transformed back.  The
+        mean of |r| this used to return made an anticorrelated pair read as a
+        correlated one (mean r -0.41 shown as 0.43).
+        """
+        r = np.asarray(corr.get('r', []), dtype=float)
+        r = r[np.isfinite(r)]
+        if not r.size:
+            return np.nan
+        if (corr.get('params') or {}).get('fisher_z'):
+            return float(np.tanh(r.mean()))
+        return float(r.mean())
+
     def _run_subject_connectivity(self, subjects, ch1, ch2, analysis_types, params,
                                     progress_q=None, total=None):
         """Run connectivity analysis per subject"""
@@ -49713,7 +50028,7 @@ cat("OK\n")
                     fisher_z=self.conn_params['rolling_fisher_z'])
                 if corr:
                     results['rolling_correlation'] = corr
-                    results['mean_correlation'] = np.mean(np.abs(corr['r']))
+                    results['mean_correlation'] = self._mean_rolling_r(corr)
 
             if any(['_coherence' in k or 'correlation' in k for k in results.keys()]):
                 self.connectivity_results[subject] = results
@@ -49802,7 +50117,7 @@ cat("OK\n")
                         method=self.conn_params['rolling_method'],
                         fisher_z=self.conn_params['rolling_fisher_z'])
                     if corr:
-                        group_results['rolling_correlation_by_subject'][subject] = np.mean(np.abs(corr['r']))
+                        group_results['rolling_correlation_by_subject'][subject] = self._mean_rolling_r(corr)
                         group_results['rolling_timeseries_by_subject'][subject] = {
                             'times': corr['times'], 'r': corr['r']
                         }
@@ -50142,6 +50457,15 @@ cat("OK\n")
         self.dec_prob_plot_type_var  = tk.StringVar(value="Line")
         self.dec_prob_alpha_var      = tk.StringVar(value="0.05")
         self.dec_prob_results        = {}
+        self.dec_mode_var            = tk.StringVar(value=self.DEC_MODES[0])
+        self.dec_event_signal_var    = tk.StringVar(value=self.DEC_WINDOWS[0])
+        self.dec_event_window_var    = tk.StringVar(value="1.0")
+        self.dec_event_debounce_var  = tk.StringVar(value="0.2")
+        self.dec_event_depth_var     = tk.StringVar(value="3")
+        self.dec_event_shifts_var    = tk.StringVar(value="500")
+        self.dec_event_results       = {}
+        self.dec_event_meta          = {}
+        self.dec_last_kind           = 'frames'
         self.dec_prob_figure         = None
         self.dec_prob_canvas_widget  = None
 
@@ -50200,6 +50524,11 @@ cat("OK\n")
         self._dec_prob_toggle_mode()
 
         # ── Settings ─────────────────────────────────────────────────────────
+        ttk.Label(settings, text="Output:").pack(anchor='w')
+        ttk.Combobox(settings, textvariable=self.dec_mode_var,
+                     values=list(self.DEC_MODES), state='readonly').pack(
+            fill='x', pady=(0, self.ui_px(6)))
+
         ch_row = ttk.Frame(settings)
         ch_row.pack(fill='x')
         ttk.Label(ch_row, text="Channel:").pack(side='left')
@@ -50261,6 +50590,21 @@ cat("OK\n")
         ttk.Checkbutton(settings, text="Apply exclusions",
                         variable=self.use_exclusions_dec_prob).pack(
             anchor='w', pady=(self.ui_px(6), 0))
+
+        # Settings for the event-based outputs (every Output but the first).
+        ev_box = ttk.LabelFrame(settings, text="Event outputs")
+        ev_box.pack(fill='x', pady=(self.ui_px(6), 0))
+        ttk.Label(ev_box, text="Center signal from:").pack(anchor='w')
+        ttk.Combobox(ev_box, textvariable=self.dec_event_signal_var,
+                     values=list(self.DEC_WINDOWS), state='readonly').pack(fill='x')
+        for _label, _var in (("Signal window (s):", self.dec_event_window_var),
+                             ("Ignore zone visits under (s):", self.dec_event_debounce_var),
+                             ("Min excursion depth (cm):", self.dec_event_depth_var),
+                             ("Shift-null repeats:", self.dec_event_shifts_var)):
+            _row = ttk.Frame(ev_box)
+            _row.pack(fill='x', pady=(self.ui_px(2), 0))
+            ttk.Label(_row, text=_label).pack(side='left')
+            ttk.Entry(_row, textvariable=_var, width=6).pack(side='right')
 
         ttk.Button(settings, text="⚙  Binning & Statistics Settings…",
                    command=self.open_dec_prob_settings).pack(
@@ -50497,13 +50841,14 @@ cat("OK\n")
             return None
 
         signal = np.asarray(beh_synced[:, channel_col], dtype=float)
+        valid = self._dec_signal_valid_mask(data, beh_synced, channel_col)
         in_source  = np.isin(codes, src_codes)
         in_outcome = np.isin(codes, out_codes)
 
         # Only frames with a full look-ahead window ahead of them can be scored;
         # the tail is censored, as it was before.
         last = n_frames - lookahead_frames
-        starts = np.flatnonzero(in_source[:last] & ~np.isnan(signal[:last]))
+        starts = np.flatnonzero(in_source[:last] & valid[:last])
         if starts.size == 0:
             return None
 
@@ -50586,11 +50931,634 @@ cat("OK\n")
 
         return bin_centers, mean_prob, sem_prob, per_subject_probs, n_frames
 
+    # ── Event-based decision outputs ─────────────────────────────────────────
+    # The frame-binned curve above scores every frame; these score one row per
+    # decision, which is what the animal actually made a handful of.
+
+    DEC_MODES = ("Signal-binned probability", "Explore vs avoid (center)",
+                 "Signal vs P(explore)", "Distal turn-back")
+    DEC_WINDOWS = ("Before center entry", "Whole center dwell", "End of center dwell")
+    _DEC_WINDOW_KEYS = {"Before center entry": 'pre', "Whole center dwell": 'dwell',
+                        "End of center dwell": 'last'}
+
+    def _dec_signal_valid_mask(self, data, beh, col):
+        """Rows of ``beh`` that hold a photometry sample that was really recorded.
+
+        Projects processed before the sync gained a matching tolerance carry the
+        last (or first) sample repeated across every behavior row the recording
+        does not cover.  Scored as data, those rows put thousands of frames of
+        real behavior behind one invented z-score.  Coverage is taken from the
+        FP timestamps when the clocks allow it, and a leading or trailing run of
+        one repeated value longer than a second is dropped either way.
+        """
+        sig = np.asarray(beh[:, col], dtype=float)
+        n = len(sig)
+        valid = np.isfinite(sig)
+        try:
+            cov = self._photometry_coverage_mask(data, beh)
+        except Exception:
+            cov = None
+        if cov is not None and len(cov) == n:
+            valid &= cov
+        chg = np.flatnonzero(np.diff(sig) != 0)
+        if chg.size:
+            fps = self.get_fps(data) or 30.0
+            min_run = max(2, int(round(fps)))
+            if chg[0] + 1 >= min_run:
+                valid[:chg[0]] = False
+            if n - (chg[-1] + 1) >= min_run:
+                valid[chg[-1] + 2:] = False
+        return valid
+
+    @staticmethod
+    def _dec_runs(lab):
+        """Run-length encode ``lab`` -> (starts, ends_exclusive, values)."""
+        lab = np.asarray(lab)
+        if lab.size == 0:
+            return (np.array([], int),) * 2 + (np.array([], lab.dtype),)
+        ch = np.flatnonzero(lab[1:] != lab[:-1]) + 1
+        st = np.concatenate(([0], ch))
+        en = np.concatenate((ch, [lab.size]))
+        return st, en, lab[st]
+
+    def _dec_event_labels(self, beh, fps, from_zones, to_zones, mid_zones, debounce_s):
+        """Per-frame role: 1 = From (safe), 2 = To (risky), 3 = decision zone, 0 = other.
+
+        Zone runs shorter than ``debounce_s`` are absorbed into the run before
+        them: a tracked point sitting on a boundary flickers across it, and each
+        flicker would otherwise count as a visit and a decision.
+        """
+        codes, index = self._dec_prob_zone_codes(beh)
+        lab = np.zeros(len(codes), dtype=np.int8)
+        for val, zs in ((1, from_zones), (2, to_zones), (3, mid_zones)):
+            lab[np.isin(codes, [index[z] for z in zs if z in index])] = val
+        n_min = int(round(float(debounce_s) * fps))
+        if n_min > 1:
+            for _ in range(3):
+                st, en, _v = self._dec_runs(lab)
+                short = np.flatnonzero((en - st < n_min) & (st > 0))
+                if short.size == 0:
+                    break
+                for i in short:
+                    lab[st[i]:en[i]] = lab[st[i] - 1]
+        return lab
+
+    def _dec_events_for_subject(self, subject, channel, from_zones, to_zones,
+                                mid_zones, win_s=1.0, debounce_s=0.2,
+                                min_depth_cm=3.0, ctrl_margin_cm=5.0):
+        """Decision events for one subject, as frame indices into beh_synced.
+
+        ``center``: every visit to the decision zone entered from the From zone
+        and left to either From (avoid) or To (explore).
+        ``exc``: every excursion into the To zone - where it peaked (the frame
+        furthest from the decision zone's middle), how far that was, where the
+        animal went next, and for the same-place control the frames at which a
+        *further-going* excursion of the same animal passed that distance on its
+        way out.  Returns None when the subject cannot be analysed.
+        """
+        data = self.processed_data.get(subject)
+        if data is None or 'beh_synced' not in data or not data.get('has_position', False):
+            return None
+        beh = data['beh_synced']
+        col = self._bout_channel_column(data, channel)
+        fps = self.get_fps(data)
+        if col is None or beh.shape[1] <= col or not fps or not np.isfinite(fps) or fps <= 0:
+            return None
+        W = max(1, int(round(float(win_s) * fps)))
+        sig = np.asarray(beh[:, col], dtype=float)
+        valid = self._dec_signal_valid_mask(data, beh, col)
+        if valid.sum() < 4 * W:
+            return None
+        bad = np.concatenate(([0], np.cumsum(~valid)))
+
+        def all_valid(a, b):
+            return a >= 0 and b <= len(sig) and b > a and bad[b] - bad[a] == 0
+
+        lab = self._dec_event_labels(beh, fps, from_zones, to_zones, mid_zones, debounce_s)
+        st, en, val = self._dec_runs(lab)
+
+        ref = [self.zones[z] for z in mid_zones if z in self.zones] or \
+              [self.zones[z] for z in from_zones if z in self.zones]
+        cx = float(np.mean([(z['x_min'] + z['x_max']) / 2 for z in ref]))
+        cy = float(np.mean([(z['y_min'] + z['y_max']) / 2 for z in ref]))
+        dist = np.hypot(np.asarray(beh[:, 2], float) - cx, np.asarray(beh[:, 3], float) - cy)
+
+        c_entry, c_exit, c_explore = [], [], []
+        for i in range(1, len(st) - 1):
+            if val[i] == 3 and val[i - 1] == 1 and val[i + 1] in (1, 2):
+                if all_valid(st[i] - W, en[i]):
+                    c_entry.append(st[i]); c_exit.append(en[i])
+                    c_explore.append(val[i + 1] == 2)
+
+        e_entry, e_peak, e_exit, e_dmax, e_depth, e_next = [], [], [], [], [], []
+        for i in range(1, len(st)):
+            if val[i] != 2:
+                continue
+            seg = dist[st[i]:en[i]]
+            if not np.isfinite(seg).any():
+                continue
+            k = int(np.nanargmax(seg)); pk = st[i] + k
+            first = seg[np.flatnonzero(np.isfinite(seg))[0]]
+            depth = float(seg[k] - first)
+            if depth < min_depth_cm or not all_valid(pk + 1 - W, pk + 1) \
+                    or not all_valid(st[i], min(st[i] + W, en[i])):
+                continue
+            nxt = 0
+            for j in range(i + 1, len(st)):
+                if val[j] in (1, 2):
+                    nxt = int(val[j]); break
+            e_entry.append(st[i]); e_peak.append(pk); e_exit.append(en[i])
+            e_dmax.append(float(seg[k])); e_depth.append(depth); e_next.append(nxt)
+
+        ctrl = []
+        for a in range(len(e_peak)):
+            hits = []
+            for b in range(len(e_peak)):
+                if b == a or e_dmax[b] < e_dmax[a] + ctrl_margin_cm:
+                    continue
+                seg = dist[e_entry[b]:e_peak[b] + 1]
+                h = np.flatnonzero(seg >= e_dmax[a])
+                if h.size and all_valid(e_entry[b] + h[0] + 1 - W, e_entry[b] + h[0] + 1):
+                    hits.append(e_entry[b] + int(h[0]))
+            ctrl.append(np.asarray(hits, dtype=int))
+
+        cov = np.flatnonzero(valid)
+        return {'subject': subject, 'fps': float(fps), 'W': W, 'sig': sig, 'valid': valid,
+                'lo': int(cov[0]), 'hi': int(cov[-1]) + 1, 'dist': dist,
+                'center': {'entry': np.asarray(c_entry, int), 'exit': np.asarray(c_exit, int),
+                           'explore': np.asarray(c_explore, bool)},
+                'exc': {'entry': np.asarray(e_entry, int), 'peak': np.asarray(e_peak, int),
+                        'exit': np.asarray(e_exit, int), 'dmax': np.asarray(e_dmax, float),
+                        'depth': np.asarray(e_depth, float), 'next': np.asarray(e_next, int),
+                        'ctrl': ctrl}}
+
+    @staticmethod
+    def _dec_event_signals(sig, ev):
+        """Window means of ``sig`` for every event in ``ev`` (see _dec_events_for_subject)."""
+        W = ev['W']
+        cs = np.concatenate(([0.0], np.cumsum(np.nan_to_num(sig))))
+        c, x = ev['center'], ev['exc']
+        out = {'pre': (cs[c['entry']] - cs[c['entry'] - W]) / W,
+               'dwell': (cs[c['exit']] - cs[c['entry']]) / np.maximum(c['exit'] - c['entry'], 1),
+               'last': (cs[c['exit']] - cs[np.maximum(c['exit'] - W, 0)]) / W,
+               'pre_turn': (cs[x['peak'] + 1] - cs[x['peak'] + 1 - W]) / W}
+        e_end = np.minimum(x['entry'] + W, x['exit'])
+        out['at_entry'] = (cs[e_end] - cs[x['entry']]) / np.maximum(e_end - x['entry'], 1)
+        out['ctrl'] = np.array([np.mean((cs[h + 1] - cs[h + 1 - W]) / W) if len(h) else np.nan
+                                for h in x['ctrl']], dtype=float)
+        return out
+
+    @staticmethod
+    def _dec_auroc(x, y):
+        """Probability that a random y=True event has a higher x than a y=False one."""
+        x = np.asarray(x, float); y = np.asarray(y, bool)
+        n1, n0 = int(y.sum()), int((~y).sum())
+        if n1 < 3 or n0 < 3:
+            return np.nan
+        r = stats.rankdata(x)
+        return float((r[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+    def _dec_event_summary(self, ev, vals, window_key='pre'):
+        """One number per subject for each question the event outputs ask."""
+        c, x = ev['center'], ev['exc']
+        out = {'auroc': self._dec_auroc(vals[window_key], c['explore']),
+               'turn_minus_pass': np.nan, 'rho_dist': np.nan}
+        m = np.isfinite(vals['ctrl'])
+        if m.sum() >= 2:
+            out['turn_minus_pass'] = float(np.mean(vals['pre_turn'][m] - vals['ctrl'][m]))
+        if len(x['dmax']) >= 5 and np.ptp(x['dmax']) > 0 and np.ptp(vals['pre_turn']) > 0:
+            out['rho_dist'] = float(stats.spearmanr(vals['pre_turn'], x['dmax'])[0])
+        return out
+
+    def _dec_event_null(self, ev, window_key='pre', n_shift=500, rng=None):
+        """Null for _dec_event_summary: the same events against the animal's own
+        signal circularly shifted (by at least 30 s) inside the recorded stretch.
+
+        This keeps the signal's autocorrelation and the behavior's structure and
+        breaks only their alignment, which is the thing being tested.
+        """
+        rng = rng or np.random.default_rng(0)
+        lo, hi = ev['lo'], ev['hi']
+        n = hi - lo
+        gap = int(30 * ev['fps'])
+        keys = ('auroc', 'turn_minus_pass', 'rho_dist')
+        out = {k: np.full(n_shift, np.nan) for k in keys}
+        if n <= 2 * gap + 1:
+            return out
+        base = ev['sig'][lo:hi]
+        sig = ev['sig'].copy()
+        for k in range(n_shift):
+            sig[lo:hi] = np.roll(base, int(rng.integers(gap, n - gap)))
+            s = self._dec_event_summary(ev, self._dec_event_signals(sig, ev), window_key)
+            for key in keys:
+                out[key][k] = s[key]
+        return out
+
+    @staticmethod
+    def _dec_group_test(observed, nulls, chance):
+        """Group mean of a per-subject statistic against its shift null.
+
+        ``observed``: one value per subject; ``nulls``: subjects x shifts.  The
+        null group mean is recomputed per shift over the same subjects, and the
+        p-value is two-sided about the null's own centre.
+        """
+        obs = np.asarray(observed, float)
+        ok = np.isfinite(obs)
+        res = {'n': int(ok.sum()), 'mean': np.nan, 'null_mean': np.nan,
+               'null_sd': np.nan, 'p_shift': np.nan, 'p_t': np.nan}
+        if not ok.any():
+            return res
+        res['mean'] = float(obs[ok].mean())
+        nul = np.asarray(nulls, float).reshape(len(obs), -1)[ok]
+        cnt = np.isfinite(nul).sum(axis=0)
+        gn = np.nansum(nul, axis=0)[cnt > 0] / cnt[cnt > 0]
+        if gn.size:
+            res['null_mean'] = float(gn.mean()); res['null_sd'] = float(gn.std())
+            res['p_shift'] = float((np.sum(np.abs(gn - gn.mean()) >=
+                                           abs(res['mean'] - gn.mean())) + 1) / (gn.size + 1))
+        if ok.sum() > 2 and np.ptp(obs[ok]) > 0:
+            res['p_t'] = float(stats.ttest_1samp(obs[ok], chance).pvalue)
+        return res
+
+    @staticmethod
+    def _dec_locked_trace(ev, idx, pre_s=3.0, post_s=3.0):
+        """Mean signal around the frames ``idx`` (None when fewer than 2 fit)."""
+        a, b = int(round(pre_s * ev['fps'])), int(round(post_s * ev['fps']))
+        bad = np.concatenate(([0], np.cumsum(~ev['valid'])))
+        rows = [ev['sig'][i - a:i + b] for i in idx
+                if i - a >= 0 and i + b <= len(ev['sig']) and bad[i + b] - bad[i - a] == 0]
+        if len(rows) < 2:
+            return None
+        return np.mean(rows, axis=0)
+
+    def _dec_clear_plot(self):
+        """Empty the tab's output area and return a fresh frame to draw into."""
+        if self.dec_prob_canvas_widget is not None:
+            try:
+                self.dec_prob_canvas_widget.get_tk_widget().destroy()
+            except Exception:
+                pass
+            self.dec_prob_canvas_widget = None
+        if self.dec_prob_figure is not None:
+            try:
+                plt.close(self.dec_prob_figure)
+            except Exception:
+                pass
+            self.dec_prob_figure = None
+        for w in self.dec_prob_plot_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        frame = ttk.Frame(self.dec_prob_plot_frame)
+        frame.pack(fill='both', expand=True)
+        return frame
+
+    def _dec_selected_groups(self):
+        """{series name: [subjects]} for the current selection, or None (warned)."""
+        if self.dec_prob_by_var.get() == "Group":
+            if not self.dec_prob_group_listbox.curselection():
+                messagebox.showwarning("Warning", "Please select at least one group.")
+                return None
+            names = self.selected_series('decision_probability', self.dec_prob_group_listbox)
+            return {g: self._series_members(g) for g in names}
+        idx = self.dec_prob_subject_listbox.curselection()
+        if not idx:
+            messagebox.showwarning("Warning", "Please select at least one subject.")
+            return None
+        return {"Selected subjects": [self.dec_prob_subject_listbox.get(i) for i in idx]}
+
+    def _run_dec_events(self):
+        """Compute and plot the event-based decision outputs."""
+        mode = self.dec_mode_var.get()
+        try:
+            win_s = float(self.dec_event_window_var.get())
+            debounce_s = float(self.dec_event_debounce_var.get())
+            min_depth = float(self.dec_event_depth_var.get())
+            n_shift = int(float(self.dec_event_shifts_var.get()))
+            if win_s <= 0 or debounce_s < 0 or min_depth < 0 or n_shift < 0:
+                raise ValueError("values must be positive")
+        except ValueError as exc:
+            messagebox.showerror("Invalid Settings", f"Please check the event settings:\n{exc}")
+            return
+        from_base, to_base = self.dec_prob_from_var.get(), self.dec_prob_to_var.get()
+        from_zones = self._dec_prob_zones_for_base(from_base)
+        to_zones = self._dec_prob_zones_for_base(to_base)
+        mid_zones = self._dec_prob_zones_for_base('center')
+        if not from_zones or not to_zones or from_base == to_base:
+            messagebox.showwarning("Zone Error",
+                                   "Choose two DIFFERENT zones in 'Decision Zones' (From / To).")
+            return
+        if not mid_zones and mode != self.DEC_MODES[3]:
+            messagebox.showwarning(
+                "Zone Error",
+                "This output needs a decision zone between From and To: a zone whose "
+                "category is 'center'.")
+            return
+        groups = self._dec_selected_groups()
+        if groups is None:
+            return
+        channel = self.dec_prob_channel_var.get()
+        wkey = self._DEC_WINDOW_KEYS.get(self.dec_event_signal_var.get(), 'pre')
+        apply_excl = self.use_exclusions_dec_prob.get()
+        rng = np.random.default_rng(0)
+
+        res = {}
+        for g, subjects in groups.items():
+            subs = []
+            for s in subjects:
+                if apply_excl and self.is_subject_channel_excluded(s, channel):
+                    continue
+                ev = self._dec_events_for_subject(s, channel, from_zones, to_zones, mid_zones,
+                                                  win_s, debounce_s, min_depth)
+                if ev is None:
+                    continue
+                vals = self._dec_event_signals(ev['sig'], ev)
+                summ = self._dec_event_summary(ev, vals, wkey)
+                null = self._dec_event_null(ev, wkey, n_shift, rng) if n_shift else None
+                subs.append({'ev': ev, 'vals': vals, 'summ': summ, 'null': null})
+            if not subs:
+                continue
+            tests = {}
+            for key, chance in (('auroc', 0.5), ('turn_minus_pass', 0.0), ('rho_dist', 0.0)):
+                obs = [d['summ'][key] for d in subs]
+                nul = [d['null'][key] if d['null'] else np.full(1, np.nan) for d in subs]
+                tests[key] = self._dec_group_test(obs, nul, chance)
+            res[g] = {'subjects': subs, 'tests': tests}
+        if not res:
+            messagebox.showwarning("No Data", "No valid data found for the selected subjects/groups.")
+            return
+        self.dec_event_results = res
+        self.dec_event_meta = {'mode': mode, 'channel': channel, 'from_zone': from_base,
+                               'to_zone': to_base, 'window_s': win_s, 'debounce_s': debounce_s,
+                               'min_depth_cm': min_depth, 'n_shift': n_shift,
+                               'signal_window': self.dec_event_signal_var.get(),
+                               'window_key': wkey, 'exclusions_applied': apply_excl}
+        self.dec_last_kind = 'events'
+        self._plot_dec_events()
+
+    def _dec_events_text(self):
+        """Plain-language statistics for the last event run."""
+        meta, res = self.dec_event_meta, self.dec_event_results
+        f_lab, t_lab = meta['from_zone'], meta['to_zone']
+
+        def line(label, t, unit=''):
+            if t['n'] == 0:
+                return f"  {label}: not enough events in any subject."
+            p = "n/a" if np.isnan(t['p_shift']) else f"{t['p_shift']:.4f}"
+            pt = "n/a" if np.isnan(t['p_t']) else f"{t['p_t']:.4f}"
+            return (f"  {label}: mean {t['mean']:+.3f}{unit} over {t['n']} subjects; "
+                    f"shift null {t['null_mean']:+.3f} +/- {t['null_sd']:.3f}; "
+                    f"p(shift) = {p}; p(t-test) = {pt}")
+
+        out = [f"{meta['mode']} - {meta['channel']}; window {meta['window_s']:g} s; "
+               f"zone runs under {meta['debounce_s']:g} s ignored; exclusions "
+               f"{'applied' if meta['exclusions_applied'] else 'NOT applied'}", ""]
+        for g, d in res.items():
+            n_ex = sum(int(s['ev']['center']['explore'].sum()) for s in d['subjects'])
+            n_av = sum(int((~s['ev']['center']['explore']).sum()) for s in d['subjects'])
+            n_x = sum(len(s['ev']['exc']['peak']) for s in d['subjects'])
+            n_c = sum(int(np.isfinite(s['vals']['ctrl']).sum()) for s in d['subjects'])
+            out.append(f"{g}  ({len(d['subjects'])} subjects)")
+            if meta['mode'] == self.DEC_MODES[3]:
+                out.append(f"  {t_lab} excursions: {n_x}; with a further-going excursion to compare against: {n_c}")
+                out.append(line("Signal before turning back minus signal passing the same distance",
+                                d['tests']['turn_minus_pass'], ' z'))
+                out.append(line("Within-subject Spearman rho, pre-turn signal vs furthest distance",
+                                d['tests']['rho_dist']))
+            else:
+                out.append(f"  decisions: {n_ex} explore ({f_lab} -> center -> {t_lab}), "
+                           f"{n_av} avoid (back to {f_lab})")
+                out.append(line(f"AUROC, signal [{meta['signal_window']}] for explore (0.5 = none)",
+                                d['tests']['auroc']))
+            out.append("")
+        out.append("p(shift): the same events scored against each animal's own signal, circularly "
+                   "shifted by at least 30 s. It is the test to trust;")
+        out.append("the t-test treats subjects as independent draws and ignores how slowly the signal moves.")
+        if meta['mode'] != self.DEC_MODES[3] and meta['window_key'] != 'pre':
+            out.append("This window overlaps the choice itself: a difference here is concurrent with "
+                       "the decision, not a prediction of it.")
+        return "\n".join(out)
+
+    def _plot_dec_events(self):
+        """Draw the event-based outputs for the last run."""
+        meta, res = self.dec_event_meta, self.dec_event_results
+        mode, wkey = meta['mode'], meta['window_key']
+        frame = self._dec_clear_plot()
+        canvas_frame = ttk.Frame(frame)
+        canvas_frame.pack(fill='both', expand=True)
+        cols = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        gcol = {g: cols[i % len(cols)] for i, g in enumerate(res)}
+        f_lab, t_lab = meta['from_zone'], meta['to_zone']
+        fig, axs = plt.subplots(1, 3 if mode != self.DEC_MODES[2] else 1,
+                                figsize=(13.5, 4.6) if mode != self.DEC_MODES[2] else (6.5, 4.8),
+                                squeeze=False)
+        axs = axs[0]
+        self.dec_prob_figure = fig
+
+        def trace(ax, g, picker, ls='-', label=None):
+            rows = []
+            for s in res[g]['subjects']:
+                tr = self._dec_locked_trace(s['ev'], picker(s))
+                if tr is not None:
+                    rows.append(tr)
+            if len(rows) < 2:
+                return
+            n = min(len(r) for r in rows)
+            M = np.array([r[:n] for r in rows])
+            t = (np.arange(n) - n / 2.0) / res[g]['subjects'][0]['ev']['fps']
+            m, se = M.mean(0), M.std(0, ddof=1) / np.sqrt(len(M))
+            ax.fill_between(t, m - se, m + se, color=gcol[g], alpha=0.15, linewidth=0)
+            ax.plot(t, m, color=gcol[g], linestyle=ls, linewidth=1.8,
+                    label=f"{label or g} (n={len(M)})")
+
+        if mode == self.DEC_MODES[1]:                       # explore vs avoid
+            ax = axs[0]
+            for gi, g in enumerate(res):
+                for s in res[g]['subjects']:
+                    e = s['ev']['center']['explore']; v = s['vals'][wkey]
+                    if e.sum() and (~e).sum():
+                        ax.plot([gi - 0.17, gi + 0.17], [v[~e].mean(), v[e].mean()],
+                                color=gcol[g], marker='o', markersize=3.5, linewidth=0.7, alpha=0.55)
+            ax.set_xticks(range(len(res)))
+            ax.set_xticklabels([f"{g}\navoid | explore" for g in res], fontsize=8)
+            ax.set_ylabel("Subject mean z-score")
+            ax.set_title(f"Signal: {meta['signal_window'].lower()}", fontsize=10)
+            ax = axs[1]
+            for gi, g in enumerate(res):
+                a = np.array([s['summ']['auroc'] for s in res[g]['subjects']], float)
+                a = a[np.isfinite(a)]
+                jit = np.linspace(-0.15, 0.15, len(a)) if len(a) > 1 else np.zeros(len(a))
+                ax.scatter(gi + jit, a, s=22, color=gcol[g], alpha=0.7, linewidths=0)
+                if len(a):
+                    ax.plot([gi - 0.25, gi + 0.25], [a.mean()] * 2, color=gcol[g], linewidth=2.5)
+            ax.axhline(0.5, color='gray', linestyle=':', linewidth=1)
+            ax.set_xticks(range(len(res))); ax.set_xticklabels(list(res), fontsize=8)
+            ax.set_ylim(0, 1); ax.set_ylabel("AUROC per subject (explore vs avoid)")
+            ax.set_title("How well signal separates the two choices", fontsize=10)
+            ax = axs[2]
+            for g in res:
+                trace(ax, g, lambda s: s['ev']['center']['entry'][s['ev']['center']['explore']],
+                      '-', f"{g} explore")
+                trace(ax, g, lambda s: s['ev']['center']['entry'][~s['ev']['center']['explore']],
+                      '--', f"{g} avoid")
+            ax.axvline(0, color='gray', linestyle=':', linewidth=1)
+            ax.set_xlabel("Time from center entry (s)"); ax.set_ylabel("z-score")
+            ax.set_title("Signal around center entry", fontsize=10)
+            ax.legend(fontsize=7, framealpha=0.85)
+        elif mode == self.DEC_MODES[2]:                     # signal vs P(explore)
+            ax = axs[0]
+            for g in res:
+                pts = []
+                for s in res[g]['subjects']:
+                    e = s['ev']['center']['explore'].astype(float); v = s['vals'][wkey]
+                    if len(v) < 9 or e.sum() < 2:
+                        continue
+                    order = np.argsort(v, kind='stable')
+                    parts = np.array_split(order, 3)
+                    xs = [v[p].mean() for p in parts]; ys = [e[p].mean() for p in parts]
+                    ax.plot(xs, ys, color=gcol[g], linewidth=0.6, alpha=0.3, marker='o', markersize=2.5)
+                    pts.append(np.c_[xs, ys])
+                if pts:
+                    P = np.array(pts)
+                    se = P[:, :, 1].std(0, ddof=1) / np.sqrt(len(P)) if len(P) > 1 else None
+                    ax.errorbar(P[:, :, 0].mean(0), P[:, :, 1].mean(0), yerr=se, color=gcol[g],
+                                linewidth=2, marker='o', markersize=7, capsize=3,
+                                label=f"{g} (n={len(P)})")
+            ax.set_ylim(0, 1)
+            ax.set_xlabel(f"z-score, {meta['signal_window'].lower()} (low / middle / high third)")
+            ax.set_ylabel(f"P(explore): center -> {t_lab}")
+            ax.set_title("Signal vs probability of exploring", fontsize=10)
+            ax.legend(fontsize=8, framealpha=0.85)
+        else:                                               # distal turn-back
+            ax = axs[0]
+            for g in res:
+                x = np.concatenate([s['ev']['exc']['dmax'] for s in res[g]['subjects']])
+                y = np.concatenate([s['vals']['pre_turn'] for s in res[g]['subjects']])
+                nx = np.concatenate([s['ev']['exc']['next'] for s in res[g]['subjects']])
+                ax.scatter(x[nx != 2], y[nx != 2], s=16, color=gcol[g], alpha=0.6, linewidths=0,
+                           label=f"{g}: then {f_lab}")
+                ax.scatter(x[nx == 2], y[nx == 2], s=18, facecolors='none', edgecolors=gcol[g],
+                           alpha=0.8, label=f"{g}: then {t_lab} again")
+            ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+            ax.set_xlabel("Furthest point of excursion (cm from center)")
+            ax.set_ylabel(f"z-score, {meta['window_s']:g} s before turning back")
+            ax.set_title("Signal before retreat vs distance reached", fontsize=10)
+            ax.legend(fontsize=7, framealpha=0.85)
+            ax = axs[1]
+            for gi, g in enumerate(res):
+                for s in res[g]['subjects']:
+                    m = np.isfinite(s['vals']['ctrl'])
+                    if m.sum() >= 2:
+                        ax.plot([gi - 0.17, gi + 0.17],
+                                [s['vals']['ctrl'][m].mean(), s['vals']['pre_turn'][m].mean()],
+                                color=gcol[g], marker='o', markersize=3.5, linewidth=0.7, alpha=0.55)
+            ax.axhline(0, color='gray', linestyle=':', linewidth=1)
+            ax.set_xticks(range(len(res)))
+            ax.set_xticklabels([f"{g}\nkept going | turned back" for g in res], fontsize=8)
+            ax.set_ylabel("Subject mean z-score")
+            ax.set_title("Same distance, different decision", fontsize=10)
+            ax = axs[2]
+            for g in res:
+                trace(ax, g, lambda s: s['ev']['exc']['peak'])
+            ax.axvline(0, color='gray', linestyle=':', linewidth=1)
+            ax.set_xlabel("Time from furthest point (s)"); ax.set_ylabel("z-score")
+            ax.set_title("Signal around the turn-back point", fontsize=10)
+            ax.legend(fontsize=7, framealpha=0.85)
+        for ax in axs:
+            ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        fig.suptitle(f"{mode} — {meta['channel']}", fontsize=12)
+        fig.tight_layout()
+        self.dec_prob_canvas_widget = self._embed_plot_canvas(fig, canvas_frame)
+
+        stats_outer = ttk.Frame(frame)
+        stats_outer.pack(fill='x')
+        txt = tk.Text(stats_outer, height=9, font=('Courier', 9), wrap='word',
+                      relief='flat', background='#f8f8f8')
+        yscr = ttk.Scrollbar(stats_outer, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=yscr.set)
+        yscr.pack(side='right', fill='y')
+        txt.pack(fill='both', expand=True)
+        txt.insert('end', self._dec_events_text())
+        txt.configure(state='disabled')
+
+    def _dec_event_tables(self):
+        """(center decisions, excursions, per-subject summary) as DataFrames."""
+        meta, res = self.dec_event_meta, self.dec_event_results
+        cen, exc, summ = [], [], []
+        for g, d in res.items():
+            for s in d['subjects']:
+                ev, v = s['ev'], s['vals']; fps = ev['fps']; name = ev['subject']
+                c, x = ev['center'], ev['exc']
+                for i in range(len(c['entry'])):
+                    cen.append({'Group': g, 'Subject': name, 'Channel': meta['channel'],
+                                'Center_Entry_Frame': int(c['entry'][i]),
+                                'Center_Exit_Frame': int(c['exit'][i]),
+                                'Entry_Time_s': c['entry'][i] / fps,
+                                'Dwell_s': (c['exit'][i] - c['entry'][i]) / fps,
+                                'Decision': 'explore' if c['explore'][i] else 'avoid',
+                                'Next_Zone': meta['to_zone'] if c['explore'][i] else meta['from_zone'],
+                                'Signal_Before_Entry': v['pre'][i], 'Signal_Dwell': v['dwell'][i],
+                                'Signal_End_Of_Dwell': v['last'][i]})
+                for i in range(len(x['peak'])):
+                    nxt = {1: meta['from_zone'], 2: meta['to_zone']}.get(int(x['next'][i]), 'none')
+                    exc.append({'Group': g, 'Subject': name, 'Channel': meta['channel'],
+                                'Entry_Frame': int(x['entry'][i]), 'Distal_Frame': int(x['peak'][i]),
+                                'Exit_Frame': int(x['exit'][i]), 'Distal_Time_s': x['peak'][i] / fps,
+                                'Current_Zone': meta['to_zone'], 'Next_Zone': 'center',
+                                'Next_Arm': nxt, 'Max_Distance_cm': x['dmax'][i],
+                                'Depth_cm': x['depth'][i],
+                                'Time_Out_s': (x['peak'][i] - x['entry'][i]) / fps,
+                                'Time_Back_s': (x['exit'][i] - x['peak'][i]) / fps,
+                                'Signal_Before_Turn': v['pre_turn'][i],
+                                'Signal_At_Arm_Entry': v['at_entry'][i],
+                                'Signal_Same_Distance_Kept_Going': v['ctrl'][i],
+                                'N_Control_Passes': len(x['ctrl'][i])})
+                summ.append({'Group': g, 'Subject': name, 'Channel': meta['channel'],
+                             'N_Explore': int(c['explore'].sum()), 'N_Avoid': int((~c['explore']).sum()),
+                             'P_Explore': float(c['explore'].mean()) if len(c['explore']) else np.nan,
+                             'AUROC_Explore': s['summ']['auroc'],
+                             'N_Excursions': len(x['peak']),
+                             'Turn_Minus_Pass_z': s['summ']['turn_minus_pass'],
+                             'Rho_Signal_vs_Distance': s['summ']['rho_dist']})
+        return pd.DataFrame(cen), pd.DataFrame(exc), pd.DataFrame(summ)
+
+    def _export_dec_events(self):
+        """Export the event tables behind the last event-based run."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export Decision Events")
+        if not path:
+            return
+        try:
+            cen, exc, summ = self._dec_event_tables()
+            meta = self.dec_event_meta
+            tests = pd.DataFrame([dict(Group=g, Statistic=k, **t)
+                                  for g, d in self.dec_event_results.items()
+                                  for k, t in d['tests'].items()])
+            settings = pd.DataFrame([{'Setting': k, 'Value': v} for k, v in meta.items()])
+            if path.lower().endswith('.csv'):
+                table = exc if meta['mode'] == self.DEC_MODES[3] else cen
+                table.to_csv(path, index=False)
+            else:
+                with pd.ExcelWriter(path) as xl:
+                    cen.to_excel(xl, sheet_name='Center decisions', index=False)
+                    exc.to_excel(xl, sheet_name='Excursions', index=False)
+                    summ.to_excel(xl, sheet_name='Subject summary', index=False)
+                    tests.to_excel(xl, sheet_name='Group tests', index=False)
+                    settings.to_excel(xl, sheet_name='Settings', index=False)
+            messagebox.showinfo("Exported", f"Decision events exported to:\n{path}")
+        except Exception as exc_:
+            messagebox.showerror("Export Error", f"Could not export:\n{exc_}")
+
     # ── Main run / plot / export ──────────────────────────────────────────────
 
     def run_decision_probability(self):
         """Compute and plot decision probability curves."""
         try:
+            if self.dec_mode_var.get() != self.DEC_MODES[0]:
+                return self._run_dec_events()
             # Parse settings
             try:
                 lookahead_sec = float(self.dec_prob_lookahead_var.get())
@@ -50735,6 +51703,7 @@ cat("OK\n")
                 return
 
             self.dec_prob_results = results
+            self.dec_last_kind = 'frames'
             self.dec_prob_meta = {
                 'channel': channel, 'from_zone': from_base, 'to_zone': to_base,
                 'lookahead_sec': lookahead_sec, 'avg_method': avg_method,
@@ -51214,6 +52183,8 @@ cat("OK\n")
     @exports_channel_labels
     def export_decision_probability(self):
         """Export decision probability results to Excel or CSV."""
+        if getattr(self, 'dec_last_kind', 'frames') == 'events' and self.dec_event_results:
+            return self._export_dec_events()
         if not self.dec_prob_results:
             messagebox.showwarning("No Results",
                                    "Run the analysis first before exporting.")
@@ -52891,9 +53862,17 @@ cat("OK\n")
 
     def _kin_channel_index(self):
         """Map the selected channel label to a beh_synced signal column offset."""
-        label = (self.kin_channel_var.get() or "G0").upper()
-        # G0 -> col 6, G1 -> col 7 (see synchronize_behavior layout).
-        return 1 if label.endswith("1") else 0
+        label = str(self.kin_channel_var.get() or "G0").strip()
+        # Resolve through the subjects' own channel order, so G2 and up (or a
+        # red channel) read their own column instead of falling back to Ch0.
+        for data in getattr(self, 'processed_data', {}).values():
+            if not isinstance(data, dict):
+                continue
+            for slot in range(max(1, self._beh_channel_count(data))):
+                if str(self.get_channel_name(data, slot)).upper() == label.upper():
+                    return slot
+        m = re.match(r'^(?:G|CH)(\d+)$', label.upper())
+        return int(m.group(1)) if m else 0
 
     def _kin_settings(self):
         """Read and sanity-clamp the parameter entries."""
@@ -52946,6 +53925,9 @@ cat("OK\n")
         vel = np.nan_to_num(vel, nan=0.0)
         sig_col = 6 + ch_index
         sig = bs[:, sig_col].astype(float) if bs.shape[1] > sig_col else np.full(n, np.nan)
+        # Rows the photometry never recorded carry one repeated sample; they
+        # are movement with no signal, so they drop out of every pairing.
+        sig[~self._recorded_rows(bs)] = np.nan
 
         # Smoothed velocity + acceleration via Savitzky-Golay.
         win = settings['win']
@@ -54216,7 +55198,8 @@ cat("OK\n")
             r_r = stats.pearsonr(k['radial_vel'][mr], k['sig'][mr])[0] if mr.sum() > 5 else np.nan
             lags, rs = self._kin_xcorr(k['sig'], k['vel'], max_lag_frames)
             if len(rs):
-                pi = int(np.nanargmin(rs))
+                # The extremum of either sign, as the column name says.
+                pi = int(np.nanargmax(np.abs(rs)))
                 peak_lag = lags[pi] / fps
                 peak_r = rs[pi]
             else:
