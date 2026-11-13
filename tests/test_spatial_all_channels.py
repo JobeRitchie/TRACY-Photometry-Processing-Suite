@@ -89,7 +89,9 @@ def test_zone_average_plot_draws_a_bar_per_channel():
     app.plot_zone_averages_multi(fig, ['s1', 's2'])
     labels = [c.get_label() for c in fig.axes[0].containers
               if not c.get_label().startswith('_')]
-    assert labels == [f'G{c} Mean±SEM' for c in range(N_CH)]
+    # Each series' legend entry ends with its n, e.g. "G0 Mean±SEM (n=3)".
+    assert [l.split(' (n=')[0] for l in labels] == [f'G{c} Mean±SEM' for c in range(N_CH)]
+    assert all(' (n=' in l for l in labels)
 
 
 def test_distance_group_comparison_has_a_row_per_channel():

@@ -31,6 +31,8 @@ from pathlib import Path
 import openpyxl
 from openpyxl import Workbook, load_workbook
 
+import tracy_glossary
+
 # On Windows, every child process the GUI spawns (git, pip, …) briefly flashes
 # its own console window. Passing this flag suppresses it. CREATE_NO_WINDOW
 # exists only on Windows, so the lookup is guarded; it is a no-op elsewhere.
@@ -40,8 +42,8 @@ SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Single source of truth for the application version. Referenced by the
 # Welcome tab, the Info/Changelog tab, and the System Check tab so the
 # displayed version only ever needs to be updated in one place.
-APP_VERSION = "1.34.0"
-APP_VERSION_DATE = "November 12, 2026"
+APP_VERSION = "1.35.0"
+APP_VERSION_DATE = "November 13, 2026"
 
 # ── Shared UI layout constants ──────────────────────────────────────────────
 # A single source of truth for sizing so every tab looks cohesive.
@@ -746,6 +748,8 @@ PARAM_GROUPS = [
             ('time_bin_size', "Time bin (s)", "0 = no binning"),
             ('spatial_bin_size', "Spatial bin (cm)", "Heatmap bin size"),
             ('distance_bin_cm', "Distance bin (cm)", "Distance from centre plots; 1 = every cm"),
+            ('behav_distance_bin_cm', "Time-at-distance bin (cm)",
+             "Behavioral Data time at distance from centre; 1 = every cm"),
         ]),
         ("Plot defaults", "", [
             ('series_factor', "Factor plotted as series", ""),
@@ -2565,6 +2569,7 @@ class FPAnalysisGUI:
             'time_bin_size': 60,  # seconds (0 = no binning)
             'spatial_bin_size': 2,  # cm for heatmap binning
             'distance_bin_cm': 1,  # cm bins for the distance-from-centre plots
+            'behav_distance_bin_cm': 1,  # cm bins for time at distance from centre
             # Baseline correction for bouts
             'baseline_correct_bouts': True,  # Apply baseline correction to extracted bouts
             # User's names for channels, {designation: name} e.g. {'G0': 'BLA'}.
@@ -3315,7 +3320,8 @@ class FPAnalysisGUI:
     # app is learned once rather than per tab. Selection (who is plotted) and
     # Settings (how) stack in a left column; Output (the figure) fills the rest.
     def make_layout_zones(self, parent, selection_title="Selection",
-                          settings_title="Settings", column_px=300):
+                          settings_title="Settings", column_px=300,
+                          help_key=None):
         """Return the tab's ``(selection, settings, output, actions)`` frames.
 
         Building the arrangement here rather than hand-laying each tab is what
@@ -3360,6 +3366,12 @@ class FPAnalysisGUI:
 
         selection = ttk.LabelFrame(column, text=selection_title, padding=4)
         selection.pack(fill='x')
+        if help_key:
+            # In the title band of the first frame, level with its heading:
+            # the one spot at the top of the column that no control occupies.
+            self.make_help_button(column, help_key).place(
+                in_=selection, relx=1.0, x=-self.ui_px(4), y=0, anchor='ne',
+                bordermode='outside')
 
         settings = ttk.LabelFrame(column, text=settings_title, padding=4)
         settings.pack(fill='both', expand=True, pady=(self.ui_px(4), 0))
@@ -3408,6 +3420,106 @@ class FPAnalysisGUI:
         # narrow the window may get; keep it modest for the same reason.
         output = self.make_scrollable(output_host, width=self.ui_px(320))
         return selection, settings, output, actions
+
+    # ------------------------------------------------------------------
+    # Glossary help ("?") buttons
+    #
+    # Every tab carries one. It opens Info > Glossary at the entry for the
+    # graph currently selected on that tab, or at the tab's own explainer when
+    # the tab has no graph selector (or nothing has been plotted yet).
+    # ------------------------------------------------------------------
+
+    # Coherence graph -> the mode page it is drawn from, so a graph remembered
+    # from one page is not offered while another page is showing.
+    COH_GRAPH_PAGE = {
+        'coh:Visualize Coherence': 0, 'coh:Power Spectra': 0,
+        'coh:Wavelet Spectrogram': 0, 'coh:Band Bars (whole session)': 0,
+        'coh:Plot Epoch Coherence': 1, 'coh:Epoch Band Bars': 1,
+        'coh:Epoch Spectrogram': 1,
+        'coh:Plot Spectra (groups)': 2, 'coh:Plot Band Bars (groups)': 2,
+        'coh:Zone Coherence': 2, 'coh:Plot Spectra (Pre vs Post)': 2,
+        'coh:Plot Band Bars (Pre vs Post)': 2, 'coh:Plot Delta Coherence': 2,
+        'coh:Peri-Event Spectrogram': 2,
+    }
+    COH_PAGE_ENTRIES = ('coh:Whole Session', 'coh:By Bout', 'coh:By Group')
+
+    def make_help_button(self, parent, help_key):
+        """A small "?" that opens the glossary entry for ``help_key``'s tab."""
+        return ttk.Button(parent, text="?", style='Help.TButton', width=2,
+                          takefocus=False,
+                          command=lambda: self.open_glossary(
+                              self.glossary_target(help_key)))
+
+    def place_tab_help(self, tab, help_key):
+        """Pin a "?" to the top-right corner of a tab that has no control
+        column to carry one. Inset past the tab's own scrollbar."""
+        btn = self.make_help_button(tab, help_key)
+        btn.place(relx=1.0, x=-self.ui_px(24), y=self.ui_px(4), anchor='ne')
+        # Siblings packed later would otherwise be drawn over it.
+        self.root.after_idle(btn.lift)
+        return btn
+
+    def remember_graph(self, help_key, entry_id, command):
+        """Wrap ``command`` so running it records ``entry_id`` as the graph
+        last drawn on that tab, for tabs whose graphs are buttons or menu
+        items rather than one dropdown."""
+        def run(*args, **kwargs):
+            if not hasattr(self, '_help_last_graph'):
+                self._help_last_graph = {}
+            self._help_last_graph[help_key] = entry_id
+            return command(*args, **kwargs)
+        return run
+
+    def glossary_target(self, help_key):
+        """Glossary entry id the "?" on tab ``help_key`` should open now."""
+        resolve = tracy_glossary.resolve
+        last = getattr(self, '_help_last_graph', {}).get(help_key)
+
+        def var(name):
+            v = getattr(self, name, None)
+            try:
+                return v.get() if v is not None else ''
+            except tk.TclError:
+                return ''
+
+        if help_key == 'visualization':
+            return resolve('viz', var('plot_type_var'), 'tab:Visualization')
+        if help_key == 'kinematics':
+            return resolve('kin', var('kin_analysis_var'), 'tab:Kinematics')
+        if help_key == 'decision_probability':
+            return resolve('dec', var('dec_mode_var'), 'tab:Decision Probability')
+        if help_key == 'spatial':
+            opts = getattr(self, '_spatial_vars', None) or {}
+            plot = opts['plot'].get() if 'plot' in opts else ''
+            return resolve('spatial', plot, 'tab:Spike Analysis')
+        if help_key == 'behavioral':
+            metric = var('_behav_metric_var')
+            if not metric:
+                return 'tab:Behavioral Data'
+            if metric.startswith(self.TIME_AT_DISTANCE_PREFIX):
+                return 'behav:Time at Distance from Center'
+            if metric.startswith('[Summary] '):
+                return resolve('behav', metric[len('[Summary] '):],
+                               'tab:Behavioral Data')
+            return 'behav:Single metric'
+        if help_key == 'coherence':
+            nb = getattr(self, 'conn_mode_nb', None)
+            try:
+                page = nb.index(nb.select()) if nb is not None else 0
+            except tk.TclError:
+                page = 0
+            if last and self.COH_GRAPH_PAGE.get(last) == page:
+                return last
+            return self.COH_PAGE_ENTRIES[page]
+        if help_key == 'signal_linkage':
+            return 'link:Onset linkage'
+        fallback = {
+            'bout_analysis': 'tab:Bout Analysis',
+            'spike': 'tab:Spike Analysis',
+        }.get(help_key)
+        if fallback:
+            return last or fallback
+        return resolve('tab', help_key, 'tab:Glossary')
 
     def fit_notebook_tabs(self):
         """Keep every tab label readable by fitting the row to the notebook.
@@ -3756,6 +3868,18 @@ class FPAnalysisGUI:
                  background=[('active', self.colors['accent_dark_blue']),
                            ('pressed', self.colors['bg_medium'])],
                  relief=[('pressed', 'sunken'), ('active', 'raised')])
+
+        # The "?" on every tab that opens the glossary. Narrow padding so it
+        # stays a small square; its size follows the font, not a pixel count.
+        style.configure('Help.TButton',
+                       background=self.colors['accent_blue'],
+                       foreground='white',
+                       borderwidth=0, relief='raised', focuscolor='none',
+                       font=('Segoe UI', 9, 'bold'),
+                       padding=[px(5), 0])
+        style.map('Help.TButton',
+                 background=[('active', self.colors['accent_dark_blue']),
+                           ('pressed', self.colors['bg_medium'])])
 
         # Spinboxes: give the arrows a real hit target and keep the field from
         # collapsing to a couple of characters at small scales, which is what
@@ -4130,6 +4254,7 @@ class FPAnalysisGUI:
         """
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="Welcome")
+        self.place_tab_help(tab, 'Welcome')
         
         # Create main container with dark blue background
         main_frame = tk.Frame(tab, bg=self.colors['bg_dark'])
@@ -4245,6 +4370,7 @@ class FPAnalysisGUI:
         """Tab for project creation and management"""
         tab_outer = ttk.Frame(self.project_notebook)
         self.project_notebook.add(tab_outer, text="Setup")
+        self.place_tab_help(tab_outer, 'Setup')
         # This tab's content is ~820 px tall — more than the viewport on a
         # 1366x768 laptop — so host it in a scrolling viewport rather than
         # letting the lower controls fall off the bottom of the screen.
@@ -5240,6 +5366,7 @@ class FPAnalysisGUI:
         """Tab for data processing"""
         tab = ttk.Frame(self.project_notebook)
         self.project_notebook.add(tab, text="Processing")
+        self.place_tab_help(tab, 'Processing')
         
         # Create canvas with scrollbar for scrollable content
         canvas = tk.Canvas(tab, highlightthickness=0)
@@ -5702,6 +5829,7 @@ class FPAnalysisGUI:
         """Tab for viewing and editing boutframes"""
         tab = ttk.Frame(self.project_notebook)
         self.project_notebook.add(tab, text="Bout Frames Editor")
+        self.place_tab_help(tab, 'Bout Frames Editor')
 
         # ── Shared subject/file controls (above both subtabs) ──────────
         control_frame = ttk.Frame(tab)
@@ -6098,7 +6226,7 @@ class FPAnalysisGUI:
 
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
-            settings_title="Analysis Settings")
+            settings_title="Analysis Settings", help_key='behavioral')
 
         # ---------------------------------------------------------------- Selection
         mode_frame = ttk.Frame(selection)
@@ -6195,8 +6323,30 @@ class FPAnalysisGUI:
                   wraplength=self.ui_px(250), justify='left').pack(
             anchor='w', pady=(self.ui_px(3), 0))
 
+        # Time at distance from centre: binned at view time from the samples
+        # Calculate Metrics keeps, so changing the bin needs no recalculation.
+        dist_frame = ttk.LabelFrame(settings, text="Time at distance from center", padding=5)
+        dist_frame.pack(fill='x', pady=(self.ui_px(6), 0))
+        dist_row = ttk.Frame(dist_frame)
+        dist_row.pack(fill='x')
+        ttk.Label(dist_row, text="Distance bin (cm):").pack(side='left')
+        self.behav_distance_bin_var = tk.StringVar(
+            value=f"{self.params.get('behav_distance_bin_cm', 1):g}")
+        behav_dist_entry = ttk.Entry(dist_row, textvariable=self.behav_distance_bin_var, width=8)
+        behav_dist_entry.pack(side='left', padx=(self.ui_px(6), 0))
+        behav_dist_entry.bind('<Return>', lambda e: self.root.after_idle(self._behav_replot_if_shown))
+        ttk.Label(dist_frame,
+                  text="A width (5 = 0-5, 5-10, ... cm) or your own ranges "
+                       "(5-10, 10-15, 20-40). "
+                       "Pick a \"Time at Distance from Center\" summary under "
+                       "Visualize Data; press Enter to redraw.",
+                  foreground='gray', font=('Segoe UI', 8),
+                  wraplength=self.ui_px(250), justify='left').pack(
+            anchor='w', pady=(self.ui_px(3), 0))
+
         ttk.Checkbutton(settings, text="Apply exclusions",
-                        variable=self.use_exclusions_behavioral).pack(
+                        variable=self.use_exclusions_behavioral,
+                        command=self._behav_refresh_view).pack(
             anchor='w', pady=(self.ui_px(6), 0))
 
         # ---------------------------------------------------------------- Actions
@@ -6207,6 +6357,9 @@ class FPAnalysisGUI:
             fill='x', pady=(self.ui_px(4), 0))
         ttk.Button(actions, text="Export to CSV",
                    command=self.export_behavioral_metrics).pack(
+            fill='x', pady=(self.ui_px(4), 0))
+        ttk.Button(actions, text="Export Time at Distance",
+                   command=self.export_time_at_distance).pack(
             fill='x', pady=(self.ui_px(4), 0))
 
         # ---------------------------------------------------------------- Output
@@ -6253,6 +6406,7 @@ class FPAnalysisGUI:
         """
         tab = ttk.Frame(self.project_notebook)
         self.project_notebook.add(tab, text="Factors")
+        self.place_tab_help(tab, 'Factors')
 
         canvas = tk.Canvas(tab, highlightthickness=0)
         scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
@@ -7538,6 +7692,7 @@ class FPAnalysisGUI:
         """Tab for managing subject exclusions on a per-channel basis"""
         tab = ttk.Frame(self.project_notebook)
         self.project_notebook.add(tab, text="Exclusions")
+        self.place_tab_help(tab, 'Exclusions')
         
         # Main container
         main_container = ttk.Frame(tab)
@@ -7615,7 +7770,8 @@ class FPAnalysisGUI:
         self.data_notebook.add(tab, text="Visualization")
 
         selection, settings, output, actions = self.make_layout_zones(
-            tab, selection_title="Subjects & Groups", settings_title="Plot Settings")
+            tab, selection_title="Subjects & Groups", settings_title="Plot Settings",
+            help_key='visualization')
 
         # ── Selection zone ───────────────────────────────────────────────────
         mode_row = ttk.Frame(selection)
@@ -8064,7 +8220,7 @@ class FPAnalysisGUI:
         # and the frequency bands -- so those stop being repeated per mode.
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
-            settings_title="Coherence Settings")
+            settings_title="Coherence Settings", help_key='coherence')
 
         # ── Selection ──────────────────────────────────────────────────────
         self.conn_mode_var = tk.StringVar(value="Subject")
@@ -8177,8 +8333,9 @@ class FPAnalysisGUI:
         # ══════════════════════════════════════════════════════════════════
         #  ANALYSIS MODE NOTEBOOK  (Whole Session | By Bout | By Group)
         # ══════════════════════════════════════════════════════════════════
-        mode_nb = ttk.Notebook(output)
+        mode_nb = self.conn_mode_nb = ttk.Notebook(output)
         mode_nb.pack(fill='both', expand=True)
+        _g = lambda entry, fn: self.remember_graph('coherence', entry, fn)
 
         # ── TAB 1: Whole Session ──────────────────────────────────────────
         ws_tab = ttk.Frame(mode_nb, padding=10)
@@ -8212,10 +8369,10 @@ class FPAnalysisGUI:
         ws_btns.pack(fill='x', pady=(0, 6))
         self.button_grid(ws_btns, (
             ("▶ Run Analysis", self.run_connectivity_analysis),
-            ("📊 Visualize Coherence", self.visualize_connectivity),
-            ("📈 Power Spectra", self.visualize_power_spectra),
-            ("🌊 Wavelet Spectrogram", self.visualize_wavelet_spectrogram),
-            ("📈 Band Bars", self.visualize_static_band_bars),
+            ("📊 Visualize Coherence", _g('coh:Visualize Coherence', self.visualize_connectivity)),
+            ("📈 Power Spectra", _g('coh:Power Spectra', self.visualize_power_spectra)),
+            ("🌊 Wavelet Spectrogram", _g('coh:Wavelet Spectrogram', self.visualize_wavelet_spectrogram)),
+            ("📈 Band Bars", _g('coh:Band Bars (whole session)', self.visualize_static_band_bars)),
             ("💾 Export", self.export_connectivity_results)))
 
         ws_tree_frame = ttk.Frame(ws_tab)
@@ -8305,9 +8462,9 @@ class FPAnalysisGUI:
         bout_btns.pack(fill='x', pady=(0, 6))
         self.button_grid(bout_btns, (
             ("▶ Run Bout Epoch Coherence", self.run_bout_epoch_coherence),
-            ("📊 Plot Epoch Coherence", self.visualize_bout_epoch_coherence),
-            ("📈 Plot Band Bars", self.visualize_connectivity_band_bars),
-            ("🌊 Epoch Spectrogram", self.visualize_bout_epoch_spectrogram),
+            ("📊 Plot Epoch Coherence", _g('coh:Plot Epoch Coherence', self.visualize_bout_epoch_coherence)),
+            ("📈 Plot Band Bars", _g('coh:Epoch Band Bars', self.visualize_connectivity_band_bars)),
+            ("🌊 Epoch Spectrogram", _g('coh:Epoch Spectrogram', self.visualize_bout_epoch_spectrogram)),
             ("💾 Export Epoch Data", self.export_bout_epoch_coherence),
             ("📋 Prism Copy/Paste", self.export_bout_epoch_prism)))
 
@@ -8410,20 +8567,20 @@ class FPAnalysisGUI:
         self._grp_ws_btns.grid(row=5, column=0, columnspan=4, sticky='ew', pady=(4, 0))
         self.button_grid(self._grp_ws_btns, (
             ("▶ Run Group Comparison", self.run_group_coherence_comparison),
-            ("📊 Plot Spectra", self.visualize_group_coherence_spectra),
-            ("📈 Plot Band Bars", self.visualize_group_coherence_bands),
+            ("📊 Plot Spectra", _g('coh:Plot Spectra (groups)', self.visualize_group_coherence_spectra)),
+            ("📈 Plot Band Bars", _g('coh:Plot Band Bars (groups)', self.visualize_group_coherence_bands)),
             ("💾 Export", self.export_group_coherence_comparison),
             ("📋 Prism Copy/Paste", self.export_group_coherence_prism),
-            ("🔗 Zone Coherence", self.run_zone_coherence)))
+            ("🔗 Zone Coherence", _g('coh:Zone Coherence', self.run_zone_coherence))))
 
         self._grp_bout_btns = ttk.Frame(grp_tab)
         self._grp_bout_btns.grid(row=5, column=0, columnspan=4, sticky='ew', pady=(4, 0))
         self.button_grid(self._grp_bout_btns, (
             ("▶ Run Bout-Epoch Group Comparison", self.run_bout_epoch_group_comparison),
-            ("📊 Plot Spectra (Pre vs Post)", self.visualize_beg_spectra),
-            ("📈 Plot Band Bars (Pre vs Post)", self.visualize_beg_band_bars),
-            ("📈 Plot Delta Coherence", self.visualize_beg_delta),
-            ("🌡 Peri-Event Spectrogram", self.visualize_beg_peri_event_spectrogram),
+            ("📊 Plot Spectra (Pre vs Post)", _g('coh:Plot Spectra (Pre vs Post)', self.visualize_beg_spectra)),
+            ("📈 Plot Band Bars (Pre vs Post)", _g('coh:Plot Band Bars (Pre vs Post)', self.visualize_beg_band_bars)),
+            ("📈 Plot Delta Coherence", _g('coh:Plot Delta Coherence', self.visualize_beg_delta)),
+            ("🌡 Peri-Event Spectrogram", _g('coh:Peri-Event Spectrogram', self.visualize_beg_peri_event_spectrogram)),
             ("💾 Export", self.export_beg_comparison),
             ("📋 Prism Copy/Paste", self.export_beg_prism)))
 
@@ -9239,7 +9396,8 @@ class FPAnalysisGUI:
             sems = [(np.std(results[g][c]) / np.sqrt(len(results[g][c])))
                     if len(results[g].get(c, [])) > 1 else 0 for c in categories]
             offset = (gi - len(groups) / 2 + 0.5) * gw
-            ax.bar(x + offset, means, gw, yerr=sems, capsize=3, label=g,
+            n_g = max((len(results[g].get(c) or []) for c in categories), default=0)
+            ax.bar(x + offset, means, gw, yerr=sems, capsize=3, label=f"{g} (n={n_g})",
                    color=gcolors[gi], edgecolor='black', linewidth=0.6, alpha=0.85)
             for ci, c in enumerate(categories):
                 vals = results[g].get(c, [])
@@ -9857,7 +10015,7 @@ class FPAnalysisGUI:
             ax_ov.fill_between(freqs_post, mean_post - sem_post, mean_post + sem_post,
                                color=color, alpha=0.15)
             ax_ov.plot(freqs_pre, mean_pre, color=color, lw=1.3, ls='--',
-                       alpha=0.75, label=f"{gname} baseline")
+                       alpha=0.75, label=f"{gname} baseline (n={n_subj})")
 
         ax_ov.set_xlim(fxmin, fxmax)
         ax_ov.set_ylim(ymin, ymax)
@@ -11538,7 +11696,7 @@ class FPAnalysisGUI:
                 # The baseline arm was computed and thrown away, which left a
                 # plot titled "baseline vs post-onset" showing only post.
                 ax0.plot(freqs, pre_m, color=c_post, lw=1.2, ls='--', alpha=0.8,
-                         label=f"{gname} baseline")
+                         label=f"{gname} baseline (n={n} subj)")
 
                 per_subj_deltas = [results[s]['mean_post_coh'] - results[s]['mean_pre_coh']
                                    for s in subj_list]
@@ -13315,7 +13473,7 @@ class FPAnalysisGUI:
 
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
-            settings_title="Analysis Settings")
+            settings_title="Analysis Settings", help_key='bout_analysis')
 
         # ── Selection ────────────────────────────────────────────────────
         mode_frame = ttk.Frame(selection)
@@ -13420,19 +13578,20 @@ class FPAnalysisGUI:
         # to the top of the display, nowhere near the button the user clicked.
         plot_mb = ttk.Menubutton(actions, text="Plot", direction='right')
         plot_menu = tk.Menu(plot_mb, tearoff=0)
+        _g = lambda label, fn: self.remember_graph('bout_analysis', f'bout:{label}', fn)
         plot_menu.add_command(label="Bar Graphs (per metric)",
-                              command=self.generate_bout_bar_graphs)
+                              command=_g("Bar Graphs (per metric)", self.generate_bout_bar_graphs))
         plot_menu.add_command(label="Compare Across Bouts",
-                              command=self.compare_across_bouts)
+                              command=_g("Compare Across Bouts", self.compare_across_bouts))
         plot_menu.add_command(label="Compare Channels (within groups)",
-                              command=self.compare_bout_channels)
+                              command=_g("Compare Channels (within groups)", self.compare_bout_channels))
         plot_menu.add_command(label="Compare First vs Last",
-                              command=self.compare_first_vs_last_bouts)
+                              command=_g("Compare First vs Last", self.compare_first_vs_last_bouts))
         plot_menu.add_command(label="Binned Progression",
-                              command=self.plot_binned_bout_progression)
+                              command=_g("Binned Progression", self.plot_binned_bout_progression))
         plot_menu.add_separator()
         plot_menu.add_command(label="Bars by Bout Length",
-                              command=self.plot_bout_length_bars)
+                              command=_g("Bars by Bout Length", self.plot_bout_length_bars))
         plot_menu.add_command(label="Edit Length Bins…",
                               command=self._open_bout_length_bin_editor)
         plot_menu.add_separator()
@@ -13603,7 +13762,7 @@ class FPAnalysisGUI:
         # the only way to know the detection settings are sound.
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
-            settings_title="Detection Settings")
+            settings_title="Detection Settings", help_key='spike')
 
         # ── Selection ────────────────────────────────────────────────────────
         self.spike_mode_var = tk.StringVar(value="Subject")
@@ -13775,11 +13934,15 @@ class FPAnalysisGUI:
                         variable=self.use_exclusions_spike).pack(
             anchor='w', pady=(0, self.ui_px(4)))
 
+        _g = lambda entry, fn: self.remember_graph('spike', entry, fn)
         for text, command in (
                 ("Run Spike Analysis", self.run_spike_analysis),
-                ("Visualize Spike Data", self.visualize_spike_data),
-                ("Analyze Spikes by Zone", self.visualize_spikes_by_zone),
-                ("Spikes by Bout Phase", self.analyze_spikes_by_bout_phase),
+                ("Visualize Spike Data",
+                 _g('spike:Visualize Spike Data', self.visualize_spike_data)),
+                ("Analyze Spikes by Zone",
+                 _g('spike:Analyze Spikes by Zone', self.visualize_spikes_by_zone)),
+                ("Spikes by Bout Phase",
+                 _g('spike:Spikes by Bout Phase', self.analyze_spikes_by_bout_phase)),
                 ("Spatial Transients...", self.open_spatial_transients),
                 ("Export Results", self.export_spike_results),
                 ("Export for Prism (CSV)", self.export_spike_prism)):
@@ -13819,7 +13982,8 @@ class FPAnalysisGUI:
         trace_btns = ttk.Frame(trace_frame)
         trace_btns.pack(fill='x', pady=(self.ui_px(4), 0))
         ttk.Button(trace_btns, text="Plot Trace", style='Compact.TButton',
-                   command=self.plot_spike_trace).pack(side='left')
+                   command=_g('spike:Representative Trace',
+                              self.plot_spike_trace)).pack(side='left')
         ttk.Button(trace_btns, text="Export Trace for Prism (CSV)",
                    style='Compact.TButton',
                    command=self.export_spike_trace_prism).pack(
@@ -15464,7 +15628,9 @@ class FPAnalysisGUI:
                 except Exception:
                     pass
         ax.set_xticks(x)
-        ax.set_xticklabels(groups, rotation=20, ha='right')
+        ax.set_xticklabels(
+            [f"{g} (n={max((len(data[g][p]) for p in phases), default=0)})" for g in groups],
+            rotation=20, ha='right')
         ax.set_ylabel('Transient rate (per min)')
         ax.set_title(f"Transient rate by bout phase — {behavior}\n(pre/post window = {win_sec:g}s)",
                      fontsize=11, fontweight='bold')
@@ -16219,6 +16385,9 @@ class FPAnalysisGUI:
 
         top = ttk.LabelFrame(body, text="Plot", padding=pad)
         top.pack(fill='x', pady=(0, pad))
+        self.make_help_button(body, 'spatial').place(
+            in_=top, relx=1.0, x=-self.ui_px(4), y=0, anchor='ne',
+            bordermode='outside')
         for key, text in self.SPATIAL_PLOTS:
             ttk.Radiobutton(top, text=text, variable=o['plot'], value=key,
                             command=lambda: show_panel()).pack(anchor='w')
@@ -16411,7 +16580,9 @@ class FPAnalysisGUI:
                     offset = (si - len(series) / 2 + 0.5) * width
                     ax.bar(x + offset, means, width, yerr=sems if group_mode else None,
                            capsize=3, color=colors[si], edgecolor='black', linewidth=0.6,
-                           alpha=0.8, label=name)
+                           alpha=0.8,
+                       label=(f"{name} (n={max((int(np.isfinite(np.asarray(vals[c], float)).sum()) for c in categories), default=0)})"
+                              if group_mode else name))
                     if group_mode:
                         for k, c in enumerate(categories):
                             v = np.asarray(vals[c], float)
@@ -16482,6 +16653,8 @@ class FPAnalysisGUI:
         if sections:
             self.info_nav_listbox.selection_set(0)
 
+        self.create_glossary_tab()
+
         # ── Changelog subtab ─────────────────────────────────────────────
         changelog_tab = ttk.Frame(self.info_notebook)
         self.info_notebook.add(changelog_tab, text="Changelog")
@@ -16497,6 +16670,236 @@ class FPAnalysisGUI:
 
         cl_text.insert('1.0', self._get_changelog_text())
         cl_text.config(state='disabled')  # Make read-only
+
+    # ------------------------------------------------------------------
+    # Glossary (Info > Glossary)
+    #
+    # The entries themselves live in tracy_glossary; this is only the page
+    # that searches and shows them, and open_glossary(), which the "?"
+    # buttons call to jump here.
+    # ------------------------------------------------------------------
+
+    def create_glossary_tab(self):
+        """Info > Glossary: a search box, the list of entries, and the
+        selected entry's what-it-shows / how-it-is-calculated text."""
+        tab = self._glossary_tab = ttk.Frame(self.info_notebook)
+        self.info_notebook.add(tab, text="Glossary")
+        pad = self.ui_px(10)
+
+        head = ttk.Frame(tab)
+        head.pack(fill='x', padx=pad, pady=(pad, self.ui_px(4)))
+        ttk.Label(head, text="Search:").pack(side='left')
+        self._glossary_search_var = tk.StringVar()
+        search = ttk.Entry(head, textvariable=self._glossary_search_var, width=36)
+        search.pack(side='left', padx=(self.ui_px(6), 0))
+        ttk.Button(head, text="Clear", style='Compact.TButton',
+                   command=lambda: self._glossary_search_var.set('')).pack(
+            side='left', padx=(self.ui_px(4), 0))
+        self._glossary_count = ttk.Label(head, text="", foreground='gray')
+        self._glossary_count.pack(side='left', padx=(self.ui_px(10), 0))
+        # Shown only after a "?" brought the user here, to take them back.
+        self._glossary_back = ttk.Button(head, text="", style='Compact.TButton',
+                                         command=self._glossary_go_back)
+        self._glossary_origin = None
+
+        ttk.Label(tab,
+                  text="Every graph, tab and recurring term: what it shows and how "
+                       "it is calculated. Type any word, e.g. coherence, AUC, "
+                       "turn-back. The \"?\" on each tab opens the entry for the "
+                       "graph selected there.",
+                  foreground='gray', font=('Segoe UI', 8), justify='left',
+                  wraplength=self.ui_px(900)).pack(anchor='w', padx=pad)
+
+        panes = ttk.Panedwindow(tab, orient='horizontal')
+        panes.pack(fill='both', expand=True, padx=pad, pady=pad)
+
+        left = ttk.Frame(panes)
+        lsb = ttk.Scrollbar(left, orient='vertical')
+        lsb.pack(side='right', fill='y')
+        self._glossary_listbox = tk.Listbox(
+            left, width=38, activestyle='none', exportselection=False,
+            font=('Segoe UI', 10), highlightthickness=0, bd=0,
+            yscrollcommand=lsb.set)
+        self._glossary_listbox.pack(side='left', fill='both', expand=True)
+        lsb.config(command=self._glossary_listbox.yview)
+        panes.add(left, weight=1)
+
+        right = ttk.Frame(panes)
+        rsb = ttk.Scrollbar(right, orient='vertical')
+        rsb.pack(side='right', fill='y')
+        text = self._glossary_text = tk.Text(
+            right, wrap='word', font=('Segoe UI', 10), padx=self.ui_px(16),
+            pady=self.ui_px(8), bd=0, highlightthickness=0, cursor='arrow',
+            background='white', width=40, yscrollcommand=rsb.set)
+        text.pack(side='left', fill='both', expand=True)
+        rsb.config(command=text.yview)
+        panes.add(right, weight=3)
+
+        accent = self.colors['accent_dark_blue']
+        dark = self.colors['text_dark']
+        text.tag_configure('h1', font=('Segoe UI Semibold', 15, 'bold'),
+                           foreground=accent, spacing1=6, spacing3=2)
+        text.tag_configure('where', font=('Segoe UI', 9), foreground='gray',
+                           spacing3=8)
+        text.tag_configure('sub', font=('Segoe UI', 10, 'bold'),
+                           foreground=dark, spacing1=10, spacing3=3)
+        text.tag_configure('body', font=('Segoe UI', 10), foreground=dark,
+                           spacing3=6, lmargin1=4, lmargin2=4)
+        text.tag_configure('link', font=('Segoe UI', 10, 'underline'),
+                           foreground=self.colors['accent_blue'])
+        text.tag_bind('link', '<Enter>', lambda e: text.config(cursor='hand2'))
+        text.tag_bind('link', '<Leave>', lambda e: text.config(cursor='arrow'))
+        text.config(state='disabled')
+
+        self._glossary_rows = []          # entry id per listbox row, None = heading
+        self._glossary_search_var.trace_add(
+            'write', lambda *_a: self._glossary_refilter())
+        self._glossary_listbox.bind('<<ListboxSelect>>', self._glossary_on_select)
+        search.bind('<Return>', lambda e: self._glossary_listbox.focus_set())
+        search.bind('<Down>', lambda e: self._glossary_listbox.focus_set())
+        self._glossary_refilter()
+
+    def _glossary_refilter(self, select=None):
+        """Rebuild the entry list for the current search text.
+
+        With no search the list is grouped under section headings; a search
+        gives a flat list, best match first. ``select`` is an entry id to
+        leave selected (default: the first entry).
+        """
+        lb = self._glossary_listbox
+        query = self._glossary_search_var.get().strip()
+        hits = tracy_glossary.search(query)
+        lb.delete(0, 'end')
+        rows = self._glossary_rows = []
+        section = None
+        for e in hits:
+            if not query:
+                title = tracy_glossary.section_of(e)
+                if title != section:
+                    section = title
+                    lb.insert('end', title.upper())
+                    lb.itemconfig('end', foreground=self.colors['accent_dark_blue'],
+                                  background='#eef2f6',
+                                  selectforeground=self.colors['accent_dark_blue'],
+                                  selectbackground='#eef2f6')
+                    rows.append(None)
+            lb.insert('end', ('   ' if not query else '') + e.term)
+            rows.append(e.id)
+        n = len(hits)
+        self._glossary_count.config(
+            text=(f"{n} match{'es' if n != 1 else ''}" if query else f"{n} entries"))
+        target = select if select in rows else next((r for r in rows if r), None)
+        if target is None:
+            self._glossary_show(None)
+            return
+        row = rows.index(target)
+        lb.selection_clear(0, 'end')
+        lb.selection_set(row)
+        lb.see(row)
+        self._glossary_show(tracy_glossary.entry(target))
+
+    def _glossary_on_select(self, _event=None):
+        sel = self._glossary_listbox.curselection()
+        if not sel:
+            return
+        row = sel[0]
+        entry_id = self._glossary_rows[row] if row < len(self._glossary_rows) else None
+        if entry_id is None:
+            # A section heading: step onto its first entry instead.
+            if row + 1 < len(self._glossary_rows) and self._glossary_rows[row + 1]:
+                self._glossary_listbox.selection_clear(0, 'end')
+                self._glossary_listbox.selection_set(row + 1)
+                entry_id = self._glossary_rows[row + 1]
+            else:
+                return
+        self._glossary_show(tracy_glossary.entry(entry_id))
+
+    def _glossary_show(self, e):
+        """Render one entry (or the no-match note) in the detail pane."""
+        text = self._glossary_text
+        text.config(state='normal')
+        text.delete('1.0', 'end')
+        for tag in text.tag_names():
+            if tag.startswith('goto_'):
+                text.tag_delete(tag)
+        if e is None:
+            text.insert('end', "No match. Try a shorter or different word.\n", 'body')
+            text.config(state='disabled')
+            return
+        text.insert('end', e.term + '\n', 'h1')
+        text.insert('end', f"Where: {e.where}\n", 'where')
+        if e.kind == 'graph':
+            parts = (("What it shows", e.shows), ("How it is calculated", e.calc),
+                     ("How to read it", e.read))
+        else:
+            parts = ((None, e.shows), ("How it works", e.calc),
+                     ("Good to know", e.read))
+        for title, body in parts:
+            if not body:
+                continue
+            if title:
+                text.insert('end', title + '\n', 'sub')
+            for para in body.split('\n\n'):
+                text.insert('end', para + '\n', 'body')
+        if e.aliases:
+            text.insert('end', "Also searched as\n", 'sub')
+            text.insert('end', ", ".join(e.aliases) + '\n', 'body')
+        links = [tracy_glossary.entry(i) for i in e.see]
+        links = [x for x in links if x is not None]
+        if links:
+            text.insert('end', "See also\n", 'sub')
+            for i, other in enumerate(links):
+                tag = f'goto_{i}'
+                text.tag_bind(tag, '<Button-1>',
+                              lambda _ev, eid=other.id: self.open_glossary(
+                                  eid, remember_origin=False))
+                if i:
+                    text.insert('end', '   \u2022   ', 'body')
+                text.insert('end', other.term, ('body', 'link', tag))
+            text.insert('end', '\n', 'body')
+        text.config(state='disabled')
+        text.yview_moveto(0)
+
+    def open_glossary(self, entry_id=None, remember_origin=True):
+        """Show Info > Glossary at ``entry_id``.
+
+        Called by every "?" button. The tab the user came from is remembered
+        so the Back button can return them to it.
+        """
+        if remember_origin:
+            try:
+                main = self.notebook.select()
+                sub_nb = self._group_frame_to_subnb.get(main)
+                sub = sub_nb.select() if sub_nb is not None else None
+                if sub_nb is not self.info_notebook or sub != str(self._glossary_tab):
+                    label = (sub_nb.tab(sub, 'text') if sub
+                             else self.notebook.tab(main, 'text'))
+                    self._glossary_origin = (main, sub_nb, sub)
+                    self._glossary_back.config(text=f"\u2190 Back to {label}")
+                    self._glossary_back.pack(side='right')
+            except tk.TclError:
+                pass
+        self.notebook.select(self._info_group_frame)
+        self.info_notebook.select(self._glossary_tab)
+        if tracy_glossary.entry(entry_id) is None:
+            entry_id = None
+        # A leftover search could filter the target out of the list.
+        self._glossary_search_var.set('')
+        self._glossary_refilter(select=entry_id)
+
+    def _glossary_go_back(self):
+        """Return to the tab a "?" was pressed on."""
+        origin, self._glossary_origin = self._glossary_origin, None
+        self._glossary_back.pack_forget()
+        if not origin:
+            return
+        main, sub_nb, sub = origin
+        try:
+            self.notebook.select(main)
+            if sub_nb is not None and sub:
+                sub_nb.select(sub)
+        except tk.TclError:
+            pass
 
     def _populate_info_text(self, text, sections):
         """Render a list of (title, body) sections into a styled, read-only Text
@@ -16688,6 +17091,8 @@ Data group:
 
 Info group:
 • Overview — this page.
+• Glossary — every graph, tab and term: what it shows and how it is
+  calculated. The "?" on each tab opens the entry for the selected graph.
 • Changelog — version history.
 • System Check — verify Python dependencies and environment.
 """),
@@ -16733,6 +17138,22 @@ Based on: FP_Behavior_Agnostic_BoutCollector_GCAMP.m
 ╚════════════════════════════════════════════════════════════════════════════════╝
 
 Version {APP_VERSION}  •  {APP_VERSION_DATE}
+────────────────────────────────────────────────────────────────────────────────
+  • New — Info > Glossary: a searchable entry for every graph type, tab
+    and recurring term, saying what it shows, how it is calculated and
+    how to read it, with links between related entries.
+  • New — Every tab has a "?" that opens the glossary at the graph
+    selected there (or the tab's own explainer), with a Back button to
+    return. Kinematics "Explain this plot" opens the same entries.
+  • New — Behavioral Data: "Time at Distance from Center" summaries
+    (Euclidean, X, Y) show seconds spent in each distance bin, with a
+    bin width or your own ranges, and "Export Time at Distance".
+  • New — Legends on group plots show each series' n.
+  • Change — Behavioral Data: Calculate Metrics keeps every subject; the
+    selection and "Apply exclusions" are read when results are shown, so
+    changing either no longer needs a recalculation.
+
+Version 1.34.0  •  November 12, 2026
 ────────────────────────────────────────────────────────────────────────────────
   • Fix — Analyses that pair position with photometry no longer score
     rows the photometry never recorded. In projects processed before the
@@ -19452,6 +19873,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             self.spatial_bin_var.set(str(self.params['spatial_bin_size']))
             if hasattr(self, 'distance_bin_var'):
                 self.distance_bin_var.set(f"{self.params.get('distance_bin_cm', 1):g}")
+            if hasattr(self, 'behav_distance_bin_var'):
+                self.behav_distance_bin_var.set(f"{self.params.get('behav_distance_bin_cm', 1):g}")
 
             # Update file naming UI vars if they exist
             if hasattr(self, 'fpdata_pattern_var'):
@@ -20940,6 +21363,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 self.spatial_bin_var.set(str(self.params['spatial_bin_size']))
                 if hasattr(self, 'distance_bin_var'):
                     self.distance_bin_var.set(f"{self.params.get('distance_bin_cm', 1):g}")
+                if hasattr(self, 'behav_distance_bin_var'):
+                    self.behav_distance_bin_var.set(f"{self.params.get('behav_distance_bin_cm', 1):g}")
 
                 # Update file naming UI vars if they exist
                 if hasattr(self, 'fpdata_pattern_var'):
@@ -25948,16 +26373,18 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             merged[edge] = row
         return merged
 
-    def _distance_plot_x(self, edges):
+    def _distance_plot_x(self, edges, width=None):
         """Where to draw each bin: its lower edge at 1 cm (as before), else its centre."""
-        width = self._distance_bin_width()
+        if width is None:
+            width = self._distance_bin_width()
         if width == 1.0:
             return list(edges)
         return [e + width / 2.0 for e in edges]
 
-    def _label_distance_bins(self, ax, xs):
+    def _label_distance_bins(self, ax, xs, width=None):
         """Tick each wide bin with its range (0-5, 5-10, ...)."""
-        width = self._distance_bin_width()
+        if width is None:
+            width = self._distance_bin_width()
         if width == 1.0 or not len(xs) or len(xs) > 24:
             return
         ax.set_xticks(list(xs))
@@ -26378,60 +26805,62 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         # Fall back to geometric centre of the arena
         return maze_width / 2.0, maze_width / 2.0
 
+    def _behav_view(self):
+        """``(subjects, {subject: series})`` the Behavioral Data tab currently shows.
+
+        The one place the tab's selection and exclusions are read: the table,
+        every plot and both exports go through it, and Calculate Metrics does
+        not, so the stored results cover every subject. An empty selection
+        means everyone, as on the other graphing tabs.
+        """
+        mapping = {}
+        mode = getattr(self, 'behav_plot_by_var', None)
+        if mode is not None and mode.get() == "Group":
+            for name in self.selected_series('behavioral', self.behav_group_listbox):
+                for subject in self._series_members(name):
+                    mapping[subject] = name
+            subjects = list(mapping)
+        else:
+            box = getattr(self, 'behav_subject_listbox', None)
+            subjects = [] if box is None else (
+                [box.get(i) for i in box.curselection()]
+                or [box.get(i) for i in range(box.size())])
+            # The list can still be empty while a project is loading.
+            subjects = subjects or list(dict.fromkeys(
+                r.get('Subject')
+                for r in getattr(self, 'behavioral_results', None) or []))
+        subjects = [s for s in subjects if not self.is_behavior_excluded(s)]
+        return subjects, {s: mapping[s] for s in subjects if s in mapping}
+
+    def _behav_view_results(self):
+        """`behavioral_results` rows for the subjects in view, in selection order,
+        with ``Group`` set to the series each subject is drawn in."""
+        subjects, mapping = self._behav_view()
+        order = {s: i for i, s in enumerate(subjects)}
+        rows = []
+        for result in getattr(self, 'behavioral_results', None) or []:
+            subject = result.get('Subject')
+            if subject not in order:
+                continue
+            row = {k: v for k, v in result.items() if k != 'Group'}
+            if subject in mapping:
+                row['Group'] = mapping[subject]
+            rows.append(row)
+        rows.sort(key=lambda r: order[r['Subject']])
+        return rows
+
     def calculate_behavioral_metrics(self):
         """Calculate behavioral metrics for selected subjects"""
         try:
-            # Get selected subjects or groups
-            subject_to_group = {}  # Map subjects to their groups
-            
-            if self.behav_plot_by_var.get() == "Group":
-                # Group mode - get selected groups and their members
-                selected_indices = self.behav_group_listbox.curselection()
-                if not selected_indices:
-                    messagebox.showwarning("Warning", "Please select at least one subject.")
-                    return
-                
-                selected_groups = self.selected_series('behavioral', self.behav_group_listbox)
-                selected_subjects = []
-                for group_name in selected_groups:
-                    group_members = self._series_members(group_name)
-                    for member in group_members:
-                        subject_to_group[member] = group_name
-                    selected_subjects.extend(group_members)
-                
-                # Remove duplicates while preserving order
-                seen = set()
-                selected_subjects = [s for s in selected_subjects if not (s in seen or seen.add(s))]
-                
-                if not selected_subjects:
-                    messagebox.showwarning("Warning", "Selected groups have no members.")
-                    return
-            else:
-                # Subject mode
-                selected_indices = self.behav_subject_listbox.curselection()
-                if not selected_indices:
-                    messagebox.showwarning("Warning", "Please select at least one subject.")
-                    return
-                
-                selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
-            
-            # Apply exclusions if enabled
-            # Note: Behavioral data typically uses all channels, but we'll filter based on behavioral exclusions
-            # Remembered so the export can report them: these subjects never
-            # reach behavioral_results, so the export's own filter sees none.
+            # Every loaded subject is calculated, whatever is selected or excluded:
+            # the selection and the exclusions are applied when the table, plots
+            # and exports read the results (see _behav_view), so changing either
+            # needs no recalculation.
+            selected_subjects = list(self.processed_data)
+            if not selected_subjects:
+                messagebox.showwarning("Warning", "No processed subjects to calculate metrics for.")
+                return
             self.behavioral_excluded_subjects = []
-            if self.use_exclusions_behavioral.get():
-                self.behavioral_excluded_subjects = [
-                    s for s in selected_subjects
-                    if self.is_behavior_excluded(s, use_exclusions=True)]
-                selected_subjects = [s for s in selected_subjects
-                                     if s not in self.behavioral_excluded_subjects]
-                if not selected_subjects:
-                    messagebox.showwarning("All Excluded", "All selected subjects have behavioral data excluded")
-                    return
-                excluded_count = len(self.behavioral_excluded_subjects)
-                if excluded_count > 0:
-                    self.log_message(f"Excluded {excluded_count} subject(s) based on behavioral data exclusion settings")
             
             # The entry thresholds are read here, not cached at build time, so
             # editing them and pressing Calculate is the whole workflow.
@@ -26461,7 +26890,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             
             # Store results for export
             self.behavioral_results = []
-            
+            # Per-subject distance-from-centre samples over the analysed
+            # session, binned at view time (see _time_at_distance).
+            self.behav_distance_samples = {}
+
             subjects_processed = 0
             subjects_skipped = []
             
@@ -26485,7 +26917,12 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 y_coords = beh_synced[:, 3]
                 velocity = (beh_synced[:, _vel_col]
                             if beh_synced.shape[1] > _vel_col else np.zeros(len(beh_synced)))
-                
+                # Distance from centre X/Y sit at kinematics +3/+4.
+                if beh_synced.shape[1] > _vel_col + 3:
+                    dist_x, dist_y = beh_synced[:, _vel_col + 2], beh_synced[:, _vel_col + 3]
+                else:
+                    dist_x = dist_y = np.full(len(beh_synced), np.nan)
+
                 # Calculate zones for each frame
                 zones = []
                 for x, y in zip(x_coords, y_coords):
@@ -26508,6 +26945,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         zones = zones[_lo:_hi]
                         x_coords, y_coords = x_coords[_lo:_hi], y_coords[_lo:_hi]
                         velocity = velocity[_lo:_hi]
+                        dist_x, dist_y = dist_x[_lo:_hi], dist_y[_lo:_hi]
+
+                self.behav_distance_samples[subject] = {
+                    'x': np.array(dist_x, dtype=float),
+                    'y': np.array(dist_y, dtype=float),
+                    'euclidean': np.sqrt(np.asarray(dist_x, dtype=float) ** 2
+                                         + np.asarray(dist_y, dtype=float) ** 2),
+                    'fps': fps,
+                }
 
                 # One cleaned zone sequence feeds time, entries and decisions, so
                 # the three cannot disagree about what counted as a visit.
@@ -26522,8 +26968,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     metrics = self._calculate_session_metrics(zones, x_coords, y_coords, velocity, 
                                                               fps, distal_threshold, total_time)
                     metrics['Subject'] = subject
-                    if subject in subject_to_group:
-                        metrics['Group'] = subject_to_group[subject]
                     metrics['Time_Bin'] = 'Full Session'
                     self.behavioral_results.append(metrics)
                 else:
@@ -26544,8 +26988,6 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         metrics = self._calculate_session_metrics(bin_zones, bin_x, bin_y, bin_vel,
                                                                   fps, distal_threshold, bin_time)
                         metrics['Subject'] = subject
-                        if subject in subject_to_group:
-                            metrics['Group'] = subject_to_group[subject]
                         metrics['Time_Bin'] = f"{bin_idx * bin_size}-{(bin_idx + 1) * bin_size}s"
                         self.behavioral_results.append(metrics)
         
@@ -26808,7 +27250,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
     
     def _display_behavioral_results(self):
         """Display behavioral results in treeview"""
-        results = self.included_behavioral_results()
+        results = self._behav_view_results()
+        for item in self.behav_tree.get_children():
+            self.behav_tree.delete(item)
         if not results:
             return
 
@@ -26869,7 +27313,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             return
         
         # Filter results on the one behavioral rule (see included_behavioral_results).
-        results_to_export = self.included_behavioral_results()
+        results_to_export = self._behav_view_results()
         if not results_to_export:
             messagebox.showwarning("All Excluded",
                                   "All results have been excluded based on your exclusion settings.")
@@ -26949,12 +27393,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         export_format = "time-binned (horizontal)" if use_bins else "flat (vertical)"
         exclusions_note = ""
         if self.use_exclusions_behavioral.get():
-            # Subjects dropped when the metrics were calculated, plus any whose
-            # exclusion was ticked afterwards and only filtered out here.
-            kept = {r.get('Subject') for r in results_to_export}
-            excluded = list(getattr(self, 'behavioral_excluded_subjects', None) or [])
-            excluded += sorted({r.get('Subject') for r in self.behavioral_results
-                                if r.get('Subject') not in kept} - set(excluded))
+            excluded = sorted({r.get('Subject') for r in self.behavioral_results
+                               if self.is_behavior_excluded(r.get('Subject'))})
             exclusions_note = f"\nExclusions applied: {len(excluded)} subject(s) excluded"
             if excluded:
                 exclusions_note += f" ({', '.join(map(str, excluded))})"
@@ -26988,7 +27428,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         # Get available metrics (exclude Subject and Time_Bin)
         all_metrics = set()
-        for result in self.included_behavioral_results():
+        for result in self._behav_view_results():
             all_metrics.update(result.keys())
         all_metrics.discard('Subject')
         all_metrics.discard('Time_Bin')
@@ -26999,9 +27439,15 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         if not use_bins:  # Summary views only make sense for non-binned data
             summary_options = ['[Summary] Time in Each Zone', '[Summary] Entries into Each Zone']
         
+        # Whole-session curves, so they are offered with or without time bins.
+        if getattr(self, 'behav_distance_samples', None):
+            summary_options += [f'{self.TIME_AT_DISTANCE_PREFIX} ({name})'
+                                for name, _key in self.TIME_AT_DISTANCE_AXES]
+
         metric_list = summary_options + sorted(all_metrics)
-        
+
         metric_var = tk.StringVar(value=metric_list[0] if metric_list else '')
+        self._behav_metric_var = metric_var     # read by the "?" button
         metric_combo = ttk.Combobox(control_frame, textvariable=metric_var, 
                                     values=metric_list, width=40, state='readonly')
         metric_combo.pack(side='left', padx=5)
@@ -27032,6 +27478,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
         
         def update_plot():
             try:
+                # Read on every redraw so the plot follows the current mode,
+                # selection and exclusions without pressing Visualize again.
+                is_group_mode = self.behav_plot_by_var.get() == "Group"
+                self._display_behavioral_results()
                 # Clear previous plot
                 for widget in plot_frame.winfo_children():
                     widget.destroy()
@@ -27044,6 +27494,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                              font=('Segoe UI', 12)).pack(expand=True)
                     return
                 
+                if metric.startswith(self.TIME_AT_DISTANCE_PREFIX):
+                    self._plot_time_at_distance(plot_frame, metric, is_group_mode)
+                    return
+
                 # Check if this is a summary visualization
                 if metric.startswith('[Summary]'):
                     zone_mode = zone_mode_var.get()
@@ -27073,7 +27527,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # Group mode with bins - one line per group
                         group_data = {}
                         
-                        for result in self.included_behavioral_results():
+                        for result in self._behav_view_results():
                             subj = result.get('Subject', 'Unknown')
                             time_bin = result.get('Time_Bin', '')
                             value = result.get(metric, 0)
@@ -27107,7 +27561,9 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                         sems.append(np.nan)
                                 
                                 x_pos = range(len(all_bins))
-                                ax.plot(x_pos, means, marker='o', label=group_name, 
+                                ax.plot(x_pos, means, marker='o',
+                                       label=f"{group_name} (n={max((len(v) for v in bins_dict.values()), default=0)})",
+                                       
                                        linewidth=2.5, markersize=8, color=color)
                                 ax.fill_between(x_pos, 
                                               np.array(means) - np.array(sems),
@@ -27121,7 +27577,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     else:
                         # Subject mode with bins - one line per subject
                         subjects = {}
-                        for result in self.included_behavioral_results():
+                        for result in self._behav_view_results():
                             subj = result.get('Subject', 'Unknown')
                             time_bin = result.get('Time_Bin', '')
                             value = result.get(metric, 0)
@@ -27152,7 +27608,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         # Group mode without bins - bar graph with individual points
                         group_data = {}
                         
-                        for result in self.included_behavioral_results():
+                        for result in self._behav_view_results():
                             subj = result.get('Subject', 'Unknown')
                             value = result.get(metric, 0)
                             
@@ -27185,13 +27641,14 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                      color='black', alpha=0.6, s=50, zorder=3)
                         
                         ax.set_xticks(x_pos)
-                        ax.set_xticklabels(group_names, rotation=45, ha='right')
+                        ax.set_xticklabels([f"{g}\n(n={len(group_data[g])})" for g in group_names],
+                                           rotation=45, ha='right')
                         ax.set_xlabel('Group', fontsize=12, fontweight='bold')
                         
                     else:
                         # Subject mode without bins
-                        values = [result.get(metric, 0) for result in self.included_behavioral_results()]
-                        subjects_list = [result.get('Subject', 'Unknown') for result in self.included_behavioral_results()]
+                        values = [result.get(metric, 0) for result in self._behav_view_results()]
+                        subjects_list = [result.get('Subject', 'Unknown') for result in self._behav_view_results()]
                         
                         if plot_type == 'histogram':
                             # Histogram
@@ -27225,9 +27682,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 traceback.print_exc()
         
         # Generate button
-        ttk.Button(control_frame, text="Generate Plot", 
+        ttk.Button(control_frame, text="Generate Plot",
                   command=update_plot).pack(side='left', padx=5)
-        
+        self._behav_replot = update_plot
+
         # Bind zone mode changes to auto-update
         zone_mode_combo.bind('<<ComboboxSelected>>', lambda e: update_plot())
         
@@ -27238,6 +27696,219 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             ttk.Label(plot_frame, text="No metrics available to visualize.\nPlease calculate behavioral metrics first.",
                      font=('Segoe UI', 12)).pack(expand=True)
     
+    # ---------------------------------------------- Time at distance from centre
+    TIME_AT_DISTANCE_PREFIX = '[Summary] Time at Distance from Center'
+    TIME_AT_DISTANCE_AXES = (('Euclidean', 'euclidean'), ('X', 'x'), ('Y', 'y'))
+
+    def _behav_replot_if_shown(self):
+        """Redraw the Behavioral Data plot, if one has been generated."""
+        replot = getattr(self, '_behav_replot', None)
+        if replot is not None and self.behav_viz_container.winfo_children():
+            replot()
+
+    def _behav_refresh_view(self):
+        """Re-read selection and exclusions into the table and the shown plot."""
+        if getattr(self, 'behavioral_results', None):
+            self._display_behavioral_results()
+            self._behav_replot_if_shown()
+
+    def _behav_distance_ranges(self):
+        """Explicit ``[(lo, hi), ...]`` ranges typed as "5-10, 11-15, ...", else None.
+
+        A single number in the box is a bin width and is handled by
+        _behav_distance_bin_width; anything unparseable also returns None.
+        """
+        var = getattr(self, 'behav_distance_bin_var', None)
+        text = str(var.get()) if var is not None else ''
+        if '-' not in text:
+            return None
+        ranges = []
+        try:
+            for part in text.replace(';', ',').split(','):
+                if not part.strip():
+                    continue
+                lo, hi = (float(v) for v in part.split('-'))
+                if not (0 <= lo < hi):
+                    return None
+                ranges.append((lo, hi))
+        except ValueError:
+            return None
+        return ranges or None
+
+    def _behav_distance_bin_width(self):
+        """The Behavioral Data distance bin in cm; 1 when unset or invalid."""
+        var = getattr(self, 'behav_distance_bin_var', None)
+        try:
+            width = float(var.get()) if var is not None else float(
+                self.params.get('behav_distance_bin_cm', 1))
+        except (TypeError, ValueError, tk.TclError):
+            return 1.0
+        if not np.isfinite(width) or width <= 0:
+            return 1.0
+        self.params['behav_distance_bin_cm'] = width
+        return width
+
+    @staticmethod
+    def _time_at_distance(distances, fps, bin_width=1.0):
+        """Seconds spent in each ``bin_width``-cm distance bin.
+
+        Keyed by each bin's lower edge, as _distance_bin_stats keys the signal
+        bins: bin ``k`` covers ``[k*w, (k+1)*w)``. Untracked (NaN) frames are
+        time at no distance and are left out; a bin inside the visited range
+        that was never occupied keeps its key with 0 s.
+        """
+        d = np.asarray(distances, dtype=float)
+        d = d[np.isfinite(d)]
+        if not d.size or not fps:
+            return {}
+        width = float(bin_width)
+        counts = np.bincount(np.floor(d / width).astype(int))
+        unit = width == 1.0
+        return {(k if unit else round(k * width, 6)): float(c) / fps
+                for k, c in enumerate(counts)}
+
+    def _included_distance_samples(self):
+        """Calculated distance samples for subjects whose behavior is not excluded."""
+        samples = getattr(self, 'behav_distance_samples', None) or {}
+        return {s: samples[s] for s in self._behav_view()[0] if s in samples}
+
+    def _time_at_distance_curves(self, subjects, axis, width):
+        """``(bin edges, {subject: seconds per bin})`` on one shared set of bins.
+
+        A subject that never reached a far bin spent 0 s there, so it is
+        filled with 0 rather than left out of the mean.
+        """
+        samples = self._included_distance_samples()
+        ranges = self._behav_distance_ranges()
+        if ranges:
+            # Explicit ranges: seconds with lo <= distance < hi, keyed by lo.
+            tables = {}
+            for s in subjects:
+                if s not in samples or not samples[s]['fps']:
+                    continue
+                d = np.asarray(samples[s][axis], dtype=float)
+                d = d[np.isfinite(d)]
+                if d.size:
+                    tables[s] = {lo: float(((d >= lo) & (d < hi)).sum()) / samples[s]['fps']
+                                 for lo, hi in ranges}
+            edges = [lo for lo, _hi in ranges]
+            return edges, {s: [t[e] for e in edges] for s, t in tables.items()}
+        tables = {s: self._time_at_distance(samples[s][axis], samples[s]['fps'], width)
+                  for s in subjects if s in samples}
+        tables = {s: t for s, t in tables.items() if t}
+        edges = sorted({e for t in tables.values() for e in t})
+        return edges, {s: [t.get(e, 0.0) for e in edges] for s, t in tables.items()}
+
+    def _time_at_distance_series(self, is_group_mode):
+        """``{series label: [subjects]}`` for the current Behavioral Data selection."""
+        samples = self._included_distance_samples()
+        if not is_group_mode:
+            return {None: list(samples)}
+        series = {}
+        for subject, name in self._behav_view()[1].items():
+            if subject in samples:
+                series.setdefault(name, []).append(subject)
+        return series
+
+    def _plot_time_at_distance(self, plot_frame, metric, is_group_mode):
+        """Time spent at each distance from centre: subjects as thin traces, mean ± SEM on top."""
+        axis_name = metric[metric.rfind('(') + 1:].rstrip(')')
+        axis = dict(self.TIME_AT_DISTANCE_AXES).get(axis_name, 'euclidean')
+        width = self._behav_distance_bin_width()
+        series = self._time_at_distance_series(is_group_mode)
+        subjects = list(dict.fromkeys(s for members in series.values() for s in members))
+        edges, curves = self._time_at_distance_curves(subjects, axis, width)
+        if not edges:
+            ttk.Label(plot_frame,
+                      text="No tracked distance-from-center samples.\n"
+                           "Calculate metrics for subjects with position data first.",
+                      font=('Segoe UI', 12)).pack(expand=True)
+            return
+
+        fig = Figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        xs = self._distance_plot_x(edges, width)
+        ranges = self._behav_distance_ranges()
+        if ranges:
+            xs = list(range(len(ranges)))
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(series), 1)))
+        for (name, members), color in zip(series.items(), colors):
+            members = [s for s in members if s in curves]
+            if not members:
+                continue
+            if name is None:
+                color = self.colors['accent_blue']
+            rows = np.array([curves[s] for s in members], dtype=float)
+            if len(members) == 1:
+                ax.plot(xs, rows[0], 'o-', color=color, linewidth=2, markersize=4,
+                        label=members[0] if name is None else f'{name} (n=1)')
+                continue
+            for row in rows:
+                ax.plot(xs, row, color=color, alpha=0.25, linewidth=0.8, zorder=1)
+            ax.errorbar(xs, rows.mean(axis=0),
+                        yerr=rows.std(axis=0) / np.sqrt(len(rows)),
+                        fmt='o-', color=color, linewidth=2.5, markersize=5, capsize=3,
+                        zorder=3,
+                        label=f"{'Mean±SEM' if name is None else name} (n={len(rows)})")
+        if ranges:
+            ax.set_xticks(xs)
+            ax.set_xticklabels([f'{lo:g}-{hi:g}' for lo, hi in ranges],
+                               rotation=45 if len(xs) > 8 else 0,
+                               ha='right' if len(xs) > 8 else 'center')
+        else:
+            self._label_distance_bins(ax, xs, width)
+
+        x_title, y_title = self._distance_axis_titles()
+        where = {'x': x_title, 'y': y_title}.get(axis, 'Euclidean')
+        ax.set_xlabel(f'Distance from Center, {where} (cm)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Time in range (s)' if ranges else f'Time per {width:g} cm bin (s)',
+                      fontsize=12, fontweight='bold')
+        ax.set_title(f'Time Spent at Distance from Center ({axis_name})',
+                     fontsize=14, fontweight='bold')
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.legend(loc='best', fontsize=9)
+        fig.tight_layout()
+        self._embed_plot_canvas(fig, plot_frame)
+
+    def export_time_at_distance(self):
+        """Export seconds per distance bin: one row per subject and axis, bins as columns."""
+        samples = self._included_distance_samples()
+        if not samples:
+            messagebox.showwarning("Warning", "No time-at-distance data to export. "
+                                              "Please calculate metrics first.")
+            return
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export Time at Distance from Center")
+        if not filename:
+            return
+
+        width = self._behav_distance_bin_width()
+        groups = self._behav_view()[1]
+        range_hi = dict(self._behav_distance_ranges() or [])
+        rows = []
+        for axis_name, axis in self.TIME_AT_DISTANCE_AXES:
+            edges, curves = self._time_at_distance_curves(list(samples), axis, width)
+            for subject, values in curves.items():
+                row = {'Subject': subject,
+                       'Group': groups.get(subject, 'N/A'),
+                       'Axis': axis_name}
+                for edge, seconds in zip(edges, values):
+                    span = (f'{edge:g}-{range_hi[edge]:g}' if range_hi else
+                            f'{int(edge)}' if width == 1.0 else f'{edge:g}-{edge + width:g}')
+                    row[f'dist_{span}cm_sec'] = seconds
+                rows.append(row)
+        if not rows:
+            messagebox.showwarning("Warning", "No tracked distance-from-center samples to export.")
+            return
+        pd.DataFrame(rows).to_csv(filename, index=False, encoding=EXPORT_CSV_ENCODING)
+        self._add_metadata_comment_to_csv(filename, self._create_export_metadata('behavioral'))
+        messagebox.showinfo("Export Complete",
+                            f"Time at distance from center exported to:\n{filename}\n\n"
+                            f"Distance bin: {width:g} cm\nSubjects: {len(samples)}")
+
     def _plot_behavioral_summary(self, plot_frame, summary_type, is_group_mode, zone_mode='simple'):
         """Plot summary visualizations for time in zones or entries
         
@@ -27288,10 +27959,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         subjects_by_group[group_name] = self._series_members(group_name)
                 else:
                     selected_indices = self.behav_subject_listbox.curselection()
-                    selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
+                    selected_subjects = self._behav_view()[0]
                 
                 # Collect data from pre-calculated metrics
-                for result in self.included_behavioral_results():
+                for result in self._behav_view_results():
                     subject = result.get('Subject', 'Unknown')
                     
                     # Check if this subject should be included
@@ -27378,7 +28049,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             
                             bar_positions = x + idx * width - (len(zone_times) - 1) * width / 2
                             ax.bar(bar_positions, means, width,
-                                  label=group_name, yerr=sems, capsize=5, alpha=0.7, color=colors[idx])
+                                  label=f"{group_name} (n={max((len(v) for v in zones_data.values()), default=0)})",
+                                  yerr=sems, capsize=5, alpha=0.7, color=colors[idx])
                             
                             # Add individual subject points
                             for zone_idx, zone in enumerate(zone_order):
@@ -27462,10 +28134,10 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         subjects_by_group[group_name] = self._series_members(group_name)
                 else:
                     selected_indices = self.behav_subject_listbox.curselection()
-                    selected_subjects = [self.behav_subject_listbox.get(i) for i in selected_indices]
+                    selected_subjects = self._behav_view()[0]
                 
                 # Collect data from pre-calculated metrics
-                for result in self.included_behavioral_results():
+                for result in self._behav_view_results():
                     subject = result.get('Subject', 'Unknown')
                     
                     # Check if this subject should be included
@@ -27552,7 +28224,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                             
                             bar_positions = x + idx * width - (len(zone_entries) - 1) * width / 2
                             ax.bar(bar_positions, means, width,
-                                  label=group_name, yerr=sems, capsize=5, alpha=0.7, color=colors[idx])
+                                  label=f"{group_name} (n={max((len(v) for v in zones_data.values()), default=0)})",
+                                  yerr=sems, capsize=5, alpha=0.7, color=colors[idx])
                             
                             # Add individual subject points
                             for zone_idx, zone in enumerate(zone_order):
@@ -38468,7 +39141,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 ax.plot(distances, vals, color=color, alpha=0.2, linewidth=0.8, zorder=1)
             # Group mean ± SEM
             ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[i % len(markers)]}-',
-                        label=f'{label} Mean±SEM', linewidth=2.5, markersize=6,
+                        label=f'{label} Mean±SEM (n={len(curves)})', linewidth=2.5, markersize=6,
                         color=color, capsize=4, zorder=3)
             self._label_distance_bins(ax, distances)
 
@@ -38806,7 +39479,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                     ax.scatter([x[j] + offset] * len(vals[cat]) + jitter, vals[cat],
                                alpha=0.4, s=40, color=color, edgecolors='black', linewidth=0.5)
             # Group means and error bars
-            ax.bar(x + offset, means, width, yerr=sems, label=f'{label} Mean±SEM',
+            ax.bar(x + offset, means, width, yerr=sems,
+                   label=f"{label} Mean±SEM (n={max((len(v) for v in vals.values()), default=0)})",
                    alpha=0.7, capsize=5, color=color, edgecolor='black', linewidth=1.5)
 
         ax.set_xlabel('Zone Category', fontsize=12)
@@ -38891,7 +39565,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                                    alpha=0.5, s=30, color=colors[group_idx],
                                    edgecolors='black', linewidth=0.5, zorder=3)
                 ax.bar(x + offset, means, group_width, yerr=sems,
-                       label=group_name, alpha=0.7, capsize=4,
+                       label=f"{group_name} (n={max((len(v) for v in by_cat.values()), default=0)})",
+                       alpha=0.7, capsize=4,
                        color=colors[group_idx], edgecolor='black', linewidth=1)
 
             ax.set_xlabel('Zone Category', fontsize=11)
@@ -38944,7 +39619,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                 for vals in curves.values():
                     ax.plot(distances, vals, color=color, alpha=0.2, linewidth=0.8, zorder=1)
                 ax.errorbar(distances, means, yerr=sems, fmt=f'{markers[i % len(markers)]}-',
-                            label=f'{label} Mean±SEM', linewidth=2.5, markersize=6,
+                            label=f'{label} Mean±SEM (n={len(curves)})', linewidth=2.5, markersize=6,
                             color=color, capsize=4, zorder=3)
                 self._label_distance_bins(ax, distances)
             ax.set_xlabel(f'Distance from Center {axis_label}-axis (cm)', fontsize=11)
@@ -38991,7 +39666,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         self._series_members(group_name), data_key, s)
                     if not distances:
                         continue
-                    ax.errorbar(distances, means, yerr=sems, label=group_name,
+                    ax.errorbar(distances, means, yerr=sems,
+                                    label=f'{group_name} (n={len(_curves)})',
                                 marker=markers[row % len(markers)], capsize=3, alpha=0.8,
                                 color=colors[group_idx], linewidth=2)
                     self._label_distance_bins(ax, distances)
@@ -39126,7 +39802,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
             means = [np.nanmean(v) if v else np.nan for v in pair]
             sems = [np.nanstd(v) / np.sqrt(len(v)) if v else 0 for v in pair]
             ax.bar(x + offset, means, width, yerr=sems,
-                   label=label, alpha=0.7, capsize=5, color=color, zorder=3)
+                   label=f"{label} (n={max((len(v) for v in pair), default=0)})",
+                       alpha=0.7, capsize=5, color=color, zorder=3)
 
         ax.set_xlabel('Movement Direction in Open Arms', fontsize=12)
         ax.set_ylabel('Average Z-score', fontsize=12)
@@ -39173,7 +39850,8 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         jittered_x = x[i] + offset + np.random.uniform(-jitter, jitter, len(vals))
                         ax.scatter(jittered_x, vals, alpha=0.5, s=25, color=colors[group_idx],
                                    edgecolors='white', linewidths=0.5, zorder=2)
-                ax.bar(x + offset, means, width, yerr=sems, label=group_name,
+                ax.bar(x + offset, means, width, yerr=sems,
+                       label=f"{group_name} (n={max((len(v) for v in pair), default=0)})",
                        alpha=0.7, capsize=4, color=colors[group_idx], zorder=3)
             ax.set_xlabel('Movement Direction', fontsize=11)
             ax.set_ylabel('Average Z-score', fontsize=11)
@@ -40405,7 +41083,7 @@ For detailed documentation, see: TTL_FILE_GUIDE.md"""
                         if (bn in gm and len(gm[bn][metric_key]) > 1) else 0
                         for bn in bout_numbers])
                     valid = ~np.isnan(means)
-                    lbl = grp if multi_group else None
+                    lbl = f"{grp} (n={int(ns.max()) if len(ns) else 0})" if multi_group else None
 
                     ax.plot(x_pos[valid], means[valid], color=gcolor, linewidth=2,
                             marker='o', markersize=5, label=lbl, zorder=3)
@@ -42417,6 +43095,10 @@ cat("OK\n")
         another plot has replaced it on the canvas."""
         import datetime
         self.flmm_timecourse_data = store
+        if not hasattr(self, '_help_last_graph'):
+            self._help_last_graph = {}
+        self._help_last_graph['bout_analysis'] = (
+            'bout:Time-Course Statistics (FLMM-style)')
         title = self._FLMM_REFERENCE_TITLES.get(reference, reference)
         behs = store.get('facet_behaviors')
         what = (f"{len(behs)} behaviors" if behs
@@ -46601,7 +47283,7 @@ cat("OK\n")
                     means = np.array(means, dtype=float)
                     sems  = np.array(sems,  dtype=float)
                     valid = ~np.isnan(means)
-                    lbl = grp if grp != 'All' else None
+                    lbl = f"{grp} (n={max(ns, default=0)})" if grp != 'All' else None
                     ax.plot(x_pos[valid], means[valid], color=color, linewidth=2,
                             marker='o', markersize=5, label=lbl, zorder=3)
                     ax.fill_between(x_pos[valid], means[valid] - sems[valid],
@@ -50471,7 +51153,8 @@ cat("OK\n")
 
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
-            settings_title="Analysis Settings")
+            settings_title="Analysis Settings",
+            help_key='decision_probability')
         self.dec_prob_plot_frame = ttk.Frame(output)
         self.dec_prob_plot_frame.pack(fill='both', expand=True)
 
@@ -51437,9 +52120,9 @@ cat("OK\n")
                 y = np.concatenate([s['vals']['pre_turn'] for s in res[g]['subjects']])
                 nx = np.concatenate([s['ev']['exc']['next'] for s in res[g]['subjects']])
                 ax.scatter(x[nx != 2], y[nx != 2], s=16, color=gcol[g], alpha=0.6, linewidths=0,
-                           label=f"{g}: then {f_lab}")
+                           label=f"{g} (n={len(res[g]['subjects'])}): then {f_lab}")
                 ax.scatter(x[nx == 2], y[nx == 2], s=18, facecolors='none', edgecolors=gcol[g],
-                           alpha=0.8, label=f"{g}: then {t_lab} again")
+                           alpha=0.8, label=f"{g} (n={len(res[g]['subjects'])}): then {t_lab} again")
             ax.axhline(0, color='gray', linestyle=':', linewidth=1)
             ax.set_xlabel("Furthest point of excursion (cm from center)")
             ax.set_ylabel(f"z-score, {meta['window_s']:g} s before turning back")
@@ -52098,9 +52781,9 @@ cat("OK\n")
                                         color=exp_col, alpha=0.20)
                         ln, = ax.plot(centers[valid], mean_p[valid], '-o',
                                       color=exp_col, linewidth=2, markersize=4,
-                                      label=f"{group_name} {self._dec_prob_label('explore')}")
+                                      label=f"{group_name} {self._dec_prob_label('explore')} (n={d.get('n_subjects', 0)})")
                         handles.append(ln)
-                        labels.append(f"{group_name} {self._dec_prob_label('explore')}")
+                        labels.append(f"{group_name} {self._dec_prob_label('explore')} (n={d.get('n_subjects', 0)})")
 
                 if 'retreat' in gdata:
                     d = gdata['retreat']
@@ -52120,9 +52803,9 @@ cat("OK\n")
                         ln, = ax.plot(centers[valid], mean_p[valid],
                                       color=ret_col, linewidth=2, markersize=4,
                                       marker='o', linestyle='--',
-                                      label=f"{group_name} {self._dec_prob_label('retreat')}")
+                                      label=f"{group_name} {self._dec_prob_label('retreat')} (n={d.get('n_subjects', 0)})")
                         handles.append(ln)
-                        labels.append(f"{group_name} {self._dec_prob_label('retreat')}")
+                        labels.append(f"{group_name} {self._dec_prob_label('retreat')} (n={d.get('n_subjects', 0)})")
 
         # ── Axes formatting ────────────────────────────────────────────────────
         ax.set_xlabel("dF/F (z-score)", fontsize=12)
@@ -52293,133 +52976,11 @@ cat("OK\n")
         "Velocity & acceleration distribution",
     }
 
-    # Per-analysis explainers shown by the Info button: what each plot shows
-    # and how to read it. Note on "acceleration": TRACY's velocity is *speed*
-    # (a scalar, sqrt(dx²+dy²)/dt), so acceleration here is the rate of change
-    # of speed (d|v|/dt). It is signed by definition — negative simply means the
-    # animal is slowing down (decelerating). This does NOT require knowing which
-    # way the mouse faces, because speed has no direction.
-    KIN_EXPLAIN = {
-        "Velocity vs Signal (overlay)":
-            "Dual-axis time series: locomotor speed (left axis) and the photometry "
-            "z-score (right axis) over the session.\n\nHow to read: look for the two "
-            "traces moving oppositely (signal up when speed drops). The title reports "
-            "the Pearson r between them — a strong negative r confirms inverse coupling.",
-        "Velocity vs Signal (scatter)":
-            "Each point is one frame: x = speed, y = signal. A fitted regression line "
-            "and Pearson r (linear) and Spearman ρ (rank/monotonic) are shown.\n\n"
-            "How to read: a downward cloud / negative r means faster movement coincides "
-            "with lower signal. Spearman is robust to non-linearity.",
-        "Velocity–Signal cross-correlation":
-            "Correlation between signal and speed computed at a range of time lags. "
-            "Lag 0 = same frame; positive lag = signal sampled AFTER velocity "
-            "(signal lags movement).\n\nHow to read: the red dot marks the most "
-            "negative (most inverse) group-mean correlation. A trough at a positive lag "
-            "means the signal change trails the movement change by that delay.\n\n"
-            "Statistics (box on plot): for each subject the lag of its own cross-"
-            "correlation extremum is the estimated delay; a one-sample t-test asks "
-            "whether that delay differs from 0 (is the trough/peak truly delayed from "
-            "movement onset). With groups, the per-subject delays are compared between "
-            "groups (Welch t / Mann–Whitney for two groups, one-way ANOVA for more), "
-            "and trough depth is compared too. Tick marks at the bottom show each "
-            "subject's peak lag. Runs at frame resolution regardless of the temporal "
-            "bin, since the statistical unit here is the subject, not the frame.",
-        "Velocity–Signal coupling (summary bars)":
-            "A robust, no-trace summary of how strongly speed and signal are "
-            "(inversely) coupled, designed for weak/flat cross-correlations where the "
-            "trough LAG is unreliable. Three metrics per subject, each a bar per group "
-            "(mean ± SEM) with every subject shown as a dot:\n"
-            "  • Instantaneous r (lag 0) — coupling with no time shift (fully robust).\n"
-            "  • Mean r over 0–2 s — average coupling just after movement.\n"
-            "  • Negative-lobe area — total inverse coupling at positive lags.\n\n"
-            "How to read: negative values = inverse coupling (signal down when fast). "
-            "A star over a bar = that group's coupling differs from 0 (one-sample t). "
-            "A bracket = groups differ (Welch t / Mann–Whitney; ANOVA for >2). These "
-            "avoid picking a single lag entirely, so they don't suffer the trough-lag "
-            "instability. A warning is shown when coupling is too weak to interpret "
-            "individual or group differences.",
-        "Signal by velocity bin":
-            "Speed is split into bins; the mean ± SEM signal is plotted per bin "
-            "(optionally using velocity z-score).\n\nHow to read: a downward staircase "
-            "= signal falls monotonically as the animal moves faster. Flat = no speed "
-            "dependence.",
-        "Acceleration vs Signal (overlay)":
-            "Like the velocity overlay but the left axis is acceleration = rate of "
-            "change of speed (negative = decelerating).\n\nHow to read: compare the "
-            "acceleration trace against the signal; the reported r quantifies their "
-            "instantaneous relationship.",
-        "Acceleration vs Signal (scatter)":
-            "Per-frame scatter of acceleration (d speed/dt; <0 = decelerating) vs "
-            "signal, with regression, Pearson r and Spearman ρ.\n\nHow to read: a "
-            "positive r would mean signal is higher while speeding up; negative while "
-            "slowing.",
-        "Signal by acceleration bin":
-            "Mean ± SEM signal across bins of acceleration (negative = decelerating, "
-            "positive = accelerating).\n\nHow to read: tells you whether the signal "
-            "tracks speeding-up vs slowing-down rather than absolute speed.",
-        "Accelerating vs decelerating":
-            "Mean signal during frames where the animal is speeding up (accel > 0) vs "
-            "slowing down (accel < 0). Uses signed acceleration regardless of the "
-            "'magnitude' display setting. Paired t-test across subjects when n>1.\n\n"
-            "How to read: a higher deceleration bar suggests the signal rises as the "
-            "animal arrests movement.",
-        "Radial velocity vs Signal":
-            "Radial velocity = the component of the movement vector pointing toward "
-            "(−) or away from (+) the arena center. Scatter vs signal with correlation."
-            "\n\nHow to read: negative x = moving inward (approach), positive x = moving "
-            "outward (avoidance/perimeter). A relationship here links signal to "
-            "approach vs avoidance movement.",
-        "Center vs Perimeter coupling":
-            "The velocity–signal Pearson r computed separately for frames in the inner "
-            "vs outer arena (split at the median distance from center).\n\nHow to read: "
-            "compare the two bars — is the inverse coupling tighter when the animal is "
-            "in the center vs zooming the perimeter?",
-        "Arena heatmap: Signal":
-            "2-D spatial map: the arena is binned into squares, colored by the mean "
-            "signal recorded while the animal occupied each square.\n\nHow to read: "
-            "warm/cool regions show where signal tends to be high/low. Color limits and "
-            "map are configurable in Settings.",
-        "Arena heatmap: Velocity":
-            "Spatial map colored by mean speed per arena bin.\n\nHow to read: highlights "
-            "where the animal moves fast (e.g. perimeter runs) vs lingers.",
-        "Arena heatmap: Acceleration":
-            "Spatial map colored by mean acceleration (rate of change of speed) per "
-            "bin.\n\nHow to read: shows where the animal tends to speed up vs slow down.",
-        "3D arena map (height=velocity, color=signal)":
-            "A 3-D surface over the arena: bar/surface HEIGHT = mean speed in each x,y "
-            "bin, surface COLOR = mean signal there. Unvisited locations are left blank."
-            "\n\nHow to read: tall regions = fast movement; the color on top tells you "
-            "what the signal was doing in those fast (or slow) locations.",
-        "Velocity×Acceleration phase map (signal)":
-            "A 2-D map over the speed (x) × acceleration (y) plane, colored by mean "
-            "signal.\n\nHow to read: the bottom-left (slow + decelerating) corner tests "
-            "whether signal peaks during behavioral arrest; the right side is fast "
-            "movement.",
-        "Movement-onset triggered signal":
-            "Average signal aligned to the moment the animal starts moving (speed "
-            "crosses the movement threshold), ± SEM across all onset events.\n\nHow to "
-            "read: a dip after t=0 means signal drops when movement begins; a rise "
-            "before/after marks pre/post-movement dynamics.",
-        "Distance-from-center vs Signal":
-            "Mean ± SEM signal binned by radial distance from the arena center.\n\nHow "
-            "to read: a trend shows whether signal depends on how peripheral the animal "
-            "is, independent of speed.",
-        "Velocity & acceleration distribution":
-            "Distribution (histogram + smooth density curve) of speed and of "
-            "acceleration, with a rug of every individual datapoint along the bottom. "
-            "Dotted vertical lines mark z-score thresholds (mean and ±1/±2/±3 SD).\n\n"
-            "How to read: the spread and skew show the animal's movement profile; the "
-            "z-lines let you see what speed/acceleration corresponds to, e.g., a +2 SD "
-            "event. With groups selected, each group is drawn in its own row of panels "
-            "so their distributions can be compared. Uses the temporal bin, so each "
-            "point is one time bin.",
-        "Kinematic–Signal coupling by zone":
-            "For every user-defined zone, the correlation between the chosen kinematic "
-            "(velocity or acceleration, set in the controls) and the signal is computed "
-            "and shown as one bar per zone.\n\nHow to read: compare bars across zones to "
-            "see where movement–signal coupling is strongest. Uses the same zones as the "
-            "other zone-based analyses.",
-    }
+    # What each analysis shows and how to read it lives in the glossary
+    # (tracy_glossary, ids 'kin:<analysis>'), opened by the tab's "?" and by
+    # "Explain this plot". Note on "acceleration": TRACY's velocity is
+    # *speed* (a scalar), so acceleration is the rate of change of speed.
+    # Negative means the animal is slowing down; no heading is needed.
 
     # ================================================================== #
     #  SIGNAL LINKAGE  —  peri-onset behavior/signal coupling analysis     #
@@ -52479,7 +53040,7 @@ cat("OK\n")
 
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Behaviors",
-            settings_title="Analysis Settings")
+            settings_title="Analysis Settings", help_key='signal_linkage')
 
         # ── Selection ────────────────────────────────────────────────────
         # Kept at 13 pt: at 26 the badge alone cost ~50 px of a control column
@@ -53415,7 +53976,7 @@ cat("OK\n")
 
         selection, settings, output, actions = self.make_layout_zones(
             tab, selection_title="Subjects & Groups",
-            settings_title="Analysis Settings")
+            settings_title="Analysis Settings", help_key='kinematics')
 
         # ── Selection ──────────────────────────────────────────────────────
         # BETA badge — this tab is new/experimental. Kept modest: at 26 pt it
@@ -53556,7 +54117,8 @@ cat("OK\n")
                    command=self.open_kin_graph_settings).grid(
             row=0, column=0, columnspan=2, sticky='ew')
         ttk.Button(extras, text="ⓘ  Explain this plot",
-                   command=self.show_kin_explainer).grid(
+                   command=lambda: self.open_glossary(
+                       self.glossary_target('kinematics'))).grid(
             row=1, column=0, columnspan=2, sticky='ew', pady=(self.ui_px(4), 0))
 
         self.register_option_clusters(
@@ -53753,25 +54315,6 @@ cat("OK\n")
 
         ttk.Button(bf, text="Apply", command=_apply).pack(side='right', padx=4)
         ttk.Button(bf, text="Cancel", command=win.destroy).pack(side='right')
-
-    def show_kin_explainer(self):
-        """Show the explainer for the currently selected analysis."""
-        analysis = self.kin_analysis_var.get()
-        text = self.KIN_EXPLAIN.get(analysis, "No description available for this analysis.")
-        win = tk.Toplevel(self.root)
-        win.title(f"About: {analysis}")
-        self.fit_toplevel(win, 560, 340)
-        win.transient(self.root)
-        frame = ttk.Frame(win, padding=12)
-        frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text=analysis, font=('TkDefaultFont', 12, 'bold'),
-                  wraplength=self.ui_px(520), justify='left').pack(anchor='w', pady=(0, 8))
-        body = tk.Text(frame, wrap='word', font=('TkDefaultFont', 10),
-                       relief='flat', height=12)
-        body.insert('1.0', text)
-        body.config(state='disabled', background=win.cget('background'))
-        body.pack(fill='both', expand=True)
-        ttk.Button(frame, text="Close", command=win.destroy).pack(pady=(8, 0))
 
     # ── Shared plotting helpers (style + colormap) ──────────────────────────
 
@@ -54738,7 +55281,7 @@ cat("OK\n")
                 sems = [np.nanstd(sub[sub['region'] == reg]['r']) /
                         np.sqrt(max(1, len(sub[sub['region'] == reg]))) for reg in regions]
                 ax.bar(xbase + gi * width, means, width, yerr=sems, capsize=3,
-                       label=f"{grp}")
+                       label=f"{grp} (n={sub['subject'].nunique()})")
             ax.set_xticks(xbase + width * (len(groups) - 1) / 2)
             ax.legend(fontsize=9)
         else:
@@ -54868,7 +55411,8 @@ cat("OK\n")
                     if np.isfinite(mean):
                         top = mean + np.sign(mean if mean else 1) * (sem)
                         star_marks.append((xbase[zi] + gi * width, mean, top, p))
-                ax.bar(xbase + gi * width, means, width, yerr=sems, capsize=3, label=grp)
+                ax.bar(xbase + gi * width, means, width, yerr=sems, capsize=3,
+                       label=f"{grp} (n={sub['subject'].nunique()})")
             ax.set_xticks(xbase + width * (len(groups) - 1) / 2)
             ax.legend(fontsize=9, title="Group")
         else:

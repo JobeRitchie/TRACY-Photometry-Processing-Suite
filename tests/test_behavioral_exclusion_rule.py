@@ -184,15 +184,33 @@ def _export_message(app, path, monkeypatch):
     return shown[0]
 
 
-def test_export_message_counts_subjects_dropped_at_calculation(tmp_path, monkeypatch):
-    """Calculate drops excluded subjects before they reach behavioral_results,
-    so the export's own filter removes nothing; the message said 0 excluded."""
-    app = _app({'S2': ['Behavior']},
-               results=[{'Subject': 'S1', 'Open_Arms': 1.0},
-                        {'Subject': 'S3', 'Open_Arms': 3.0}])
-    app.behavioral_excluded_subjects = ['S2']
-    msg = _export_message(app, tmp_path / 'beh.csv', monkeypatch)
-    assert 'Exclusions applied: 1 subject(s) excluded (S2)' in msg
+class _Listbox:
+    def __init__(self, items, selected=()):
+        self.items, self.selected = list(items), tuple(selected)
+
+    def curselection(self):
+        return self.selected
+
+    def size(self):
+        return len(self.items)
+
+    def get(self, i):
+        return self.items[i]
+
+
+def test_view_applies_selection_and_exclusion_to_stored_results():
+    """Calculate keeps every subject; the selection and the exclusions are
+    read when the results are shown, in selection order."""
+    app = _app({'S2': ['Behavior']})
+    app.behav_plot_by_var = _Var('Subject')
+    app.behav_subject_listbox = _Listbox(['S3', 'S2', 'S1'], selected=(0, 1))
+    assert _subjects(app._behav_view_results()) == ['S3']
+    assert len(app.behavioral_results) == 3
+
+    app.behav_subject_listbox.selected = ()          # nothing selected = everyone
+    assert _subjects(app._behav_view_results()) == ['S3', 'S1']
+    app.use_exclusions_behavioral = _Var(False)
+    assert _subjects(app._behav_view_results()) == ['S3', 'S2', 'S1']
 
 
 def test_export_message_counts_subjects_excluded_after_calculation(tmp_path, monkeypatch):

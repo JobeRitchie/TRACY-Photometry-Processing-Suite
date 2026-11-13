@@ -63,7 +63,8 @@ class _Fig:
     def series(self, panel, label):
         """Heights for one label in one subplot (panel 1 = G0, panel 2 = G1)."""
         for p, lbl, heights in self.bars:
-            if p == panel and lbl == label:
+            # Legend labels carry the series' n: "G0 (n=1)".
+            if p == panel and (lbl == label or str(lbl).startswith(f'{label} (n=')):
                 return heights
         return None
 
